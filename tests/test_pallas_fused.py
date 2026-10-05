@@ -9,7 +9,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 import jax
 import jax.numpy as jnp
-from sarfocus.pallas_ffbp import band_blocks, pad_columns, fused_rotate_dec_k
+from fastsar.pallas_ffbp import band_blocks, pad_columns, fused_rotate_dec_k
 
 jax.config.update('jax_platform_name', 'cpu')
 rng = np.random.default_rng(0)
@@ -44,7 +44,7 @@ for passes in (1, 3):
     print(f'passes {passes}: error {err:.1f} dB relative to float64 (expect about -45 single-pass, below -70 three-pass)')
 
 # second-generation kernel: two parents, three children each, against the same float64 reference per child
-from sarfocus.pallas_ffbp import band_blocks2, fused_rotate_dec_k2
+from fastsar.pallas_ffbp import band_blocks2, fused_rotate_dec_k2
 band2 = band_blocks2(Fk, D)
 print('band2', {k: band2[k] for k in ('kob', 'win', 'stride', 'nb', 'Kpad', 'chunk')})
 N, nc = 2, 3
@@ -78,7 +78,7 @@ for n in range(N):
 print(f'kernel2 multi-block: error {10 * np.log10(num / den):.1f} dB')
 
 # third kernel: precomputed coarse tables, with and without the fused pulse decimation
-from sarfocus.pallas_ffbp import fused_rotate_dec_k3
+from fastsar.pallas_ffbp import fused_rotate_dec_k3
 Dp, Po = 2, 40
 tp_ = np.kaiser(16, 8.0) * np.sinc((np.arange(16) - 7.5) / Dp) / Dp
 Fp = np.zeros((P, Po))

@@ -1,8 +1,8 @@
 """Read a spotlight collection from CPHD (frequency domain, fixed scene reference point) and, optionally, the image
 grid of the matching SICD, into the arrays form_image takes. Needs sarpy.
 
-    col = sarfocus.io.read_cphd('x_CPHD.cphd', sicd='x_SICD.nitf')
-    img = sarfocus.form_image(**col)
+    col = fastsar.io.read_cphd('x_CPHD.cphd', sicd='x_SICD.nitf')
+    img = fastsar.form_image(**col)
 
 The local frame has x along track, y along ground range away from the radar and z up, with its origin at the scene
 reference point. With a SICD the output grid is the vendor's own (pixel counts, spacings and image-plane axes);

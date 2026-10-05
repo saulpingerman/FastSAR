@@ -3,8 +3,8 @@ format against factorized backprojection (amplitude, since polar format's residu
 import os, sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
-import sarfocus
-from sarfocus import sim
+import fastsar
+from fastsar import sim
 
 rng = np.random.default_rng(1)
 col = sim.make_collect(res=0.5, scene=60.0, r0=5e3)
@@ -18,20 +18,20 @@ def rel_db(a, b):
     return 10 * np.log10(np.sum(np.abs(a - b) ** 2) / np.sum(np.abs(b) ** 2))
 
 
-ref = sarfocus.form_image(S, col.ant, col.fmin, col.df, **grid, backend='jax', T=16, levels=2)
-print('backends here:', sarfocus.available_backends())
-for b in sarfocus.available_backends():
-    img = sarfocus.form_image(S, col.ant, col.fmin, col.df, **grid, backend=b, T=16, levels=2)
+ref = fastsar.form_image(S, col.ant, col.fmin, col.df, **grid, backend='jax', T=16, levels=2)
+print('backends here:', fastsar.available_backends())
+for b in fastsar.available_backends():
+    img = fastsar.form_image(S, col.ant, col.fmin, col.df, **grid, backend=b, T=16, levels=2)
     e = rel_db(img, ref)
     print(f'{b:5s} vs jax: {e:.1f} dB')
     assert e < -60, (b, e)
-if 'cuda' in sarfocus.available_backends():
-    ref32 = sarfocus.form_image(S, col.ant, col.fmin, col.df, **grid, backend='jax', T=32, levels=2)
-    img = sarfocus.form_image(S, col.ant, col.fmin, col.df, **grid, backend='cuda', precision='float16', T=32, levels=2)
+if 'cuda' in fastsar.available_backends():
+    ref32 = fastsar.form_image(S, col.ant, col.fmin, col.df, **grid, backend='jax', T=32, levels=2)
+    img = fastsar.form_image(S, col.ant, col.fmin, col.df, **grid, backend='cuda', precision='float16', T=32, levels=2)
     e = rel_db(img, ref32)
     print(f'cuda float16 vs jax: {e:.1f} dB')
     assert e < -45, e
-pf = sarfocus.form_image(S, col.ant, col.fmin, col.df, **grid, algorithm='pfa', pfa_guard=10.0)
+pf = fastsar.form_image(S, col.ant, col.fmin, col.df, **grid, algorithm='pfa', pfa_guard=10.0)
 c = np.corrcoef(np.abs(pf).ravel(), np.abs(ref).ravel())[0, 1]
 print(f'pfa amplitude correlation with ffbp: {c:.3f}')
 assert c > 0.9, c

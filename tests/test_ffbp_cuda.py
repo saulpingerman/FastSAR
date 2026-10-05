@@ -3,7 +3,7 @@ import os, sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np, jax
 jax.config.update('jax_platform_name', 'cpu')
-from sarfocus import sim, ffbp2, ffbp_cuda
+from fastsar import sim, ffbp2, ffbp_cuda
 import cupy as cp
 rng = np.random.default_rng(1)
 col = sim.make_collect(res=0.5, scene=60.0, r0=5e3)

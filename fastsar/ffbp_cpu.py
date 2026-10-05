@@ -29,7 +29,7 @@ def lib():
         return _lib
     src = open(_SRC).read()
     tag = hashlib.sha1(src.encode()).hexdigest()[:12]
-    d = os.path.join(os.path.expanduser('~'), '.cache', 'sarfocus')
+    d = os.path.join(os.path.expanduser('~'), '.cache', 'fastsar')
     os.makedirs(d, exist_ok=True)
     so = os.path.join(d, f'libffbp_cpu_{tag}.so')
     if not os.path.exists(so):
