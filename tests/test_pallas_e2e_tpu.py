@@ -5,7 +5,7 @@ os.environ['FFBP_FORCE_TPU_KERNELS'] = '1'
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np, jax, jax.numpy as jnp
 jax.config.update('jax_platform_name', 'cpu')
-from sarform import sim, ffbp2, pallas_ffbp
+from sarfocus import sim, ffbp2, pallas_ffbp
 for name in ('fused_rotate_dec_k2', 'fused_rotate_dec_k3', 'fused_final', 'fused_final2', 'fused_final3'):
     _o = getattr(pallas_ffbp, name)
     setattr(pallas_ffbp, name, (lambda o: lambda *a, **k: o(*a, **{**k, 'interpret': True}))(_o))

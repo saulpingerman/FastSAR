@@ -1,11 +1,11 @@
-# sarform
+# SARfocus
 
 Spotlight SAR image formation for Cloud TPUs, Nvidia GPUs and x86 CPUs from one Python call.
 
 ```python
-import sarform
-col = sarform.io.read_cphd('scene_CPHD.cphd', sicd='scene_SICD.nitf')   # phase history and the vendor's grid
-img = sarform.form_image(**col)                                          # complex64 [azimuth, range]
+import sarfocus
+col = sarfocus.io.read_cphd('scene_CPHD.cphd', sicd='scene_SICD.nitf')   # phase history and the vendor's grid
+img = sarfocus.form_image(**col)                                          # complex64 [azimuth, range]
 ```
 
 The main algorithm is factorized backprojection (three levels of tiles, Kaiser decimation filters, a 2T by 2T

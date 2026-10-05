@@ -3,7 +3,7 @@ requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "sarform"
+name = "sarfocus"
 version = "0.1.0"
 description = "Spotlight SAR image formation on Cloud TPUs, Nvidia GPUs and x86 CPUs"
 readme = "README.md"
@@ -17,7 +17,7 @@ cuda = ["cupy-cuda12x"]
 io = ["sarpy"]
 
 [tool.setuptools]
-packages = ["sarform"]
+packages = ["sarfocus"]
 
 [tool.setuptools.package-data]
-sarform = ["ffbp_cpu.cpp"]
+sarfocus = ["ffbp_cpu.cpp"]

@@ -3,7 +3,7 @@ import os, sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np, jax, jax.numpy as jnp
 jax.config.update('jax_platform_name', 'cpu')
-from sarform.pallas_ffbp import fused_final
+from sarfocus.pallas_ffbp import fused_final
 rng = np.random.default_rng(0)
 B, Pf, Qf, T = 3, 16, 79, 32
 Qpad = 128
@@ -29,7 +29,7 @@ for passes in (1, 3):
     print(f'final kernel passes {passes}: error {10 * np.log10(np.sum(np.abs(out - ref) ** 2) / np.sum(np.abs(ref) ** 2)):.1f} dB')
 
 # the recurrence version: data transposed (q on rows, p on columns)
-from sarform.pallas_ffbp import fused_final2
+from sarfocus.pallas_ffbp import fused_final2
 Pl = 128
 Qp8 = 8 * -(-Qf // 8)
 dT = np.zeros((B, Qp8, Pl), np.complex128); dT[:, :Qf, :Pf] = np.transpose(data, (0, 2, 1))
@@ -41,7 +41,7 @@ for passes in (1, 3):
     print(f'final kernel 2 (recurrence) passes {passes}: error {10 * np.log10(np.sum(np.abs(out - ref) ** 2) / np.sum(np.abs(ref) ** 2)):.1f} dB')
 
 # the stacked-tile version (B = 3 tiles here -> pad to 4)
-from sarform.pallas_ffbp import fused_final3
+from sarfocus.pallas_ffbp import fused_final3
 Bp = 4
 pad = lambda x: np.concatenate([x, np.zeros((Bp - B,) + x.shape[1:], x.dtype)], 0)
 for passes in (1, 3):

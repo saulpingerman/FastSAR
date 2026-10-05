@@ -1,8 +1,8 @@
 """One call for spotlight image formation on any of the supported devices.
 
-    import sarform
-    img = sarform.form_image(S, ant, fmin, df, nx, ny, spx, spy, e1, e2)            # factorized backprojection
-    img = sarform.form_image(..., algorithm='pfa')                                  # polar format
+    import sarfocus
+    img = sarfocus.form_image(S, ant, fmin, df, nx, ny, spx, spy, e1, e2)            # factorized backprojection
+    img = sarfocus.form_image(..., algorithm='pfa')                                  # polar format
 
 S is the phase history [pulses, samples] (complex, frequency domain, motion compensated to the scene reference
 point), ant the antenna phase centers [pulses, 3] in a frame whose origin is the scene reference point, fmin and df

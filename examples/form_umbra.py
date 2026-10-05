@@ -6,7 +6,7 @@ import argparse, time
 
 import numpy as np
 
-import sarform
+import sarfocus
 
 
 def main():
@@ -15,10 +15,10 @@ def main():
     ap.add_argument('--backend', default='auto'); ap.add_argument('--precision', default='float32')
     ap.add_argument('--algorithm', default='ffbp')
     a = ap.parse_args()
-    col = sarform.io.read_cphd(a.cphd, sicd=a.sicd)
-    print('pulses, samples', col['S'].shape, 'grid', col['nx'], col['ny'], 'backends', sarform.available_backends())
+    col = sarfocus.io.read_cphd(a.cphd, sicd=a.sicd)
+    print('pulses, samples', col['S'].shape, 'grid', col['nx'], col['ny'], 'backends', sarfocus.available_backends())
     t = time.perf_counter()
-    img = sarform.form_image(**col, algorithm=a.algorithm, backend=a.backend, precision=a.precision)
+    img = sarfocus.form_image(**col, algorithm=a.algorithm, backend=a.backend, precision=a.precision)
     print(f'formed in {time.perf_counter() - t:.1f} s (includes compilation on the first call)')
     np.save(a.out + '.npy', img)
     try:
