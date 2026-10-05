@@ -3,7 +3,7 @@ same host-side orchestration as the CUDA pipeline (ffbp_cuda.py), with NumPy for
 
     form = make_ffbp_cpu(plan, coll); img = form(S)        # S [P, K] complex64 (windowed) -> complex64 [nx, ny]
 
-The shared library is compiled on first use with g++ (-O3 -march=native -fopenmp) into ~/.cache/sarbench.
+The shared library is compiled on first use with g++ (-O3 -march=native -fopenmp) into ~/.cache/fastsar.
 """
 import ctypes, hashlib, os, subprocess, time
 
