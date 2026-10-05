@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sarform"
+version = "0.1.0"
+description = "Spotlight SAR image formation on Cloud TPUs, Nvidia GPUs and x86 CPUs"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [{name = "Paul Singerman"}]
+requires-python = ">=3.10"
+dependencies = ["numpy", "scipy", "jax"]
+
+[project.optional-dependencies]
+cuda = ["cupy-cuda12x"]
+io = ["sarpy"]
+
+[tool.setuptools]
+packages = ["sarform"]
+
+[tool.setuptools.package-data]
+sarform = ["ffbp_cpu.cpp"]
