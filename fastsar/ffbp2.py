@@ -134,6 +134,40 @@ def make_plan(col, nx, ny, spx, spy, T=32, nlev=3, pmax=0.4, atten=70.0, splits=
     return out
 
 
+def final_phase_error(ant, fmax, nx, ny, spx, spy, e1, e2, T):
+    """Predicted image error (dB, relative to exact backprojection) from the final stage's plane-wave model on
+    T x T tiles: the peak phase it leaves out (exact range offset of a pixel from its tile center minus the linear
+    term and the aperture-mean curvature, over pulses, tile corners and a 3 x 3 sample of tiles across the image)
+    mapped by 20 log10(phase) - 14 dB, which matches measured errors to about 2 dB from 1 km to orbital range."""
+    ant, e1, e2 = np.asarray(ant, np.float64), np.asarray(e1, np.float64), np.asarray(e2, np.float64)
+    a = ant[::max(1, len(ant) // 2048)]
+    hx, hy = 0.5 * T * spx, 0.5 * T * spy
+    worst = 1e-30
+    for fx in (-0.5, 0.0, 0.5):
+        for fy in (-0.5, 0.0, 0.5):
+            c = fx * max(0.0, nx * spx - 2 * hx) * e1 + fy * max(0.0, ny * spy - 2 * hy) * e2
+            w = a - c
+            r = np.linalg.norm(w, axis=1)
+            u = w / r[:, None]
+            for sx in np.linspace(-1, 1, 5):
+                for sy in np.linspace(-1, 1, 5):
+                    d = sx * hx * e1 + sy * hy * e2
+                    ud = u @ d
+                    res = np.linalg.norm(w - d, axis=1) - r + ud - (d @ d - ud * ud).mean() / (2 * r.mean())
+                    worst = max(worst, float(np.abs(res - res.mean()).max()))
+    return 20.0 * np.log10(4 * np.pi * fmax / C * worst) - 14.0
+
+
+def choose_T(ant, fmax, nx, ny, spx, spy, e1, e2, target_db=-40.0, choices=(32, 16)):
+    """Largest final tile size whose predicted final-stage error meets target_db (the smallest choice otherwise),
+    with the predicted error."""
+    for T in choices:
+        err = final_phase_error(ant, fmax, nx, ny, spx, spy, e1, e2, T)
+        if err <= target_db:
+            return T, err
+    return choices[-1], err
+
+
 HOST_LEVELS = 2          # levels whose rotation phases are computed in float64 on the host
 
 

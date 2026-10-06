@@ -57,6 +57,20 @@ leaves the amplitude image unchanged but adds phase error beside bright returns.
   Needs `T=32`.
 - `single-pass`, `three-pass`: the TPU's one- and three-pass products.
 
+## Tile size and range
+
+The final stage treats each T by T tile with a plane-wave model plus an aperture-mean curvature term. What that
+leaves out grows as the square of the tile size and falls with range. With `T='auto'` (the default) FastSAR
+predicts the error from the collection geometry and takes the largest tile (32 or 16 pixels) that meets
+`target_db` (default -40 dB), warning when neither does. The prediction tracks measurement to within about 2 dB
+on simulated scenes of 0.5 m pixels:
+
+- 1 km: T=16, -36 dB (T=32 would give -22 dB; the warning suggests coarser pixels or exact backprojection)
+- 4 km: T=16, -48 dB (T=32: -35 dB)
+- 16 km and beyond: T=32, -47 dB at 16 km, falling to about -62 dB at orbital range
+
+Spaceborne collections therefore keep T=32. CUDA float16 always uses T=32.
+
 ## Install
 
 ```

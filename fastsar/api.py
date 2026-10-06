@@ -24,6 +24,11 @@ few kilometers and must be smaller for small simulated scenes.
 Precision: 'float32' (default), 'float16' (CUDA: float16 storage throughout with float32 accumulation),
 'single-pass' (TPU: one bfloat16 pass per product, the device default), 'three-pass' (TPU: float32-class accuracy).
 On the TPU 'float32' means three-pass.
+
+Tile size: T='auto' (default) picks the largest final tile (32 or 16 pixels) whose predicted error against exact
+backprojection meets target_db (-40 dB by default). The error of the final stage's plane-wave model grows as the
+square of the tile size and falls with range, so orbital collections keep T=32 and short-range (airborne) ones
+drop to 16. The prediction is kept as ImageFormer.predicted_error_db.
 """
 import numpy as np
 
@@ -63,8 +68,9 @@ class ImageFormer:
     a different antenna path needs a new former. Arguments as for form_image."""
 
     def __init__(self, ant, fmin, df, K, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 1.0, 0.0), backend='auto',
-                 precision='float32', window=True, T=32, levels=3, pmax=0.4):
+                 precision='float32', window=True, T='auto', levels=3, pmax=0.4, target_db=-40.0):
         from . import ffbp2
+        import warnings
         self.ant = np.asarray(ant, np.float64)
         self.P, self.K = self.ant.shape[0], int(K)
         self.window = window
@@ -72,6 +78,21 @@ class ImageFormer:
         e1, e2 = np.asarray(e1, np.float64), np.asarray(e2, np.float64)
         self.backend = available_backends()[0] if backend == 'auto' else backend
         self.precision = precision
+        self.predicted_error_db = None
+        if T == 'auto':
+            fmax = float(fmin) + self.K * float(df)
+            if self.backend == 'cuda' and precision == 'float16':
+                T, err = 32, ffbp2.final_phase_error(self.ant, fmax, nx, ny, spx, spy, e1, e2, 32)
+                if err > target_db:
+                    warnings.warn(f'cuda float16 needs T=32, predicted error {err:.1f} dB misses target {target_db:.1f} dB; '
+                                  "use precision='float32' for this geometry")
+            else:
+                T, err = ffbp2.choose_T(self.ant, fmax, nx, ny, spx, spy, e1, e2, target_db)
+                if err > target_db:
+                    warnings.warn(f'predicted error {err:.1f} dB at T={T} misses target {target_db:.1f} dB '
+                                  '(short range for this pixel size)')
+            self.predicted_error_db = float(err)
+        self.T = T
         plan = ffbp2.make_plan(col, nx, ny, spx, spy, T=T, nlev=levels, pmax=pmax, e1=e1, e2=e2)
         coll = ffbp2.collection_arrays(plan, self.ant)
         if window:
@@ -120,7 +141,7 @@ class ImageFormer:
 
 
 def form_image(S, ant, fmin, df, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 1.0, 0.0), algorithm='ffbp',
-               backend='auto', precision='float32', window=True, T=32, levels=3, pmax=0.4, pfa_guard=300.0):
+               backend='auto', precision='float32', window=True, T='auto', levels=3, pmax=0.4, pfa_guard=300.0, target_db=-40.0):
     """Form the complex image [nx, ny] (complex64). See the module docstring for the arguments. For more than one
     image of the same geometry, build an ImageFormer once and call it; this function sets one up on every call."""
     S = np.asarray(S)
@@ -133,7 +154,7 @@ def form_image(S, ant, fmin, df, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
         return _pfa(S.astype(np.complex64), col, nx, ny, spx, spy, np.asarray(e1, np.float64), np.asarray(e2, np.float64), pfa_guard)
     if algorithm != 'ffbp':
         raise ValueError("algorithm must be 'ffbp' or 'pfa'")
-    return ImageFormer(ant, fmin, df, S.shape[1], nx, ny, spx, spy, e1, e2, backend, precision, window, T, levels, pmax)(S)
+    return ImageFormer(ant, fmin, df, S.shape[1], nx, ny, spx, spy, e1, e2, backend, precision, window, T, levels, pmax, target_db)(S)
 
 
 def _pfa(S, col, nx, ny, spx, spy, e1, e2, guard=300.0):

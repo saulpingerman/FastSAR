@@ -27,7 +27,8 @@ def lib():
     global _lib
     if _lib is not None:
         return _lib
-    src = open(_SRC).read()
+    with open(_SRC) as fh:
+        src = fh.read()
     tag = hashlib.sha1(src.encode()).hexdigest()[:12]
     d = os.path.join(os.path.expanduser('~'), '.cache', 'fastsar')
     os.makedirs(d, exist_ok=True)
