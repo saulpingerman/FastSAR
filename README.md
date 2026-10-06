@@ -1,6 +1,20 @@
 # FastSAR
 
-Spotlight SAR image formation for Cloud TPUs, Nvidia GPUs and x86 CPUs from one Python call.
+SAR image formation for Cloud TPUs, Nvidia GPUs and x86 CPUs from one Python call.
+
+What it covers, with the section that documents and validates each part:
+
+- spotlight phase histories (CPHD, frequency domain), by factorized backprojection with device kernels or polar
+  format; the final tile size follows the collection's range (Tile size and range)
+- exact backprojection onto any points: DEM surfaces, map grids, bistatic geometry, moving reference points
+  (Exact backprojection)
+- CPHD reading with per-pulse frequency grids, moving reference points, channel selection and alignment to a
+  vendor SICD grid (Reading CPHD)
+- wide-angle and circular apertures (Wide-angle and circular apertures)
+- phase gradient autofocus (Autofocus)
+- stripmap focusing by range-Doppler and omega-k (Stripmap)
+- interferograms and coherence for interferometry and change detection (Interferometry and change detection)
+- multilooking, terrain-corrected geocoding, GeoTIFF and SICD output (Products and geolocation)
 
 ```python
 import fastsar
@@ -107,6 +121,40 @@ The tests use a small simulated scene and take seconds to a few minutes.
 given by pixel counts `nx, ny`, spacings `spx, spy` (m) and unit vectors `e1` (azimuth) and `e2` (range) of the
 image plane; pixel (i, j) sits at `(i - nx/2) spx e1 + (j - ny/2) spy e2`. `read_cphd` builds all of
 these from the files, using the SICD's grid when one is given.
+
+## Exact backprojection
+
+`fastsar.backproject(S, ant, fmin, df, points, rcv=None, ref=None)` forms the image at any points [..., 3]: the
+plane of `plane_points(nx, ny, spx, spy, e1, e2, height=None)` (the grid of `form_image`, optionally lifted onto a
+DEM), a map grid, or scattered points. With `rcv` the geometry is bistatic (`ant` is then the transmitter), and
+`ref` gives per-pulse reference ranges for a phase history compensated to a moving point. Its cost is pulses times
+points, so for large planar images `form_image` is the fast path. Ranges are computed in float64 at the centers of
+blocks of 256 nearby points and in float32 within a block, so the float32 kernels keep their accuracy at orbital
+range. Against a float64 reference (`tests/test_bp.py`, upsample 16) the CPU kernel, which works in float64,
+agrees to -77 to -82 dB, and the JAX and CUDA kernels to -72 to -76 dB, monostatic and bistatic, at 5 and 600 km;
+a phase history compensated to a moving point and imaged with its reference ranges matches the fixed-point image
+to -60 dB. Each pulse is range compressed by a zero-padded FFT (`upsample` times its length) and read with linear
+interpolation; the image error against a 128x reference falls by 12 dB per doubling of `upsample`, from -39 dB at
+2 to -63 dB at 8 (the default) and -88 dB at 32.
+
+## Reading CPHD
+
+`fastsar.io.read_cphd(path, sicd=None, channel=0, meta=False)` reads a frequency-domain CPHD with sarpy and returns
+the arguments of `form_image`; with `meta=True` it also returns the transmitter and receiver positions, the
+per-pulse reference ranges and the frame (`io.local_to_ecf`, `io.ecf_to_geodetic` and their inverses convert
+points). It handles:
+
+- per-pulse frequency grids (FXFixed false), resampled onto a common grid with a 16-tap Kaiser sinc (-80 dB on a
+  test signal); on the Panama collection the largest offset is 0.0045 samples and the image changes by -65 to
+  -94 dB
+- a moving scene reference point, re-referenced to the mid-aperture point when the range change is small and
+  otherwise left for `backproject` with `ref=meta['ref']`
+- channels by index or identifier (polarizations)
+- pulses with invalid positions (trimmed at the ends, interpolated inside) and empty or flagged pulses (reported)
+- with a vendor SICD, the vendor's grid: the origin moves onto its pixel grid so that the image is the SICD array
+  (transposed when range runs along rows); on Panama our pixels coincide with the vendor's to a quarter pixel near
+  the scene center
+- optionally (`troposphere=True`) the per-pulse troposphere delay at the scene reference point
 
 ## Wide-angle and circular apertures
 
