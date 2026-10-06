@@ -36,3 +36,13 @@ c = np.corrcoef(np.abs(pf).ravel(), np.abs(ref).ravel())[0, 1]
 print(f'pfa amplitude correlation with ffbp: {c:.3f}')
 assert c > 0.9, c
 print('ok')
+
+# a reused former gives the same image as form_image, and the second call skips setup
+import time
+b0 = fastsar.available_backends()[0]
+former = fastsar.ImageFormer(col.ant, col.fmin, col.df, S.shape[1], **grid, backend=b0, T=16, levels=2)
+img1 = former(S); t = time.perf_counter(); img2 = former(S); t2 = time.perf_counter() - t
+ref_b = fastsar.form_image(S, col.ant, col.fmin, col.df, **grid, backend=b0, T=16, levels=2)
+print(f'ImageFormer ({b0}) vs form_image: {rel_db(img2, ref_b):.1f} dB; second call {t2:.3f} s')
+assert rel_db(img2, ref_b) < -100
+print('ok')

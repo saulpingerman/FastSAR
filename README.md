@@ -8,6 +8,14 @@ col = fastsar.io.read_cphd('scene_CPHD.cphd', sicd='scene_SICD.nitf')   # phase 
 img = fastsar.form_image(**col)                                          # complex64 [azimuth, range]
 ```
 
+For many images of the same geometry, build the plan and compile the kernels once:
+
+```python
+former = fastsar.ImageFormer(col['ant'], col['fmin'], col['df'], col['S'].shape[1],
+                             col['nx'], col['ny'], col['spx'], col['spy'], col['e1'], col['e2'])
+img = former(col['S'])            # each further call pays only the image formation
+```
+
 The main algorithm is factorized backprojection (three levels of tiles, Kaiser decimation filters, a 2T by 2T
 product per final tile), with a kernel for each kind of device:
 
@@ -27,6 +35,9 @@ Polar format, with the resampling that removes its planar-wavefront displacement
 Time to form one Umbra spotlight image of the Panama Canal (12,207 by 8,808 pixels from 15,186 pulses of 14,399
 samples), at float32-class accuracy (about -59.5 dB against a float64 exact backprojection), on-demand prices
 of October 2026:
+
+Times are the image formation itself (an `ImageFormer` call); a one-off `form_image` call adds planning and
+compilation, a few seconds on an image of this size.
 
 | device | seconds per image | dollars per 1000 images |
 |---|---|---|

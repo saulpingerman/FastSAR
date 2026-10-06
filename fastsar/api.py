@@ -54,56 +54,86 @@ def available_backends():
     return out
 
 
+class ImageFormer:
+    """Factorized backprojection set up once for a collection geometry and output grid, then called on phase
+    histories:  former = ImageFormer(ant, fmin, df, K, nx, ny, spx, spy, e1, e2); img = former(S).
+
+    Building plans the tiles and filters, computes the float64 geometry and compiles the kernels; each call then
+    pays only the image formation. Reuse one former for repeated images of the same geometry (or for timing);
+    a different antenna path needs a new former. Arguments as for form_image."""
+
+    def __init__(self, ant, fmin, df, K, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 1.0, 0.0), backend='auto',
+                 precision='float32', window=True, T=32, levels=3, pmax=0.4):
+        from . import ffbp2
+        self.ant = np.asarray(ant, np.float64)
+        self.P, self.K = self.ant.shape[0], int(K)
+        self.window = window
+        col = Collect(fmin=float(fmin), df=float(df), K=self.K, ant=self.ant, res=0.5)
+        e1, e2 = np.asarray(e1, np.float64), np.asarray(e2, np.float64)
+        self.backend = available_backends()[0] if backend == 'auto' else backend
+        self.precision = precision
+        plan = ffbp2.make_plan(col, nx, ny, spx, spy, T=T, nlev=levels, pmax=pmax, e1=e1, e2=e2)
+        coll = ffbp2.collection_arrays(plan, self.ant)
+        if window:
+            self.wp, self.wk = _window(self.P, self.K)
+        if self.backend == 'cuda':
+            from . import ffbp_cuda
+            if precision not in ('float32', 'float16'):
+                raise ValueError("cuda precision: 'float32' or 'float16'")
+            if precision == 'float16' and T != 32:
+                raise ValueError('cuda float16 uses the tensor-core final stage, which is built for T=32')
+            self._form = ffbp_cuda.make_ffbp_cuda(plan, coll, final_mode='f16tc' if precision == 'float16' else 'fp32',
+                                                  store='f16' if precision == 'float16' else 'fp32')
+        elif self.backend == 'cpu':
+            from . import ffbp_cpu
+            if precision != 'float32':
+                raise ValueError("cpu precision: 'float32'")
+            self._form = ffbp_cpu.make_ffbp_cpu(plan, coll)
+        elif self.backend in ('tpu', 'jax'):
+            pol = {'float32': 'fp32_high' if self.backend == 'tpu' else 'fp32', 'three-pass': 'fp32_high',
+                   'single-pass': 'fp32_fast', 'float16': 'f16'}.get(precision)
+            if pol is None:
+                raise ValueError(f'unknown precision {precision!r}')
+            filt = 'pallas2' if self.backend == 'tpu' else 'conv'
+            self._pol = pol
+            self._fn = ffbp2.make_ffbp(pol, plan, filt, 1 << 26, 'direct', pallas_pb=256, pallas_nc=8, pallas_ng=16,
+                                       pallas_final=2, pallas_gen=3)
+            self._arrs = ffbp2.device_arrays(pol, plan, coll, ffbp2.static_arrays(pol, plan, filt))
+        else:
+            raise ValueError(f'unknown backend {backend!r}')
+
+    def __call__(self, S):
+        """S [P, K] complex phase history -> complex64 image [nx, ny]."""
+        S = np.asarray(S)
+        if S.shape != (self.P, self.K):
+            raise ValueError(f'phase history must be {(self.P, self.K)}, got {S.shape}')
+        S = (S * self.wp[:, None] * self.wk[None, :]).astype(np.complex64) if self.window else S.astype(np.complex64)
+        if self.backend == 'cuda':
+            import cupy as cp
+            return cp.asnumpy(self._form(cp.asarray(S), ng=8)).astype(np.complex64)
+        if self.backend == 'cpu':
+            return self._form(S, ng=8).astype(np.complex64)
+        from . import ffbp2
+        hre, him, scale = ffbp2.prepare(self._pol, S)
+        re, im = self._fn(hre, him, self._arrs)
+        return ((np.asarray(re) + 1j * np.asarray(im)) * scale).astype(np.complex64)
+
+
 def form_image(S, ant, fmin, df, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 1.0, 0.0), algorithm='ffbp',
                backend='auto', precision='float32', window=True, T=32, levels=3, pmax=0.4, pfa_guard=300.0):
-    """Form the complex image [nx, ny] (complex64). See the module docstring for the arguments."""
+    """Form the complex image [nx, ny] (complex64). See the module docstring for the arguments. For more than one
+    image of the same geometry, build an ImageFormer once and call it; this function sets one up on every call."""
     S = np.asarray(S)
-    ant = np.asarray(ant, np.float64)
-    P, K = S.shape
-    col = Collect(fmin=float(fmin), df=float(df), K=K, ant=ant, res=0.5)
-    e1, e2 = np.asarray(e1, np.float64), np.asarray(e2, np.float64)
-    if window:
-        wp, wk = _window(P, K)
-        S = (S * wp[:, None] * wk[None, :]).astype(np.complex64)
-    else:
-        S = S.astype(np.complex64)
     if algorithm == 'pfa':
-        return _pfa(S, col, nx, ny, spx, spy, e1, e2, pfa_guard)
+        P, K = S.shape
+        col = Collect(fmin=float(fmin), df=float(df), K=K, ant=np.asarray(ant, np.float64), res=0.5)
+        if window:
+            wp, wk = _window(P, K)
+            S = (S * wp[:, None] * wk[None, :]).astype(np.complex64)
+        return _pfa(S.astype(np.complex64), col, nx, ny, spx, spy, np.asarray(e1, np.float64), np.asarray(e2, np.float64), pfa_guard)
     if algorithm != 'ffbp':
         raise ValueError("algorithm must be 'ffbp' or 'pfa'")
-    from . import ffbp2
-    if backend == 'auto':
-        backend = available_backends()[0]
-    plan = ffbp2.make_plan(col, nx, ny, spx, spy, T=T, nlev=levels, pmax=pmax, e1=e1, e2=e2)
-    coll = ffbp2.collection_arrays(plan, ant)
-    if backend == 'cuda':
-        from . import ffbp_cuda
-        import cupy as cp
-        if precision not in ('float32', 'float16'):
-            raise ValueError("cuda precision: 'float32' or 'float16'")
-        if precision == 'float16' and T != 32:
-            raise ValueError('cuda float16 uses the tensor-core final stage, which is built for T=32')
-        store = 'f16' if precision == 'float16' else 'fp32'
-        fin = 'f16tc' if precision == 'float16' else 'fp32'
-        form = ffbp_cuda.make_ffbp_cuda(plan, coll, final_mode=fin, store=store)
-        return cp.asnumpy(form(cp.asarray(S), ng=8)).astype(np.complex64)
-    if backend == 'cpu':
-        from . import ffbp_cpu
-        if precision != 'float32':
-            raise ValueError("cpu precision: 'float32'")
-        return ffbp_cpu.make_ffbp_cpu(plan, coll)(S, ng=8).astype(np.complex64)
-    if backend in ('tpu', 'jax'):
-        pol = {'float32': 'fp32_high' if backend == 'tpu' else 'fp32', 'three-pass': 'fp32_high', 'single-pass': 'fp32_fast',
-               'float16': 'f16'}.get(precision)
-        if pol is None:
-            raise ValueError(f'unknown precision {precision!r}')
-        filt = 'pallas2' if backend == 'tpu' else 'conv'
-        fn = ffbp2.make_ffbp(pol, plan, filt, 1 << 26, 'direct', pallas_pb=256, pallas_nc=8, pallas_ng=16, pallas_final=2, pallas_gen=3)
-        static = ffbp2.static_arrays(pol, plan, filt)
-        hre, him, scale = ffbp2.prepare(pol, S)
-        re, im = fn(hre, him, ffbp2.device_arrays(pol, plan, coll, static))
-        return ((np.asarray(re) + 1j * np.asarray(im)) * scale).astype(np.complex64)
-    raise ValueError(f'unknown backend {backend!r}')
+    return ImageFormer(ant, fmin, df, S.shape[1], nx, ny, spx, spy, e1, e2, backend, precision, window, T, levels, pmax)(S)
 
 
 def _pfa(S, col, nx, ny, spx, spy, e1, e2, guard=300.0):
