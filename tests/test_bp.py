@@ -92,3 +92,9 @@ for b in backends:
     print(f'{b}: moving reference point vs fixed: {e:.1f} dB')
     assert e < -55, e
 print('ok')
+
+# gain: backproject has the gain of form_image (the plain sum over pulses and samples)
+g = np.vdot(ff.ravel(), ex.ravel()) / np.vdot(ff.ravel(), ff.ravel())
+print(f'backproject / form_image gain: {abs(g):.4f}')
+assert abs(abs(g) - 1) < 0.02, g
+print('ok')

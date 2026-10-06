@@ -52,13 +52,14 @@ def _order(points):
 
 
 def range_compress(S, nfft, xp=np):
-    """S [p, K] -> [p, nfft] complex, zero delay at index nfft // 2, carrier fmin + (K // 2) df removed."""
+    """S [p, K] -> [p, nfft] complex, zero delay at index nfft // 2, carrier fmin + (K // 2) df removed; the sum of
+    the samples, not their mean (the unnormalized inverse transform), so that images have the gain of form_image."""
     P, K = S.shape
     h = K // 2
     pad = xp.zeros((P, nfft), dtype=S.dtype)
     pad[:, :K - h] = S[:, h:]
     pad[:, nfft - h:] = S[:, :h]
-    return xp.fft.fftshift(xp.fft.ifft(pad, axis=1), axes=1)
+    return xp.fft.fftshift(xp.fft.ifft(pad, axis=1), axes=1) * nfft
 
 
 def _centers(tx, rcv, ref, cen, nfft, inv_dr, kcyc):
@@ -300,7 +301,7 @@ def _rc_jax(S, nfft):
     P, K = S.shape
     h = K // 2
     pad = jnp.zeros((P, nfft), S.dtype).at[:, :K - h].set(S[:, h:]).at[:, nfft - h:].set(S[:, :h])
-    return jnp.fft.fftshift(jnp.fft.ifft(pad, axis=1), axes=1)
+    return jnp.fft.fftshift(jnp.fft.ifft(pad, axis=1), axes=1) * nfft
 
 
 # ---------------------------------------------------------------------------------------------------- entry point

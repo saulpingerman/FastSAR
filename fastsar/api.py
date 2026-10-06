@@ -107,6 +107,8 @@ class ImageFormer:
                                                   store='f16' if precision == 'float16' else 'fp32')
         elif self.backend == 'cpu':
             from . import ffbp_cpu
+            if T not in (16, 32):
+                raise ValueError(f'the cpu backend supports T=16 or T=32, not {T}')
             if precision != 'float32':
                 raise ValueError("cpu precision: 'float32'")
             self._form = ffbp_cpu.make_ffbp_cpu(plan, coll)
