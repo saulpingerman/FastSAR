@@ -13,6 +13,7 @@ What it covers, with the section that documents and validates each part:
 - wide-angle and circular apertures (Wide-angle and circular apertures)
 - phase gradient autofocus (Autofocus)
 - stripmap focusing by range-Doppler and omega-k (Stripmap)
+- ScanSAR and TOPS burst modes (Burst modes)
 - interferograms and coherence for interferometry and change detection (Interferometry and change detection)
 - multilooking, terrain-corrected geocoding, GeoTIFF and SICD output (Products and geolocation)
 
@@ -106,6 +107,7 @@ python tests/test_ffbp_cuda.py     # CUDA kernels against the dense JAX image
 python tests/test_pallas_fused.py  # TPU kernels in interpret mode (runs on a CPU)
 python tests/test_autofocus.py     # phase gradient autofocus against injected phase errors (jax; or pass cpu)
 python tests/test_stripmap.py      # stripmap omega-k and RDA against float64 backprojection
+python tests/test_burst.py         # ScanSAR and TOPS burst focusing against float64 backprojection
 python tests/test_products.py      # layover projection, geocoding and multilooking on off-plane targets
 python tests/test_bp.py            # exact backprojection: backends, bistatic, orbital range, moving reference
 python tests/test_io.py            # CPHD helpers: frequency resampling, re-referencing, geodetic conversions
@@ -243,6 +245,65 @@ raises the Taylor sidelobes by about 2 dB) and peak positions within 1.5 mm of t
 sheared, so its range cut measures 1.74 m. The float32 and float64 omega-k images differ by -125 dB, and the residual
 against backprojection comes from the edge of the processed Doppler band, which backprojection cuts on pulses and
 the other two on Doppler bins. On four CPU threads omega-k takes 0.3 s and RDA 0.1 s for this scene.
+
+## Burst modes (ScanSAR and TOPS)
+
+`fastsar.burst` simulates and focuses burst-mode data on the same straight, constant-velocity track:
+
+```python
+from fastsar import burst as bm
+bs = bm.make_bursts('tops', nburst=2)                   # or 'scansar', subswaths=[(5e3, 200.0), (5.25e3, 200.0)]
+raw = bm.simulate(bs[0], [[0.0, bs[0].r0]])              # one burst's echoes
+img, r, x = bm.focus_burst(raw, bs[0], algorithm='omegak', rwin='taylor')    # or 'rda'
+```
+
+A burst is a `BurstParams`, the stripmap parameters of its pulses plus a steering rate `kpsi`: the beam points at
+psi(eta) = squint + kpsi (eta - eta_mid), so the Doppler centroid is 2 v sin(psi)/lambda and varies at
+k_t = 2 v kpsi/lambda within the burst. ScanSAR has `kpsi = 0`. In TOPS (`kpsi > 0`, backward to forward) the
+footprint moves at v + r kpsi, each target is seen for the fraction alpha = v/(v + r kpsi) of the stripmap dwell,
+and the azimuth resolution is the stripmap value divided by alpha. Subswaths differ in range window and in an
+elevation gain applied to each target's zero-Doppler range. The simulator keeps the exact time-domain echoes of
+the stripmap simulator with the beam of each pulse.
+
+Each burst is padded in azimuth to cover the zero-Doppler times of all targets it illuminates. A ScanSAR burst is
+then focused with stripmap omega-k or RDA, which is the full-aperture approach. A TOPS burst covers a Doppler band
+of k_t T_burst + 4 v/La, several times the PRF, so the stripmap focusers cannot take it directly. It is deramped
+with the exact integral of its Doppler centroid, scaled by (fc + f_tau)/fc in the range-frequency domain, which
+brings every instant to the beam's band. The azimuth window is applied there as a function of the position in the
+beam, the spectrum is zero-padded to L times the PRF (L = 3 in the example below), the data are reramped on the
+fine grid and focused, and every L-th row is kept. Outside the burst the deramp holds the steering at its end
+values, which keeps the reramped signal inside the fine band. The burst images lie on the zero-Doppler grid with
+rows on the pulse grid, have the complex scale of backprojection of the same burst's pulses, and are combined
+by `mosaic`, which takes each row from the burst that illuminates it with the most pattern energy.
+
+`tests/test_burst.py` uses the radar of the stripmap test (9.6 GHz, 100 MHz, PRF 650 Hz, 200 m/s, 1.5 m antenna,
+sinc^2 pattern, Taylor range window) and compares each burst image with float64 backprojection of the same pulses
+on 64 by 64 pixel patches around targets at two ranges:
+
+- TOPS, one burst of 512 pulses (0.79 s) steered at 0.12 rad/s from -2.70 to +2.70 degrees; the Doppler centroid
+  runs from -604 to +604 Hz and the band including the beam spans 1741 Hz, 2.68 times the PRF. For targets
+  illuminated at the beginning, middle and end of the burst, omega-k is within -60.1 to -63.1 dB of
+  backprojection and RDA with secondary range compression within -61.8 to -64.4 dB. The azimuth resolution is
+  2.316 to 2.356 m against 2.318 to 2.357 m expected (0.585 m divided by alpha = 0.25 at 5 km), the azimuth PSLR
+  -39.3 to -39.5 dB and the peak positions within 1.6 mm. A target seen by only half the beam, at the first pulse,
+  agrees to -56 dB. The float32 and float64 omega-k images differ by -126 dB. On four CPU threads omega-k takes
+  3.7 s and RDA 1.2 s for the 2940 by 448 pixel burst image.
+- ScanSAR, two subswaths at 5.0 and 5.25 km with alternating bursts of 128 pulses (0.197 s; 0.394 s between the
+  bursts of a subswath; stripmap dwell 1.04 s). For targets crossing the beam center 0.25 s before the burst, at
+  its first, middle and last pulse and 0.25 s after it, omega-k is within -59.0 to -68.1 dB of backprojection and
+  RDA within -59.4 to -72.4 dB. The azimuth resolution, 1.766 to 2.185 m, agrees to within 0.1% with the value
+  computed from each target's weighted Doppler support (1.735 m for uniform illumination of the whole burst at
+  4.94 km). Targets seen near the edges of the beam have the coarser resolution and a lower PSLR (-19 dB against
+  -14 dB for the sinc response of central targets), and all peak positions are within 1.8 mm. The mosaic of two
+  bursts of one subswath takes each target from the burst with the larger illumination energy.
+
+Two limits follow from the comparison. First, backprojection cuts the processed band on pulses and the frequency
+domain on Doppler bins, which matters wherever data sit close to the band edge. The unweighted ScanSAR response
+has sinc sidelobes, and 80 m from a target the two differ by -45 dB relative to the peak, where the sidelobes
+themselves are at -41 dB; the ScanSAR targets are therefore simulated and compared one at a time. A ScanSAR target
+seen only between u = -0.96 and -0.58 of the beam agrees to -48.6 dB. Second, the TOPS chain processes L times
+the pulses of the burst. SPECAN and extended chirp scaling, which avoid this cost, are not implemented, and the
+images keep the Doppler centroid variation of TOPS along azimuth.
 
 ## Autofocus
 
