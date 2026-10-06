@@ -96,6 +96,7 @@ python tests/test_products.py      # layover projection, geocoding and multilook
 python tests/test_bp.py            # exact backprojection: backends, bistatic, orbital range, moving reference
 python tests/test_io.py            # CPHD helpers: frequency resampling, re-referencing, geodetic conversions
 python tests/test_wide_angle.py    # 10 to 360 degree apertures against exact backprojection
+python tests/test_insar.py         # change detection and interferometric height (needs finufft)
 ```
 
 The tests use a small simulated scene and take seconds to a few minutes.
@@ -115,6 +116,22 @@ apertures of 10, 45, 120 and 360 degrees (X band, 1.5 GHz of bandwidth, pixels o
 with exact backprojection: -53.0, -61.7, -63.8 and -65.2 dB. An axis of the phase history that has become shorter
 than its decimation kernel at a late level (a few frequency samples remain at these resolutions) is left
 undecimated at that level.
+
+## Interferometry and change detection
+
+Images of two passes formed onto the same grid or the same points are coregistered by construction, and a
+scatterer that lies on the grid surface contributes zero interferometric phase, so no flat-earth or topographic
+phase needs removing. `products.interferogram` gives the multilooked interferogram and `products.coherence` the
+sample coherence over moving windows, the statistic of coherent change detection. `tests/test_insar.py` (needs
+finufft for the clutter simulation) checks three cases on simulated X-band clutter at 5 km:
+
+- change detection, same geometry, coherence 0.98 outside two disturbed areas and a vehicle track: median sample
+  coherence 0.981 on unchanged ground and 0.275 inside the changes (7 by 7 windows)
+- height, passes 3.5 m apart vertically (height of ambiguity 22.3 m), a 6 m block on flat ground, both formed onto
+  the ground plane: the phase converts to 5.98 m on the block (at its layover position, 3.5 m toward the radar) and
+  0.00 m on the flat ground, with coherence 0.999 there
+- the same pair formed by exact backprojection onto the terrain itself: median phase 0.008 rad on the block top and
+  0.003 rad on the flat ground
 
 ## Products and geolocation
 

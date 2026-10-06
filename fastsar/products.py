@@ -1,5 +1,6 @@
-"""Products from a formed image: multilooked detection, range-Doppler projection of 3-D points into the image
-(geocoding and terrain correction), GeoTIFF and SICD output.
+"""Products from formed images: multilooked detection, interferograms and coherence (interferometry and coherent change
+detection), range-Doppler projection of 3-D points into the image (geocoding and terrain correction), GeoTIFF and
+SICD output.
 
     amp_db = products.to_db(products.multilook(img, 2, 2))
     vals = products.geocode(img, grid, ant, points)           # image sampled at 3-D points (e.g. a map grid on a DEM)
@@ -20,6 +21,32 @@ def multilook(img, la=1, lr=1):
     p = np.abs(np.asarray(img)) ** 2
     nx, ny = (p.shape[0] // la) * la, (p.shape[1] // lr) * lr
     return p[:nx, :ny].reshape(nx // la, la, ny // lr, lr).mean((1, 3))
+
+
+def _box(x, w1, w2):
+    """Moving average over w1 x w2 windows, same shape (edges average what is there)."""
+    from scipy.ndimage import uniform_filter
+    f = lambda v: uniform_filter(v, (w1, w2), mode='nearest')
+    return f(x.real) + 1j * f(x.imag) if np.iscomplexobj(x) else f(x)
+
+
+def interferogram(a, b, la=1, lr=1):
+    """Multilooked interferogram: a conj(b) averaged over la x lr boxes and decimated, complex (np.angle is the
+    interferometric phase). a and b must be formed on the same grid (coregistered), which backprojection onto one
+    set of points or one planar grid gives directly."""
+    x = np.asarray(a) * np.conj(np.asarray(b))
+    nx, ny = (x.shape[0] // la) * la, (x.shape[1] // lr) * lr
+    return x[:nx, :ny].reshape(nx // la, la, ny // lr, lr).mean((1, 3))
+
+
+def coherence(a, b, w1=5, w2=5):
+    """Sample coherence |<a b*>| / sqrt(<|a|^2> <|b|^2>) over moving w1 x w2 windows, same shape as the images:
+    the coherent change detection statistic (low where the scene changed between passes). It is biased upward for
+    small windows, to about 1/sqrt(w1 w2) for incoherent pairs."""
+    a, b = np.asarray(a).astype(np.complex128), np.asarray(b).astype(np.complex128)
+    num = np.abs(_box(a * np.conj(b), w1, w2))
+    den = np.sqrt(_box(np.abs(a) ** 2, w1, w2) * _box(np.abs(b) ** 2, w1, w2))
+    return num / np.maximum(den, 1e-300)
 
 
 def to_db(power, floor=1e-30):
