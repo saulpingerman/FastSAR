@@ -18,6 +18,11 @@ grid of the median start frequency and spacing with a 16-tap Kaiser-windowed sin
 regrid_tol samples. A moving scene reference point (SRPFixed false) is re-referenced to the mid-aperture point when
 the change of range stays within a quarter of the unambiguous range; otherwise the data keep their per-pulse
 reference, meta['ref'] gives it, and the collection must be imaged with backproject (form_image would refuse).
+
+troposphere=True removes the per-pulse troposphere delay at the scene reference point (PVP TDTropoSRP). On the
+Umbra Panama collection (25.1 ns mean, 0.48 ns span) it sharpens 1024 x 1024 crops by 1 to 7 percent (fourth
+moment of the amplitude) and shifts the image 3.8 m in range; without it the image lands on the vendor's SICD
+pixel grid to a quarter pixel near the scene center, so it is off by default.
 """
 import numpy as np
 
@@ -54,7 +59,7 @@ def rereference(S, fmin, df, dref):
     return (S * np.exp(-4j * np.pi * f[None, :] / C * np.asarray(dref, np.float64)[:, None])).astype(S.dtype)
 
 
-def read_cphd(cphd, sicd=None, channel=0, meta=False, regrid_tol=1e-3, drop_flagged=False):
+def read_cphd(cphd, sicd=None, channel=0, meta=False, regrid_tol=1e-3, drop_flagged=False, troposphere=False):
     """-> dict(S, ant, fmin, df[, nx, ny, spx, spy, e1, e2]) ready for form_image(**d), and with meta=True also a
     dict of tx, rcv [P, 3] and ref [P] (local frame), R (local axes in ECF rows), srp (ECF origin), times, the
     channel's polarization and identifier, the radar mode, and what was done to the data."""
@@ -101,6 +106,16 @@ def read_cphd(cphd, sicd=None, channel=0, meta=False, regrid_tol=1e-3, drop_flag
         if drop_flagged:
             S[flagged] = 0
         notes.append(f'{int(flagged.sum())} pulses flagged SIGNAL=0 (not normal): ' + ('zeroed' if drop_flagged else 'kept'))
+    if troposphere:
+        td = pv('TDTropoSRP')
+        if td is None:
+            notes.append('no TDTropoSRP in the file: troposphere delay not applied')
+        else:
+            td = np.asarray(td, np.float64)[lo:hi]
+            # the data hold the SRP's echo at its tropospheric delay td beyond the geometric one: exp(+j 2 pi f td)
+            # moves it back, f from each pulse's own grid
+            S = (S * np.exp(2j * np.pi * (sc0[:, None] + scss[:, None] * np.arange(K)[None, :]) * td[:, None])).astype(np.complex64)
+            notes.append(f'removed the troposphere delay at the SRP (mean {td.mean() * 1e9:.2f} ns, span {np.ptp(td) * 1e9:.3f} ns)')
     f0, df = float(np.median(sc0)), float(np.median(scss))
     u = (f0 + np.arange(K)[None, :] * df - sc0[:, None]) / scss[:, None]
     shift = float(np.abs(u - np.arange(K)[None, :]).max())
