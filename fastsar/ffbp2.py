@@ -121,6 +121,13 @@ def make_plan(col, nx, ny, spx, spy, T=32, nlev=3, pmax=0.4, atten=70.0, splits=
         pass_p = 2.0 * (2.0 * (f0 + K * df) / C) * dop * Dp
         Fk, mk = decimator(K, Dk, min(pass_k, 0.95), atten)
         Fp, mp = decimator(P, Dp, min(pass_p, 0.95), atten)
+        # an axis shorter than its decimation kernel (late levels of small or wide-angle collections) is not decimated
+        if Dk > 1 and Fk.shape[0] < 2 * mk * Dk + Dk:
+            Dk, pass_k = 1, rk / (C / (2.0 * df) / 2.0)
+            Fk, mk = decimator(K, 1, 0.95, atten)
+        if Dp > 1 and Fp.shape[0] < 2 * mp * Dp + Dp:
+            Dp, pass_p = 1, 2.0 * (2.0 * (f0 + K * df) / C) * dop
+            Fp, mp = decimator(P, 1, 0.95, atten)
         pidx = Dp * (np.arange(Fp.shape[1]) - mp) + (Dp - 1) / 2.0
         out['levels'].append(dict(sx=sx, sy=sy, C=sx * sy, Dk=Dk, Dp=Dp, Fk=Fk, Fp=Fp, K=K, P=P, Ko=Fk.shape[1], Po=Fp.shape[1],
                                   fir_k=fir(Fk, Dk, mk) if Dk > 1 else None, fir_p=fir(Fp, Dp, mp) if Dp > 1 else None,

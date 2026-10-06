@@ -95,6 +95,7 @@ python tests/test_stripmap.py      # stripmap omega-k and RDA against float64 ba
 python tests/test_products.py      # layover projection, geocoding and multilooking on off-plane targets
 python tests/test_bp.py            # exact backprojection: backends, bistatic, orbital range, moving reference
 python tests/test_io.py            # CPHD helpers: frequency resampling, re-referencing, geodetic conversions
+python tests/test_wide_angle.py    # 10 to 360 degree apertures against exact backprojection
 ```
 
 The tests use a small simulated scene and take seconds to a few minutes.
@@ -105,6 +106,15 @@ The tests use a small simulated scene and take seconds to a few minutes.
 given by pixel counts `nx, ny`, spacings `spx, spy` (m) and unit vectors `e1` (azimuth) and `e2` (range) of the
 image plane; pixel (i, j) sits at `(i - nx/2) spx e1 + (j - ny/2) spy e2`. `read_cphd` builds all of
 these from the files, using the SICD's grid when one is given.
+
+## Wide-angle and circular apertures
+
+Factorized backprojection makes no small-angle assumption, so the same call images wide-angle and circular
+collections, which polar format cannot. `tests/test_wide_angle.py` forms 256 by 256 images at the resolution of
+apertures of 10, 45, 120 and 360 degrees (X band, 1.5 GHz of bandwidth, pixels of 72 to 6 mm) and compares them
+with exact backprojection: -53.0, -61.7, -63.8 and -65.2 dB. An axis of the phase history that has become shorter
+than its decimation kernel at a late level (a few frequency samples remain at these resolutions) is left
+undecimated at that level.
 
 ## Products and geolocation
 
