@@ -92,6 +92,9 @@ python tests/test_ffbp_cuda.py     # CUDA kernels against the dense JAX image
 python tests/test_pallas_fused.py  # TPU kernels in interpret mode (runs on a CPU)
 python tests/test_autofocus.py     # phase gradient autofocus against injected phase errors (jax; or pass cpu)
 python tests/test_stripmap.py      # stripmap omega-k and RDA against float64 backprojection
+python tests/test_products.py      # layover projection, geocoding and multilooking on off-plane targets
+python tests/test_bp.py            # exact backprojection: backends, bistatic, orbital range, moving reference
+python tests/test_io.py            # CPHD helpers: frequency resampling, re-referencing, geodetic conversions
 ```
 
 The tests use a small simulated scene and take seconds to a few minutes.
@@ -102,6 +105,29 @@ The tests use a small simulated scene and take seconds to a few minutes.
 given by pixel counts `nx, ny`, spacings `spx, spy` (m) and unit vectors `e1` (azimuth) and `e2` (range) of the
 image plane; pixel (i, j) sits at `(i - nx/2) spx e1 + (j - ny/2) spy e2`. `read_cphd` builds all of
 these from the files, using the SICD's grid when one is given.
+
+## Products and geolocation
+
+`fastsar.products` turns a formed image into products: `multilook` and `to_db` for detected images, `project` and
+`geocode` to place 3-D points (a map grid, optionally on a DEM) in an image and sample it there, `write_geotiff`
+(needs rasterio) and `write_sicd` (needs sarpy). A point off the image plane appears where the plane has its range
+and Doppler cone angle at the aperture center; `project` solves that pair of conditions in closed form, so terrain
+correction is exact under that model.
+
+`tests/test_products.py` forms an image on the ground plane of targets 0 to 30 m above it: each target appears
+within 0.5 cm of its projection, with layover up to 21 m. On the Umbra Panama collection, a 2048 by 2048 crop
+formed by factorized backprojection and geocoded onto the pixel grid of the vendor's GEC GeoTIFF, and exact
+backprojection directly onto the same ground points, both land 6.98 m from the GEC when the surface is taken at the
+height of the scene reference point (-0.34 m above the ellipsoid); the offset changes by 1.33 m per meter of
+assumed height and vanishes at 5.3 m above that height, where exact backprojection onto the ground points also
+focuses best (correlation with the GEC 0.75, against 0.13 at -0.34 m). The vendor's SICD projected through its
+own model lands on the GEC with no offset.
+
+`write_sicd` writes an image formed on a vendor SICD's grid (`read_cphd(..., sicd=...)`) with that SICD's
+metadata, ImageFormAlgo OTHER and Grid.Type PLANE: the pixels are backprojection's on the template's image plane.
+A round trip of the Panama SICD keeps every pixel and passes sarpy's validity check; its projection of the center
+pixel agrees with the vendor's exactly and departs from it by up to about 6 m at the corners, where the vendor's
+polar-format image is displaced by the distortion its own projection model accounts for.
 
 ## Stripmap
 
