@@ -1,0 +1,315 @@
+"""Long apertures and arbitrary tracks: the scene is cut into patches, and each patch is formed by the spotlight
+factorized backprojection (ImageFormer) from the pulses that illuminate it, with the phase history re-referenced to
+the patch center and gated in range to the patch.
+
+    from fastsar import stripmap as sm, patches
+    img, r, x = patches.form_stripmap(raw, p, rwin='taylor')                    # straight track, zero-Doppler grid
+    fx = patches.echoes_to_fx(raw, p)                                          # any track: FX phase history
+    img = patches.form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1, e2, beam=patches.stripmap_beam(p, ant))
+
+Phase history. form_mosaic takes the frequency-domain (FX) form of the CPHD convention with per-pulse reference
+ranges, fx = dict(S [P, K], fmin, df, ref [P], band), in which a scatterer at x contributes
+exp(-j 4 pi f_k (|x - a_p| - ref_p)/c) at f_k = fmin + k df; band = (f_lo, f_hi) is the occupied band. Time-domain
+echoes in the conventions of fastsar.stripmap (fast time tau_k = t0 + k/fs, carrier fc removed, up-chirp) become this
+form by echoes_to_fx: the range FFT of the range-compressed pulse on the n-point grid of stripmap.backproject gives
+S at f = fc + f_tau over the sampled band fc +- fs/2, with ref_p = c t0/2 (the range of sample 0), so that
+    sum_k S[p, k] exp(+j 4 pi f_k (R - ref_p)/c) = s_rc(2R/c) exp(+j 4 pi R/lambda),
+the per-pulse term of stripmap.backproject, s_rc read by band-limited (periodic) interpolation.
+
+Patches. The output grid is planar: pixel (i, j) at origin + i spx e1 + j spy e2 (origin is pixel (0, 0), not the
+center as in form_image). It is cut into tiles of patch = (mx, my) pixels; each is formed as a patch of
+(mx + 2 crop, my + 2 crop) pixels centered on the tile, and crop pixels are dropped on each side. For a patch with
+center c the pulses are those that illuminate any of 9 x 9 points spread over the patch (|u| <= umax for the
+normalized azimuth coordinate u that beam returns; all pulses without a beam, or a given range), taken as one
+contiguous run; the antenna path becomes ant - c and each pulse is re-referenced from ref_p to |a_p - c| (a delay
+shift, a linear phase in f, as io.rereference). The range profile of each pulse (the inverse DFT along f) is then
+kept over a gate of +-(largest |x - a_p| - |a_p - c| over the patch and its pulses, plus margin) about the center
+and transformed back on the coarser frequency grid df' = c/(2 x gate length), so that the unambiguous range covers
+the patch and the margins. Before the gate the frequency axis is extended with zeros to band +- guard where needed,
+and after it the samples are weighted by a raised-cosine taper that is 1 over the band and falls to zero across the
+guard. The data are band-limited to the band, so the taper does not change the image, but it makes the
+reconstruction kernel short: what the gate drops reaches the patch through the kernel's tail at the margin, below
+-60 dB for 25 m of margin with a 12.5 MHz guard. The default margin is 3 c/(2 guard).
+
+Azimuth weighting. stripmap.backproject weights pulse p at pixel x by W_a(u_p(x)/umax) for |u_p(x)| <= umax, where u
+is the normalized Doppler of the two-way pattern. Without an azimuth window every pulse of a patch has weight 1; with
+umax at the simulated extent of the pattern (the first null of the sinc^2 pattern, the default) the per-pixel mask
+then only drops pulses that hold other scatterers' returns near the pattern null, and the two agree to about -65 dB.
+With a window the weight W_a(u_p(x)/umax) (the window clipped at its edges, no mask) on the patch's pulses and 9 x 9
+points is split by its SVD into separable terms a_t(p) b_t(x); each term is one FFBP of the phase history weighted
+by a_t, multiplied by b_t interpolated to the pixels. Three or four terms reach -50 dB on 40 m patches of the
+airborne scene in tests/test_patches.py.
+
+Factorized backprojection. Each patch is an ImageFormer with window=False (its Taylor windows are not used; the
+range window is applied in range compression, as in stripmap). The final tile size T and an optional finer grid
+(tile_plan) are chosen from the predicted final-stage error: the C++ and CUDA final stages take T = 16 or 32 only,
+so where T = 16 misses target_db the patch is formed on a grid finer by 2 in one or both axes and decimated, which
+halves the final tiles; the JAX program also takes T = 8.
+"""
+import numpy as np
+
+from . import stripmap as sm
+
+C = 299792458.0
+
+
+def echoes_to_fx(data, p, compressed=False, rwin=None):
+    """Raw (or range-compressed) echoes [P, nr] with the fast-time grid and chirp of StripParams p ->
+    dict(S [P, n] complex128, fmin, df, ref [P], band) on the n-point range FFT grid of stripmap.backproject:
+    matched filter and range window W_r(f_tau/(B/2)) applied unless compressed, ref = c t0/2, band fc +- B/2."""
+    data = np.asarray(data)
+    P, nr = data.shape
+    n = sm._fast(nr + sm._ntp(p))
+    f = np.fft.fftfreq(n, 1 / p.fs)
+    X = np.fft.fft(data.astype(np.complex128), n, axis=1)
+    if not compressed:
+        X *= sm.matched_filter(p, n) * sm.window(rwin)(f / (p.B / 2))
+    # sample k of the shifted spectrum sits at f_tau = (k - n//2) fs/n; with ref = c t0/2 the fast-time phase
+    # exp(-j 2 pi f_tau t0) and the reference exp(+j 4 pi f ref/c) leave exp(+j 2 pi fc t0)
+    S = np.fft.fftshift(X, axes=1) * (np.exp(2j * np.pi * p.fc * p.t0) / n)
+    return dict(S=S, fmin=p.fc - (n // 2) * p.fs / n, df=p.fs / n, ref=np.full(P, C * p.t0 / 2),
+                band=(p.fc - p.B / 2, p.fc + p.B / 2))
+
+
+def stripmap_beam(p, ant, direction=(1.0, 0.0, 0.0)):
+    """Normalized azimuth coordinate of the pattern of StripParams p for antenna positions ant [P, 3] (any track):
+    u = La (sin(theta) - sin(theta_s))/lambda with sin(theta) = d.(x - a)/|x - a|, d the unit along-track direction
+    of the antenna (one vector, or one per pulse [P, 3]). -> beam(idx, points [m, 3]) -> u [len(idx), m] for the
+    pulses idx (indices or a slice)."""
+    ant = np.asarray(ant, np.float64)
+    d = np.asarray(direction, np.float64)
+    d = np.broadcast_to(d / np.linalg.norm(d, axis=-1, keepdims=True), ant.shape)
+
+    def beam(idx, pts):
+        w = np.asarray(pts, np.float64)[None, :, :] - ant[idx][:, None, :]
+        return p.La * ((w * d[idx][:, None, :]).sum(-1) / np.linalg.norm(w, axis=-1) - np.sin(p.squint)) / p.lam
+    return beam
+
+
+def straight_track(p, height=0.0):
+    """Antenna positions [na, 3] of the straight track of stripmap: (v eta_p, 0, height). With height 0 a target
+    at zero-Doppler coordinates (x, r) sits at (x, r, 0), and the (x, r) grid is the plane z = 0."""
+    return np.stack([p.v * p.eta, np.zeros(p.na), np.full(p.na, float(height))], 1)
+
+
+def simulate(p, ant, targets, amp=None, beam=None):
+    """Raw echoes [na, nr] complex128 of point targets [n, 3] for antenna positions ant [na, 3] (any track): the
+    signal model of stripmap.simulate with R = |x_n - a_p| and the pattern at u = beam(pulses, x_n) (default
+    stripmap_beam(p, ant))."""
+    targets = np.atleast_2d(np.asarray(targets, np.float64))
+    ant = np.asarray(ant, np.float64)
+    amp = np.ones(len(targets), np.complex128) if amp is None else np.asarray(amp, np.complex128)
+    beam = stripmap_beam(p, ant) if beam is None else beam
+    tau = p.tau
+    out = np.zeros((len(ant), p.nr), np.complex128)
+    for x, a in zip(targets, amp):
+        R = np.linalg.norm(x[None] - ant, axis=1)
+        u = beam(slice(None), x[None])[:, 0]
+        on = np.abs(u) <= p.extent
+        d = tau[None, :] - 2 * R[on, None] / C
+        out[on] += np.where(np.abs(d) <= p.Tp / 2, (a * sm.pattern(p, u[on]))[:, None]
+                            * np.exp(1j * (np.pi * p.Kr * d * d - 4 * np.pi * R[on, None] / p.lam)), 0)
+    return out
+
+
+def backproject(data, p, ant, points, compressed=False, rwin=None, awin=None, umax=1.0, beam=None, up=16, taps=8):
+    """stripmap.backproject on any track: exact time-domain backprojection in float64 at points [..., 3], with
+    R = |x - a_p| and u = beam(pulses, x) (default stripmap_beam(p, ant)). The float64 reference for form_mosaic."""
+    pts = np.asarray(points, np.float64)
+    shape, pts = pts.shape[:-1], pts.reshape(-1, 3)
+    ant = np.asarray(ant, np.float64)
+    beam = stripmap_beam(p, ant) if beam is None else beam
+    na, nr = data.shape
+    n = sm._fast(nr + sm._ntp(p))
+    f = np.fft.fftfreq(n, 1 / p.fs)
+    X = np.fft.fft(np.asarray(data, np.complex128), n, axis=1)
+    if not compressed:
+        X *= sm.matched_filter(p, n) * sm.window(rwin)(f / (p.B / 2))
+    wa = sm.window(awin)
+    h = taps // 2
+    k = np.arange(-h + 1, h + 1)
+    out = np.zeros(len(pts), np.complex128)
+    for i in range(na):
+        R = np.linalg.norm(pts - ant[i], axis=1)
+        u = beam(slice(i, i + 1), pts)[0]
+        m = np.abs(u) <= umax
+        if not m.any():
+            continue
+        s = np.fft.ifft(np.concatenate([X[i, :n // 2], np.zeros(n * (up - 1)), X[i, n // 2:]])) * up
+        pos = (2 * R[m] / C - p.t0) * up * p.fs
+        i0 = np.floor(pos)
+        d = (pos - i0)[:, None] - k[None]
+        w = np.sinc(d) * np.i0(2.2 * h * np.sqrt(np.clip(1 - (d / h) ** 2, 0, 1))) / np.i0(2.2 * h)
+        val = np.sum(s[(i0.astype(np.int64)[:, None] + k[None]) % s.size] * w, 1)
+        out[m] += wa(u[m] / umax) * val * np.exp(1j * 4 * np.pi * R[m] / p.lam)
+    return out.reshape(shape)
+
+
+def _taper(f, band, guard):
+    """1 over band, raised cosine to 0 across guard on either side."""
+    t = np.clip(np.maximum(band[0] - f, f - band[1]) / guard, 0, 1)
+    return 0.5 * (1 + np.cos(np.pi * t))
+
+
+def _levels(n, T, most=3):
+    """Most levels (up to `most`) whose smallest split, 2 per level, does not pad n pixels beyond ceil(n/T) tiles."""
+    need = -(-n // T)
+    return max(1, min(most, int(np.floor(np.log2(max(need, 1))))))
+
+
+SUBS = ((1, 1), (1, 2), (2, 1), (2, 2), (2, 4), (4, 2), (4, 4))
+
+
+def tile_plan(ant, fmax, px, py, spx, spy, e1, e2, target_db=-40.0, tiles=(32, 16), subs=SUBS):
+    """Cheapest final tile size T and sub-grid factors (s1, s2) whose predicted final-stage error
+    (ffbp2.final_phase_error) meets target_db; the patch is then formed on the grid of spacings spx/s1, spy/s2 and
+    every s-th pixel kept, which shrinks the final tiles by s at s1 s2 times the pixels. -> (T, (s1, s2), error dB);
+    the smallest error found when none meets the target."""
+    from . import ffbp2
+    best = None
+    for s1, s2 in subs:
+        for T in tiles:
+            err = ffbp2.final_phase_error(ant, fmax, px * s1, py * s2, spx / s1, spy / s2, e1, e2, T)
+            if err <= target_db:
+                return T, (s1, s2), float(err)
+            if best is None or err < best[2]:
+                best = (T, (s1, s2), float(err))
+    return best
+
+
+def patch_history(fx, ant, center, pts, lo, hi, margin=None, guard=None):
+    """Phase history of one patch: pulses lo:hi of fx re-referenced to center [3] and gated in range to the extent
+    of the points pts [m, 3] (the patch outline) plus margin (m), with the guard taper.
+    -> (S [hi - lo, K'] complex128, ant - center, fmin', df')."""
+    S, fmin, df = fx['S'], float(fx['fmin']), float(fx['df'])
+    K = S.shape[1]
+    band = fx.get('band') or (fmin, fmin + (K - 1) * df)
+    room = min(band[0] - fmin, fmin + (K - 1) * df - band[1])
+    guard = max(room, 0.125 * (band[1] - band[0])) if guard is None else float(guard)
+    margin = 3 * C / (2 * guard) if margin is None else float(margin)
+    # zero padding of the frequency axis to band +- guard
+    npl = max(0, int(np.ceil((fmin - band[0] + guard) / df)))
+    npu = max(0, int(np.ceil((band[1] + guard - fmin - (K - 1) * df) / df)))
+    from scipy.fft import next_fast_len
+    K2 = next_fast_len(K + npl + npu)
+    f0 = fmin - npl * df
+    f = f0 + df * np.arange(K2)
+    a = np.asarray(ant[lo:hi], np.float64)
+    rc = np.linalg.norm(a - center, axis=1)
+    S2 = np.zeros((hi - lo, K2), np.complex128)
+    S2[:, npl:npl + K] = S[lo:hi]
+    S2 *= np.exp(-4j * np.pi * f[None, :] / C * (np.asarray(fx['ref'], np.float64)[lo:hi] - rc)[:, None])
+    # range bins of c/(2 K2 df); the gate keeps N bins centered on the patch center's range
+    dR = np.linalg.norm(pts[None, :, :] - a[:, None, :], axis=2) - rc[:, None]
+    half = np.abs(dR).max() + margin
+    N = next_fast_len(2 * int(np.ceil(half * 2 * K2 * df / C)))
+    N += N % 2
+    if N < K2:
+        q = np.fft.ifft(S2, axis=1)
+        j = (np.arange(N) + N // 2) % N - N // 2
+        S2 = np.fft.fft(q[:, j % K2], axis=1) * (K2 / N)          # the sum over N samples, not K2
+        df = K2 * df / N
+        f = f0 + df * np.arange(N)
+    T = _taper(f, band, guard)
+    keep = np.nonzero(T > 0)[0]
+    k0, k1 = int(keep[0]), int(keep[-1]) + 1
+    return S2[:, k0:k1] * T[k0:k1][None, :], a - center, float(f[k0]), float(df)
+
+
+def weight_terms(W, wtol_db=-50.0, most=8):
+    """Separable approximation of per-pixel pulse weights W [P, m] (pulses x sample points): W ~ sum_t a_t b_t^T,
+    from the SVD, keeping the terms whose singular value is within wtol_db of the largest (at most `most`).
+    -> (a [t, P], b [t, m])."""
+    U, s, Vt = np.linalg.svd(W, full_matrices=False)
+    n = max(1, min(most, int(np.sum(s >= s[0] * 10 ** (wtol_db / 20)))))
+    return U[:, :n].T, s[:n, None] * Vt[:n]
+
+
+def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 1.0, 0.0), patch=(128, 128), crop=0,
+                beam=None, umax=1.0, awin=None, pulses=None, margin=None, guard=None, backend='cpu', T='auto',
+                levels='auto', target_db=-40.0, sub='auto', wtol_db=None, exact=False, info=None):
+    """Complex image [nx, ny] (complex64) on the grid origin + i spx e1 + j spy e2 from the FX phase history fx
+    (see echoes_to_fx and the module docstring) and the antenna positions ant [P, 3] of any track, formed patch by
+    patch with ImageFormer on backend ('cpu', 'jax', 'cuda', 'tpu').
+    beam(idx, points) -> u [len(idx), m]: normalized azimuth coordinate of pulses idx (stripmap_beam); a pulse
+    serves a patch when |u| <= umax somewhere on it. With an azimuth window awin (stripmap.window) pulse p is
+    weighted at pixel x by W_a(u_p(x)/umax), the window clipped at its edges: the weight on pulses x 9 x 9 points of
+    the patch is split into separable terms (weight_terms, down to wtol_db, default target_db - 10), each formed by
+    one FFBP of the weighted phase history and multiplied by its pixel factor, interpolated by bicubic splines.
+    pulses: (lo, hi) or a function of the patch center returning (lo, hi), used when beam is None (default: all).
+    margin, guard: range gate margin (m) and spectral guard (Hz), see patch_history. T, target_db: as for ImageFormer,
+    with sub (s1, s2) or 'auto' chosen with T by tile_plan (T = 8 only on 'jax'; the C++ and CUDA final stages take 16
+    or 32). levels: 'auto' takes up to 3, as many as the patch allows without padding. exact=True forms each patch by
+    exact backprojection (fastsar.backproject, cpu) instead, to separate FFBP's error from the patching.
+    info: a list to which a dict per patch is appended (center, pulse range, K, T, sub, levels, predicted error,
+    number of weight terms)."""
+    from scipy.interpolate import RectBivariateSpline
+    from .api import ImageFormer
+    tiles = ((32, 16, 8) if backend == 'jax' else (32, 16)) if T == 'auto' else (T,)
+    subs = SUBS if sub == 'auto' else (tuple(sub),)
+    wtol_db = target_db - 10.0 if wtol_db is None else wtol_db
+    ant = np.asarray(ant, np.float64)
+    o, e1, e2 = (np.asarray(v, np.float64) for v in (origin, e1, e2))
+    mx, my = patch
+    px, py = mx + 2 * crop, my + 2 * crop
+    wa = sm.window(awin)
+    si, sj = np.linspace(0, px - 1, 9), np.linspace(0, py - 1, 9)          # sample points, in patch pixels
+    gi, gj = np.meshgrid(si - px / 2, sj - py / 2, indexing='ij')
+    out = np.zeros((nx, ny), np.complex64)
+    for i0 in range(0, nx, mx):
+        for j0 in range(0, ny, my):
+            c = o + (i0 - crop + px / 2) * spx * e1 + (j0 - crop + py / 2) * spy * e2
+            pts = c + (gi.ravel() * spx)[:, None] * e1 + (gj.ravel() * spy)[:, None] * e2
+            wt = None
+            if beam is not None:
+                u = beam(slice(None), pts)
+                on = np.nonzero((np.abs(u) <= umax).any(1))[0]
+                if len(on) == 0:
+                    continue
+                lo, hi = int(on[0]), int(on[-1]) + 1
+                if awin is not None:
+                    wt = weight_terms(wa(np.clip(u[lo:hi] / umax, -1, 1)), wtol_db)
+            else:
+                lo, hi = (0, len(ant)) if pulses is None else (pulses(c) if callable(pulses) else pulses)
+            S, a, f0, df = patch_history(fx, ant, c, pts, lo, hi, margin, guard)
+            if exact:
+                from .bp import backproject as bpx, plane_points
+                xyz = plane_points(px, py, spx, spy, e1, e2)
+                form = lambda S_: bpx(S_, a, f0, df, xyz, backend='cpu', window=False, upsample=16)
+                Tp, s12, nlev, err = None, None, None, None
+            else:
+                Tp, s12, err = tile_plan(a, f0 + S.shape[1] * df, px, py, spx, spy, e1, e2, target_db, tiles, subs)
+                s1, s2 = s12
+                nlev = _levels(min(px * s1, py * s2), Tp) if levels == 'auto' else levels
+                former = ImageFormer(a, f0, df, S.shape[1], px * s1, py * s2, spx / s1, spy / s2, e1, e2, backend,
+                                     window=False, T=Tp, levels=nlev)
+                form = lambda S_: former(S_.astype(np.complex64))[::s1, ::s2]
+            if wt is None:
+                img = form(S)
+            else:
+                img = 0
+                for at, bt in zip(*wt):
+                    img = img + form(S * at[:, None]) * RectBivariateSpline(si, sj, bt.reshape(len(si), len(sj)))(
+                        np.arange(px), np.arange(py))
+            ci, cj = min(mx, nx - i0), min(my, ny - j0)
+            out[i0:i0 + ci, j0:j0 + cj] = img[crop:crop + ci, crop:crop + cj]
+            if info is not None:
+                info.append(dict(center=c, pulses=(lo, hi), K=S.shape[1], df=df, T=Tp, sub=s12, levels=nlev,
+                                 predicted_error_db=err, terms=1 if wt is None else len(wt[0])))
+    return out
+
+
+def form_stripmap(data, p, compressed=False, rwin=None, awin=None, umax=1.0, rows=None, cols=None, patch=(128, 128),
+                  crop=0, backend='cpu', **kw):
+    """Patch-wise factorized backprojection of stripmap echoes on the straight track, on the zero-Doppler grid of
+    stripmap.focus_stripmap (rows x along track, columns slant range r), which is the plane z = 0 of straight_track.
+    rows, cols: (start, stop) of the grid to form (default all). -> (image, r, x) as focus_stripmap. Further keywords
+    go to form_mosaic."""
+    r, x = sm.axes(p, None, data.shape[1], data.shape[0])
+    i0, i1 = (0, len(x)) if rows is None else rows
+    j0, j1 = (0, len(r)) if cols is None else cols
+    fx = echoes_to_fx(data, p, compressed, rwin)
+    img = form_mosaic(fx, straight_track(p), (x[i0], r[j0], 0.0), i1 - i0, j1 - j0, x[1] - x[0], r[1] - r[0],
+                      patch=patch, crop=crop, beam=stripmap_beam(p, straight_track(p)), umax=umax, awin=awin,
+                      backend=backend, **kw)
+    return img, r[j0:j1], x[i0:i1]

@@ -14,6 +14,7 @@ What it covers, with the section that documents and validates each part:
 - phase gradient autofocus (Autofocus)
 - stripmap focusing by range-Doppler and omega-k (Stripmap)
 - ScanSAR and TOPS burst modes (Burst modes)
+- long apertures and arbitrary tracks (airborne motion) by patches of factorized backprojection (Long apertures and arbitrary tracks)
 - interferograms and coherence for interferometry and change detection (Interferometry and change detection)
 - multilooking, terrain-corrected geocoding, GeoTIFF and SICD output (Products and geolocation)
 
@@ -107,6 +108,7 @@ python tests/test_ffbp_cuda.py     # CUDA kernels against the dense JAX image
 python tests/test_pallas_fused.py  # TPU kernels in interpret mode (runs on a CPU)
 python tests/test_autofocus.py     # phase gradient autofocus against injected phase errors (jax; or pass cpu)
 python tests/test_stripmap.py      # stripmap omega-k and RDA against float64 backprojection
+python tests/test_patches.py       # patch-wise FFBP for stripmap and non-linear tracks against backprojection
 python tests/test_burst.py         # ScanSAR and TOPS burst focusing against float64 backprojection
 python tests/test_products.py      # layover projection, geocoding and multilooking on off-plane targets
 python tests/test_bp.py            # exact backprojection: backends, bistatic, orbital range, moving reference
@@ -245,6 +247,68 @@ raises the Taylor sidelobes by about 2 dB) and peak positions within 1.5 mm of t
 sheared, so its range cut measures 1.74 m. The float32 and float64 omega-k images differ by -125 dB, and the residual
 against backprojection comes from the edge of the processed Doppler band, which backprojection cuts on pulses and
 the other two on Doppler bins. On four CPU threads omega-k takes 0.3 s and RDA 0.1 s for this scene.
+
+## Long apertures and arbitrary tracks
+
+`fastsar.patches` forms stripmap images, and images from any antenna track, with the spotlight factorized
+backprojection. The output grid is cut into patches, and each patch is formed by an `ImageFormer` from the pulses
+whose beam covers it, with the phase history referenced to the patch center:
+
+```python
+from fastsar import stripmap as sm, patches
+img, r, x = patches.form_stripmap(raw, p, rwin='taylor')       # straight track, the grid of focus_stripmap
+fx = patches.echoes_to_fx(raw, p, rwin='taylor')               # echoes -> frequency-domain phase history
+img = patches.form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1, e2,
+                          beam=patches.stripmap_beam(p, ant), backend='cpu')   # antenna positions ant [P, 3]
+```
+
+`echoes_to_fx` converts time-domain echoes in the conventions of `fastsar.stripmap` into the CPHD form with
+per-pulse reference ranges: the range FFT of the range-compressed pulse gives the phase history at fc + f_tau,
+referenced to the range of the first fast-time sample. `form_mosaic` also accepts such a phase history directly. For
+each patch, every pulse is re-referenced to the patch center (a linear phase in frequency), its range profile is kept
+over a gate that covers the patch plus a margin, and the gated profile is transformed back onto a frequency grid
+whose unambiguous range equals the gate. A raised-cosine taper over the guard band between the signal band and the
+sampling rate (the frequency axis is padded where there is none) shortens the reconstruction kernel; the returns
+dropped by the gate reach the patch only through the kernel's tail, which is below -60 dB at the default margin,
+36 m for a 12.5 MHz guard. A pulse
+serves a patch when its normalized Doppler satisfies |u| <= umax at some point of the patch. An azimuth window,
+which `stripmap.backproject` evaluates per pixel, is split by a singular value decomposition of the pulse-by-pixel
+weight into separable terms, each formed by one factorized backprojection; terms are kept down to 50 dB below the
+first, three or four for 40 m patches here. The C++ and CUDA final stages take tiles of 16 or 32 pixels only, so a
+patch whose predicted error at T = 16 misses the target (-40 dB) is formed on a grid twice as fine in range and
+decimated; the JAX program also accepts T = 8.
+
+`tests/test_patches.py` uses the scene of `tests/test_stripmap.py` and 128 by 128 pixel patches (12 patches of
+730 to 900 pulses for a 280 by 448 pixel image, about 1 s on four CPU threads). Against float64 backprojection
+(`stripmap.backproject`) on 64 by 64 pixel neighborhoods of the five targets, after the best complex gain:
+
+- broadside: -48.0 to -60.4 dB (CPU), -54.8 to -60.2 dB (JAX, which uses T = 8 where needed); the same from
+  range-compressed input
+- 5 degrees of squint: -48.0 to -62.6 dB
+- Taylor azimuth window: -48.5 to -58.8 dB with three or four terms per patch
+- the same patches formed by exact backprojection instead of FFBP: -65.3 to -66.7 dB without an azimuth window and
+  -54.7 to -67.6 dB with the Taylor window, the share of the patching itself
+
+Resolution agrees with backprojection to 0.7 % in azimuth and 0.1 % in range, peak sidelobe ratios to 0.4 dB (1.3 dB
+for the -62 dB azimuth sidelobes of the Taylor window) and peak positions to 2 mm. A phase history cut to the signal
+band (no guard, so the frequency axis is padded) and referenced per pulse to a point that moves with the platform
+gives the same image as the echo input to -141 dB.
+
+The second part flies the same radar at 3 km altitude over flat ground on a track with smooth cross-track and
+vertical motion, two sinusoids each with periods from 0.47 s to 1.7 s, 1.68 m and 1.57 m peak to peak, which changes
+the range to the swath center by up to 0.97 m. Omega-k on the nominal straight track does not focus these data: the
+peaks reach 6 to 9 % of the exact image and the error is about 0 dB, while on echoes from the straight track the
+same comparison gives -64.9 to -65.5 dB. The patch mosaic with the true positions, on a ground-plane grid of 0.31 by
+1.5 m, matches exact backprojection with the true positions to -49.9 to -64.9 dB (-65.6 to -66.1 dB with exact
+patches), with the same resolution, sidelobes and positions as above.
+
+Limitations. Each pulse enters every patch its beam covers, about six along track for this 208 m footprint and
+40 m patches, so longer patches lower the cost per pixel. Without an azimuth window the per-pixel mask |u| <= umax of
+`stripmap.backproject` is reproduced only where the data vanish beyond umax (umax at the extent of the simulated
+pattern, the default); with a smaller umax, pixels near a patch edge also receive pulses that their own mask would
+exclude. `echoes_to_fx` assumes one fast-time grid for all pulses. `stripmap_beam` models an antenna held along a
+fixed direction (or one direction per pulse); other patterns can be passed as a function of pulse and point. The
+method has been validated on simulated point targets only.
 
 ## Burst modes (ScanSAR and TOPS)
 
