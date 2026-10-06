@@ -98,3 +98,17 @@ g = np.vdot(ff.ravel(), ex.ravel()) / np.vdot(ff.ravel(), ff.ravel())
 print(f'backproject / form_image gain: {abs(g):.4f}')
 assert abs(abs(g) - 1) < 0.02, g
 print('ok')
+
+# a frequency-domain phase history is periodic in range: a scatterer 0.7 of the unambiguous range c / (2 df) from
+# the reference range focuses as well as one at the reference point
+col = sim.make_collect(res=1.0, scene=30.0, r0=5e3)
+L = C / (2 * col.df)
+for off in (0.0, 0.7 * L):
+    x = np.array([[off * np.cos(np.deg2rad(30)), 0.0, 0.0]])     # along ground range; slant offset about 0.7 L
+    S = sim.simulate_brute(col, x, np.ones(1))
+    v = fastsar.backproject(S, col.ant, col.fmin, col.df, x, backend='cpu')[0]
+    if off == 0.0:
+        v0 = v
+    print(f'scatterer {off:6.1f} m from the reference in ground range: |image| / |image at the reference| = {abs(v) / abs(v0):.4f}')
+assert abs(abs(v) / abs(v0) - 1) < 0.02
+print('ok')

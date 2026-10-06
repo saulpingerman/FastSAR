@@ -11,7 +11,8 @@ coordinates of ant, tx, rcv and points), so that a scatterer at x contributes ex
 dR = |x - a| - |a| (monostatic) or dR = (|x - tx| + |x - rcv| - |tx| - |rcv|) / 2 (bistatic), the CPHD convention.
 
 Each pulse is range compressed by a zero-padded inverse FFT (upsample times the sample count, rounded up to a
-power of two) and read with linear interpolation. Against a 128x reference on a simulated scene the image error
+power of two) and read with linear interpolation, circularly: a frequency-domain phase history is periodic in range
+with period c / (2 df), so a scene may lie anywhere within that period about the reference range. Against a 128x reference on a simulated scene the image error
 is -39 dB at upsample=2, -51 at 4, -63 at 8 (the default), -75 at 16 and -88 at 32: 12 dB per doubling.
 Ranges are computed in float64 at the center of each block of nearby points and in float32 only for offsets
 within the block, so float32 kernels keep their accuracy at orbital range.
@@ -118,12 +119,13 @@ extern "C" void bp_points(const float* rre, const float* rim, int P, int nfft, c
       dR -= ref[p];
       double t = dR * inv_dr + (nfft / 2);
       double tf = std::floor(t);
-      long i = (long)tf;
-      if (i < 0 || i + 1 >= nfft) continue;
+      long i = (long)tf % nfft;
+      if (i < 0) i += nfft;
+      const long i1 = (i + 1 == nfft) ? 0 : i + 1;
       double w = t - tf;
-      const float* r0 = rre + (long)p * nfft + i;
-      const float* i0 = rim + (long)p * nfft + i;
-      double vre = r0[0] + w * (r0[1] - r0[0]), vim = i0[0] + w * (i0[1] - i0[0]);
+      const float* rr = rre + (long)p * nfft;
+      const float* ri = rim + (long)p * nfft;
+      double vre = rr[i] + w * (rr[i1] - rr[i]), vim = ri[i] + w * (ri[i1] - ri[i]);
       double ph = kcyc * dR;
       ph = two_pi * (ph - std::nearbyint(ph));
       double c = std::cos(ph), s = std::sin(ph);
@@ -218,10 +220,11 @@ extern "C" __global__ void bp_blocks(const float2* rc, int P, int nfft, const do
         del = 0.5f * (del + (2.f*dv + dd) / (sqrtf(fmaxf(s_rr[k]*s_rr[k] + 2.f*dv + dd, 0.f)) + s_rr[k]));
       }
       float t = s_tf[k] + del * (float)inv_dr, tf = floorf(t);
-      int i = s_ti[k] + (int)tf;
-      if (i < 0 || i + 1 >= nfft) continue;
+      int i = (s_ti[k] + (int)tf) % nfft;
+      if (i < 0) i += nfft;
+      const int i1 = (i + 1 == nfft) ? 0 : i + 1;
       float w = t - tf;
-      float2 r0 = rc[(long)(p0 + k) * nfft + i], r1 = rc[(long)(p0 + k) * nfft + i + 1];
+      float2 r0 = rc[(long)(p0 + k) * nfft + i], r1 = rc[(long)(p0 + k) * nfft + i1];
       float vre = r0.x + w * (r1.x - r0.x), vim = r0.y + w * (r1.y - r0.y);
       float ph = s_ph[k] + (float)kcyc * del;
       float s, c;
@@ -275,12 +278,11 @@ def _run_jax(S, tx, rcv, ref, cen, d, nfft, inv_dr, kcyc, chunk):
             fl = jnp.floor(t)
             i = ti[:, None] + fl.astype(jnp.int32)
             w = t - fl
-            ok = (i >= 0) & (i + 1 < nfft)
-            ic = jnp.clip(i, 0, nfft - 2)
-            v = rcp[ic] * (1 - w) + rcp[ic + 1] * w
+            ic = jnp.mod(i, nfft)
+            v = rcp[ic] * (1 - w) + rcp[jnp.mod(ic + 1, nfft)] * w
             p = ph[:, None] + kcyc * de
             p = p - jnp.round(p)
-            return acc + jnp.where(ok, v * jnp.exp(2j * jnp.pi * p), 0), None
+            return acc + v * jnp.exp(2j * jnp.pi * p), None
         acc, _ = jax.lax.scan(one, acc, (rc, ti, tf, ph, wt, rt, wr, rr))
         return acc
 
