@@ -91,6 +91,7 @@ python tests/test_ffbp_cpu.py      # C++ kernels against the dense JAX image, tw
 python tests/test_ffbp_cuda.py     # CUDA kernels against the dense JAX image
 python tests/test_pallas_fused.py  # TPU kernels in interpret mode (runs on a CPU)
 python tests/test_autofocus.py     # phase gradient autofocus against injected phase errors (jax; or pass cpu)
+python tests/test_stripmap.py      # stripmap omega-k and RDA against float64 backprojection
 ```
 
 The tests use a small simulated scene and take seconds to a few minutes.
@@ -101,6 +102,46 @@ The tests use a small simulated scene and take seconds to a few minutes.
 given by pixel counts `nx, ny`, spacings `spx, spy` (m) and unit vectors `e1` (azimuth) and `e2` (range) of the
 image plane; pixel (i, j) sits at `(i - nx/2) spx e1 + (j - ny/2) spy e2`. `read_cphd` builds all of
 these from the files, using the SICD's grid when one is given.
+
+## Stripmap
+
+`fastsar.stripmap` focuses stripmap data from a straight, constant-velocity track, starting from raw echoes or from
+range-compressed ones:
+
+```python
+import numpy as np
+from fastsar import stripmap as sm, quality
+p = sm.make_params(squint_deg=5.0)                          # airborne X-band geometry; see make_params
+raw = sm.simulate(p, [[0.0, p.r0], [20.0, p.r0 + 80.0]])    # point targets at (x, zero-Doppler range)
+img, r, x = sm.focus_stripmap(raw, p, algorithm='omegak', rwin='taylor')    # or 'rda', 'bp'
+ij = np.unravel_index(np.abs(img).argmax(), img.shape)
+m = quality.point_target(img, ij, d_az=x[1] - x[0], d_rg=r[1] - r[0])     # resolution, PSLR, ISLR, peak
+```
+
+The simulator computes the echoes of each target exactly in float64 in the time domain (up-chirp, two-way sinc^2 or
+Gaussian azimuth pattern, optional squint). Omega-k uses the exact two-dimensional reference phase and the exact
+Stolt mapping, interpolated with a windowed sinc; the range-Doppler algorithm corrects the exact range migration
+r/cos(theta) by sinc interpolation and has optional secondary range compression. Both run in JAX on any device, in
+float32 by default or float64, with phases and interpolation positions computed in float64 on the host. Time-domain
+backprojection in numpy float64 is the reference. All three return the image on the zero-Doppler grid with the same
+complex scale and phase, so they can be compared sample by sample.
+
+`tests/test_stripmap.py` checks them on a 9.6 GHz scene (100 MHz chirp of 2 us sampled at 125 MHz, PRF 650 Hz,
+200 m/s, 5 km range, 1.5 m antenna, 1024 pulses of 448 samples) with five targets across a 200 m swath, a Taylor
+range window and the sinc^2 pattern as the only azimuth weighting. The error against backprojection on 64 by 64
+pixel patches around the targets is:
+
+- broadside: omega-k -64.9 to -65.5 dB, RDA with secondary range compression -66.5 to -67.7 dB, without it -65.4 to
+  -66.3 dB
+- 5 degrees of squint (Doppler centroid 1116 Hz, 1.7 times the PRF): omega-k -60.2 to -62.5 dB, RDA with secondary
+  range compression -61.1 to -67.4 dB, without it -27.4 to -27.7 dB
+
+At broadside every algorithm measures 0.585 m in azimuth and 1.79 m in range against 0.585 m and 1.775 m expected
+from the weighting, with peak sidelobe ratios of -39.6 dB (azimuth) and -32.7 dB (range; the chirp's spectral ripple
+raises the Taylor sidelobes by about 2 dB) and peak positions within 1.5 mm of the truth. The squinted image is
+sheared, so its range cut measures 1.74 m. The float32 and float64 omega-k images differ by -125 dB, and the residual
+against backprojection comes from the edge of the processed Doppler band, which backprojection cuts on pulses and
+the other two on Doppler bins. On four CPU threads omega-k takes 0.3 s and RDA 0.1 s for this scene.
 
 ## Autofocus
 
