@@ -178,10 +178,12 @@ Every Capella CPHD in the program declares SGN = +1, but the phase of both colle
 declared sign the images do not focus or do not match the vendor's (correlation -0.01 to 0.05). `read_cphd`
 therefore takes SGN = -1 for Capella collectors and says so in its notes; `phase_sign` overrides it.
 
-A Capella dynamic stripmap (sliding spotlight) collection is not yet handled correctly: its scene reference point
-moves by 757 m of range, more than a re-referencing can absorb, and exact backprojection with per-pulse reference
-ranges matches the vendor's image near the scene center only after a 2-pixel registration (amplitude correlation
-0.40 to 0.51 on low-contrast terrain, 0.04 with the opposite phase sign) and fails near the edge of the range swath.
+A Capella dynamic stripmap (sliding spotlight) collection of 2022 is not supported. Its CPHD declares a valid delay
+window (TOA1 to TOA2) 2,962 m long and 4.1 to 7.1 km beyond the scene reference point, while its frequency spacing
+(114.3 kHz) gives an unambiguous range of 1,311 m: the samples cannot hold that window as a plain frequency-domain
+phase history, so the file follows a convention FastSAR does not model. Exact backprojection matches the vendor's
+image near the scene center only after a 2-pixel registration (amplitude correlation 0.40 to 0.51 on low-contrast
+terrain) and fails near the edge of the swath.
 
 ## Wide-angle and circular apertures
 
