@@ -90,6 +90,7 @@ python tests/test_api.py           # every backend this machine has against the 
 python tests/test_ffbp_cpu.py      # C++ kernels against the dense JAX image, two and three levels
 python tests/test_ffbp_cuda.py     # CUDA kernels against the dense JAX image
 python tests/test_pallas_fused.py  # TPU kernels in interpret mode (runs on a CPU)
+python tests/test_autofocus.py     # phase gradient autofocus against injected phase errors (jax; or pass cpu)
 ```
 
 The tests use a small simulated scene and take seconds to a few minutes.
@@ -98,8 +99,47 @@ The tests use a small simulated scene and take seconds to a few minutes.
 
 `ant` holds the antenna phase centers in a frame whose origin is the scene reference point. The output grid is
 given by pixel counts `nx, ny`, spacings `spx, spy` (m) and unit vectors `e1` (azimuth) and `e2` (range) of the
-image plane; pixel (i, j) sits at `(i - (nx - 1)/2) spx e1 + (j - (ny - 1)/2) spy e2`. `read_cphd` builds all of
+image plane; pixel (i, j) sits at `(i - nx/2) spx e1 + (j - ny/2) spy e2`. `read_cphd` builds all of
 these from the files, using the SICD's grid when one is given.
+
+## Autofocus
+
+`fastsar.autofocus` estimates an unknown phase error per pulse by phase gradient autofocus (Wahl, Eichel,
+Ghiglia and Jakowatz, 1994) and removes it from the phase history:
+
+```python
+img, phi = fastsar.autofocus.autofocus(S, ant, fmin, df, nx, ny, spx, spy, e1, e2, backend='cpu')
+S_corrected = S * np.exp(-1j * phi)[:, None]
+```
+
+The image is formed by factorized backprojection, and PGA runs along its azimuth axis (axis 0): the brightest
+pixel of each range line is centered, the lines with the highest peak-to-mean intensity are kept and windowed, and
+the phase difference between adjacent azimuth frequency bins is estimated jointly over the kept lines. The window
+narrows as the image focuses. The estimate on bins is mapped to pulses through each pulse's azimuth spatial
+frequency at the center frequency, the phase history is corrected and the image re-formed, twice by default.
+
+A backprojection image keeps the spherical wavefront, so the azimuth spectrum of a scatterer moves with its
+position (by 16 of 128 bins for a scatterer 20 m from the center at 5 km range in the test below). Before PGA the
+image is therefore multiplied by `exp(-1j * deramp_phase(...))`, the difference between the spherical and planar
+wavefronts of the center pulse, which returns every scatterer to the polar-format convention in which one pulse
+occupies one bin. `pga` can be called on its own on an image in that convention.
+
+`tests/test_autofocus.py` injects phase errors into a simulated 128 by 128 image of 0.5 m pixels (0.6 m
+resolution, 5 km range, 190 pulses) holding 40 point targets over 3,000 clutter scatterers. Image errors are
+relative to the error-free image after the best complex gain, and residuals are rms over pulses after removing
+the constant and linear terms:
+
+- quadratic, 5.3 rad peak: image error -2.7 dB before, -30.1 dB after; residual 0.036 rad
+- polynomial to fifth order, 4.1 rad peak: -6.8 dB before, -29.2 dB after; residual 0.037 rad
+- low-pass random walk, 3.0 rad peak: -0.2 dB before, -30.3 dB after; residual 0.036 rad
+
+On the error-free image the procedure changes the image by -30.1 dB (estimated phase 0.038 rad rms), and on the
+same targets without clutter by -34.3 dB. This floor is the estimator's error on the scene, set by clutter and
+by scatterers that share a range line, rather than a residual of the injected errors; two other random scenes
+gave residuals of 0.035 and 0.05 rad. The method assumes an aperture that fits inside the image's azimuth band,
+that is, azimuth pixels finer than the resolution, and an image long enough in azimuth for its bin spacing,
+1/(nx spx), to follow the variation of the phase error across the aperture. It has been validated with
+backprojection images only.
 
 ## Paper
 
