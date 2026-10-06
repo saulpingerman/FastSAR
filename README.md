@@ -160,6 +160,23 @@ points). It handles:
   the scene center
 - optionally (`troposphere=True`) the per-pulse troposphere delay at the scene reference point
 
+## Real collections
+
+Besides the Umbra spotlight collections of the paper, FastSAR has been run on two Capella collections from the
+Capella Open Data program, compared with the vendor's own SICD of each:
+
+- stripmap (2021, 39,899 pulses of 6,003 samples, scene reference point moving 27.5 km with the beam):
+  `examples/form_capella_stripmap.py` forms a 512 by 512 pixel crop of the vendor's range / zero-Doppler grid by the
+  patch mosaic on the CPU (165 patches of about 10,300 pulses, 398 s on four threads) and samples it on the vendor's
+  pixels; the amplitude images correlate at 0.960
+- spotlight (2024, 74,203 pulses of 17,282 samples): exact backprojection onto the vendor's pixels (`io.sicd_points`)
+  correlates with the vendor's polar-format image at 0.78 at the center of the scene and 0.54 off center, where the
+  vendor's image carries the polar-format distortion
+
+Every Capella CPHD in the program declares SGN = +1, but the phase of both collections follows SGN = -1: with the
+declared sign the images do not focus or do not match the vendor's (correlation -0.01 to 0.05). `read_cphd`
+therefore takes SGN = -1 for Capella collectors and says so in its notes; `phase_sign` overrides it.
+
 ## Wide-angle and circular apertures
 
 Factorized backprojection makes no small-angle assumption, so the same call images wide-angle and circular

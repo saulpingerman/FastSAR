@@ -19,6 +19,10 @@ regrid_tol samples. A moving scene reference point (SRPFixed false) is re-refere
 the change of range stays within a quarter of the unambiguous range; otherwise the data keep their per-pulse
 reference, meta['ref'] gives it, and the collection must be imaged with backproject (form_image would refuse).
 
+phase_sign overrides the file's SGN (-1: the phase of a scatterer falls with frequency, the convention of
+form_image; +1: the data are conjugated on reading). By default the file's SGN is used, except for Capella
+collections, whose files declare +1 while their phase follows -1 (checked against the vendor's SICD).
+
 troposphere=True removes the per-pulse troposphere delay at the scene reference point (PVP TDTropoSRP). On the
 Umbra Panama collection (25.1 ns mean, 0.48 ns span) it sharpens 1024 x 1024 crops by 1 to 7 percent (fourth
 moment of the amplitude) and shifts the image 3.8 m in range; without it the image lands on the vendor's SICD
@@ -59,7 +63,7 @@ def rereference(S, fmin, df, dref):
     return (S * np.exp(-4j * np.pi * f[None, :] / C * np.asarray(dref, np.float64)[:, None])).astype(S.dtype)
 
 
-def read_cphd(cphd, sicd=None, channel=0, meta=False, regrid_tol=1e-3, drop_flagged=False, troposphere=False):
+def read_cphd(cphd, sicd=None, channel=0, meta=False, regrid_tol=1e-3, drop_flagged=False, troposphere=False, phase_sign=None):
     """-> dict(S, ant, fmin, df[, nx, ny, spx, spy, e1, e2]) ready for form_image(**d), and with meta=True also a
     dict of tx, rcv [P, 3] and ref [P] (local frame), R (local axes in ECF rows), srp (ECF origin), times, the
     channel's polarization and identifier, the radar mode, and what was done to the data."""
@@ -85,9 +89,18 @@ def read_cphd(cphd, sicd=None, channel=0, meta=False, regrid_tol=1e-3, drop_flag
     tx, rcv, srp = pv('TxPos'), pv('RcvPos'), pv('SRPPos')
     sc0, scss = pv('SC0'), pv('SCSS')
     S = r.read_chip((0, P), (0, K), index=channel).astype(np.complex64)
-    if m.Global.SGN > 0:
-        S = np.conj(S)
     notes = []
+    sgn = phase_sign
+    if sgn is None:
+        sgn = int(m.Global.SGN)
+        collector = str(getattr(m.CollectionID, 'CollectorName', '') or '')
+        if collector.lower().startswith('capella') and sgn > 0:
+            # Capella's open-data CPHDs declare SGN = +1, but their phase follows -1: a 2021 stripmap and a 2024 spotlight
+            # collection focus and match the vendor's SICD (amplitude correlation 0.94 and 0.78) only without conjugation
+            sgn = -1
+            notes.append('Capella collection: SGN = +1 declared, phase taken as SGN = -1')
+    if sgn > 0:
+        S = np.conj(S)
     # pulses without valid positions or samples at the ends of the aperture are trimmed; an invalid interior
     # position is interpolated from its neighbors, and non-finite interior samples are zeroed
     posbad = ~np.isfinite(tx).all(1) | ~np.isfinite(rcv).all(1) | ~np.isfinite(srp).all(1)
@@ -155,6 +168,9 @@ def read_cphd(cphd, sicd=None, channel=0, meta=False, regrid_tol=1e-3, drop_flag
     if sicd is not None:
         from sarpy.io.complex.converter import open_complex
         sm = open_complex(sicd).sicd_meta
+        if sm.Grid.Type not in ('RGAZIM', 'PLANE', 'XRGYCR', 'XCTYAT'):
+            raise ValueError(f'the SICD grid is {sm.Grid.Type}, not a plane: read without sicd and form its pixels with '
+                             'fastsar.backproject(S, ..., io.sicd_points(sicd, rows, cols, meta))')
         rows, cols = int(sm.ImageData.NumRows), int(sm.ImageData.NumCols)
         row_ss, col_ss = float(sm.Grid.Row.SS), float(sm.Grid.Col.SS)
         row_u = np.array(sm.Grid.Row.UVectECF.get_array()) @ R.T
@@ -192,6 +208,19 @@ def read_cphd(cphd, sicd=None, channel=0, meta=False, regrid_tol=1e-3, drop_flag
                 polarization=None if pol is None else f'{pol.TxPol}{pol.RcvPol}', channel=ch.Identifier,
                 mode=m.CollectionID.RadarMode.ModeType, notes=notes)
     return out, info
+
+
+def sicd_points(sicd, rows, cols, meta, hae=None):
+    """Positions [..., 3] in read_cphd's local frame of the SICD pixels (rows, cols) (arrays of one shape), projected
+    by the SICD's own model onto the surface at height hae above the ellipsoid (default: the SCP's). Any grid type,
+    including range / zero-Doppler grids, which are not planes; backproject onto these points forms the image on the
+    vendor's pixels."""
+    from sarpy.io.complex.converter import open_complex
+    sm = sicd if not isinstance(sicd, str) else open_complex(sicd).sicd_meta
+    rows, cols = np.broadcast_arrays(np.asarray(rows, np.float64), np.asarray(cols, np.float64))
+    h = float(sm.GeoData.SCP.LLH.HAE) if hae is None else float(hae)
+    ecf = np.asarray(sm.project_image_to_ground(np.stack([rows.ravel(), cols.ravel()], 1), projection_type='HAE', hae0=h))
+    return ecf_to_local(ecf.reshape(rows.shape + (3,)), meta)
 
 
 def local_to_ecf(points, meta):
