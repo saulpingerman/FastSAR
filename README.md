@@ -17,6 +17,7 @@ What it covers, with the section that documents and validates each part:
 - long apertures and arbitrary tracks (airborne motion) by patches of factorized backprojection (Long apertures and arbitrary tracks)
 - interferograms and coherence for interferometry and change detection (Interferometry and change detection)
 - multilooking, terrain-corrected geocoding, GeoTIFF and SICD output (Products and geolocation)
+- checks on real collections: Umbra spotlight, Capella stripmap and spotlight against the vendors' images (Real collections)
 
 ```python
 import fastsar
@@ -176,6 +177,11 @@ Capella Open Data program, compared with the vendor's own SICD of each:
 Every Capella CPHD in the program declares SGN = +1, but the phase of both collections follows SGN = -1: with the
 declared sign the images do not focus or do not match the vendor's (correlation -0.01 to 0.05). `read_cphd`
 therefore takes SGN = -1 for Capella collectors and says so in its notes; `phase_sign` overrides it.
+
+A Capella dynamic stripmap (sliding spotlight) collection is not yet handled correctly: its scene reference point
+moves by 757 m of range, more than a re-referencing can absorb, and exact backprojection with per-pulse reference
+ranges matches the vendor's image near the scene center only after a 2-pixel registration (amplitude correlation
+0.40 to 0.51 on low-contrast terrain, 0.04 with the opposite phase sign) and fails near the edge of the range swath.
 
 ## Wide-angle and circular apertures
 
