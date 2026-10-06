@@ -74,3 +74,21 @@ e = rel_db(ff, ex)
 print(f'ffbp vs exact backprojection on the ffbp grid: {e:.1f} dB')
 assert e < -40, e
 print('ok')
+
+# a moving reference point: each pulse compensated to its own point along the track; backprojection with the
+# per-pulse reference ranges gives the image of the fixed-reference data
+col = sim.make_collect(res=0.5, scene=60.0, r0=8e3)
+srp = np.zeros((col.Np, 3)); srp[:, 1] = np.linspace(-20, 20, col.Np)
+f = col.freqs
+S0 = np.zeros((col.Np, col.K), complex); S1 = np.zeros_like(S0)
+for x, a in zip(tg[:8], rng.standard_normal(8) + 1j):
+    r = np.linalg.norm(x - col.ant, axis=1)
+    S0 += a * np.exp(-4j * np.pi * f[None, :] / C * (r - np.linalg.norm(col.ant, axis=1))[:, None])
+    S1 += a * np.exp(-4j * np.pi * f[None, :] / C * (r - np.linalg.norm(col.ant - srp, axis=1))[:, None])
+pts = fastsar.plane_points(64, 64, 0.5, 0.5, (0.0, 1.0, 0.0), (1.0, 0.0, 0.0))
+for b in backends:
+    e = rel_db(fastsar.backproject(S1, col.ant, col.fmin, col.df, pts, ref=np.linalg.norm(col.ant - srp, axis=1), backend=b),
+               fastsar.backproject(S0, col.ant, col.fmin, col.df, pts, backend='cpu'))
+    print(f'{b}: moving reference point vs fixed: {e:.1f} dB')
+    assert e < -55, e
+print('ok')

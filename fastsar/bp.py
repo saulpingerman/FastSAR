@@ -61,18 +61,18 @@ def range_compress(S, nfft, xp=np):
     return xp.fft.fftshift(xp.fft.ifft(pad, axis=1), axes=1)
 
 
-def _centers(tx, rcv, cen, nfft, inv_dr, kcyc):
+def _centers(tx, rcv, ref, cen, nfft, inv_dr, kcyc):
     """float64 center terms for pulses tx [p, 3] and blocks cen [nb, 3]: integer and fractional range bin of the
     block center, its phase in cycles (wrapped), and the center-to-antenna vectors and their lengths in float32."""
     wt = cen[None, :, :] - tx[:, None, :]
     rt = np.linalg.norm(wt, axis=2)
     if rcv is None:
-        dR = rt - np.linalg.norm(tx, axis=1)[:, None]
+        dR = rt - ref[:, None]
         wr = rr = None
     else:
         wr = cen[None, :, :] - rcv[:, None, :]
         rr = np.linalg.norm(wr, axis=2)
-        dR = 0.5 * (rt + rr - np.linalg.norm(tx, axis=1)[:, None] - np.linalg.norm(rcv, axis=1)[:, None])
+        dR = 0.5 * (rt + rr) - ref[:, None]
     t = dR * inv_dr + nfft // 2
     ti = np.floor(t)
     ph = kcyc * dR
@@ -99,7 +99,7 @@ _CPU_SRC = r'''
 #include <complex>
 #include <omp.h>
 extern "C" void bp_points(const float* rre, const float* rim, int P, int nfft, const double* tx, const double* rcv,
-                          const double* pts, int N, double inv_dr, double kcyc, double* ore, double* oim) {
+                          const double* ref, const double* pts, int N, double inv_dr, double kcyc, double* ore, double* oim) {
   const double two_pi = 6.283185307179586;
   #pragma omp parallel for schedule(dynamic, 64)
   for (int n = 0; n < N; ++n) {
@@ -108,12 +108,13 @@ extern "C" void bp_points(const float* rre, const float* rim, int P, int nfft, c
     for (int p = 0; p < P; ++p) {
       const double* a = tx + 3*p;
       double ax = x - a[0], ay = y - a[1], az = z - a[2];
-      double dR = std::sqrt(ax*ax + ay*ay + az*az) - std::sqrt(a[0]*a[0] + a[1]*a[1] + a[2]*a[2]);
+      double dR = std::sqrt(ax*ax + ay*ay + az*az);
       if (rcv) {
         const double* b = rcv + 3*p;
         double bx = x - b[0], by = y - b[1], bz = z - b[2];
-        dR = 0.5 * (dR + std::sqrt(bx*bx + by*by + bz*bz) - std::sqrt(b[0]*b[0] + b[1]*b[1] + b[2]*b[2]));
+        dR = 0.5 * (dR + std::sqrt(bx*bx + by*by + bz*bz));
       }
+      dR -= ref[p];
       double t = dR * inv_dr + (nfft / 2);
       double tf = std::floor(t);
       long i = (long)tf;
@@ -153,13 +154,13 @@ def _cpu():
         L = ctypes.CDLL(so)
         f32 = np.ctypeslib.ndpointer(np.float32, flags='C_CONTIGUOUS')
         f64 = np.ctypeslib.ndpointer(np.float64, flags='C_CONTIGUOUS')
-        L.bp_points.argtypes = [f32, f32, ctypes.c_int, ctypes.c_int, f64, ctypes.c_void_p, f64, ctypes.c_int,
+        L.bp_points.argtypes = [f32, f32, ctypes.c_int, ctypes.c_int, f64, ctypes.c_void_p, f64, f64, ctypes.c_int,
                                 ctypes.c_double, ctypes.c_double, f64, f64]
         _cpu_lib = L
     return _cpu_lib
 
 
-def _run_cpu(S, tx, rcv, pts, nfft, inv_dr, kcyc, chunk):
+def _run_cpu(S, tx, rcv, ref, pts, nfft, inv_dr, kcyc, chunk):
     L = _cpu()
     N = len(pts)
     ore, oim = np.zeros(N), np.zeros(N)
@@ -170,7 +171,7 @@ def _run_cpu(S, tx, rcv, pts, nfft, inv_dr, kcyc, chunk):
         t = np.ascontiguousarray(tx[sl])
         r = None if rcv is None else np.ascontiguousarray(rcv[sl])
         L.bp_points(np.ascontiguousarray(rc.real), np.ascontiguousarray(rc.imag), len(t), nfft, t,
-                    None if r is None else r.ctypes.data, pts, N, inv_dr, kcyc, ore, oim)
+                    None if r is None else r.ctypes.data, np.ascontiguousarray(ref[sl]), pts, N, inv_dr, kcyc, ore, oim)
     return (ore + 1j * oim).astype(np.complex64)
 
 
@@ -178,7 +179,7 @@ def _run_cpu(S, tx, rcv, pts, nfft, inv_dr, kcyc, chunk):
 
 _CUDA_SRC = r'''
 extern "C" __global__ void bp_blocks(const float2* rc, int P, int nfft, const double* tx, const double* rcv,
-                                     const double* cen, const float* d, double inv_dr, double kcyc, float2* out) {
+                                     const double* ref, const double* cen, const float* d, double inv_dr, double kcyc, float2* out) {
   // one thread block per block of 256 points (one thread per point); the block's center terms for 256 pulses at a
   // time are computed in float64 by the block's threads and shared, offsets are handled in float32
   __shared__ float s_wt[256][3], s_rt[256], s_wr[256][3], s_rr[256], s_tf[256], s_ph[256];
@@ -193,15 +194,16 @@ extern "C" __global__ void bp_blocks(const float2* rc, int P, int nfft, const do
     if (p < P) {
       const double* a = tx + 3*p;
       double wx = cx - a[0], wy = cy - a[1], wz = cz - a[2];
-      double rt = sqrt(wx*wx + wy*wy + wz*wz), dR = rt - sqrt(a[0]*a[0] + a[1]*a[1] + a[2]*a[2]);
+      double rt = sqrt(wx*wx + wy*wy + wz*wz), dR = rt;
       s_wt[j][0] = (float)wx; s_wt[j][1] = (float)wy; s_wt[j][2] = (float)wz; s_rt[j] = (float)rt;
       if (rcv) {
         const double* q = rcv + 3*p;
         double vx = cx - q[0], vy = cy - q[1], vz = cz - q[2];
         double rr = sqrt(vx*vx + vy*vy + vz*vz);
-        dR = 0.5 * (dR + rr - sqrt(q[0]*q[0] + q[1]*q[1] + q[2]*q[2]));
+        dR = 0.5 * (dR + rr);
         s_wr[j][0] = (float)vx; s_wr[j][1] = (float)vy; s_wr[j][2] = (float)vz; s_rr[j] = (float)rr;
       }
+      dR -= ref[p];
       double t = dR * inv_dr + (nfft / 2), tf = floor(t), ph = kcyc * dR;
       s_ti[j] = (int)tf; s_tf[j] = (float)(t - tf); s_ph[j] = (float)(ph - rint(ph));
     }
@@ -234,7 +236,7 @@ extern "C" __global__ void bp_blocks(const float2* rc, int P, int nfft, const do
 '''
 
 
-def _run_cuda(S, tx, rcv, cen, d, nfft, inv_dr, kcyc, chunk):
+def _run_cuda(S, tx, rcv, ref, cen, d, nfft, inv_dr, kcyc, chunk):
     import cupy as cp
     k = cp.RawKernel(_CUDA_SRC, 'bp_blocks', options=('-use_fast_math',))
     nb = len(cen)
@@ -245,14 +247,15 @@ def _run_cuda(S, tx, rcv, cen, d, nfft, inv_dr, kcyc, chunk):
         rc = range_compress(cp.asarray(S[sl], cp.complex64), nfft, xp=cp).astype(cp.complex64)
         t = cp.asarray(tx[sl], cp.float64)
         r = None if rcv is None else cp.asarray(rcv[sl], cp.float64)
-        k((nb,), (BLOCK,), (rc, np.int32(len(t)), np.int32(nfft), t, r if r is not None else cp.uint64(0), cen_d, d_d,
+        k((nb,), (BLOCK,), (rc, np.int32(len(t)), np.int32(nfft), t, r if r is not None else cp.uint64(0),
+                             cp.asarray(ref[sl], cp.float64), cen_d, d_d,
                              np.float64(inv_dr), np.float64(kcyc), out))
     return cp.asnumpy(out)
 
 
 # ---------------------------------------------------------------------------------------------------- JAX
 
-def _run_jax(S, tx, rcv, cen, d, nfft, inv_dr, kcyc, chunk):
+def _run_jax(S, tx, rcv, ref, cen, d, nfft, inv_dr, kcyc, chunk):
     import jax, jax.numpy as jnp
     nb = len(cen)
     bis = rcv is not None
@@ -285,7 +288,7 @@ def _run_jax(S, tx, rcv, cen, d, nfft, inv_dr, kcyc, chunk):
     for p0 in range(0, len(S), chunk):
         sl = slice(p0, min(len(S), p0 + chunk))
         rc = _rc_jax(jnp.asarray(S[sl], jnp.complex64), nfft).astype(jnp.complex64)
-        ct = _centers(tx[sl], None if rcv is None else rcv[sl], cen, nfft, inv_dr, kcyc)
+        ct = _centers(tx[sl], None if rcv is None else rcv[sl], ref[sl], cen, nfft, inv_dr, kcyc)
         z = np.zeros((sl.stop - sl.start, nb), np.float32)
         acc = step(acc, rc, ct['ti'], ct['tf'], ct['ph'], ct['wt'], ct['rt'], ct.get('wr', np.zeros_like(ct['wt'])),
                    ct.get('rr', z), dd_)
@@ -302,16 +305,21 @@ def _rc_jax(S, nfft):
 
 # ---------------------------------------------------------------------------------------------------- entry point
 
-def backproject(S, ant, fmin, df, points, rcv=None, backend='auto', upsample=8, window=True, chunk=256):
+def backproject(S, ant, fmin, df, points, rcv=None, ref=None, backend='auto', upsample=8, window=True, chunk=256):
     """Complex image at points [..., 3] (shape [...], complex64). ant [P, 3] is the antenna phase center
-    (monostatic) or the transmitter position when rcv [P, 3] is given. backend: 'cpu' (float64 throughout),
-    'cuda', 'jax' (float32 with float64 block centers), or 'auto'."""
+    (monostatic) or the transmitter position when rcv [P, 3] is given. ref [P] is the range (one way, or the mean
+    of the two legs) to which each pulse was motion compensated; by default the distance to the origin, the fixed
+    scene reference point. A moving reference point (sliding spotlight, stripmap CPHD) passes its per-pulse range.
+    backend: 'cpu' (float64 throughout), 'cuda', 'jax' (float32 with float64 block centers), or 'auto'."""
     from .api import available_backends
     S = np.asarray(S)
     P, K = S.shape
     tx = np.asarray(ant, np.float64)
     rcv = None if rcv is None else np.asarray(rcv, np.float64)
     points = np.asarray(points, np.float64)
+    if ref is None:
+        ref = np.linalg.norm(tx, axis=1) if rcv is None else 0.5 * (np.linalg.norm(tx, axis=1) + np.linalg.norm(rcv, axis=1))
+    ref = np.asarray(ref, np.float64)
     shape = points.shape[:-1]
     if window:
         wp, wk = _window(P, K)
@@ -324,12 +332,12 @@ def backproject(S, ant, fmin, df, points, rcv=None, backend='auto', upsample=8, 
         backend = available_backends()[0]
         backend = 'jax' if backend == 'tpu' else backend
     if backend == 'cpu':
-        return _run_cpu(S, tx, rcv, points.reshape(-1, 3), nfft, inv_dr, kcyc, chunk).reshape(shape)
+        return _run_cpu(S, tx, rcv, ref, points.reshape(-1, 3), nfft, inv_dr, kcyc, chunk).reshape(shape)
     order, cen, d = _order(points)
     if backend == 'cuda':
-        flat = _run_cuda(S, tx, rcv, cen, d, nfft, inv_dr, kcyc, chunk)
+        flat = _run_cuda(S, tx, rcv, ref, cen, d, nfft, inv_dr, kcyc, chunk)
     elif backend in ('jax', 'tpu'):
-        flat = _run_jax(S, tx, rcv, cen, d, nfft, inv_dr, kcyc, chunk)
+        flat = _run_jax(S, tx, rcv, ref, cen, d, nfft, inv_dr, kcyc, chunk)
     else:
         raise ValueError(f'unknown backend {backend!r}')
     out = np.empty(len(order), np.complex64)
