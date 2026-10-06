@@ -138,6 +138,15 @@ def read_cphd(cphd, sicd=None, channel=0, meta=False, regrid_tol=1e-3, drop_flag
             S = (S * np.exp(2j * np.pi * (sc0[:, None] + scss[:, None] * np.arange(K)[None, :]) * td[:, None])).astype(np.complex64)
             notes.append(f'removed the troposphere delay at the SRP (mean {td.mean() * 1e9:.2f} ns, span {np.ptp(td) * 1e9:.3f} ns)')
     f0, df = float(np.median(sc0)), float(np.median(scss))
+    t1, t2 = pv('TOA1'), pv('TOA2')
+    if t1 is not None and t2 is not None:
+        span = float(np.nanmax(np.asarray(t2, np.float64)[lo:hi] - np.asarray(t1, np.float64)[lo:hi])) * C / 2
+        if span > C / (2 * df) * 1.001:
+            import warnings
+            msg = (f'valid delay window (TOA1 to TOA2) of {span:.0f} m exceeds the unambiguous range c/(2 df) = '
+                   f'{C / (2 * df):.0f} m: the samples are not a plain frequency-domain phase history and images will alias')
+            warnings.warn(msg)
+            notes.append(msg)
     u = (f0 + np.arange(K)[None, :] * df - sc0[:, None]) / scss[:, None]
     shift = float(np.abs(u - np.arange(K)[None, :]).max())
     if shift > regrid_tol:
