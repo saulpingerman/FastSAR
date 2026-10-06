@@ -557,6 +557,8 @@ def final_tile_tc(are, aim, ux, uy, dlx, dly, a0, a1, T, store='fp32'):
     KP = (K2 + 15) // 16 * 16
     LD = KP + 8
     smem = max(2 * 2 * T * LD * 2, 2 * T * (2 * T + 4) * 4)
+    if smem > 48 * 1024:                                   # wide final tiles: opt in to more than the default 48 KB
+        k.max_dynamic_shared_size_bytes = smem
     ore = cp.empty((B, T, T), cp.float32)
     oim = cp.empty((B, T, T), cp.float32)
     k((B,), (512,), (are, aim, ux, uy, dlx, dly, ore, oim, np.int32(Pf), np.int32(Qf), np.float32(a0), np.float32(a1)), shared_mem=smem)

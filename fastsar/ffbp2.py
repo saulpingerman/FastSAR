@@ -47,7 +47,25 @@ def choose_splits(n, T, nlev):
             rec(prefix + [f], prod * f)
 
     rec([], 1)
+    if best is None:
+        # too few levels for this image with factors up to 8: allow larger factors (the levels' filters and tile
+        # geometry take any factor; only the plans of record avoid them)
+        for f in range(16, 8, -1):
+            if f ** nlev >= need:
+                rec_big = [f] * nlev
+                while len(rec_big) and _prod(rec_big[:-1]) * (rec_big[-1] - 1) >= need and rec_big[-1] > 2:
+                    rec_big[-1] -= 1
+                best = (_prod(rec_big), tuple(rec_big))
+        if best is None:
+            raise ValueError(f'{nlev} levels cannot split {n} pixels into tiles of {T}: use more levels or a larger T')
     return best[1]
+
+
+def _prod(v):
+    out = 1
+    for x in v:
+        out *= x
+    return out
 
 
 def fir(F, D, m):
