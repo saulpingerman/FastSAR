@@ -1,0 +1,45 @@
+"""CPHD helpers that need no file: per-pulse frequency resampling, re-referencing the motion-compensation point,
+and the geodetic conversions."""
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import numpy as np
+import fastsar
+from fastsar import io, sim
+
+C = 299792458.0
+rng = np.random.default_rng(0)
+
+# a row of scatterer returns sampled on a slightly offset and stretched frequency grid, resampled onto the nominal one
+K = 2048
+tau = rng.uniform(-0.3, 0.3, 6)
+a = rng.standard_normal(6) + 1j * rng.standard_normal(6)
+f = lambda k: (a * np.exp(-2j * np.pi * k[..., None] * tau)).sum(-1)
+k = np.arange(K)[None, :].astype(float)
+u = 0.37 + k * (1 + 3e-6)
+out = io._sinc_regrid(f(k).astype(np.complex64), u)
+e = 10 * np.log10(np.sum(np.abs(out[0, 20:-20] - f(u)[0, 20:-20]) ** 2) / np.sum(np.abs(f(u)[0, 20:-20]) ** 2))
+print(f'frequency resampling (16 taps, interior): {e:.1f} dB')
+assert e < -70, e
+
+# moving the reference point: data compensated to the origin, re-referenced to a point c, equals data simulated
+# with c as reference
+col = sim.make_collect(res=0.5, scene=40.0, r0=8e3)
+tg = np.stack([rng.uniform(-15, 15, 5), rng.uniform(-15, 15, 5), np.zeros(5)], 1)
+c = np.array([3.0, -2.0, 0.5])
+S0 = np.zeros((col.Np, col.K), complex); S1 = np.zeros_like(S0)
+for x, amp in zip(tg, rng.standard_normal(5) + 1j):
+    r = np.linalg.norm(x - col.ant, axis=1)
+    S0 += amp * np.exp(-4j * np.pi * col.freqs / C * (r - np.linalg.norm(col.ant, axis=1))[:, None])
+    S1 += amp * np.exp(-4j * np.pi * col.freqs / C * (r - np.linalg.norm(col.ant - c, axis=1))[:, None])
+S2 = io.rereference(S0, col.fmin, col.df, np.linalg.norm(col.ant, axis=1) - np.linalg.norm(col.ant - c, axis=1))
+e = 10 * np.log10(np.sum(np.abs(S2 - S1) ** 2) / np.sum(np.abs(S1) ** 2))
+print(f're-referencing: {e:.1f} dB')
+assert e < -100, e
+
+# geodetic round trip
+lat, lon, h = rng.uniform(-80, 80, 50), rng.uniform(-180, 180, 50), rng.uniform(-100, 9000, 50)
+la, lo, hh = io.ecf_to_geodetic(io.geodetic_to_ecf(lat, lon, h))
+err = max(np.abs(la - lat).max() * 111e3, np.abs((lo - lon + 180) % 360 - 180).max() * 111e3, np.abs(hh - h).max())
+print(f'geodetic round trip: {err:.2e} m')
+assert err < 1e-4, err
+print('ok')
