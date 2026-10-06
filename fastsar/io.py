@@ -4,7 +4,7 @@ arrays form_image takes. Needs sarpy.
     col = fastsar.io.read_cphd('x_CPHD.cphd', sicd='x_SICD.nitf')
     img = fastsar.form_image(**col)
 
-    col, meta = fastsar.io.read_cphd('x_CPHD.cphd', channel=1, meta=True)     # second channel (e.g. polarization)
+    col, meta = fastsar.io.read_cphd('x_CPHD.cphd', channel='HV', meta=True)  # a channel by polarization or identifier
     img = fastsar.backproject(col['S'], meta['tx'], col['fmin'], col['df'], points, rcv=meta['rcv'], ref=meta['ref'])
 
 The local frame has x along track, y along ground range away from the radar and z up, with its origin at the scene
@@ -67,7 +67,15 @@ def read_cphd(cphd, sicd=None, channel=0, meta=False, regrid_tol=1e-3, drop_flag
     r = open_phase_history(cphd)
     m = r.cphd_meta
     if isinstance(channel, str):
-        channel = [c.Identifier for c in m.Data.Channels].index(channel)
+        ids = [c.Identifier for c in m.Data.Channels]
+        pols = [f'{p.Polarization.TxPol}{p.Polarization.RcvPol}' if getattr(p, 'Polarization', None) is not None else None
+                for p in m.Channel.Parameters]
+        if channel in ids:
+            channel = ids.index(channel)
+        elif channel.upper() in pols:
+            channel = pols.index(channel.upper())
+        else:
+            raise ValueError(f'channel {channel!r} not among identifiers {ids} or polarizations {pols}')
     ch = m.Data.Channels[channel]
     par = m.Channel.Parameters[channel]
     P, K = ch.NumVectors, ch.NumSamples

@@ -49,6 +49,15 @@ def coherence(a, b, w1=5, w2=5):
     return num / np.maximum(den, 1e-300)
 
 
+def pauli(hh, hv, vv, vh=None, la=1, lr=1):
+    """Pauli decomposition of a quad-polarization image set (formed on one grid): the powers of
+    (HH - VV)/sqrt(2) (double bounce), 2 HV/sqrt(2) with HV the mean of HV and VH when both are given (volume), and
+    (HH + VV)/sqrt(2) (surface), multilooked over la x lr boxes; stacked [..., 3] in the usual red, green, blue order."""
+    x = np.asarray(hv) if vh is None else 0.5 * (np.asarray(hv) + np.asarray(vh))
+    k = [(np.asarray(hh) - np.asarray(vv)) / np.sqrt(2), np.sqrt(2) * x, (np.asarray(hh) + np.asarray(vv)) / np.sqrt(2)]
+    return np.stack([multilook(c, la, lr) for c in k], -1)
+
+
 def to_db(power, floor=1e-30):
     return 10 * np.log10(np.maximum(power, floor))
 

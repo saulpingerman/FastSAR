@@ -42,3 +42,11 @@ try:
 except ImportError:
     have_sarpy = False
 print('ok' + ('' if have_sarpy else ' (SICD round trip skipped: no sarpy)'))
+
+# Pauli decomposition: a trihedral (HH = VV), a dihedral (HH = -VV) and a dipole at 45 degrees (HV only) land in
+# the surface, double-bounce and volume channels; total power is kept
+hh, hv, vv = np.array([[1.0, 1.0, 0.0]]), np.array([[0.0, 0.0, 1.0]]), np.array([[1.0, -1.0, 0.0]])
+p = products.pauli(hh, hv, vv)[0]
+print('pauli (double bounce, volume, surface):', np.round(p, 3).tolist())
+assert np.allclose(p, [[0, 0, 2], [2, 0, 0], [0, 2, 0]])
+print('ok')
