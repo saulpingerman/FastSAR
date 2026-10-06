@@ -31,7 +31,9 @@ _SRC = r'''
   #define LD(v) (v)
   #define ST(v) (v)
 #endif
-#define PB 32          /* pulses per block in rot_fir_k */
+#ifndef PB
+#define PB 32          /* pulses per block in rot_fir_k (16 or 8 when a wide window would overflow shared memory) */
+#endif
 #define JT 8           /* threads per pulse, each two consecutive outputs: 16 columns per block */
 extern "C" __global__
 void rot_fir_k(const sample_t* __restrict__ sre, const sample_t* __restrict__ sim, const float* __restrict__ c0, const float* __restrict__ sl,
@@ -243,16 +245,19 @@ void final_tile(const sample_t* __restrict__ dre, const sample_t* __restrict__ d
 '''
 
 _mods = {}
+_PB_CHOICES = (32, 16, 8)        # pulses per block tried in order by the level kernel (tests may narrow this)
 
 
-def _kernels(store='fp32'):
+def _kernels(store='fp32', pb=32):
     bits = 16 if store == 'f16' else 32
-    if bits not in _mods:
-        _mods[bits] = cp.RawModule(code=_SRC, options=('--std=c++14', '--use_fast_math', f'-DSTORE={bits}'))
-    out = {k: _mods[bits].get_function(k) for k in ('rot_fir_k', 'fir_p', 'final_tile')}
+    key = (bits, pb)
+    if key not in _mods:
+        _mods[key] = cp.RawModule(code=_SRC, options=('--std=c++14', '--use_fast_math', f'-DSTORE={bits}', f'-DPB={pb}'))
+    out = {k: _mods[key].get_function(k) for k in ('rot_fir_k', 'fir_p', 'final_tile')}
     for k in out.values():
         k.max_dynamic_shared_size_bytes = 96 * 1024          # opt in to more than 48 KB of shared memory per block
     out['dtype'] = cp.float16 if bits == 16 else cp.float32
+    out['store'] = store
     return out
 
 
@@ -269,9 +274,13 @@ def _children(kern, pre, pim, c0, sl, lv):
         yre = cp.empty((Np * Cn, P, Ko), kern['dtype'])
         yim = cp.empty((Np * Cn, P, Ko), kern['dtype'])
         W = 16 * Dk + L
-        smem = (2 * 32 * (W | 1) + L + 2 * 32 * 16) * 4
+        for pb in _PB_CHOICES:                            # pulses per block: the largest whose window fits in 96 KB
+            smem = (2 * pb * (W | 1) + L + 2 * pb * 16) * 4
+            if smem <= 96 * 1024:
+                break
         assert smem <= 96 * 1024, (Dk, L)
-        kern['rot_fir_k'](((Ko + 15) // 16, (P + 31) // 32, Np), (256,),
+        kl = kern['rot_fir_k'] if pb == 32 else _kernels(kern['store'], pb)['rot_fir_k']
+        kl(((Ko + 15) // 16, (P + pb - 1) // pb, Np), (pb * 8,),
                           (pre, pim, c0, sl, taps, yre, yim, np.int32(Cn), np.int32(P), np.int32(K), np.int32(Ko), np.int32(Dk),
                            np.int32(L), np.int32(pl), np.float32(kc)), shared_mem=smem)
     else:
