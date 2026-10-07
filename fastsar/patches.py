@@ -318,9 +318,12 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
     patch with ImageFormer on backend ('cpu', 'jax', 'cuda', 'tpu').
     beam(idx, points) -> u [len(idx), m]: normalized azimuth coordinate of pulses idx (stripmap_beam); a pulse
     serves a patch when |u| <= umax somewhere on it. With an azimuth window awin (stripmap.window) pulse p is
-    weighted at pixel x by W_a(u_p(x)/umax), the window clipped at its edges: the weight on pulses x 9 x 9 points of
-    the patch is split into separable terms (weight_terms, down to wtol_db, default target_db - 10), each formed by
-    one FFBP of the weighted phase history and multiplied by its pixel factor, interpolated by bicubic splines.
+    weighted at pixel x by W_a(u_p(x)/umax), the window clipped at its edges. On the cpu and cuda backends the
+    weight is applied in FFBP's final stage (ImageFormer's aperture_weight: each final subaperture's mean weight at
+    each final tile, with its first-order variation across the tile). On jax and tpu, or with
+    FASTSAR_WEIGHT_TERMS=1, the weight on pulses x 9 x 9 points of the patch is split into separable terms
+    (weight_terms, down to wtol_db, default target_db - 10), each formed by one FFBP of the weighted phase history
+    and multiplied by its pixel factor, interpolated by bicubic splines.
     pulses: (lo, hi) or a function of the patch center returning (lo, hi), used when beam is None (default: all).
     margin, guard: range gate margin (m) and spectral guard (Hz), see patch_history. T, target_db: as for ImageFormer,
     with sub (s1, s2) or 'auto' chosen with T by tile_plan (T = 8 only on 'jax'; the C++ and CUDA final stages take 16
@@ -340,6 +343,9 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
     wa = sm.window(awin)
     si, sj = np.linspace(0, px - 1, 9), np.linspace(0, py - 1, 9)          # sample points, in patch pixels
     gi, gj = np.meshgrid(si - px / 2, sj - py / 2, indexing='ij')
+    # the azimuth window in the final stage of a single FFBP (cpu, cuda); FASTSAR_WEIGHT_TERMS=1, the jax and tpu
+    # backends and exact=True use the separable terms, one FFBP each
+    in_kernel = backend in ('cpu', 'cuda') and not exact and os.environ.get('FASTSAR_WEIGHT_TERMS', '0') != '1'
     out = np.zeros((nx, ny), np.complex64)
     npatch = -(-nx // mx) * -(-ny // my)
     prof = range_profiles(fx, guard) if npatch > 1 and os.environ.get('FASTSAR_SHARED_PROFILES', '1') != '0' else None
@@ -354,7 +360,7 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
                 if len(on) == 0:
                     continue
                 lo, hi = int(on[0]), int(on[-1]) + 1
-                if awin is not None:
+                if awin is not None and not in_kernel:
                     wt = weight_terms(wa(np.clip(u[lo:hi] / umax, -1, 1)), wtol_db)
             else:
                 lo, hi = (0, len(ant)) if pulses is None else (pulses(c) if callable(pulses) else pulses)
@@ -369,8 +375,15 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
                 Tp, s12, err = tile_plan(af, f0 + S.shape[1] * df, px, py, spx, spy, e1, e2, target_db, tiles, subs)
                 s1, s2 = s12
                 nlev = _levels(min(px * s1, py * s2), Tp) if levels == 'auto' else levels
+                aw = None
+                if beam is not None and awin is not None and in_kernel:
+                    def aw(q, pul, c=c, lo=lo, idx=idx):
+                        # the window at points q (relative to the patch center) for pulses pul of af (the nearest
+                        # recorded pulse for one inserted at a gap)
+                        k = np.clip(np.searchsorted(idx, pul), 0, len(idx) - 1)
+                        return wa(np.clip(beam(lo + k, np.asarray(q) + c) / umax, -1, 1))
                 former = ImageFormer(af, f0, df, S.shape[1], px * s1, py * s2, spx / s1, spy / s2, e1, e2, backend,
-                                     window=False, T=Tp, levels=nlev)
+                                     window=False, T=Tp, levels=nlev, aperture_weight=aw)
 
                 def form(S_, former=former, idx=idx, n=len(af), s1=s1, s2=s2):
                     if n > len(idx):                  # zero pulses at the dropped ones

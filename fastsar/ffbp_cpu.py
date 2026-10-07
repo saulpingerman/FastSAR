@@ -45,7 +45,8 @@ def lib():
     i, dbl = ctypes.c_int, ctypes.c_double
     L.rot_fir_k.argtypes = [f32, f32, i, i, i, f32, f32, i, f32, i, i, i, i, dbl, f32, f32]
     L.fir_p.argtypes = [f32, f32, i, i, i, f32, i, i, i, i, f32, f32]
-    L.final_tiles.argtypes = [f32, f32, i, i, i, i, f64, f64, f64, f64, dbl, dbl, f64, f64, f64, dbl, f32, f32]
+    vp = ctypes.c_void_p
+    L.final_tiles.argtypes = [f32, f32, i, i, i, i, f64, f64, f64, f64, dbl, dbl, f64, f64, f64, dbl, f32, f32, vp, vp, vp]
     L.ffbp_cpu_threads.restype = i
     _lib = L
     return L
@@ -116,8 +117,9 @@ def _device_phases(la, refs, lv):
     return (c0 - np.rint(c0)).astype(np.float32), (ddr * k1).astype(np.float32)
 
 
-def make_ffbp_cpu(plan, coll):
-    """Build form(S) -> complex64 image [nx, ny] for the plan and the collection arrays (host float64)."""
+def make_ffbp_cpu(plan, coll, wf=None):
+    """Build form(S) -> complex64 image [nx, ny] for the plan and the collection arrays (host float64). wf: final
+    subaperture weights per final tile [ntiles, Pf] (api.final_weights), or None."""
     L_ = lib()
     levels, T, nlev = plan['levels'], plan['T'], len(plan['levels'])
     fin = plan['final']
@@ -144,8 +146,8 @@ def make_ffbp_cpu(plan, coll):
     shape_g = [s for lv in levels[1:] for s in (lv['sx'], lv['sy'])] + [T, T]
     perm_g = [2 * i for i in range(nlev - 1)] + [2 * (nlev - 1)] + [2 * i + 1 for i in range(nlev - 1)] + [2 * (nlev - 1) + 1]
 
-    def final(are, aim, cen):
-        """are, aim [B, Pf, Qf]; cen [B, 3] float64 -> (re, im) [B, T, T]."""
+    def final(are, aim, cen, wts=None):
+        """are, aim [B, Pf, Qf]; cen [B, 3] float64; wts None or (w0, gx, gyr) [B, Pf] float32 -> (re, im) [B, T, T]."""
         B = are.shape[0]
         t0 = time.perf_counter()
         w = fr0[None, :, None] * fu[None, :, :] - cen[:, None, :]                       # [B, Pf, 3]
@@ -160,7 +162,9 @@ def make_ffbp_cpu(plan, coll):
         t0 = time.perf_counter()
         ore = pool.get('ore', (B, T, T))
         oim = pool.get('oim', (B, T, T))
-        L_.final_tiles(np.ascontiguousarray(are), np.ascontiguousarray(aim), B, Pf, Qf, T, ux, uy, dlx, dly, a0, a1, ucx, ucy, rc, fc2, ore, oim)
+        wp = [None] * 3 if wts is None else [np.ascontiguousarray(w, np.float32) for w in wts]
+        L_.final_tiles(np.ascontiguousarray(are), np.ascontiguousarray(aim), B, Pf, Qf, T, ux, uy, dlx, dly, a0, a1, ucx, ucy, rc, fc2, ore, oim,
+                       *[None if w is None else w.ctypes.data for w in wp])
         _mark('final_tile', t0)
         return ore, oim
 
@@ -179,7 +183,16 @@ def make_ffbp_cpu(plan, coll):
                 _mark('device_phases', t0)
             a, b = _children(a, b, c0, sl, lv, pool, tag=str(i))
         cen = fcen.reshape(G, -1, 3)[g]
-        re, im = final(a, b, cen)
+        if wf is not None and wf.ndim == 3:      # weight plus its gradient across the tile, in the final stage
+            w = wf.reshape(3, G, -1, Pf)[:, g]
+            w0 = w[0]
+            gyr = np.where(np.abs(w0) > 1e-6 * max(float(np.abs(w0).max()), 1e-30), w[2] / np.where(w0 == 0, 1, w0), 0.0)
+            re, im = final(a, b, cen, (w0, w[1], gyr))
+        else:
+            if wf is not None:
+                w = wf.reshape(G, -1, Pf)[g][:, :, None]
+                a, b = a * w, b * w
+            re, im = final(a, b, cen)
         return (re.reshape(shape_g).transpose(perm_g).reshape(mx, my).copy(), im.reshape(shape_g).transpose(perm_g).reshape(mx, my).copy())
 
     ox, oy, nx, ny = plan['ox'], plan['oy'], plan['nx'], plan['ny']

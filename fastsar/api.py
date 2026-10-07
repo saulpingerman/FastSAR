@@ -30,6 +30,7 @@ backprojection meets target_db (-40 dB by default). The error of the final stage
 square of the tile size and falls with range, so orbital collections keep T=32 and short-range (airborne) ones
 drop to 16. The prediction is kept as ImageFormer.predicted_error_db.
 """
+import os
 import numpy as np
 
 from .sim import Collect
@@ -59,16 +60,46 @@ def available_backends():
     return out
 
 
+def final_weights(plan, weight, P, grad=False, points=None):
+    """Weight of each final subaperture at each final tile [ntiles, Pf] (float32), for ImageFormer's aperture_weight:
+    weight(points [m, 3], pulses [n] int) -> [n, m], the per-pulse weights at the tile centers, averaged over the
+    pulses that each final subaperture spans (its center on the input pulse axis composed through the levels'
+    decimations, width the product of the decimation factors) by 3-point Gauss-Legendre quadrature. grad=True
+    also returns the gradient along e1 and e2 (per metre) at the tile centers: [3, ntiles, Pf]."""
+    cen = np.asarray(plan['final']['cen'], np.float64)
+    if grad:
+        h1, h2 = 0.5 * plan['T'] * plan['spx'], 0.5 * plan['T'] * plan['spy']
+        e1, e2 = np.asarray(plan['e1'], np.float64), np.asarray(plan['e2'], np.float64)
+        w = [final_weights(plan, weight, P, points=q) for q in (cen, cen + h1 * e1, cen - h1 * e1, cen + h2 * e2, cen - h2 * e2)]
+        return np.stack([w[0], (w[1] - w[2]) / (2 * h1), (w[3] - w[4]) / (2 * h2)]).astype(np.float32)
+    q = cen if points is None else points
+    idx, D = np.arange(plan['final']['P'], dtype=np.float64), 1.0
+    for lv in reversed(plan['levels']):
+        idx = lv['Dp'] * idx + float(lv['pidx'][0])
+        D *= lv['Dp']
+    # pulse p covers [p - 1/2, p + 1/2); a subaperture spans [idx - D/2, idx + D/2] within the collection
+    a = np.clip(idx - D / 2, -0.5, P - 0.5); b = np.clip(idx + D / 2, -0.5, P - 0.5)
+    t, gw = np.array([-np.sqrt(0.6), 0.0, np.sqrt(0.6)]), np.array([5.0, 8.0, 5.0]) / 18.0
+    nodes = np.clip(np.rint(0.5 * (a + b)[:, None] + 0.5 * (b - a)[:, None] * t[None, :]), 0, P - 1).astype(np.int64)
+    U, inv = np.unique(nodes.ravel(), return_inverse=True)
+    W = np.asarray(weight(q, U), np.float64)[inv].reshape(len(idx), 3, -1)    # [Pf, 3, ntiles]
+    m = np.where((b > a)[:, None], np.tensordot(gw, W, axes=(0, 1)), 0.0)       # [Pf, ntiles]
+    return np.ascontiguousarray(m.T, np.float32)
+
+
 class ImageFormer:
     """Factorized backprojection set up once for a collection geometry and output grid, then called on phase
     histories:  former = ImageFormer(ant, fmin, df, K, nx, ny, spx, spy, e1, e2); img = former(S).
 
     Building plans the tiles and filters, computes the float64 geometry and compiles the kernels; each call then
     pays only the image formation. Reuse one former for repeated images of the same geometry (or for timing);
-    a different antenna path needs a new former. Arguments as for form_image."""
+    a different antenna path needs a new former. Arguments as for form_image, and
+    aperture_weight(points [m, 3], pulses [n]) -> W [n, m]: a per-pixel weight of pulses (int indices) (a stripmap aperture window), applied
+    in the final stage as the mean weight of each final subaperture's pulses at each final tile's center, with its
+    first-order variation across the tile (final_weights; cpu and cuda backends)."""
 
     def __init__(self, ant, fmin, df, K, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 1.0, 0.0), backend='auto',
-                 precision='float32', window=True, T='auto', levels=3, pmax=0.4, target_db=-40.0):
+                 precision='float32', window=True, T='auto', levels=3, pmax=0.4, target_db=-40.0, aperture_weight=None):
         from . import ffbp2
         import warnings
         self.ant = np.asarray(ant, np.float64)
@@ -95,6 +126,9 @@ class ImageFormer:
         self.T = T
         plan = ffbp2.make_plan(col, nx, ny, spx, spy, T=T, nlev=levels, pmax=pmax, e1=e1, e2=e2)
         coll = ffbp2.collection_arrays(plan, self.ant)
+        wf = None if aperture_weight is None else final_weights(plan, aperture_weight, self.P, grad=os.environ.get('FASTSAR_WEIGHT_GRAD', '1') == '1')
+        if wf is not None and self.backend not in ('cpu', 'cuda'):
+            raise ValueError('aperture_weight is implemented for the cpu and cuda backends')
         if window:
             self.wp, self.wk = _window(self.P, self.K)
         if self.backend == 'cuda':
@@ -104,14 +138,14 @@ class ImageFormer:
             if precision == 'float16' and T != 32:
                 raise ValueError('cuda float16 uses the tensor-core final stage, which is built for T=32')
             self._form = ffbp_cuda.make_ffbp_cuda(plan, coll, final_mode='f16tc' if precision == 'float16' else 'fp32',
-                                                  store='f16' if precision == 'float16' else 'fp32')
+                                                  store='f16' if precision == 'float16' else 'fp32', wf=wf)
         elif self.backend == 'cpu':
             from . import ffbp_cpu
             if T not in (16, 32):
                 raise ValueError(f'the cpu backend supports T=16 or T=32, not {T}')
             if precision != 'float32':
                 raise ValueError("cpu precision: 'float32'")
-            self._form = ffbp_cpu.make_ffbp_cpu(plan, coll)
+            self._form = ffbp_cpu.make_ffbp_cpu(plan, coll, wf=wf)
         elif self.backend in ('tpu', 'jax'):
             pol = {'float32': 'fp32_high' if self.backend == 'tpu' else 'fp32', 'three-pass': 'fp32_high',
                    'single-pass': 'fp32_fast', 'float16': 'f16'}.get(precision)

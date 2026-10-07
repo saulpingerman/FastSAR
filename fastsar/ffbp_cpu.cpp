@@ -190,8 +190,10 @@ void fir_p(const float* yre, const float* yim, int B, int P, int Ko, const float
 // accumulators of every output block are carried across the chunks in a small array.
 void final_tiles(const float* dre, const float* dim, int B, int Pf, int Qf, int T, const double* ux, const double* uy,
                  const double* dlx, const double* dly, double a0, double a1, const double* ucx, const double* ucy,
-                 const double* rc, double fc2, float* ore, float* oim)
+                 const double* rc, double fc2, float* ore, float* oim, const float* w0, const float* gx, const float* gyr)
 {
+    // w0, gx, gyr [B, Pf] (or null): an aperture weight per subaperture and pixel, w0 + gx dx + gy dy, applied as
+    // (w0 + gx dx)(1 + gyr dy) with gyr = gy / w0, the x factor on the data table and the y factor on the other
     if (T != VL && T != 2 * VL) { std::abort(); }             // the tables are one or two vectors wide
     const int NH = T / VL;
     const int PC = std::max(1, 24576 / (Qf * T * 4 * 2));     // pulses per chunk: A and B chunks of about 24 KB each per plane
@@ -238,6 +240,19 @@ void final_tiles(const float* dre, const float* dim, int B, int Pf, int Qf, int 
                                 if (h == 0) { wr0 = wr; wi0 = wi; cr0 = cr; ci0 = ci; } else { wr1 = wr; wi1 = wi; cr1 = cr; ci1 = ci; }
                             }
                         }
+                        v16 lw0 = bcast(1.f), lw1 = bcast(1.f);              // the weight factor per lane
+                        if (w0 != nullptr) {
+                            const size_t bp = (size_t)b * Pf + p;
+                            for (int l = 0; l < VL; ++l) {
+                                if (tab == 0) {
+                                    lw0[l] = w0[bp] + gx[bp] * (float)dl[l];
+                                    if (NH == 2) lw1[l] = w0[bp] + gx[bp] * (float)dl[VL + l];
+                                } else {
+                                    lw0[l] = 1.f + gyr[bp] * (float)dl[l];
+                                    if (NH == 2) lw1[l] = 1.f + gyr[bp] * (float)dl[VL + l];
+                                }
+                            }
+                        }
                         const float* drp = dr + (size_t)p * Qf;
                         const float* dip = di + (size_t)p * Qf;
                         const size_t nb = (size_t)(p - pc0) * Qf;
@@ -245,12 +260,12 @@ void final_tiles(const float* dre, const float* dim, int B, int Pf, int Qf, int 
                             const size_t n = nb + q;
                             if (tab == 0) {
                                 const v16 d_r = bcast(drp[q]), d_i = bcast(dip[q]);
-                                Tr[n * NH] = d_r * wr0 - d_i * wi0;
-                                Ti[n * NH] = d_r * wi0 + d_i * wr0;
-                                if (NH == 2) { Tr[n * NH + 1] = d_r * wr1 - d_i * wi1; Ti[n * NH + 1] = d_r * wi1 + d_i * wr1; }
+                                Tr[n * NH] = (d_r * wr0 - d_i * wi0) * lw0;
+                                Ti[n * NH] = (d_r * wi0 + d_i * wr0) * lw0;
+                                if (NH == 2) { Tr[n * NH + 1] = (d_r * wr1 - d_i * wi1) * lw1; Ti[n * NH + 1] = (d_r * wi1 + d_i * wr1) * lw1; }
                             } else {
-                                Tr[n * NH] = wr0; Ti[n * NH] = wi0;
-                                if (NH == 2) { Tr[n * NH + 1] = wr1; Ti[n * NH + 1] = wi1; }
+                                Tr[n * NH] = wr0 * lw0; Ti[n * NH] = wi0 * lw0;
+                                if (NH == 2) { Tr[n * NH + 1] = wr1 * lw1; Ti[n * NH + 1] = wi1 * lw1; }
                             }
                             v16 nr = wr0 * cr0 - wi0 * ci0; wi0 = wr0 * ci0 + wi0 * cr0; wr0 = nr;
                             if (NH == 2) { nr = wr1 * cr1 - wi1 * ci1; wi1 = wr1 * ci1 + wi1 * cr1; wr1 = nr; }

@@ -378,7 +378,7 @@ def _tick():
     return None
 
 
-def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32'):
+def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
     """Build form(S) -> complex64 image [nx, ny] (device) for the plan and the collection arrays (host float64).
     final_mode: 'fp32' (CUDA cores, float32) or 'f16tc' (tensor cores, float16 operands, float32 accumulation).
     store: 'fp32' or 'f16' for the phase history, every intermediate and the final-stage input in memory; the filter
@@ -403,6 +403,8 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32'):
         dev.append(e)
     fu, fr0 = cp.asarray(coll['final']['u']), cp.asarray(coll['final']['r0'])
     fcen = cp.asarray(fin['cen'])
+    wfd = None if wf is None else cp.asarray(wf)
+    dlxw, dlyw = cp.asarray(dlx_h, cp.float32), cp.asarray(dly_h, cp.float32)
     e1d, e2d, end = cp.asarray(e1), cp.asarray(e2), cp.asarray(en)
     sx0, sy0 = levels[0]['sx'], levels[0]['sy']
     G = sx0 * sy0
@@ -467,7 +469,17 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32'):
                 _mark('device_phases', t0)
                 a, b = _children(kern, a, b, c0, sl, lv)
         cen = fcen.reshape(G, -1, 3)[g]
-        re, im = final(a, b, cen)
+        if wfd is not None and wfd.ndim == 3:    # final subaperture weights per tile and their gradient across it
+            w = wfd.reshape(3, G, -1, Pf)[:, g][..., None]
+            re, im = final((a * w[0]).astype(a.dtype), (b * w[0]).astype(b.dtype), cen)
+            for k, dl in ((1, dlxw[None, :, None]), (2, dlyw[None, None, :])):
+                r_, i_ = final((a * w[k]).astype(a.dtype), (b * w[k]).astype(b.dtype), cen)
+                re, im = re + dl * r_, im + dl * i_
+        else:
+            if wfd is not None:            # final subaperture weights per tile (api.final_weights)
+                w = wfd.reshape(G, -1, Pf)[g][:, :, None]
+                a, b = (a * w).astype(a.dtype), (b * w).astype(b.dtype)
+            re, im = final(a, b, cen)
         return (re.reshape(shape_g).transpose(perm_g).reshape(mx, my), im.reshape(shape_g).transpose(perm_g).reshape(mx, my))
 
     ox, oy, nx, ny = plan['ox'], plan['oy'], plan['nx'], plan['ny']

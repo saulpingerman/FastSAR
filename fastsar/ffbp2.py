@@ -68,6 +68,65 @@ def _prod(v):
     return out
 
 
+class LazyDecimator:
+    """The decimation matrix of ffbp.decimator, built only when an array is asked for (np.asarray, the JAX paths):
+    for a long aperture it is P x P/D dense (an identity of 67 GB at 91,426 pulses when D = 1), while the C++ and
+    CUDA paths need only its kernel (decimator_fir)."""
+
+    def __init__(self, n_in, D, pass_frac, atten):
+        self.args = (int(n_in), int(D), float(pass_frac), float(atten))
+        n_in, D = self.args[:2]
+        if D == 1:
+            self.m, n_out = 0, n_in
+        else:
+            dw = (2.0 - 2.0 * pass_frac) * np.pi / D
+            half = math.ceil((atten - 8.0) / (2.285 * dw)) / 2.0 + 1.0
+            self.m = int(math.ceil(half / D))
+            n_out = -(-n_in // D) + 2 * self.m
+        self.shape = (n_in, n_out)
+
+    def __array__(self, dtype=None, copy=None):
+        F = decimator(*self.args)[0]
+        return F if dtype is None else F.astype(dtype)
+
+    def astype(self, dtype):
+        return np.asarray(self).astype(dtype)
+
+    @property
+    def T(self):
+        return np.asarray(self).T
+
+
+def decimator_fir(n_in, D, pass_frac, atten=70.0):
+    """The kernel form of ffbp.decimator (as fir(F, D, m) returns it) without the dense matrix: F is shift-invariant,
+    each column one Kaiser-windowed sinc divided by the row sums of its inputs."""
+    dw = (2.0 - 2.0 * pass_frac) * np.pi / D
+    half = math.ceil((atten - 8.0) / (2.285 * dw)) / 2.0 + 1.0
+    m = int(math.ceil(half / D))
+    n_out = -(-n_in // D) + 2 * m
+    beta = 0.1102 * (atten - 8.7)
+
+    def K(d):
+        return np.where(np.abs(d) <= half, np.sinc(d / D) * np.i0(beta * np.sqrt(np.clip(1.0 - (d / half) ** 2, 0.0, 1.0))) / np.i0(beta), 0.0)
+    j0 = n_out // 2
+    cj = D * (j0 - m) + (D - 1) / 2.0
+    i = np.arange(max(0, int(math.floor(cj - half))), min(n_in, int(math.ceil(cj + half)) + 1))
+    v = K(i - cj)
+    nzm = v != 0
+    i, v = i[nzm], v[nzm]
+    # row sums: the inputs' weights over every output (all within reach, since each input has full support)
+    jj = np.arange(n_out)
+    cen = D * (jj - m) + (D - 1) / 2.0
+    near = (np.abs(cen[None, :] - i[:, None]) <= half)
+    rs = np.where(near, K(i[:, None] - cen[None, :]), 0.0).sum(1)
+    kern = v / rs
+    lo, L = int(i[0]) - D * (j0 - m), int(i[-1] - i[0] + 1)
+    pl = D * m - lo
+    assert pl >= 0 and L == len(kern)
+    pr = max(D * (n_out - 1) + L - pl - n_in, 0)
+    return dict(kern=kern, pl=int(pl), pr=int(pr), n_out=int(n_out), L=int(L)), m
+
+
 def fir(F, D, m):
     """The decimation matrix F [n_in, n_out] as one kernel: out[j] = sum_r kern[r] * xpad[D j + r],
     with xpad the input padded by pl zeros on the left and pr on the right. Exact, edges included."""
@@ -119,18 +178,19 @@ def make_plan(col, nx, ny, spx, spy, T=32, nlev=3, pmax=0.4, atten=70.0, splits=
         Dp = max(1, int(pmax / (2.0 * (2.0 * (f0 + K * df) / C) * dop)))
         pass_k = rk / (C / (2.0 * df * Dk) / 2.0)
         pass_p = 2.0 * (2.0 * (f0 + K * df) / C) * dop * Dp
-        Fk, mk = decimator(K, Dk, min(pass_k, 0.95), atten)
-        Fp, mp = decimator(P, Dp, min(pass_p, 0.95), atten)
+        Fk, Fp = LazyDecimator(K, Dk, min(pass_k, 0.95), atten), LazyDecimator(P, Dp, min(pass_p, 0.95), atten)
+        mk, mp = Fk.m, Fp.m
         # an axis shorter than its decimation kernel (late levels of small or wide-angle collections) is not decimated
         if Dk > 1 and Fk.shape[0] < 2 * mk * Dk + Dk:
             Dk, pass_k = 1, rk / (C / (2.0 * df) / 2.0)
-            Fk, mk = decimator(K, 1, 0.95, atten)
+            Fk, mk = LazyDecimator(K, 1, 0.95, atten), 0
         if Dp > 1 and Fp.shape[0] < 2 * mp * Dp + Dp:
             Dp, pass_p = 1, 2.0 * (2.0 * (f0 + K * df) / C) * dop
-            Fp, mp = decimator(P, 1, 0.95, atten)
+            Fp, mp = LazyDecimator(P, 1, 0.95, atten), 0
         pidx = Dp * (np.arange(Fp.shape[1]) - mp) + (Dp - 1) / 2.0
         out['levels'].append(dict(sx=sx, sy=sy, C=sx * sy, Dk=Dk, Dp=Dp, Fk=Fk, Fp=Fp, K=K, P=P, Ko=Fk.shape[1], Po=Fp.shape[1],
-                                  fir_k=fir(Fk, Dk, mk) if Dk > 1 else None, fir_p=fir(Fp, Dp, mp) if Dp > 1 else None,
+                                  fir_k=decimator_fir(K, Dk, Fk.args[2], atten)[0] if Dk > 1 else None,
+                                  fir_p=decimator_fir(P, Dp, Fp.args[2], atten)[0] if Dp > 1 else None,
                                   f0=f0, df=df, ref=ref, d=cen[0] - ref[0], cen=cen, pidx=pidx,
                                   pass_k=float(pass_k), pass_p=float(pass_p)))
         ant = _positions(ant, pidx)
