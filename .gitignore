@@ -1,7 +1,28 @@
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
 *.egg-info/
+build/
+dist/
+.eggs/
+*.so
+
+# environments and tool caches
+.venv/
+venv/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# radar data and arrays
 *.npy
 *.npz
 *.cphd
 *.nitf
+*.ntf
+*.tif
+*.tiff
+
+# editors and OS
+.vscode/
+.idea/
+.DS_Store

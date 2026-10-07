@@ -1,0 +1,21 @@
+name: Feature request
+description: A new algorithm, data format, device or product
+labels: [enhancement]
+body:
+  - type: textarea
+    id: need
+    attributes:
+      label: What you need
+      description: The task you are trying to do and what FastSAR is missing for it.
+    validations:
+      required: true
+  - type: textarea
+    id: data
+    attributes:
+      label: Data
+      description: The sensor, mode and file format involved, and a public example if one exists.
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed approach
+      description: Optional. References to the method, or how you would implement it.
