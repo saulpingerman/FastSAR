@@ -242,6 +242,25 @@ def weight_terms(W, wtol_db=-50.0, most=8):
     return U[:, :n].T, s[:n, None] * Vt[:n]
 
 
+def fill_gaps(a):
+    """Dropped pulses: where the step between consecutive antenna positions a [n, 3] is m >= 2 times the median step,
+    m - 1 positions are inserted on the line between them. -> (positions [n', 3], index [n] of each original pulse
+    among them). Factorized backprojection filters along the pulse axis assuming near-even spacing; zero pulses at
+    the inserted positions keep the spacing even and add nothing to the image."""
+    a = np.asarray(a, np.float64)
+    step = np.linalg.norm(np.diff(a, axis=0), axis=1)
+    m = np.maximum(np.rint(step / np.median(step)).astype(np.int64), 1)
+    if m.max() < 2:
+        return a, np.arange(len(a))
+    idx = np.concatenate([[0], np.cumsum(m)])
+    out = np.empty((idx[-1] + 1, 3))
+    for k in np.nonzero(m >= 2)[0]:
+        f = np.arange(1, m[k])[:, None] / m[k]
+        out[idx[k] + 1:idx[k + 1]] = (1 - f) * a[k] + f * a[k + 1]
+    out[idx] = a
+    return out, idx
+
+
 def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 1.0, 0.0), patch=(128, 128), crop=0,
                 beam=None, umax=1.0, awin=None, pulses=None, margin=None, guard=None, backend='cpu', T='auto',
                 levels='auto', target_db=-40.0, sub='auto', wtol_db=None, exact=False, info=None):
@@ -295,12 +314,19 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
                 form = lambda S_: bpx(S_, a, f0, df, xyz, backend='cpu', window=False, upsample=16)
                 Tp, s12, nlev, err = None, None, None, None
             else:
-                Tp, s12, err = tile_plan(a, f0 + S.shape[1] * df, px, py, spx, spy, e1, e2, target_db, tiles, subs)
+                af, idx = fill_gaps(a)
+                Tp, s12, err = tile_plan(af, f0 + S.shape[1] * df, px, py, spx, spy, e1, e2, target_db, tiles, subs)
                 s1, s2 = s12
                 nlev = _levels(min(px * s1, py * s2), Tp) if levels == 'auto' else levels
-                former = ImageFormer(a, f0, df, S.shape[1], px * s1, py * s2, spx / s1, spy / s2, e1, e2, backend,
+                former = ImageFormer(af, f0, df, S.shape[1], px * s1, py * s2, spx / s1, spy / s2, e1, e2, backend,
                                      window=False, T=Tp, levels=nlev)
-                form = lambda S_: former(S_.astype(np.complex64))[::s1, ::s2]
+
+                def form(S_, former=former, idx=idx, n=len(af), s1=s1, s2=s2):
+                    if n > len(idx):                  # zero pulses at the dropped ones
+                        Z = np.zeros((n, S_.shape[1]), np.complex64)
+                        Z[idx] = S_
+                        S_ = Z
+                    return former(S_.astype(np.complex64))[::s1, ::s2]
             if wt is None:
                 img = form(S)
             else:

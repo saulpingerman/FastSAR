@@ -10,6 +10,8 @@
 (b) A track with smooth cross-track and vertical motion of about a meter, from 3 km altitude onto flat ground:
     omega-k on the nominal straight track against exact backprojection with the true positions, and the patch
     mosaic on a ground-plane grid with the true positions against the same.
+(c) Dropped pulses: a simulated spotlight with 34 of 2122 pulses missing in gaps of 5 to 10 pulses. The mosaic, which
+    fills the gaps with zero pulses (patches.fill_gaps), against exact backprojection of the remaining pulses.
 
 Errors are complex, on 64 by 64 pixel patches around the targets, after the best complex gain. Resolution, PSLR and
 position come from fastsar.quality."""
@@ -198,4 +200,26 @@ check(res['patches true'], -45, 'patches true')
 check(res['patches exact'], -50, 'patches exact')
 for e, m, mr in res['patches nominal']:
     assert e > -10, e
+
+# (c) dropped pulses
+from fastsar import sim
+from fastsar.bp import backproject
+rng = np.random.default_rng(2)
+col = sim.make_collect(res=0.5, scene=600.0, r0=5e3)
+tg = np.stack([rng.uniform(-25, 25, 80), rng.uniform(-25, 25, 80), np.zeros(80)], 1)
+S = sim.simulate_brute(col, tg, rng.standard_normal(80) + 1j * rng.standard_normal(80)).astype(np.complex64)
+P = len(col.ant)
+keep = np.ones(P, bool)
+for c in (P // 5, P // 2, 4 * P // 5):
+    keep[c:c + rng.integers(5, 11)] = False
+    keep[c + 30:c + 40:2] = False
+e1, e2 = np.array([0, 1.0, 0]), np.array([1.0, 0, 0])
+o = -32.0 * e1 - 32.0 * e2
+X, Y = np.meshgrid(np.arange(128) * 0.5, np.arange(128) * 0.5, indexing='ij')
+ex = backproject(S[keep], col.ant[keep], col.fmin, col.df, o + X[..., None] * e1 + Y[..., None] * e2, backend='cpu', window=False, upsample=16)
+fx = dict(S=S[keep], fmin=col.fmin, df=col.df, ref=np.linalg.norm(col.ant[keep], axis=1))
+img = pt.form_mosaic(fx, col.ant[keep], o, 128, 128, 0.5, 0.5, e1, e2, patch=(64, 64), backend='cpu')
+e = 10 * np.log10(np.sum(np.abs(img - ex) ** 2) / np.sum(np.abs(ex) ** 2))
+print(f'dropped pulses ({(~keep).sum()} of {P}): {e:.1f} dB')
+assert e < -45, e                # -46.4 dB when the limit was set; -43.5 dB without the zero pulses
 print('ok')
