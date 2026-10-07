@@ -196,9 +196,12 @@ void fir_p_g(const sample_t* __restrict__ yre, const sample_t* __restrict__ yim,
 extern "C" __global__
 void final_tile(const sample_t* __restrict__ dre, const sample_t* __restrict__ dim, const float* __restrict__ ux, const float* __restrict__ uy,
                 const float* __restrict__ dlx, const float* __restrict__ dly, float* __restrict__ ore, float* __restrict__ oim,
-                int Pf, int Qf, int T, float a0, float a1, int pps)
+                int Pf, int Qf, int T, float a0, float a1, int pps, const float* __restrict__ w0, const float* __restrict__ gx,
+                const float* __restrict__ gyr, int has_w)
 {
     // grid: x = tile; block = T * T / 8 threads, each a 4 (x) by 2 (y) block of pixels. Tables for pps pulses per sync.
+    // has_w: an aperture weight per subaperture and pixel, w0 + gx dx + gy dy, applied as (w0 + gx dx)(1 + gyr dy) with
+    // gyr = gy / w0 ([B, Pf] each): the x factor on the data table A, the y factor on table B
     const int b = blockIdx.x, tid = threadIdx.x, HX = T / 4, tx = tid % HX, ty = tid / HX;
     extern __shared__ float2 sm2[];
     const int rowlen = pps * Qf;                          // pps pulses side by side
@@ -230,13 +233,18 @@ void final_tile(const sample_t* __restrict__ dre, const sample_t* __restrict__ d
                 float wr, wi, sr, si_;
                 sincospif(2.0f * cyc0, &wi, &wr);
                 sincospif(2.0f * cs, &si_, &sr);
+                float lw = 1.f;
+                if (has_w && pok) {
+                    const size_t bp = (size_t)b * Pf + p;
+                    lw = isA ? w0[bp] + gx[bp] * dlx[tr] : 1.f + gyr[bp] * dly[tr];
+                }
                 for (; q < qend; ++q) {
                     const int qq2 = q - ph * Qf;
                     if (isA) {
-                        const float d_r = pok ? LD(dr[p * Qf + qq2]) : 0.f, d_i = pok ? LD(di[p * Qf + qq2]) : 0.f;
+                        const float d_r = pok ? LD(dr[p * Qf + qq2]) * lw : 0.f, d_i = pok ? LD(di[p * Qf + qq2]) * lw : 0.f;
                         R2[q] = make_float2(d_r * wr - d_i * wi, d_r * wi + d_i * wr);
                     } else {
-                        R2[q] = make_float2(wr, wi);
+                        R2[q] = make_float2(wr * lw, wi * lw);
                     }
                     const float nr = wr * sr - wi * si_;
                     wi = wr * si_ + wi * sr; wr = nr;
@@ -405,6 +413,7 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
     fcen = cp.asarray(fin['cen'])
     wfd = None if wf is None else cp.asarray(wf)
     dlxw, dlyw = cp.asarray(dlx_h, cp.float32), cp.asarray(dly_h, cp.float32)
+    dummy_w = cp.zeros(1, cp.float32)
     e1d, e2d, end = cp.asarray(e1), cp.asarray(e2), cp.asarray(en)
     sx0, sy0 = levels[0]['sx'], levels[0]['sy']
     G = sx0 * sy0
@@ -419,8 +428,8 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
     if smem_final > 48 * 1024:
         kern['final_tile'].max_dynamic_shared_size_bytes = smem_final
 
-    def final(are, aim, cen):
-        """are, aim [B, Pf, Qf]; cen [B, 3] float64 -> (re, im) [B, T, T]."""
+    def final(are, aim, cen, wts=None):
+        """are, aim [B, Pf, Qf]; cen [B, 3] float64; wts None or (w0, gx, gyr) [B, Pf] float32 -> (re, im) [B, T, T]."""
         B = are.shape[0]
         t0 = _tick()
         w = fr0[None, :, None] * fu[None, :, :] - cen[:, None, :]                       # [B, Pf, 3]
@@ -441,7 +450,9 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
         else:
             kern['final_tile']((B,), (T * T // 8,), (cp.ascontiguousarray(are), cp.ascontiguousarray(aim), cp.ascontiguousarray(ux.astype(cp.float32)),
                                                 cp.ascontiguousarray(uy.astype(cp.float32)), dlx, dly, ore, oim,
-                                                np.int32(Pf), np.int32(Qf), np.int32(T), np.float32(a0), np.float32(a1), np.int32(pps)), shared_mem=smem_final)
+                                                np.int32(Pf), np.int32(Qf), np.int32(T), np.float32(a0), np.float32(a1), np.int32(pps),
+                                                *((dummy_w,) * 3 if wts is None else tuple(cp.ascontiguousarray(w, cp.float32) for w in wts)),
+                                                np.int32(0 if wts is None else 1)), shared_mem=smem_final)
         _mark('final_tile', t0)
         t0 = _tick()
         dx, dy = cp.asarray(dlx_h)[None, :, None], cp.asarray(dly_h)[None, None, :]
@@ -469,7 +480,13 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
                 _mark('device_phases', t0)
                 a, b = _children(kern, a, b, c0, sl, lv)
         cen = fcen.reshape(G, -1, 3)[g]
-        if wfd is not None and wfd.ndim == 3:    # final subaperture weights per tile and their gradient across it
+        if wfd is not None and wfd.ndim == 3 and final_mode != 'f16tc':     # weights in the final kernel
+            w = wfd.reshape(3, G, -1, Pf)[:, g]
+            w0 = w[0]
+            big = cp.abs(w0) > 1e-6 * max(float(cp.abs(w0).max()), 1e-30)
+            gyr = cp.where(big, w[2] / cp.where(w0 == 0, 1, w0), 0.0)
+            re, im = final(a, b, cen, (w0, w[1], gyr))
+        elif wfd is not None and wfd.ndim == 3:    # final subaperture weights per tile and their gradient across it
             w = wfd.reshape(3, G, -1, Pf)[:, g][..., None]
             re, im = final((a * w[0]).astype(a.dtype), (b * w[0]).astype(b.dtype), cen)
             for k, dl in ((1, dlxw[None, :, None]), (2, dlyw[None, None, :])):

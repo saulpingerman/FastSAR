@@ -250,6 +250,25 @@ def patch_history(fx, ant, center, pts, lo, hi, margin=None, guard=None, prof=No
     out = np.empty((hi - lo, k1 - k0), np.complex128)
     j = (np.arange(N) + N // 2) % N - N // 2
 
+    if gate and prof is not None and prof.get('device') is not None:
+        # the same on the GPU (cuda backend): profiles in device memory, or gathered on the host and uploaded
+        import cupy as cp
+        Q = prof['Qd'] if prof.get('Qd') is not None else prof['Q']
+        sft = 2 * df * K2 * shift / C
+        m = np.rint(sft).astype(np.int64)
+        cols = (j[None, :] - m[:, None]) % K2
+        if isinstance(Q, np.ndarray):
+            u = cp.asarray(Q[lo + np.arange(hi - lo)[:, None], cols])
+        else:
+            u = Q[cp.asarray(lo + np.arange(hi - lo))[:, None], cp.asarray(cols)]
+        U = cp.fft.fft(u, axis=1)[:, k0:k1]
+        kk = cp.arange(k0, k1, dtype=cp.float32)
+        dd = cp.asarray((sft - m).astype(np.float32))
+        cph = cp.asarray((np.exp(-4j * np.pi * f0 * shift / C) * (K2 / N)).astype(np.complex64))
+        ramp = cp.exp((-2j * np.pi / N) * dd[:, None] * kk[None, :]).astype(cp.complex64)
+        out = U * ramp * (cph[:, None] * cp.asarray(T[k0:k1].astype(np.float32))[None, :])
+        return out.astype(cp.complex64), a - center, float(f2[k0]), float(df2)
+
     if gate and prof is not None:
         # exp(-j 4 pi f shift / c) with f = f0 + k df is a delay of s = 2 df K2 shift / c bins of the profile times the
         # constant exp(-j 4 pi f0 shift / c): the integer part m selects the gate's bins, the fraction d is a phase
@@ -289,6 +308,34 @@ def weight_terms(W, wtol_db=-50.0, most=8):
     U, s, Vt = np.linalg.svd(W, full_matrices=False)
     n = max(1, min(most, int(np.sum(s >= s[0] * 10 ** (wtol_db / 20)))))
     return U[:, :n].T, s[:n, None] * Vt[:n]
+
+
+def _xp(a):
+    """numpy, or cupy for a device array."""
+    if type(a).__module__.startswith('cupy'):
+        import cupy
+        return cupy
+    return np
+
+
+def beam_span(beam, P, pts, umax, step=64):
+    """Pulses [lo, hi) for which |beam(p, x)| <= umax at some of the points pts, or None: the beam evaluated on every
+    step-th pulse, then on every pulse only next to the first and last pulses found (the illuminated pulses of a point
+    are contiguous)."""
+    def on(idx):
+        return (np.abs(beam(idx, pts)) <= umax).any(1)
+    coarse = np.unique(np.r_[np.arange(0, P, step), P - 1])
+    hit = np.nonzero(on(coarse))[0]
+    if len(hit) == 0:
+        full = np.nonzero(on(np.arange(P)))[0]
+        return None if len(full) == 0 else (int(full[0]), int(full[-1]) + 1)
+    a0 = int(coarse[hit[0] - 1]) if hit[0] > 0 else 0
+    a = np.arange(a0, int(coarse[hit[0]]) + 1)
+    lo = int(a[np.nonzero(on(a))[0][0]])
+    b1 = int(coarse[hit[-1] + 1]) if hit[-1] + 1 < len(coarse) else P - 1
+    b = np.arange(int(coarse[hit[-1]]), b1 + 1)
+    hi = int(b[np.nonzero(on(b))[0][-1]]) + 1
+    return lo, hi
 
 
 def fill_gaps(a):
@@ -349,19 +396,23 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
     out = np.zeros((nx, ny), np.complex64)
     npatch = -(-nx // mx) * -(-ny // my)
     prof = range_profiles(fx, guard) if npatch > 1 and os.environ.get('FASTSAR_SHARED_PROFILES', '1') != '0' else None
+    if prof is not None and backend == 'cuda' and not exact:
+        import cupy as cp
+        prof['device'] = True
+        if prof['Q'].nbytes < 0.4 * cp.cuda.Device().mem_info[0]:      # profiles in GPU memory when they fit
+            prof['Qd'] = cp.asarray(prof['Q'])
     for i0 in range(0, nx, mx):
         for j0 in range(0, ny, my):
             c = o + (i0 - crop + px / 2) * spx * e1 + (j0 - crop + py / 2) * spy * e2
             pts = c + (gi.ravel() * spx)[:, None] * e1 + (gj.ravel() * spy)[:, None] * e2
             wt = None
             if beam is not None:
-                u = beam(slice(None), pts)
-                on = np.nonzero((np.abs(u) <= umax).any(1))[0]
-                if len(on) == 0:
+                span = beam_span(beam, len(ant), pts, umax)
+                if span is None:
                     continue
-                lo, hi = int(on[0]), int(on[-1]) + 1
+                lo, hi = span
                 if awin is not None and not in_kernel:
-                    wt = weight_terms(wa(np.clip(u[lo:hi] / umax, -1, 1)), wtol_db)
+                    wt = weight_terms(wa(np.clip(beam(slice(lo, hi), pts) / umax, -1, 1)), wtol_db)
             else:
                 lo, hi = (0, len(ant)) if pulses is None else (pulses(c) if callable(pulses) else pulses)
             S, a, f0, df = patch_history(fx, ant, c, pts, lo, hi, margin, guard, prof)
@@ -386,9 +437,10 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
                                      window=False, T=Tp, levels=nlev, aperture_weight=aw)
 
                 def form(S_, former=former, idx=idx, n=len(af), s1=s1, s2=s2):
+                    xp = _xp(S_)
                     if n > len(idx):                  # zero pulses at the dropped ones
-                        Z = np.zeros((n, S_.shape[1]), np.complex64)
-                        Z[idx] = S_
+                        Z = xp.zeros((n, S_.shape[1]), np.complex64)
+                        Z[xp.asarray(idx)] = S_
                         S_ = Z
                     return former(S_.astype(np.complex64))[::s1, ::s2]
             if wt is None:

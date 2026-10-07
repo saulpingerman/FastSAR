@@ -160,11 +160,19 @@ class ImageFormer:
             raise ValueError(f'unknown backend {backend!r}')
 
     def __call__(self, S):
-        """S [P, K] complex phase history -> complex64 image [nx, ny]."""
-        S = np.asarray(S)
+        """S [P, K] complex phase history (numpy, or cupy on the cuda backend) -> complex64 image [nx, ny]."""
+        if not (self.backend == 'cuda' and type(S).__module__.startswith('cupy')):
+            S = np.asarray(S)
         if S.shape != (self.P, self.K):
             raise ValueError(f'phase history must be {(self.P, self.K)}, got {S.shape}')
-        S = (S * self.wp[:, None] * self.wk[None, :]).astype(np.complex64) if self.window else S.astype(np.complex64, copy=False)
+        if self.window:
+            wp, wk = self.wp, self.wk
+            if not isinstance(S, np.ndarray):
+                import cupy as cp
+                wp, wk = cp.asarray(wp), cp.asarray(wk)
+            S = (S * wp[:, None] * wk[None, :]).astype(np.complex64)
+        else:
+            S = S.astype(np.complex64, copy=False)
         if self.backend == 'cuda':
             import cupy as cp
             return cp.asnumpy(self._form(cp.asarray(S), ng=8)).astype(np.complex64)
