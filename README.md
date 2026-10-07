@@ -18,6 +18,7 @@ What it covers, with the section that documents and validates each part:
 - interferograms and coherence for interferometry and change detection (Interferometry and change detection)
 - multilooking, terrain-corrected geocoding, GeoTIFF and SICD output (Products and geolocation)
 - checks on real collections: Umbra spotlight, Capella stripmap and spotlight against the vendors' images (Real collections)
+- comparison with RITSAR, the AFRL backprojection, ISCE3 and torchbp on matched hardware (Comparison with open-source implementations)
 
 ```python
 import fastsar
@@ -46,6 +47,31 @@ product per final tile), with a kernel for each kind of device:
 All four use the same plan, filters and float64 geometry, and the CUDA and C++ float32 images agree with each
 other to about -87 dB. `backend='auto'` picks the TPU if JAX sees one, else a GPU if CuPy sees one, else the CPU.
 Polar format, with the resampling that removes its planar-wavefront displacement, is there as `algorithm='pfa'`.
+
+## Comparison with open-source implementations
+
+On the Umbra Panama collection (12,207 by 8,808 pixels from 15,186 pulses), against a float64 exact backprojection,
+with every CPU implementation on the same c4d-highmem-16 instance (AMD EPYC 9B45, 16 vCPUs) and every GPU
+implementation on the same Nvidia L4. Errors span three 512 by 512 pixel regions; times are for the full image,
+estimated (est.) from one region for the slow implementations, which overstates them (the same estimate for
+FastSAR's exact backprojection gives 2.4 h against 46 min measured):
+
+- RITSAR as published, 16x oversampling: -25.3 to -27.3 dB, 44 h (est.)
+- AFRL backprojection (`bpBasic`, MATLAB toolbox of Gorham and Moore, NGA release, in Octave), default FFT length:
+  -38.1 to -43.2 dB, 57 h (est.); FFT length 2^18: -52.9 to -55.4 dB, 69 h (est.)
+- ISCE3 `backproject`, 16 threads: -31.5 to -54.9 dB after a common linear phase ramp, 4.8 h (est.)
+- FastSAR exact backprojection (`fastsar.backproject`): -54.9 to -58.7 dB, 46 min
+- FastSAR factorized backprojection: -55.8 to -61.2 dB, 12.4 s
+- on the L4: FastSAR exact backprojection -54.7 to -58.3 dB, 67 s; ISCE3 CUDA backprojection -31.5 to -52.2 dB, 27 min (est.); torchbp exact backprojection forms no image
+  (its float32 pixel-to-antenna distance is 6 cm coarse at the 744 km range of the collection) in 15.2 s, and its
+  factorized backprojection does not fit in memory; FastSAR factorized 3.6 s (float32) and 2.9 s (float16) at
+  -54.6 to -61.2 dB
+
+Polar format on the same CPU instance: the NGA `pfa_mem`, in Octave, forms the full image in 44 s with a log-amplitude
+correlation of 0.80 to 0.89 and a mean 5 by 5 coherence of 0.76 to 0.88 against the reference, after registration of
+its uncorrected image; FastSAR's corrected polar format takes 11.3 s at 0.996 to 0.999 and 0.999. The scripts and
+records are in the study repository (https://github.com/saulpingerman/sar-accel-study, directories `oss` and
+`results/oss`), and Appendix G of its paper gives the details.
 
 ## Speed
 
