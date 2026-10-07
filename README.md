@@ -62,7 +62,7 @@ output. [`examples/form_umbra.py`](examples/form_umbra.py) forms an Umbra image 
 
 | Data | Modes | Status |
 |---|---|---|
-| Capella CPHD (frequency domain) | stripmap, spotlight, sliding spotlight | formed by `form_cphd` and compared with the vendor's SICD ([real-data.md](docs/real-data.md)); one 2022 dynamic stripmap collection is not supported |
+| Capella CPHD (frequency domain) | stripmap, spotlight, sliding spotlight | formed by `form_cphd` and compared with the vendor's SICD ([real-data.md](docs/real-data.md)); one 2022 dynamic stripmap collection is correct near the scene center only |
 | Umbra CPHD (frequency domain) | spotlight | three open-data collections formed on the vendor's grid |
 | ICEYE CPHD (frequency domain) | dwell spotlight | read (mode EXPERIMENTAL accepted, SICD metadata from the `.xml`); the CPU former reads its 28 GB history in place and the CUDA former streams it; no published comparison with the vendor image |
 | CPHD in the time-of-arrival (TOA) domain | | not supported; `read_cphd` raises |
