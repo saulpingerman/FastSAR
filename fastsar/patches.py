@@ -253,20 +253,26 @@ def patch_history(fx, ant, center, pts, lo, hi, margin=None, guard=None, prof=No
     if gate and prof is not None and prof.get('device') is not None:
         # the same on the GPU (cuda backend): profiles in device memory, or gathered on the host and uploaded
         import cupy as cp
+        tm = _Timer('patch_history_gpu')
         Q = prof['Qd'] if prof.get('Qd') is not None else prof['Q']
         sft = 2 * df * K2 * shift / C
         m = np.rint(sft).astype(np.int64)
-        cols = (j[None, :] - m[:, None]) % K2
+        tm('host geometry')
         if isinstance(Q, np.ndarray):
-            u = cp.asarray(Q[lo + np.arange(hi - lo)[:, None], cols])
+            u = cp.asarray(Q[lo + np.arange(hi - lo)[:, None], (j[None, :] - m[:, None]) % K2])
         else:
-            u = Q[cp.asarray(lo + np.arange(hi - lo))[:, None], cp.asarray(cols)]
+            md = cp.asarray(m)
+            cols = (cp.asarray(j)[None, :] - md[:, None]) % K2
+            u = Q[cp.arange(lo, hi)[:, None], cols]
+        tm('gather')
         U = cp.fft.fft(u, axis=1)[:, k0:k1]
+        tm('fft')
         kk = cp.arange(k0, k1, dtype=cp.float32)
         dd = cp.asarray((sft - m).astype(np.float32))
         cph = cp.asarray((np.exp(-4j * np.pi * f0 * shift / C) * (K2 / N)).astype(np.complex64))
         ramp = cp.exp((-2j * np.pi / N) * dd[:, None] * kk[None, :]).astype(cp.complex64)
         out = U * ramp * (cph[:, None] * cp.asarray(T[k0:k1].astype(np.float32))[None, :])
+        tm('ramp')
         return out.astype(cp.complex64), a - center, float(f2[k0]), float(df2)
 
     if gate and prof is not None:
@@ -308,6 +314,37 @@ def weight_terms(W, wtol_db=-50.0, most=8):
     U, s, Vt = np.linalg.svd(W, full_matrices=False)
     n = max(1, min(most, int(np.sum(s >= s[0] * 10 ** (wtol_db / 20)))))
     return U[:, :n].T, s[:n, None] * Vt[:n]
+
+
+class _Timer:
+    """FASTSAR_TIMING=1: accumulated wall time per step (GPU synchronized), printed by report_timing()."""
+    acc = {}
+
+    def __init__(self, name):
+        import time
+        self.on = os.environ.get('FASTSAR_TIMING') == '1'
+        self.name, self.time = name, time
+        if self.on:
+            self._sync(); self.t = time.perf_counter()
+
+    def _sync(self):
+        try:
+            import cupy
+            cupy.cuda.Stream.null.synchronize()
+        except Exception:
+            pass
+
+    def __call__(self, step):
+        if self.on:
+            self._sync(); t = self.time.perf_counter()
+            k = f'{self.name}: {step}'
+            _Timer.acc[k] = _Timer.acc.get(k, 0.0) + t - self.t
+            self.t = t
+
+
+def report_timing():
+    """The accumulated FASTSAR_TIMING steps, as text."""
+    return '\n'.join(f'{v:9.2f} s  {k}' for k, v in sorted(_Timer.acc.items(), key=lambda x: -x[1]))
 
 
 def _xp(a):
@@ -403,6 +440,7 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
             prof['Qd'] = cp.asarray(prof['Q'])
     for i0 in range(0, nx, mx):
         for j0 in range(0, ny, my):
+            tm = _Timer('form_mosaic')
             c = o + (i0 - crop + px / 2) * spx * e1 + (j0 - crop + py / 2) * spy * e2
             pts = c + (gi.ravel() * spx)[:, None] * e1 + (gj.ravel() * spy)[:, None] * e2
             wt = None
@@ -415,7 +453,9 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
                     wt = weight_terms(wa(np.clip(beam(slice(lo, hi), pts) / umax, -1, 1)), wtol_db)
             else:
                 lo, hi = (0, len(ant)) if pulses is None else (pulses(c) if callable(pulses) else pulses)
+            tm('beam span')
             S, a, f0, df = patch_history(fx, ant, c, pts, lo, hi, margin, guard, prof)
+            tm('patch history')
             if exact:
                 from .bp import backproject as bpx, plane_points
                 xyz = plane_points(px, py, spx, spy, e1, e2)
@@ -443,8 +483,10 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
                         Z[xp.asarray(idx)] = S_
                         S_ = Z
                     return former(S_.astype(np.complex64))[::s1, ::s2]
+            tm('plan and former')
             if wt is None:
                 img = form(S)
+                tm('form')
             else:
                 img = 0
                 for at, bt in zip(*wt):
