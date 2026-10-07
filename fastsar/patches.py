@@ -438,74 +438,98 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
         prof['device'] = True
         if prof['Q'].nbytes < 0.4 * cp.cuda.Device().mem_info[0]:      # profiles in GPU memory when they fit
             prof['Qd'] = cp.asarray(prof['Q'])
-    for i0 in range(0, nx, mx):
-        for j0 in range(0, ny, my):
-            tm = _Timer('form_mosaic')
-            c = o + (i0 - crop + px / 2) * spx * e1 + (j0 - crop + py / 2) * spy * e2
-            pts = c + (gi.ravel() * spx)[:, None] * e1 + (gj.ravel() * spy)[:, None] * e2
-            wt = None
-            if beam is not None:
-                span = beam_span(beam, len(ant), pts, umax)
-                if span is None:
-                    continue
-                lo, hi = span
-                if awin is not None and not in_kernel:
-                    wt = weight_terms(wa(np.clip(beam(slice(lo, hi), pts) / umax, -1, 1)), wtol_db)
-            else:
-                lo, hi = (0, len(ant)) if pulses is None else (pulses(c) if callable(pulses) else pulses)
-            tm('beam span')
-            S, a, f0, df = patch_history(fx, ant, c, pts, lo, hi, margin, guard, prof)
-            tm('patch history')
-            if exact:
-                from .bp import backproject as bpx, plane_points
-                xyz = plane_points(px, py, spx, spy, e1, e2)
-                form = lambda S_: bpx(S_, a, f0, df, xyz, backend='cpu', window=False, upsample=16)
-                Tp, s12, nlev, err = None, None, None, None
-            else:
-                af, idx = fill_gaps(a)
-                if backend in ('jax', 'tpu'):         # pulses padded to a multiple of 256 so that patches share compiled
-                    # programs: zero pulses continuing the track, half before and half after (the final stage centres
-                    # its plane-wave model on the mean over the aperture)
-                    extra = -len(af) % 256
-                    if extra:
-                        e0, e1_ = extra // 2, extra - extra // 2
-                        af = np.concatenate([af[0] - (af[1] - af[0]) * np.arange(e0, 0, -1)[:, None], af,
-                                             af[-1] + (af[-1] - af[-2]) * np.arange(1, e1_ + 1)[:, None]])
-                        idx = idx + e0
-                Tp, s12, err = tile_plan(af, f0 + S.shape[1] * df, px, py, spx, spy, e1, e2, target_db, tiles, subs)
-                s1, s2 = s12
-                nlev = _levels(min(px * s1, py * s2), Tp) if levels == 'auto' else levels
-                aw = None
-                if beam is not None and awin is not None and in_kernel:
-                    def aw(q, pul, c=c, lo=lo, idx=idx):
-                        # the window at points q (relative to the patch center) for pulses pul of af (the nearest
-                        # recorded pulse for one inserted at a gap)
-                        k = np.clip(np.searchsorted(idx, pul), 0, len(idx) - 1)
-                        return wa(np.clip(beam(lo + k, np.asarray(q) + c) / umax, -1, 1))
-                former = ImageFormer(af, f0, df, S.shape[1], px * s1, py * s2, spx / s1, spy / s2, e1, e2, backend,
-                                     window=False, T=Tp, levels=nlev, aperture_weight=aw)
+    def prep(i0, j0):
+        """Everything for patch (i0, j0) up to its former: -> dict, or None when no pulse serves it."""
+        tm = _Timer('form_mosaic')
+        c = o + (i0 - crop + px / 2) * spx * e1 + (j0 - crop + py / 2) * spy * e2
+        pts = c + (gi.ravel() * spx)[:, None] * e1 + (gj.ravel() * spy)[:, None] * e2
+        wt = None
+        if beam is not None:
+            span = beam_span(beam, len(ant), pts, umax)
+            if span is None:
+                return None
+            lo, hi = span
+            if awin is not None and not in_kernel:
+                wt = weight_terms(wa(np.clip(beam(slice(lo, hi), pts) / umax, -1, 1)), wtol_db)
+        else:
+            lo, hi = (0, len(ant)) if pulses is None else (pulses(c) if callable(pulses) else pulses)
+        tm('beam span')
+        S, a, f0, df = patch_history(fx, ant, c, pts, lo, hi, margin, guard, prof)
+        tm('patch history')
+        if exact:
+            from .bp import backproject as bpx, plane_points
+            xyz = plane_points(px, py, spx, spy, e1, e2)
+            form = lambda S_: bpx(S_, a, f0, df, xyz, backend='cpu', window=False, upsample=16)
+            Tp, s12, nlev, err = None, None, None, None
+        else:
+            af, idx = fill_gaps(a)
+            if backend in ('jax', 'tpu'):         # pulses padded to a multiple of 256 so that patches share compiled
+                # programs: zero pulses continuing the track, half before and half after (the final stage centres
+                # its plane-wave model on the mean over the aperture)
+                extra = -len(af) % 256
+                if extra:
+                    e0, e1_ = extra // 2, extra - extra // 2
+                    af = np.concatenate([af[0] - (af[1] - af[0]) * np.arange(e0, 0, -1)[:, None], af,
+                                         af[-1] + (af[-1] - af[-2]) * np.arange(1, e1_ + 1)[:, None]])
+                    idx = idx + e0
+            Tp, s12, err = tile_plan(af, f0 + S.shape[1] * df, px, py, spx, spy, e1, e2, target_db, tiles, subs)
+            s1, s2 = s12
+            nlev = _levels(min(px * s1, py * s2), Tp) if levels == 'auto' else levels
+            aw = None
+            if beam is not None and awin is not None and in_kernel:
+                def aw(q, pul, c=c, lo=lo, idx=idx):
+                    # the window at points q (relative to the patch center) for pulses pul of af (the nearest
+                    # recorded pulse for one inserted at a gap)
+                    k = np.clip(np.searchsorted(idx, pul), 0, len(idx) - 1)
+                    return wa(np.clip(beam(lo + k, np.asarray(q) + c) / umax, -1, 1))
+            former = ImageFormer(af, f0, df, S.shape[1], px * s1, py * s2, spx / s1, spy / s2, e1, e2, backend,
+                                 window=False, T=Tp, levels=nlev, aperture_weight=aw)
 
-                def form(S_, former=former, idx=idx, n=len(af), s1=s1, s2=s2):
-                    xp = _xp(S_)
-                    if n > len(idx):                  # zero pulses at the dropped ones
-                        Z = xp.zeros((n, S_.shape[1]), np.complex64)
-                        Z[xp.asarray(idx)] = S_
-                        S_ = Z
-                    return former(S_.astype(np.complex64))[::s1, ::s2]
-            tm('plan and former')
-            if wt is None:
-                img = form(S)
-                tm('form')
-            else:
-                img = 0
-                for at, bt in zip(*wt):
-                    img = img + form(S * at[:, None]) * RectBivariateSpline(si, sj, bt.reshape(len(si), len(sj)))(
-                        np.arange(px), np.arange(py))
-            ci, cj = min(mx, nx - i0), min(my, ny - j0)
-            out[i0:i0 + ci, j0:j0 + cj] = img[crop:crop + ci, crop:crop + cj]
-            if info is not None:
-                info.append(dict(center=c, pulses=(lo, hi), K=S.shape[1], df=df, T=Tp, sub=s12, levels=nlev,
-                                 predicted_error_db=err, terms=1 if wt is None else len(wt[0])))
+            def form(S_, former=former, idx=idx, n=len(af), s1=s1, s2=s2):
+                xp = _xp(S_)
+                if n > len(idx):                  # zero pulses at the dropped ones
+                    Z = xp.zeros((n, S_.shape[1]), np.complex64)
+                    Z[xp.asarray(idx)] = S_
+                    S_ = Z
+                return former(S_.astype(np.complex64))[::s1, ::s2]
+        tm('plan and former')
+        return dict(i0=i0, j0=j0, c=c, lo=lo, hi=hi, S=S, df=df, wt=wt, form=form, Tp=Tp, s12=s12, nlev=nlev, err=err)
+
+    # the next patch is prepared (pulse span, range gate, plan, weights; host work) on a second thread while the
+    # current one forms (FASTSAR_MOSAIC_PREFETCH=0: one at a time)
+    order = [(i0, j0) for i0 in range(0, nx, mx) for j0 in range(0, ny, my)]
+    prefetch = os.environ.get('FASTSAR_MOSAIC_PREFETCH', '1') != '0' and len(order) > 1
+    from concurrent.futures import ThreadPoolExecutor
+    ex = ThreadPoolExecutor(1) if prefetch else None
+    nxt = ex.submit(prep, *order[0]) if prefetch else None
+    for k in range(len(order)):
+        if prefetch:
+            job = nxt.result()
+            if k + 1 < len(order):
+                nxt = ex.submit(prep, *order[k + 1])
+        else:
+            job = prep(*order[k])
+        if job is None:
+            continue
+        i0, j0, c, lo, hi, S, df, wt, form = (job[q] for q in ('i0', 'j0', 'c', 'lo', 'hi', 'S', 'df', 'wt', 'form'))
+        Tp, s12, nlev, err = (job[q] for q in ('Tp', 's12', 'nlev', 'err'))
+        tm = _Timer('form_mosaic')
+        if wt is None:
+            img = form(S)
+            tm('form')
+        else:
+            img = 0
+            for at, bt in zip(*wt):
+                img = img + form(S * at[:, None]) * RectBivariateSpline(si, sj, bt.reshape(len(si), len(sj)))(
+                    np.arange(px), np.arange(py))
+        ci, cj = min(mx, nx - i0), min(my, ny - j0)
+        out[i0:i0 + ci, j0:j0 + cj] = img[crop:crop + ci, crop:crop + cj]
+        if info is not None:
+            info.append(dict(center=c, pulses=(lo, hi), K=S.shape[1], df=df, T=Tp, sub=s12, levels=nlev,
+                             predicted_error_db=err, terms=1 if wt is None else len(wt[0])))
+
+    if ex is not None:
+        ex.shutdown()
     return out
 
 
