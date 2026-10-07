@@ -68,7 +68,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Fas
 ### Documentation
 
 - Processing-chain page and API reference; README reduced to a landing page with a supported-data table.
-
+- Documentation matches the geolocation, map GeoTIFF, SICD and autofocus calls for `form_cphd` output; each fact
+  stated on one page, about 7,000 words in all.
 - Shorter README with figures; the long-form material moved to `docs/`.
 - Contributing guide, issue and pull request templates, and package metadata for PyPI-style tools.
 
