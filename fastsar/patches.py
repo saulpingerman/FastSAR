@@ -177,6 +177,18 @@ def tile_plan(ant, fmax, px, py, spx, spy, e1, e2, target_db=-40.0, tiles=(32, 1
     return best
 
 
+def _rows(fn, n, chunk=256):
+    """fn(slice) over row chunks of n rows on a thread pool (NumPy releases the GIL in its ufuncs)."""
+    from concurrent.futures import ThreadPoolExecutor
+    import os
+    sl = [slice(i, min(n, i + chunk)) for i in range(0, n, chunk)]
+    if len(sl) == 1:
+        fn(sl[0])
+        return
+    with ThreadPoolExecutor(min(len(sl), os.cpu_count() or 1)) as ex:
+        list(ex.map(fn, sl))
+
+
 def patch_history(fx, ant, center, pts, lo, hi, margin=None, guard=None):
     """Phase history of one patch: pulses lo:hi of fx re-referenced to center [3] and gated in range to the extent
     of the points pts [m, 3] (the patch outline) plus margin (m), with the guard taper.
@@ -198,16 +210,21 @@ def patch_history(fx, ant, center, pts, lo, hi, margin=None, guard=None):
     rc = np.linalg.norm(a - center, axis=1)
     S2 = np.zeros((hi - lo, K2), np.complex128)
     S2[:, npl:npl + K] = S[lo:hi]
-    S2 *= np.exp(-4j * np.pi * f[None, :] / C * (np.asarray(fx['ref'], np.float64)[lo:hi] - rc)[:, None])
+    shift = np.asarray(fx['ref'], np.float64)[lo:hi] - rc
+
+    def rot(sl):
+        S2[sl] *= np.exp(-4j * np.pi * f[None, :] / C * shift[sl, None])
+    _rows(rot, hi - lo)
     # range bins of c/(2 K2 df); the gate keeps N bins centered on the patch center's range
     dR = np.linalg.norm(pts[None, :, :] - a[:, None, :], axis=2) - rc[:, None]
     half = np.abs(dR).max() + margin
     N = next_fast_len(2 * int(np.ceil(half * 2 * K2 * df / C)))
     N += N % 2
     if N < K2:
-        q = np.fft.ifft(S2, axis=1)
+        import scipy.fft
+        q = scipy.fft.ifft(S2, axis=1, workers=-1)
         j = (np.arange(N) + N // 2) % N - N // 2
-        S2 = np.fft.fft(q[:, j % K2], axis=1) * (K2 / N)          # the sum over N samples, not K2
+        S2 = scipy.fft.fft(q[:, j % K2], axis=1, workers=-1) * (K2 / N)          # the sum over N samples, not K2
         df = K2 * df / N
         f = f0 + df * np.arange(N)
     T = _taper(f, band, guard)
