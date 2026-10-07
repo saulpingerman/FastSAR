@@ -53,6 +53,6 @@ block. ImageFormAlgo is OTHER, which sarpy's `is_valid` rejects; sarkit's consis
 `geolocate` to better than a micrometer.
 
 `write_sicd(path, img, template)` keeps a vendor SICD's metadata, with ImageFormAlgo OTHER and Grid.Type PLANE. A
-round trip of the Umbra Panama SICD keeps every pixel and passes sarpy's validity check; its projection matches the
+round trip of the Umbra Panama SICD keeps every pixel (sarpy 2.1's `is_valid` rejects ImageFormAlgo OTHER here too); its projection matches the
 vendor's at the center and departs by up to about 6 m at the corners, where the vendor's polar-format image carries
 the distortion its own model accounts for.
