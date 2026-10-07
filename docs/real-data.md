@@ -36,6 +36,38 @@ pts = fastsar.io.sicd_points(sicd_path, rows, cols, meta)        # vendor pixels
 img = fastsar.backproject(col['S'], col['ant'], col['fmin'], col['df'], pts, ref=meta['ref'])
 ```
 
+## Any collection mode in one call
+
+```python
+out = fastsar.form_cphd(path, sicd=None, mode='auto', backend='auto', spacing=None, extent=None, height=None)
+```
+
+`form_cphd` tells a spotlight (one scene reference point for all pulses) from stripmap, sliding spotlight and
+dynamic stripmap collections (a moving one), applies a Taylor window, and forms the image on a ground-plane grid
+along and across track. The grid covers the SICD footprint when a SICD is given, else the CPHD image area, and lies
+at the height of the scene reference point (the SICD's scene center point, else the CPHD's image area reference
+point; `height=` overrides it). A spotlight is formed as one image by factorized backprojection; a moving beam as a
+mosaic of range-gated patches, each pixel weighted by a Hann window over the azimuth band around its beam center
+(the SICD's processed band, else 0.8 of the band the PRF samples). The result carries the image, its origin, axes
+and spacing in `read_cphd`'s local frame, the mode, and the reader's notes.
+
+Checks against the vendors' SICD images, on 600 m grids around the scene center (correlation over 256 by 256 vendor
+pixels, with the vendor pixels projected to the grid's height):
+
+| Collection | Mode | SICD given | Amplitude correlation | Intensity correlation, 5 by 5 average |
+|---|---|---|---|---|
+| Capella, 2021-11-12 | stripmap | no | 0.921 | 0.979 |
+| Capella, 2021-11-12 | stripmap | yes | 0.891 | 0.973 |
+| Umbra, Panama Canal | spotlight | no | 0.621 | 0.897 |
+| Capella, mountains | spotlight | no | 0.440 | 0.868 |
+| Capella, mountains | spotlight | yes | 0.605 | 0.904 |
+| Capella | sliding spotlight | yes | 0.224 | 0.752 |
+
+Amplitude correlation pixel by pixel is limited by speckle wherever the two processors' windows or azimuth bands
+differ; the averaged intensity measures whether the same structure appears in the same place. The sliding spotlight
+image is offset from the vendor's by about two pixels; FastSAR's own image of it agrees with a float64 exact
+backprojection over the same aperture to -62 dB.
+
 ## Umbra spotlight
 
 Three Umbra open-data spotlight collections were formed from the CPHD as delivered, on the vendor's own grid.

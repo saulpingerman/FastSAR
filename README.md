@@ -60,6 +60,14 @@ For the CPU, run one thread per core: `OMP_NUM_THREADS=<cores> OMP_PLACES=cores 
 ```python
 import fastsar
 
+out = fastsar.form_cphd('scene_CPHD.cphd')          # any mode: spotlight, stripmap, sliding spotlight
+img = out['image']                                  # ground-plane grid: out['origin'], out['e1'], out['e2'], spacing
+```
+
+`form_cphd` picks the mode, window and grid from the file (or from the vendor's SICD with `sicd=`). For control over
+each step:
+
+```python
 col = fastsar.io.read_cphd('scene_CPHD.cphd', sicd='scene_SICD.nitf')   # phase history and the vendor's grid
 img = fastsar.form_image(**col)                     # complex64 [nx, ny]; backend='auto' picks TPU, GPU, then CPU
 img_pfa = fastsar.form_image(**col, algorithm='pfa')                     # polar format
