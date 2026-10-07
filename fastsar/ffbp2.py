@@ -176,8 +176,10 @@ def make_plan(col, nx, ny, spx, spy, T=32, nlev=3, pmax=0.4, atten=70.0, splits=
         dop = hx * np.abs(np.diff(u1)).max() + hy * np.abs(np.diff(u2)).max()
         Dk = max(1, int(pmax * (C / (2.0 * df) / 2.0) / rk))
         Dp = max(1, int(pmax / (2.0 * (2.0 * (f0 + K * df) / C) * dop)))
-        pass_k = rk / (C / (2.0 * df * Dk) / 2.0)
-        pass_p = 2.0 * (2.0 * (f0 + K * df) / C) * dop * Dp
+        # passband edges rounded up to 1/64 of the output Nyquist rate (a little more band kept), so that patches of
+        # a mosaic with nearly equal geometry get identical filters and share one compiled JAX program
+        pass_k = math.ceil(64 * rk / (C / (2.0 * df * Dk) / 2.0)) / 64
+        pass_p = math.ceil(64 * 2.0 * (2.0 * (f0 + K * df) / C) * dop * Dp) / 64
         Fk, Fp = LazyDecimator(K, Dk, min(pass_k, 0.95), atten), LazyDecimator(P, Dp, min(pass_p, 0.95), atten)
         mk, mp = Fk.m, Fp.m
         # an axis shorter than its decimation kernel (late levels of small or wide-angle collections) is not decimated
@@ -199,6 +201,23 @@ def make_plan(col, nx, ny, spx, spy, T=32, nlev=3, pmax=0.4, atten=70.0, splits=
     assert (cx, cy) == (T, T)
     out['final'] = dict(cen=ref, f0=f0, df=df, K=K, P=P, fc=f0 + (K - 1) / 2.0 * df)
     return out
+
+
+def plan_signature(plan):
+    """Everything of a plan that the JAX program (make_ffbp) takes as a compile-time constant, as a hashable tuple:
+    two plans with equal signatures can share one compiled program, with their own runtime arrays."""
+    def r(x):
+        return float(np.float64(x))
+    lv = []
+    for l in plan['levels']:
+        fk = l['fir_k'] and (l['fir_k']['L'], l['fir_k']['pl'], l['fir_k']['pr'], l['fir_k']['n_out'])
+        fp = l['fir_p'] and (l['fir_p']['L'], l['fir_p']['pl'], l['fir_p']['pr'], l['fir_p']['n_out'])
+        lv.append((l['sx'], l['sy'], l['C'], l['Dk'], l['Dp'], l['K'], l['P'], l['Ko'], l['Po'], r(l['f0']), r(l['df']),
+                   fk, fp, l['Fk'].args, l['Fp'].args, r(l['pass_k']), r(l['pass_p'])))
+    f = plan['final']
+    return (tuple(lv), (f['P'], f['K'], r(f['f0']), r(f['df']), r(f['fc'])), plan['T'], plan['nx'], plan['ny'],
+            plan['Nx'], plan['Ny'], plan['ox'], plan['oy'], r(plan['spx']), r(plan['spy']),
+            tuple(map(r, plan['e1'])), tuple(map(r, plan['e2'])))
 
 
 def final_phase_error(ant, fmax, nx, ny, spx, spy, e1, e2, T):
@@ -694,6 +713,21 @@ def make_ffbp(policy, plan, filt='dense', budget=1 << 26, trig='split', pallas_p
     shape_g = [s for lv in levels[1:] for s in (lv['sx'], lv['sy'])] + [T, T]
     perm_g = [2 * i for i in range(L - 1)] + [2 * (L - 1)] + [2 * i + 1 for i in range(L - 1)] + [2 * (L - 1) + 1]
 
+    def final_w(a, b, fa, g):
+        """The final stage of first-level tile g, with ImageFormer's aperture weight when fa holds one (w [3, ntiles,
+        Pf]: the weight per final subaperture and tile and its gradient along e1 and e2): three final stages, combined
+        with the pixel offsets."""
+        cen = fa['cen'].reshape(G, -1, 3)[g]
+        if 'w' not in fa:
+            return final(a, b, dict(fa, cen=cen))
+        w = fa['w'].reshape(3, G, -1, Pf)[:, g][..., None].astype(a.dtype)
+        re, im = final(a * w[0], b * w[0], dict(fa, cen=cen))
+        dx, dy = jnp.asarray(dlx_host, re.dtype)[None, :, None], jnp.asarray(dly_host, re.dtype)[None, None, :]
+        for k, dl in ((1, dx), (2, dy)):
+            r_, i_ = final(a * w[k], b * w[k], dict(fa, cen=cen))
+            re, im = re + dl * r_, im + dl * i_
+        return re, im
+
     @jax.jit
     def one_tile(hre, him, arrs, g):
         """One first-level tile carried through every level: -> its mx x my block of the image."""
@@ -717,7 +751,7 @@ def make_ffbp(policy, plan, filt='dense', budget=1 << 26, trig='split', pallas_p
                     a, b = lax.map(per_parent, (a, b, refs))
                     a, b = a.reshape((-1,) + a.shape[2:]), b.reshape((-1,) + b.shape[2:])
         fa = arrs['final']
-        re, im = final(a, b, dict(fa, cen=fa['cen'].reshape(G, -1, 3)[g]))
+        re, im = final_w(a, b, fa, g)
         return re.reshape(shape_g).transpose(perm_g).reshape(mx, my), im.reshape(shape_g).transpose(perm_g).reshape(mx, my)
 
     ox, oy, nx, ny = plan['ox'], plan['oy'], plan['nx'], plan['ny']
@@ -758,7 +792,7 @@ def make_ffbp(policy, plan, filt='dense', budget=1 << 26, trig='split', pallas_p
                         a, b = lax.map(per_parent, (a, b, refs))
                         a, b = a.reshape((-1,) + a.shape[2:]), b.reshape((-1,) + b.shape[2:])
             fa = arrs['final']
-            re, im = final(a, b, dict(fa, cen=fa['cen'].reshape(G, -1, 3)[g]))
+            re, im = final_w(a, b, fa, g)
             return re.reshape(shape_g).transpose(perm_g).reshape(mx, my), im.reshape(shape_g).transpose(perm_g).reshape(mx, my)
 
         return lax.map(rest, (a0, b0, gs))

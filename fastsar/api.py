@@ -60,6 +60,9 @@ def available_backends():
     return out
 
 
+_JAX_PROGRAMS = {}         # compiled JAX/TPU programs by plan signature (ImageFormer)
+
+
 def final_weights(plan, weight, P, grad=False, points=None):
     """Weight of each final subaperture at each final tile [ntiles, Pf] (float32), for ImageFormer's aperture_weight:
     weight(points [m, 3], pulses [n] int) -> [n, m], the per-pulse weights at the tile centers, averaged over the
@@ -96,7 +99,7 @@ class ImageFormer:
     a different antenna path needs a new former. Arguments as for form_image, and
     aperture_weight(points [m, 3], pulses [n]) -> W [n, m]: a per-pixel weight of pulses (int indices) (a stripmap aperture window), applied
     in the final stage as the mean weight of each final subaperture's pulses at each final tile's center, with its
-    first-order variation across the tile (final_weights; cpu and cuda backends)."""
+    first-order variation across the tile (final_weights)."""
 
     def __init__(self, ant, fmin, df, K, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 1.0, 0.0), backend='auto',
                  precision='float32', window=True, T='auto', levels=3, pmax=0.4, target_db=-40.0, aperture_weight=None):
@@ -127,8 +130,6 @@ class ImageFormer:
         plan = ffbp2.make_plan(col, nx, ny, spx, spy, T=T, nlev=levels, pmax=pmax, e1=e1, e2=e2)
         coll = ffbp2.collection_arrays(plan, self.ant)
         wf = None if aperture_weight is None else final_weights(plan, aperture_weight, self.P, grad=os.environ.get('FASTSAR_WEIGHT_GRAD', '1') == '1')
-        if wf is not None and self.backend not in ('cpu', 'cuda'):
-            raise ValueError('aperture_weight is implemented for the cpu and cuda backends')
         if window:
             self.wp, self.wk = _window(self.P, self.K)
         if self.backend == 'cuda':
@@ -153,9 +154,19 @@ class ImageFormer:
                 raise ValueError(f'unknown precision {precision!r}')
             filt = 'pallas2' if self.backend == 'tpu' else 'conv'
             self._pol = pol
-            self._fn = ffbp2.make_ffbp(pol, plan, filt, 1 << 26, 'direct', pallas_pb=256, pallas_nc=8, pallas_ng=16,
-                                       pallas_final=2, pallas_gen=3)
+            # one compiled program per plan signature: patches of a mosaic with equal shapes and filters share it
+            key = (pol, filt, ffbp2.plan_signature(plan))
+            self._fn = _JAX_PROGRAMS.get(key)
+            if self._fn is None:
+                self._fn = ffbp2.make_ffbp(pol, plan, filt, 1 << 26, 'direct', pallas_pb=256, pallas_nc=8, pallas_ng=16,
+                                           pallas_final=2, pallas_gen=3)
+                if len(_JAX_PROGRAMS) >= 16:
+                    _JAX_PROGRAMS.pop(next(iter(_JAX_PROGRAMS)))
+                _JAX_PROGRAMS[key] = self._fn
             self._arrs = ffbp2.device_arrays(pol, plan, coll, ffbp2.static_arrays(pol, plan, filt))
+            if wf is not None:
+                import jax.numpy as jnp
+                self._arrs['final']['w'] = jnp.asarray(wf if wf.ndim == 3 else np.stack([wf, 0 * wf, 0 * wf]))
         else:
             raise ValueError(f'unknown backend {backend!r}')
 

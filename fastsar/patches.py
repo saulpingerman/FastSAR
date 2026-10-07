@@ -402,10 +402,10 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
     patch with ImageFormer on backend ('cpu', 'jax', 'cuda', 'tpu').
     beam(idx, points) -> u [len(idx), m]: normalized azimuth coordinate of pulses idx (stripmap_beam); a pulse
     serves a patch when |u| <= umax somewhere on it. With an azimuth window awin (stripmap.window) pulse p is
-    weighted at pixel x by W_a(u_p(x)/umax), the window clipped at its edges. On the cpu and cuda backends the
-    weight is applied in FFBP's final stage (ImageFormer's aperture_weight: each final subaperture's mean weight at
-    each final tile, with its first-order variation across the tile). On jax and tpu, or with
-    FASTSAR_WEIGHT_TERMS=1, the weight on pulses x 9 x 9 points of the patch is split into separable terms
+    weighted at pixel x by W_a(u_p(x)/umax), the window clipped at its edges. The weight is applied in FFBP's final
+    stage (ImageFormer's aperture_weight: each final subaperture's mean weight at each final tile, with its
+    first-order variation across the tile). With exact=True or FASTSAR_WEIGHT_TERMS=1, the weight on pulses x 9 x 9
+    points of the patch is split into separable terms
     (weight_terms, down to wtol_db, default target_db - 10), each formed by one FFBP of the weighted phase history
     and multiplied by its pixel factor, interpolated by bicubic splines.
     pulses: (lo, hi) or a function of the patch center returning (lo, hi), used when beam is None (default: all).
@@ -427,9 +427,9 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
     wa = sm.window(awin)
     si, sj = np.linspace(0, px - 1, 9), np.linspace(0, py - 1, 9)          # sample points, in patch pixels
     gi, gj = np.meshgrid(si - px / 2, sj - py / 2, indexing='ij')
-    # the azimuth window in the final stage of a single FFBP (cpu, cuda); FASTSAR_WEIGHT_TERMS=1, the jax and tpu
-    # backends and exact=True use the separable terms, one FFBP each
-    in_kernel = backend in ('cpu', 'cuda') and not exact and os.environ.get('FASTSAR_WEIGHT_TERMS', '0') != '1'
+    # the azimuth window in the final stage of a single FFBP; FASTSAR_WEIGHT_TERMS=1 and exact=True use the separable
+    # terms, one FFBP (or exact backprojection) each
+    in_kernel = not exact and os.environ.get('FASTSAR_WEIGHT_TERMS', '0') != '1'
     out = np.zeros((nx, ny), np.complex64)
     npatch = -(-nx // mx) * -(-ny // my)
     prof = range_profiles(fx, guard) if npatch > 1 and os.environ.get('FASTSAR_SHARED_PROFILES', '1') != '0' else None
@@ -463,6 +463,15 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
                 Tp, s12, nlev, err = None, None, None, None
             else:
                 af, idx = fill_gaps(a)
+                if backend in ('jax', 'tpu'):         # pulses padded to a multiple of 256 so that patches share compiled
+                    # programs: zero pulses continuing the track, half before and half after (the final stage centres
+                    # its plane-wave model on the mean over the aperture)
+                    extra = -len(af) % 256
+                    if extra:
+                        e0, e1_ = extra // 2, extra - extra // 2
+                        af = np.concatenate([af[0] - (af[1] - af[0]) * np.arange(e0, 0, -1)[:, None], af,
+                                             af[-1] + (af[-1] - af[-2]) * np.arange(1, e1_ + 1)[:, None]])
+                        idx = idx + e0
                 Tp, s12, err = tile_plan(af, f0 + S.shape[1] * df, px, py, spx, spy, e1, e2, target_db, tiles, subs)
                 s1, s2 = s12
                 nlev = _levels(min(px * s1, py * s2), Tp) if levels == 'auto' else levels

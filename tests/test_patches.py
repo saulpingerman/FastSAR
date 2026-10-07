@@ -100,7 +100,7 @@ def straight(squint, awin, compressed=False, backends=('cpu',)):
 
 
 for squint, awin in ((0.0, None), (5.0, None), (0.0, 'taylor')):
-    p, out = straight(squint, awin, backends=('cpu', 'jax') if (squint, awin) == (0.0, None) else ('cpu',))
+    p, out = straight(squint, awin, backends=('cpu', 'jax') if squint == 0.0 else ('cpu',))
     check(out['patches exact'], -50, 'exact')
     for name, res in out.items():
         check(res, -45, name)

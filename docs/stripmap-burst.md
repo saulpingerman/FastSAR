@@ -64,11 +64,11 @@ For each patch, every pulse is re-referenced to the patch center, its range prof
 covers the patch plus a margin, and the gated profile is transformed back onto a frequency grid whose unambiguous
 range equals the gate. A raised-cosine taper over the guard band shortens the
 reconstruction kernel, whose tail is below -60 dB at the default margin (36 m for a 12.5 MHz guard). A pulse
-serves a patch when its normalized Doppler satisfies |u| <= umax at some point of the patch. On the CPU and CUDA
-backends an azimuth window is applied in the final stage of a single factorized backprojection: each final
-subaperture is weighted at each final tile by its pulses' mean weight, with the weight's first-order variation
-across the tile. On JAX and TPU it is split by a singular value decomposition of the pulse-by-pixel weight into
-separable terms, each formed by one factorized backprojection. The C++ and CUDA final stages take tiles of 16 or 32 pixels only, so a patch whose
+serves a patch when its normalized Doppler satisfies |u| <= umax at some point of the patch. An azimuth window is
+applied in the final stage of a single factorized backprojection: each final subaperture is weighted at each final
+tile by its pulses' mean weight, with the weight's first-order variation across the tile (in the C++ and CUDA final
+kernels; the JAX program evaluates its final stage three times). With `exact=True` it is split by a singular value
+decomposition of the pulse-by-pixel weight into separable terms, each formed by one exact backprojection. The C++ and CUDA final stages take tiles of 16 or 32 pixels only, so a patch whose
 predicted error at T = 16 misses the target is formed on a grid twice as fine in range and decimated; the JAX
 program also accepts T = 8. Pass `exact=True` to form each patch by exact backprojection instead, which separates
 the error of the patching from that of factorized backprojection.
