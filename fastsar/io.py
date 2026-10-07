@@ -7,11 +7,11 @@ arrays form_image takes. Needs sarpy.
     col, meta = fastsar.io.read_cphd('x_CPHD.cphd', channel='HV', meta=True)  # a channel by polarization or identifier
     img = fastsar.backproject(col['S'], meta['tx'], col['fmin'], col['df'], points, rcv=meta['rcv'], ref=meta['ref'])
 
-The local frame has x along track, y along ground range away from the radar and z up, with its origin at the scene
-reference point (the mid-aperture one when it moves). With a SICD the output grid is the vendor's own (pixel counts,
-spacings and image-plane axes) and the origin moves to the point under the grid's center pixel, so that pixel (i, j)
-of the image is the SICD's column i and row j (when range runs along rows): img.T is the SICD array. Without one,
-pass nx, ny, spx, spy, e1, e2 to form_image yourself.
+The local frame has x along track, y along ground range away from the radar and z up (the ellipsoid normal), with its
+origin at the scene reference point (the mid-aperture one when it moves). With a SICD the output grid is the vendor's
+own (pixel counts, spacings and image-plane axes) and the origin moves to the point under the grid's center pixel, so
+that pixel (i, j) of the image is the SICD's column i and row j (when range runs along rows): img.T is the SICD
+array. Without one, pass nx, ny, spx, spy, e1, e2 to form_image yourself.
 
 Per-pulse frequency grids (FXFixed false: SC0 and SCSS vary from pulse to pulse) are resampled onto the common
 grid of the median start frequency and spacing with a 16-tap Kaiser-windowed sinc, when the largest offset exceeds
@@ -65,8 +65,9 @@ def rereference(S, fmin, df, dref):
 
 def read_cphd(cphd, sicd=None, channel=0, meta=False, regrid_tol=1e-3, drop_flagged=False, troposphere=False, phase_sign=None):
     """-> dict(S, ant, fmin, df[, nx, ny, spx, spy, e1, e2]) ready for form_image(**d), and with meta=True also a
-    dict of tx, rcv [P, 3] and ref [P] (local frame), R (local axes in ECF rows), srp (ECF origin), times, the
-    channel's polarization and identifier, the radar mode, and what was done to the data."""
+    dict of tx, rcv [P, 3] and ref [P] (local frame), R (local axes in ECF rows), srp (ECF origin), times (s from the
+    collection start, `start`), the channel's polarization and identifier, the collector, core name and radar mode,
+    and what was done to the data."""
     from sarpy.io.phase_history.converter import open_phase_history
     r = open_phase_history(cphd)
     m = r.cphd_meta
@@ -152,9 +153,11 @@ def read_cphd(cphd, sicd=None, channel=0, meta=False, regrid_tol=1e-3, drop_flag
     if shift > regrid_tol:
         S = _sinc_regrid(S, u)
         notes.append(f'resampled per-pulse frequency grids (largest offset {shift:.3g} samples)')
-    # local frame at the mid-aperture scene reference point
+    # local frame at the mid-aperture scene reference point, z along the ellipsoid normal (not the geocentric radial,
+    # which leans up to 0.19 degrees from it: 3 m of height across 1 km)
     s0 = srp[P // 2]
-    up = s0 / np.linalg.norm(s0)
+    phi, lam, _ = (np.radians(float(v)) for v in ecf_to_geodetic(s0))
+    up = np.array([np.cos(phi) * np.cos(lam), np.cos(phi) * np.sin(lam), np.sin(phi)])
     apc = 0.5 * (tx + rcv)
     mid = apc[P // 2] - s0
     los_h = mid - (mid @ up) * up
@@ -215,7 +218,9 @@ def read_cphd(cphd, sicd=None, channel=0, meta=False, regrid_tol=1e-3, drop_flag
     info = dict(tx=(tx - origin) @ R.T, rcv=(rcv - origin) @ R.T, ref=ref if not fixed_ref else ref0, fixed_ref=fixed_ref,
                 R=R, origin=origin, srp=s0, sicd_transpose=None if sicd is None else grid['transpose'], tx_time=pv('TxTime')[lo:hi], rcv_time=pv('RcvTime')[lo:hi], pulses=(lo, hi),
                 polarization=None if pol is None else f'{pol.TxPol}{pol.RcvPol}', channel=ch.Identifier,
-                mode=getattr(m.CollectionID.RadarMode, 'ModeType', None), notes=notes)   # None for modes outside the CPHD enumeration (ICEYE: EXPERIMENTAL)
+                mode=getattr(m.CollectionID.RadarMode, 'ModeType', None),   # None for modes outside the CPHD enumeration (ICEYE: EXPERIMENTAL)
+                notes=notes, start=str(m.Global.Timeline.CollectionStart), collector=m.CollectionID.CollectorName,
+                core_name=m.CollectionID.CoreName)
     return out, info
 
 
