@@ -46,6 +46,7 @@ range window is applied in range compression, as in stripmap). The final tile si
 so where T = 16 misses target_db the patch is formed on a grid finer by 2 in one or both axes and decimated, which
 halves the final tiles; the JAX program also takes T = 8.
 """
+import os
 import numpy as np
 
 from . import stripmap as sm
@@ -189,22 +190,47 @@ def _rows(fn, n, chunk=256):
         list(ex.map(fn, sl))
 
 
-def patch_history(fx, ant, center, pts, lo, hi, margin=None, guard=None):
-    """Phase history of one patch: pulses lo:hi of fx re-referenced to center [3] and gated in range to the extent
-    of the points pts [m, 3] (the patch outline) plus margin (m), with the guard taper.
-    -> (S [hi - lo, K'] complex128, ant - center, fmin', df')."""
+def _padding(fx, guard=None):
+    """Frequency padding of fx to band +- guard: (guard, npl, K2, f0) with K2 a fast FFT length and f0 = fmin - npl df."""
     S, fmin, df = fx['S'], float(fx['fmin']), float(fx['df'])
     K = S.shape[1]
     band = fx.get('band') or (fmin, fmin + (K - 1) * df)
     room = min(band[0] - fmin, fmin + (K - 1) * df - band[1])
     guard = max(room, 0.125 * (band[1] - band[0])) if guard is None else float(guard)
-    margin = 3 * C / (2 * guard) if margin is None else float(margin)
-    # zero padding of the frequency axis to band +- guard
     npl = max(0, int(np.ceil((fmin - band[0] + guard) / df)))
     npu = max(0, int(np.ceil((band[1] + guard - fmin - (K - 1) * df) / df)))
     from scipy.fft import next_fast_len
-    K2 = next_fast_len(K + npl + npu)
-    f0 = fmin - npl * df
+    return guard, band, npl, next_fast_len(K + npl + npu), fmin - npl * df
+
+
+def range_profiles(fx, guard=None):
+    """Range profiles of the whole phase history, shared by the patches of a mosaic: the inverse FFT of each pulse
+    zero-padded to band +- guard (_padding), complex64 [P, K2], range bin c / (2 K2 df), relative to the pulse's
+    reference range. patch_history(..., prof=range_profiles(fx)) then gates each patch from these instead of
+    transforming the full history again (a long spotlight is P K2 ~ 4e9 samples per patch)."""
+    import scipy.fft
+    S = fx['S']
+    P, K = S.shape
+    guard, band, npl, K2, f0 = _padding(fx, guard)
+    Q = np.empty((P, K2), np.complex64)
+
+    def rows(sl):
+        z = np.zeros((sl.stop - sl.start, K2), np.complex64)
+        z[:, npl:npl + K] = S[sl]
+        Q[sl] = scipy.fft.ifft(z, axis=1, workers=1)
+    _rows(rows, P, chunk=512)
+    return dict(Q=Q, guard=guard, K2=K2, npl=npl, f0=f0)
+
+
+def patch_history(fx, ant, center, pts, lo, hi, margin=None, guard=None, prof=None):
+    """Phase history of one patch: pulses lo:hi of fx re-referenced to center [3] and gated in range to the extent
+    of the points pts [m, 3] (the patch outline) plus margin (m), with the guard taper. prof: range_profiles(fx, guard)
+    computed once for all patches (faster; the same result up to the gate's edge samples).
+    -> (S [hi - lo, K'] complex128, ant - center, fmin', df')."""
+    S, df = fx['S'], float(fx['df'])
+    K = S.shape[1]
+    guard, band, npl, K2, f0 = _padding(fx, guard)
+    margin = 3 * C / (2 * guard) if margin is None else float(margin)
     f = f0 + df * np.arange(K2)
     a = np.asarray(ant[lo:hi], np.float64)
     rc = np.linalg.norm(a - center, axis=1)
@@ -212,6 +238,7 @@ def patch_history(fx, ant, center, pts, lo, hi, margin=None, guard=None):
     # range bins of c/(2 K2 df); the gate keeps N bins centered on the patch center's range
     dR = np.linalg.norm(pts[None, :, :] - a[:, None, :], axis=2) - rc[:, None]
     half = np.abs(dR).max() + margin
+    from scipy.fft import next_fast_len
     N = next_fast_len(2 * int(np.ceil(half * 2 * K2 * df / C)))
     N += N % 2
     gate = N < K2
@@ -222,6 +249,25 @@ def patch_history(fx, ant, center, pts, lo, hi, margin=None, guard=None):
     k0, k1 = int(keep[0]), int(keep[-1]) + 1
     out = np.empty((hi - lo, k1 - k0), np.complex128)
     j = (np.arange(N) + N // 2) % N - N // 2
+
+    if gate and prof is not None:
+        # exp(-j 4 pi f shift / c) with f = f0 + k df is a delay of s = 2 df K2 shift / c bins of the profile times the
+        # constant exp(-j 4 pi f0 shift / c): the integer part m selects the gate's bins, the fraction d is a phase
+        # ramp on the gated spectrum (frequencies f0 + k df2, k = 0 .. N - 1)
+        Q = prof['Q']
+        s = 2 * df * K2 * shift / C
+        m = np.rint(s).astype(np.int64); d = s - m
+        cph = np.exp(-4j * np.pi * f0 * shift / C) * (K2 / N)
+        kk = np.arange(k0, k1)
+
+        def rows(sl):
+            import scipy.fft
+            u = Q[lo + sl.start + np.arange(sl.stop - sl.start)[:, None], (j[None, :] - m[sl, None]) % K2]
+            U = scipy.fft.fft(u, axis=1, workers=1)[:, k0:k1]
+            ramp = np.exp((-2j * np.pi / N) * d[sl, None] * kk[None, :])
+            out[sl] = U * (ramp * (cph[sl, None] * T[None, k0:k1]))
+        _rows(rows, hi - lo)
+        return out, a - center, float(f2[k0]), float(df2)
 
     def rows(sl):        # pulse blocks, so only the gated history is held whole (a long spotlight is tens of GB at K2)
         import scipy.fft
@@ -295,6 +341,8 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
     si, sj = np.linspace(0, px - 1, 9), np.linspace(0, py - 1, 9)          # sample points, in patch pixels
     gi, gj = np.meshgrid(si - px / 2, sj - py / 2, indexing='ij')
     out = np.zeros((nx, ny), np.complex64)
+    npatch = -(-nx // mx) * -(-ny // my)
+    prof = range_profiles(fx, guard) if npatch > 1 and os.environ.get('FASTSAR_SHARED_PROFILES', '1') != '0' else None
     for i0 in range(0, nx, mx):
         for j0 in range(0, ny, my):
             c = o + (i0 - crop + px / 2) * spx * e1 + (j0 - crop + py / 2) * spy * e2
@@ -310,7 +358,7 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
                     wt = weight_terms(wa(np.clip(u[lo:hi] / umax, -1, 1)), wtol_db)
             else:
                 lo, hi = (0, len(ant)) if pulses is None else (pulses(c) if callable(pulses) else pulses)
-            S, a, f0, df = patch_history(fx, ant, c, pts, lo, hi, margin, guard)
+            S, a, f0, df = patch_history(fx, ant, c, pts, lo, hi, margin, guard, prof)
             if exact:
                 from .bp import backproject as bpx, plane_points
                 xyz = plane_points(px, py, spx, spy, e1, e2)
