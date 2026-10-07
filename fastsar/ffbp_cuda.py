@@ -13,6 +13,7 @@ execution differs:
 All arithmetic is float32 with float64 geometry on the host and, for the device levels, in CuPy float64.
 """
 import math
+import os
 
 import numpy as np
 import cupy as cp
@@ -168,6 +169,31 @@ void fir_p(const sample_t* __restrict__ yre, const sample_t* __restrict__ yim, c
 }
 
 extern "C" __global__
+void fir_p_g(const sample_t* __restrict__ yre, const sample_t* __restrict__ yim, const float* __restrict__ taps,
+             sample_t* __restrict__ zre, sample_t* __restrict__ zim, int P, int Ko, int Po, int D, int L, int pl, int nout)
+{
+    // fir_p for decimation factors whose input rows do not fit in shared memory: the same sums, read from global memory
+    const int j = blockIdx.x * FP_COLS + threadIdx.x % FP_COLS, i0 = blockIdx.y * nout, b = blockIdx.z, q = threadIdx.x / FP_COLS;
+    if (j >= Ko) return;
+    const sample_t* yr = yre + (size_t)b * P * Ko;
+    const sample_t* yi = yim + (size_t)b * P * Ko;
+    for (int m = 0; m < nout / 4; ++m) {
+        const int i = i0 + q * (nout / 4) + m;
+        if (i >= Po) break;
+        const int p0 = D * i - pl;
+        float ar = 0.f, ai = 0.f;
+        for (int r = max(0, -p0); r < L && p0 + r < P; ++r) {
+            const float t = taps[r];
+            const size_t o = (size_t)(p0 + r) * Ko + j;
+            ar = fmaf(t, LD(yr[o]), ar);
+            ai = fmaf(t, LD(yi[o]), ai);
+        }
+        const size_t o = ((size_t)b * Po + i) * (size_t)Ko + j;
+        zre[o] = ST(ar); zim[o] = ST(ai);
+    }
+}
+
+extern "C" __global__
 void final_tile(const sample_t* __restrict__ dre, const sample_t* __restrict__ dim, const float* __restrict__ ux, const float* __restrict__ uy,
                 const float* __restrict__ dlx, const float* __restrict__ dly, float* __restrict__ ore, float* __restrict__ oim,
                 int Pf, int Qf, int T, float a0, float a1, int pps)
@@ -253,7 +279,7 @@ def _kernels(store='fp32', pb=32):
     key = (bits, pb)
     if key not in _mods:
         _mods[key] = cp.RawModule(code=_SRC, options=('--std=c++14', '--use_fast_math', f'-DSTORE={bits}', f'-DPB={pb}'))
-    out = {k: _mods[key].get_function(k) for k in ('rot_fir_k', 'fir_p', 'final_tile')}
+    out = {k: _mods[key].get_function(k) for k in ('rot_fir_k', 'fir_p', 'fir_p_g', 'final_tile')}
     for k in out.values():
         k.max_dynamic_shared_size_bytes = 96 * 1024          # opt in to more than 48 KB of shared memory per block
     out['dtype'] = cp.float16 if bits == 16 else cp.float32
@@ -303,13 +329,18 @@ def _children(kern, pre, pim, c0, sl, lv):
             nout -= 4
         rows = (nout - 1) * Dp + fp['L']
         smem = (2 * rows * 64 + fp['L']) * 4
-        if smem > 48 * 1024:                             # large decimation factors: opt in to more shared memory
+        name = 'fir_p'
+        if os.environ.get('FASTSAR_FIRP_GLOBAL'):        # testing: force the global-memory kernel
+            name, smem = 'fir_p_g', 0
+        elif smem > 48 * 1024:                             # large decimation factors: opt in to more shared memory
             smax = int(cp.cuda.Device().attributes.get('MaxSharedMemoryPerBlockOptin', 48 * 1024))
-            assert smem <= smax, (Dp, fp['L'], smem, smax)
-            kern['fir_p'].max_dynamic_shared_size_bytes = smem
-        kern['fir_p'](((Ko + 63) // 64, (Po + nout - 1) // nout, Np * Cn), (256,),
-                      (yre, yim, taps, zre, zim, np.int32(P), np.int32(Ko), np.int32(Po), np.int32(Dp), np.int32(fp['L']), np.int32(fp['pl']), np.int32(nout)),
-                      shared_mem=smem)
+            if smem <= smax:
+                kern['fir_p'].max_dynamic_shared_size_bytes = smem
+            else:                                        # still too large: read the rows from global memory
+                name, smem = 'fir_p_g', 0
+        kern[name](((Ko + 63) // 64, (Po + nout - 1) // nout, Np * Cn), (256,),
+                   (yre, yim, taps, zre, zim, np.int32(P), np.int32(Ko), np.int32(Po), np.int32(Dp), np.int32(fp['L']), np.int32(fp['pl']), np.int32(nout)),
+                   shared_mem=smem)
         _mark('fir_p', t0)
         return zre, zim
     return yre, yim
