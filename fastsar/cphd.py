@@ -63,7 +63,8 @@ def _image_area(cphd, meta):
 
 
 def form_cphd(cphd, sicd=None, mode='auto', backend='auto', window=True, spacing=None, channel=0, patch=1024,
-              azimuth_fraction=0.8, extent=None, height=None, precision='float32', target_db=-40.0, info=None):
+              azimuth_fraction=0.8, extent=None, height=None, precision='float32', target_db=-40.0, info=None,
+              autofocus=False):
     """Form the image of a CPHD collection (see the module docstring).
 
     cphd: path. sicd: the vendor's SICD (path, .xml metadata, or sarpy SICDType) for the footprint, spacing and
@@ -72,10 +73,13 @@ def form_cphd(cphd, sicd=None, mode='auto', backend='auto', window=True, spacing
     None. extent: (along track, across track) in metres around the scene center, overriding the footprint. height:
     the grid plane's height above the ellipsoid at the scene center (default: the SICD's scene center point, else the
     CPHD's image area reference point; a scatterer at another height appears displaced in range). patch:
-    mosaic patch size in pixels. info: a list that receives one dict per mosaic patch.
+    mosaic patch size in pixels. info: a list that receives one dict per mosaic patch. autofocus: phase gradient
+    autofocus (fastsar.autofocus.autofocus, two rounds; spotlight only), which forms the image three times.
     -> dict(image [nx, ny] complex64, origin [3] (local, pixel (0, 0)), e1, e2 (unit axes, local), spx, spy, mode,
-    meta (read_cphd's), notes). Pixel (i, j) lies at origin + i spx e1 + j spy e2 in the local frame
-    (io.local_to_ecf for ECF)."""
+    band (first and last frequency, Hz), bandwidth (spatial frequency support along e1 and e2, cycles/m), window,
+    phase_error (autofocus: per pulse, rad, else None), meta (read_cphd's), notes). Pixel (i, j) lies at
+    origin + i spx e1 + j spy e2 in the local frame (io.local_to_ecf for ECF; products.geolocate for latitude and
+    longitude)."""
     from .api import ImageFormer, available_backends
     from . import patches
     col, meta = io.read_cphd(cphd, channel=channel, meta=True)
@@ -97,6 +101,8 @@ def form_cphd(cphd, sicd=None, mode='auto', backend='auto', window=True, spacing
     if mode not in ('spotlight', 'moving'):
         raise ValueError("mode must be 'auto', 'spotlight' or 'moving'")
     spot = mode == 'spotlight'
+    if autofocus and not spot:
+        raise ValueError('autofocus is implemented for spotlight collections only')
     if window:
         wk = _taylor(K)
         wp = _taylor(P) if spot else np.ones(P, np.float32)
@@ -140,6 +146,13 @@ def form_cphd(cphd, sicd=None, mode='auto', backend='auto', window=True, spacing
             vel = np.linalg.norm(np.gradient(ant, axis=0), axis=1).mean() * prf
             dsin = azimuth_fraction * lam * prf / (2 * vel)
             notes.append(f'azimuth band {azimuth_fraction:.2f} of the PRF ({prf:.0f} Hz): spread of sin(look) {dsin:.4f}')
+    # resolution the data support (before windowing)
+    if spot:
+        u = (center[None] - ant) / np.linalg.norm(center[None] - ant, axis=1, keepdims=True)
+        span = float(np.arccos(np.clip(u[0] @ u[-1], -1, 1)))
+        ares = lam / (2 * max(span, 1e-6))
+    else:
+        ares = lam / (2 * dsin)
     # spacing
     if spacing is not None:
         spx, spy = (float(spacing), float(spacing)) if np.isscalar(spacing) else map(float, spacing)
@@ -147,12 +160,6 @@ def form_cphd(cphd, sicd=None, mode='auto', backend='auto', window=True, spacing
         spx = max(float(sm.Grid.Col.SS), 0.8 * float(sm.Grid.Col.ImpRespWid))
         spy = max(float(sm.Grid.Row.SS), 0.8 * float(sm.Grid.Row.ImpRespWid)) / np.cos(np.radians(float(sm.SCPCOA.GrazeAng)))
     else:
-        if spot:
-            u = (center[None] - ant) / np.linalg.norm(center[None] - ant, axis=1, keepdims=True)
-            span = float(np.arccos(np.clip(u[0] @ u[-1], -1, 1)))
-            ares = lam / (2 * max(span, 1e-6))
-        else:
-            ares = lam / (2 * dsin)
         spx, spy = 0.8 * 1.2 * ares, 0.8 * 1.2 * rres / np.cos(graze)          # 1.2: the Taylor window's broadening
     # grid
     if corners is None:
@@ -176,9 +183,13 @@ def form_cphd(cphd, sicd=None, mode='auto', backend='auto', window=True, spacing
             sl = slice(p0, min(P, p0 + 1024))
             S[sl] *= np.exp(-4j * np.pi * f[None, :] / C * dref[sl, None]).astype(np.complex64)
         notes.append(f'phase reference moved {np.linalg.norm(c):.1f} m to the grid center')
-        former = ImageFormer(ant - c, f0, df, K, nx, ny, spx, spy, e1, e2, backend=backend, precision=precision,
-                             window=False, target_db=target_db)
-        img = former(S)
+        kw = dict(backend=backend, precision=precision, window=False, target_db=target_db)
+        if autofocus:
+            from .autofocus import autofocus as pga_autofocus
+            img, phi = pga_autofocus(S, ant - c, f0, df, nx, ny, spx, spy, e1, e2, **kw)
+            notes.append(f'autofocus: removed a phase error of {np.std(phi):.2f} rad rms (constant and linear terms excluded)')
+        else:
+            img = ImageFormer(ant - c, f0, df, K, nx, ny, spx, spy, e1, e2, **kw)(S)
         origin = c - (nx / 2.0) * spx * e1 - (ny / 2.0) * spy * e2
     else:
         sp = ((srp - ant) * d).sum(1) / np.linalg.norm(srp - ant, axis=1)        # beam center: each pulse's SRP
@@ -189,4 +200,7 @@ def form_cphd(cphd, sicd=None, mode='auto', backend='auto', window=True, spacing
 
         img = patches.form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1, e2, patch=(patch, patch), beam=beam,
                                   awin='hann' if window else None, backend=backend, target_db=target_db, info=info)
-    return dict(image=img, origin=origin, e1=e1, e2=e2, spx=float(spx), spy=float(spy), mode=mode, meta=meta, notes=notes)
+    return dict(image=img, origin=origin, e1=e1, e2=e2, spx=float(spx), spy=float(spy), mode=mode,
+                band=(f0, f0 + (K - 1) * df), bandwidth=(1.0 / ares, 2 * K * df * np.cos(graze) / C),
+                window=('taylor' if spot else 'hann', 'taylor') if window else None,
+                phase_error=phi if autofocus else None, meta=meta, notes=notes)
