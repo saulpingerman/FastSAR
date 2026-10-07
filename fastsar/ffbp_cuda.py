@@ -373,9 +373,13 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32'):
     mx, my = plan['Nx'] // sx0, plan['Ny'] // sy0
     shape_g = [s for lv in levels[1:] for s in (lv['sx'], lv['sy'])] + [T, T]
     perm_g = [2 * i for i in range(L - 1)] + [2 * (L - 1)] + [2 * i + 1 for i in range(L - 1)] + [2 * (L - 1) + 1]
-    pps = 2 if 4 * T * (2 * Qf) * 4 <= 48 * 1024 else 1                   # pulses per table (shared memory 48 KB)
+    # shared memory per block: 48 KB by default, more when the kernel opts in (99 KB on Ada, 64 KB on Turing)
+    smem_max = int(cp.cuda.Device().attributes.get('MaxSharedMemoryPerBlockOptin', 48 * 1024))
+    pps = 2 if 4 * T * (2 * Qf) * 4 <= 48 * 1024 else 1                   # pulses per table
     smem_final = 4 * T * (pps * Qf) * 4
-    assert T % 4 == 0 and T * T // 8 <= 1024 and (T * T // 8) % (2 * T) == 0 and smem_final <= 48 * 1024, (T, Qf)
+    assert T % 4 == 0 and T * T // 8 <= 1024 and (T * T // 8) % (2 * T) == 0 and smem_final <= smem_max, (T, Qf, smem_max)
+    if smem_final > 48 * 1024:
+        kern['final_tile'].max_dynamic_shared_size_bytes = smem_final
 
     def final(are, aim, cen):
         """are, aim [B, Pf, Qf]; cen [B, 3] float64 -> (re, im) [B, T, T]."""
