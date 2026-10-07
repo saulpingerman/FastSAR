@@ -81,6 +81,8 @@ def read_cphd(cphd, sicd=None, channel=0, meta=False, regrid_tol=1e-3, drop_flag
             channel = pols.index(channel.upper())
         else:
             raise ValueError(f'channel {channel!r} not among identifiers {ids} or polarizations {pols}')
+    if not 0 <= channel < len(m.Data.Channels):
+        raise ValueError(f'channel {channel} out of range: the file has {len(m.Data.Channels)} channels')
     ch = m.Data.Channels[channel]
     par = m.Channel.Parameters[channel]
     P, K = ch.NumVectors, ch.NumSamples
@@ -111,9 +113,11 @@ def read_cphd(cphd, sicd=None, channel=0, meta=False, regrid_tol=1e-3, drop_flag
     sig = pv('SIGNAL')
     flagged = np.zeros(P, bool) if sig is None else np.asarray(sig).ravel() == 0
     good = np.nonzero(~bad)[0]
+    if len(good) < 2:
+        raise ValueError(f'{len(good)} of {P} pulses have valid positions and nonzero samples: nothing to image')
     lo, hi = int(good[0]), int(good[-1]) + 1
     if lo or hi < P:
-        notes.append(f'trimmed pulses [0, {lo}) and [{hi}, {P})')
+        notes.append('trimmed pulses ' + ' and '.join(f'[{a}, {b})' for a, b in ((0, lo), (hi, P)) if b > a))
     S, tx, rcv, srp, sc0, scss, posbad, empty, flagged = (a[lo:hi] for a in (S, tx, rcv, srp, sc0, scss, posbad, empty, flagged))
     if posbad.any():
         idx = np.arange(len(tx))

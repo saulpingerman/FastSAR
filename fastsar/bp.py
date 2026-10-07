@@ -314,15 +314,20 @@ def backproject(S, ant, fmin, df, points, rcv=None, ref=None, backend='auto', up
     of the two legs) to which each pulse was motion compensated; by default the distance to the origin, the fixed
     scene reference point. A moving reference point (sliding spotlight, stripmap CPHD) passes its per-pulse range.
     backend: 'cpu' (float64 throughout), 'cuda', 'jax' (float32 with float64 block centers), or 'auto'."""
-    from .api import available_backends
-    S = np.asarray(S)
+    from .api import _backend, _check_history, _check_positions
+    backend = 'jax' if backend == 'tpu' else _backend(backend)
+    S = _check_history(np.asarray(S))
     P, K = S.shape
-    tx = np.asarray(ant, np.float64)
-    rcv = None if rcv is None else np.asarray(rcv, np.float64)
+    tx = _check_positions(ant, 'antenna (transmitter) positions', P)
+    rcv = None if rcv is None else _check_positions(rcv, 'receiver positions', P)
     points = np.asarray(points, np.float64)
+    if points.ndim < 1 or points.shape[-1] != 3 or points.size == 0:
+        raise ValueError(f'points must be [..., 3] with at least one point, got shape {points.shape}')
     if ref is None:
         ref = np.linalg.norm(tx, axis=1) if rcv is None else 0.5 * (np.linalg.norm(tx, axis=1) + np.linalg.norm(rcv, axis=1))
     ref = np.asarray(ref, np.float64)
+    if ref.shape != (P,):
+        raise ValueError(f'ref must hold one range per pulse, shape ({P},), got {ref.shape}')
     shape = points.shape[:-1]
     if window:
         wp, wk = _window(P, K)
@@ -331,9 +336,8 @@ def backproject(S, ant, fmin, df, points, rcv=None, ref=None, backend='auto', up
     nfft = 1 << int(np.ceil(np.log2(upsample * K)))
     inv_dr = 2.0 * df * nfft / C
     kcyc = 2.0 * (fmin + (K // 2) * df) / C
-    if backend == 'auto':
-        backend = available_backends()[0]
-        backend = 'jax' if backend == 'tpu' else backend
+    if backend == 'tpu':
+        backend = 'jax'
     if backend == 'cpu':
         return _run_cpu(S, tx, rcv, ref, points.reshape(-1, 3), nfft, inv_dr, kcyc, chunk).reshape(shape)
     order, cen, d = _order(points)

@@ -87,10 +87,16 @@ def simulate(col, pos, amp, eps=1e-12, nthreads=0):
 
 
 def simulate_brute(col, pos, amp):
-    """Direct O(Np K N) sum, for validating `simulate` on small cases."""
-    dr = delta_range(col.ant, pos)
-    ph = -4.0 * np.pi / C * col.freqs[None, :, None] * dr[:, None, :]
-    return (amp[None, None, :] * np.exp(1j * ph)).sum(-1)
+    """Direct O(Np K N) sum, for validating `simulate` on small cases; in blocks of scatterers, so that the
+    temporaries stay near 64 MB (one [Np, K, N] array is 5.8 GB at 2122 x 2122 x 80)."""
+    dr = delta_range(col.ant, np.asarray(pos, np.float64))
+    amp = np.asarray(amp)
+    out = np.zeros((col.Np, col.K), np.complex128)
+    nb = max(1, (1 << 22) // (col.Np * col.K))
+    for n0 in range(0, dr.shape[1], nb):
+        ph = -4.0 * np.pi / C * col.freqs[None, :, None] * dr[:, None, n0:n0 + nb]
+        out += (amp[None, None, n0:n0 + nb] * np.exp(1j * ph)).sum(-1)
+    return out
 
 
 def add_noise(S, sigma, rng):

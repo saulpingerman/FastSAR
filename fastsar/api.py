@@ -62,6 +62,77 @@ def available_backends():
 
 _JAX_PROGRAMS = {}         # compiled JAX/TPU programs by plan signature (ImageFormer)
 
+BACKENDS = ('auto', 'tpu', 'cuda', 'cpu', 'jax')
+
+
+def _backend(backend):
+    """backend checked against BACKENDS and this machine, 'auto' resolved."""
+    if backend not in BACKENDS:
+        raise ValueError(f'unknown backend {backend!r}: one of {", ".join(map(repr, BACKENDS))}')
+    if backend in ('cpu', 'jax'):            # no device probe (a mosaic builds a former per patch)
+        return backend
+    have = available_backends()
+    if backend == 'auto':
+        return have[0]
+    if backend == 'cuda' and 'cuda' not in have:
+        raise ValueError("backend 'cuda' needs CuPy and an Nvidia GPU; this machine has " + ', '.join(have + ['jax']))
+    if backend == 'tpu' and 'tpu' not in have and not os.environ.get('FFBP_FORCE_TPU_KERNELS'):
+        raise ValueError("backend 'tpu' needs JAX on a Cloud TPU; this machine has " + ', '.join(have + ['jax']))
+    return backend
+
+
+def _check_history(S, P=None, name='phase history'):
+    """S [P, K] complex (numpy or cupy) with at least 2 pulses and 2 samples, all finite; -> S unchanged. Real or
+    integer samples are refused (an I/Q pair interleaved along the last axis is S[..., 0] + 1j * S[..., 1])."""
+    if not hasattr(S, 'ndim'):
+        S = np.asarray(S)
+    if S.ndim != 2:
+        raise ValueError(f'{name} must be 2-D [pulses, samples], got shape {tuple(S.shape)}')
+    if S.dtype.kind != 'c':
+        raise TypeError(f'{name} must be complex (complex64 or complex128), got {S.dtype}')
+    if P is not None and S.shape[0] != P:
+        raise ValueError(f'{name} has {S.shape[0]} pulses but there are {P} antenna positions')
+    if S.shape[0] < 2 or S.shape[1] < 2:
+        raise ValueError(f'{name} needs at least 2 pulses and 2 samples, got shape {tuple(S.shape)}')
+    # a sum per block of rows: one pass, no full-size temporary
+    for i in range(0, S.shape[0], 4096):
+        if not np.isfinite(complex(S[i:i + 4096].sum())):
+            first = i + int(np.argmax((~np.isfinite(S[i:i + 4096])).any(1)))
+            raise ValueError(f'{name} has non-finite samples (NaN or inf), the first in pulse {first}; '
+                             'zero them (S[~np.isfinite(S)] = 0) or drop the pulses')
+    return S
+
+
+def _check_positions(a, name='antenna positions', P=None):
+    """a [P, 3] finite float64, at least 2 rows (P of them when given)."""
+    a = np.asarray(a, np.float64)
+    if a.ndim != 2 or a.shape[1] != 3:
+        raise ValueError(f'{name} must be [pulses, 3], got shape {a.shape}')
+    if P is not None and len(a) != P:
+        raise ValueError(f'{name}: {len(a)} rows for {P} pulses')
+    if len(a) < 2:
+        raise ValueError(f'{name}: at least 2 pulses are needed, got {len(a)}')
+    if not np.isfinite(a).all():
+        raise ValueError(f'{name}: non-finite values (NaN or inf)')
+    return a
+
+
+def _check_grid(nx, ny, spx, spy, e1, e2):
+    """Pixel counts (positive integers), spacings (positive) and the axes (orthonormal 3-vectors) -> nx, ny (int),
+    e1, e2 (float64)."""
+    for n, v in (('nx', nx), ('ny', ny)):
+        if not np.isscalar(v) or not np.isfinite(v) or v < 1 or int(v) != v:
+            raise ValueError(f'{n} must be a positive integer, got {v!r}')
+    for n, v in (('spx', spx), ('spy', spy)):
+        if not np.isfinite(v) or v <= 0:
+            raise ValueError(f'{n} must be a positive spacing in metres, got {v!r}')
+    e1, e2 = np.asarray(e1, np.float64), np.asarray(e2, np.float64)
+    if e1.shape != (3,) or e2.shape != (3,):
+        raise ValueError(f'e1 and e2 must be 3-vectors, got shapes {e1.shape} and {e2.shape}')
+    if abs(e1 @ e1 - 1) > 1e-6 or abs(e2 @ e2 - 1) > 1e-6 or abs(e1 @ e2) > 1e-6:
+        raise ValueError(f'e1 and e2 must be orthonormal (unit length, perpendicular), got {e1.tolist()} and {e2.tolist()}')
+    return int(nx), int(ny), e1, e2
+
 
 def final_weights(plan, weight, P, grad=False, points=None):
     """Weight of each final subaperture at each final tile [ntiles, Pf] (float32), for ImageFormer's aperture_weight:
@@ -86,7 +157,9 @@ def final_weights(plan, weight, P, grad=False, points=None):
     nodes = np.clip(np.rint(0.5 * (a + b)[:, None] + 0.5 * (b - a)[:, None] * t[None, :]), 0, P - 1).astype(np.int64)
     U, inv = np.unique(nodes.ravel(), return_inverse=True)
     W = np.asarray(weight(q, U), np.float64)[inv].reshape(len(idx), 3, -1)    # [Pf, 3, ntiles]
-    m = np.where((b > a)[:, None], np.tensordot(gw, W, axes=(0, 1)), 0.0)       # [Pf, ntiles]
+    # a subaperture centred beyond the collection holds the filter tails of the edge pulses (the decimators run m
+    # outputs past each end): it takes the weight of the nearest pulse (its nodes clip to it), not zero
+    m = np.tensordot(gw, W, axes=(0, 1))                                          # [Pf, ntiles]
     return np.ascontiguousarray(m.T, np.float32)
 
 
@@ -105,12 +178,16 @@ class ImageFormer:
                  precision='float32', window=True, T='auto', levels=3, pmax=0.4, target_db=-40.0, aperture_weight=None):
         from . import ffbp2
         import warnings
-        self.ant = np.asarray(ant, np.float64)
+        self.ant = _check_positions(ant)
         self.P, self.K = self.ant.shape[0], int(K)
+        if self.K < 2:
+            raise ValueError(f'K must be at least 2 frequency samples, got {K}')
+        if not (np.isfinite(fmin) and np.isfinite(df) and fmin > 0 and df > 0):
+            raise ValueError(f'fmin and df must be positive frequencies in Hz, got {fmin!r} and {df!r}')
         self.window = window
         col = Collect(fmin=float(fmin), df=float(df), K=self.K, ant=self.ant, res=0.5)
-        e1, e2 = np.asarray(e1, np.float64), np.asarray(e2, np.float64)
-        self.backend = available_backends()[0] if backend == 'auto' else backend
+        nx, ny, e1, e2 = _check_grid(nx, ny, spx, spy, e1, e2)
+        self.backend = _backend(backend)
         self.precision = precision
         self.predicted_error_db = None
         if T == 'auto':
@@ -178,6 +255,7 @@ class ImageFormer:
             S = np.asarray(S)
         if S.shape != (self.P, self.K):
             raise ValueError(f'phase history must be {(self.P, self.K)}, got {S.shape}')
+        _check_history(S)
         if self.window:
             wp, wk = self.wp, self.wk
             if not isinstance(S, np.ndarray):
@@ -186,6 +264,8 @@ class ImageFormer:
             S = (S * wp[:, None] * wk[None, :]).astype(np.complex64)
         else:
             S = S.astype(np.complex64, copy=False)
+        if not S.flags.c_contiguous:              # a transposed or strided view (the kernels read rows in place)
+            S = S.copy()
         if self.backend == 'cuda':
             import cupy as cp
             return cp.asnumpy(self._form(S)).astype(np.complex64, copy=False)       # a host S may stream (ffbp_cuda)
@@ -201,16 +281,17 @@ def form_image(S, ant, fmin, df, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
                backend='auto', precision='float32', window=True, T='auto', levels=3, pmax=0.4, pfa_guard=300.0, target_db=-40.0):
     """Form the complex image [nx, ny] (complex64). See the module docstring for the arguments. For more than one
     image of the same geometry, build an ImageFormer once and call it; this function sets one up on every call."""
-    S = np.asarray(S)
+    if algorithm not in ('ffbp', 'pfa'):
+        raise ValueError("algorithm must be 'ffbp' or 'pfa'")
+    S = _check_history(np.asarray(S), len(_check_positions(ant)))
     if algorithm == 'pfa':
+        nx, ny, e1, e2 = _check_grid(nx, ny, spx, spy, e1, e2)
         P, K = S.shape
         col = Collect(fmin=float(fmin), df=float(df), K=K, ant=np.asarray(ant, np.float64), res=0.5)
         if window:
             wp, wk = _window(P, K)
             S = (S * wp[:, None] * wk[None, :]).astype(np.complex64)
         return _pfa(S.astype(np.complex64), col, nx, ny, spx, spy, np.asarray(e1, np.float64), np.asarray(e2, np.float64), pfa_guard)
-    if algorithm != 'ffbp':
-        raise ValueError("algorithm must be 'ffbp' or 'pfa'")
     return ImageFormer(ant, fmin, df, S.shape[1], nx, ny, spx, spy, e1, e2, backend, precision, window, T, levels, pmax, target_db)(S)
 
 
@@ -228,6 +309,6 @@ def _pfa(S, col, nx, ny, spx, spy, e1, e2, guard=300.0):
     dist = pfa2.distortion(col, nx, ny, spx, spy, e1, e2)
     fn = pfa2.make_pfa(geo, nx, ny, spx, spy, 'taps', None, jax.lax.Precision.HIGHEST, dist=dist)
     W, alpha, eps_r, shift, eps_a = pfa2.arrays(geo, S.shape[0], 'taps')
-    scale = float(np.abs(S).max())
+    scale = float(np.abs(S).max()) or 1.0          # an all-zero history gives a zero image, not 0/0
     out = fn(jnp.asarray((S.real / scale).astype(np.float32)), jnp.asarray((S.imag / scale).astype(np.float32)), W, alpha, eps_r, shift, eps_a)
     return (np.asarray(out) * scale).astype(np.complex64)

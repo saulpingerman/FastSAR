@@ -80,8 +80,16 @@ def form_cphd(cphd, sicd=None, mode='auto', backend='auto', window=True, spacing
     phase_error (autofocus: per pulse, rad, else None), meta (read_cphd's), notes). Pixel (i, j) lies at
     origin + i spx e1 + j spy e2 in the local frame (io.local_to_ecf for ECF; products.geolocate for latitude and
     longitude)."""
-    from .api import ImageFormer, available_backends
+    from .api import ImageFormer, _backend
     from . import patches
+    if mode not in ('auto', 'spotlight', 'moving'):
+        raise ValueError("mode must be 'auto', 'spotlight' or 'moving'")
+    backend = _backend(backend)                       # before the file is read
+    for n, v in (('spacing', spacing), ('extent', extent)):
+        if v is not None and (np.size(v) not in (1, 2) or not np.all(np.isfinite(v)) or np.min(v) <= 0):
+            raise ValueError(f'{n} must be one or two positive lengths in metres, got {v!r}')
+    if extent is not None and np.size(extent) != 2:
+        raise ValueError(f'extent must be (along track, across track) in metres, got {extent!r}')
     col, meta = io.read_cphd(cphd, channel=channel, meta=True)
     S = col['S']
     P, K = S.shape
@@ -89,7 +97,6 @@ def form_cphd(cphd, sicd=None, mode='auto', backend='auto', window=True, spacing
     lam = C / (f0 + K / 2 * df)
     ant = np.asarray(col['ant'], np.float64)
     sm = _sicd_meta(sicd)
-    backend = available_backends()[0] if backend == 'auto' else backend
     notes = list(meta.get('notes', []))
     # the SRP of every pulse (local frame), for the mode and a moving beam's center
     from sarpy.io.phase_history.converter import open_phase_history
@@ -98,8 +105,6 @@ def form_cphd(cphd, sicd=None, mode='auto', backend='auto', window=True, spacing
     rres = C / (2 * K * df)
     if mode == 'auto':
         mode = 'moving' if np.linalg.norm(srp.max(0) - srp.min(0)) > rres else 'spotlight'
-    if mode not in ('spotlight', 'moving'):
-        raise ValueError("mode must be 'auto', 'spotlight' or 'moving'")
     spot = mode == 'spotlight'
     if autofocus and not spot:
         raise ValueError('autofocus is implemented for spotlight collections only')
