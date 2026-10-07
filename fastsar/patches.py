@@ -208,29 +208,32 @@ def patch_history(fx, ant, center, pts, lo, hi, margin=None, guard=None):
     f = f0 + df * np.arange(K2)
     a = np.asarray(ant[lo:hi], np.float64)
     rc = np.linalg.norm(a - center, axis=1)
-    S2 = np.zeros((hi - lo, K2), np.complex128)
-    S2[:, npl:npl + K] = S[lo:hi]
     shift = np.asarray(fx['ref'], np.float64)[lo:hi] - rc
-
-    def rot(sl):
-        S2[sl] *= np.exp(-4j * np.pi * f[None, :] / C * shift[sl, None])
-    _rows(rot, hi - lo)
     # range bins of c/(2 K2 df); the gate keeps N bins centered on the patch center's range
     dR = np.linalg.norm(pts[None, :, :] - a[:, None, :], axis=2) - rc[:, None]
     half = np.abs(dR).max() + margin
     N = next_fast_len(2 * int(np.ceil(half * 2 * K2 * df / C)))
     N += N % 2
-    if N < K2:
-        import scipy.fft
-        q = scipy.fft.ifft(S2, axis=1, workers=-1)
-        j = (np.arange(N) + N // 2) % N - N // 2
-        S2 = scipy.fft.fft(q[:, j % K2], axis=1, workers=-1) * (K2 / N)          # the sum over N samples, not K2
-        df = K2 * df / N
-        f = f0 + df * np.arange(N)
-    T = _taper(f, band, guard)
+    gate = N < K2
+    df2 = K2 * df / N if gate else df
+    f2 = f0 + df2 * np.arange(N if gate else K2)
+    T = _taper(f2, band, guard)
     keep = np.nonzero(T > 0)[0]
     k0, k1 = int(keep[0]), int(keep[-1]) + 1
-    return S2[:, k0:k1] * T[k0:k1][None, :], a - center, float(f[k0]), float(df)
+    out = np.empty((hi - lo, k1 - k0), np.complex128)
+    j = (np.arange(N) + N // 2) % N - N // 2
+
+    def rows(sl):        # pulse blocks, so only the gated history is held whole (a long spotlight is tens of GB at K2)
+        import scipy.fft
+        S2 = np.zeros((sl.stop - sl.start, K2), np.complex128)
+        S2[:, npl:npl + K] = S[lo + sl.start:lo + sl.stop]
+        S2 *= np.exp(-4j * np.pi * f[None, :] / C * shift[sl, None])
+        if gate:
+            q = scipy.fft.ifft(S2, axis=1, workers=1)
+            S2 = scipy.fft.fft(q[:, j % K2], axis=1, workers=1) * (K2 / N)          # the sum over N samples, not K2
+        out[sl] = S2[:, k0:k1] * T[k0:k1][None, :]
+    _rows(rows, hi - lo)
+    return out, a - center, float(f2[k0]), float(df2)
 
 
 def weight_terms(W, wtol_db=-50.0, most=8):
