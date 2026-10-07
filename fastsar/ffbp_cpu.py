@@ -44,6 +44,7 @@ def lib():
     f64 = np.ctypeslib.ndpointer(np.float64, flags='C_CONTIGUOUS')
     i, dbl = ctypes.c_int, ctypes.c_double
     L.rot_fir_k.argtypes = [f32, f32, i, i, i, f32, f32, i, f32, i, i, i, i, dbl, f32, f32]
+    L.rot_fir_k_cplx.argtypes = [f32, i, i, i, f32, f32, i, f32, i, i, i, i, dbl, f32, f32]
     L.fir_p.argtypes = [f32, f32, i, i, i, f32, i, i, i, i, f32, f32]
     vp = ctypes.c_void_p
     L.final_tiles.argtypes = [f32, f32, i, i, i, i, f64, f64, f64, f64, dbl, dbl, f64, f64, f64, dbl, f32, f32, vp, vp, vp]
@@ -68,7 +69,8 @@ class Pool:
 
 
 def _children(pre, pim, c0, sl, lv, pool, tag=''):
-    """pre, pim [Np, P, K] float32; c0, sl [Np, C, P] float32 -> [Np C, Po, Ko] planes (buffers owned by the pool)."""
+    """pre, pim [Np, P, K] float32 (or pre a complex64 [Np, P, K] array and pim None); c0, sl [Np, C, P] float32 ->
+    [Np C, Po, Ko] planes (buffers owned by the pool)."""
     L_ = lib()
     Np, P, K = pre.shape
     Cn, Ko, Po, Dk, Dp = c0.shape[1], lv['Ko'], lv['Po'], lv['Dk'], lv['Dp']
@@ -79,9 +81,15 @@ def _children(pre, pim, c0, sl, lv, pool, tag=''):
         taps = np.ascontiguousarray(fk['kern'], np.float32)
         yre = pool.get(f'yre{tag}', (Np * Cn, P, Ko))
         yim = pool.get(f'yim{tag}', (Np * Cn, P, Ko))
-        L_.rot_fir_k(pre, pim, Np, P, K, np.ascontiguousarray(c0, np.float32), np.ascontiguousarray(sl, np.float32), Cn,
-                     taps, fk['L'], fk['pl'], Dk, Ko, kc, yre, yim)
+        if pim is None:
+            L_.rot_fir_k_cplx(pre.view(np.float32), Np, P, K, np.ascontiguousarray(c0, np.float32), np.ascontiguousarray(sl, np.float32),
+                              Cn, taps, fk['L'], fk['pl'], Dk, Ko, kc, yre, yim)
+        else:
+            L_.rot_fir_k(pre, pim, Np, P, K, np.ascontiguousarray(c0, np.float32), np.ascontiguousarray(sl, np.float32), Cn,
+                         taps, fk['L'], fk['pl'], Dk, Ko, kc, yre, yim)
     else:
+        if pim is None:
+            pre, pim = np.ascontiguousarray(pre.real), np.ascontiguousarray(pre.imag)
         k = np.arange(K, dtype=np.float64) - kc
         cyc = c0[:, :, :, None].astype(np.float64) + k[None, None, None, :] * sl[:, :, :, None]
         ang = (cyc - np.rint(cyc)) * (2 * np.pi)
@@ -211,12 +219,16 @@ def make_ffbp_cpu(plan, coll, wf=None):
                 mem = 64e9
             budget = float(os.environ.get('FASTSAR_CPU_GROUP_GB', 0)) * 1e9 or 0.25 * mem
             ng = int(max(1, min(8, budget // per)))
-        # in row blocks and in place: a long spotlight's history is tens of GB, and each full-size temporary as much
-        scale = max(float(np.abs(S[i:i + 4096]).max()) for i in range(0, S.shape[0], 4096))
-        pre = np.empty((1,) + S.shape, np.float32); pim = np.empty((1,) + S.shape, np.float32)
-        for i in range(0, S.shape[0], 4096):
-            np.multiply(S[i:i + 4096].real, np.float32(1.0 / scale), out=pre[0, i:i + 4096])
-            np.multiply(S[i:i + 4096].imag, np.float32(1.0 / scale), out=pim[0, i:i + 4096])
+        if S.dtype == np.complex64 and S.flags.c_contiguous and levels[0]['Dk'] > 1:
+            # the first level reads the complex64 history in place (a long spotlight's history is tens of GB)
+            scale, pre, pim = 1.0, S[None], None
+        else:
+            # in row blocks and in place: each full-size temporary is as large as the history
+            scale = max(float(np.abs(S[i:i + 4096]).max()) for i in range(0, S.shape[0], 4096))
+            pre = np.empty((1,) + S.shape, np.float32); pim = np.empty((1,) + S.shape, np.float32)
+            for i in range(0, S.shape[0], 4096):
+                np.multiply(S[i:i + 4096].real, np.float32(1.0 / scale), out=pre[0, i:i + 4096])
+                np.multiply(S[i:i + 4096].imag, np.float32(1.0 / scale), out=pim[0, i:i + 4096])
         lv0, la0 = levels[0], host[0]
         full = np.empty((plan['Nx'], plan['Ny']), np.complex64)
         for g0 in range(0, G, ng):
@@ -229,6 +241,6 @@ def make_ffbp_cpu(plan, coll, wf=None):
                 x, y = g // sy0, g % sy0
                 full[x * mx:(x + 1) * mx, y * my:(y + 1) * my] = re + 1j * im
             del A, Bm
-        return full[ox:ox + nx, oy:oy + ny] * np.float32(scale)
+        return full[ox:ox + nx, oy:oy + ny] if scale == 1.0 else full[ox:ox + nx, oy:oy + ny] * np.float32(scale)
 
     return form

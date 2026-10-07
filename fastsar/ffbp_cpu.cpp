@@ -51,8 +51,12 @@ extern "C" {
 
 // sre, sim [Np, P, K]; c0, sl [Np, Cn, P]; taps [L]; yre, yim [Np * Cn, P, Ko].
 // out_c[j] = sum_r taps[r] x_c[D j + r - pl],  x_c[k] = x[k] exp(2 pi i (c0_c + sl_c (k - kc))),  x = 0 outside [0, K).
-void rot_fir_k(const float* sre, const float* sim, int Np, int P, int K, const float* c0, const float* sl, int Cn,
-               const float* taps, int L, int pl, int D, int Ko, double kc, float* yre, float* yim)
+}  // extern "C"
+
+// XS: the input's element stride (1: separate real and imaginary planes; 2: interleaved complex64, sim = sre + 1)
+template <int XS>
+static void rot_fir_k_impl(const float* sre, const float* sim, int Np, int P, int K, const float* c0, const float* sl, int Cn,
+                           const float* taps, int L, int pl, int D, int Ko, double kc, float* yre, float* yim)
 {
     const int kw = D * (Ko - 1) + L;                 // window of samples the outputs read: k = D j + r - pl, j < Ko, r < L
     const int kmin = -pl, kmax = kmin + kw;          // [kmin, kmax)
@@ -65,8 +69,8 @@ void rot_fir_k(const float* sre, const float* sim, int Np, int P, int K, const f
         #pragma omp for schedule(dynamic, 2) collapse(2)
         for (int n = 0; n < Np; ++n) {
             for (int p = 0; p < P; ++p) {
-                const float* xr = sre + ((size_t)n * P + p) * K;
-                const float* xi = sim + ((size_t)n * P + p) * K;
+                const float* xr = sre + ((size_t)n * P + p) * K * XS;
+                const float* xi = sim + ((size_t)n * P + p) * K * XS;
                 for (int cv = 0; cv < ncv; ++cv) {
                     const int cbase = cv * VL, cn = std::min(VL, Cn - cbase);
                     // per-lane phase step (one sample) and the lane constants
@@ -90,7 +94,7 @@ void rot_fir_k(const float* sre, const float* sim, int Np, int P, int K, const f
                         const int k1 = std::min(kmax, k0 + RESEED);
                         for (int k = k0; k < k1; ++k) {
                             const bool ok = (k >= 0) && (k < K);
-                            const float vr = ok ? xr[k] : 0.f, vi = ok ? xi[k] : 0.f;
+                            const float vr = ok ? xr[(size_t)k * XS] : 0.f, vi = ok ? xi[(size_t)k * XS] : 0.f;
                             const v16 br = bcast(vr), bi = bcast(vi);
                             zr[k - kmin] = br * wr - bi * wi;
                             zi[k - kmin] = br * wi + bi * wr;
@@ -144,6 +148,21 @@ void rot_fir_k(const float* sre, const float* sim, int Np, int P, int K, const f
             }
         }
     }
+}
+
+extern "C" {
+
+void rot_fir_k(const float* sre, const float* sim, int Np, int P, int K, const float* c0, const float* sl, int Cn,
+               const float* taps, int L, int pl, int D, int Ko, double kc, float* yre, float* yim)
+{
+    rot_fir_k_impl<1>(sre, sim, Np, P, K, c0, sl, Cn, taps, L, pl, D, Ko, kc, yre, yim);
+}
+
+// the same from an interleaved complex64 history x [Np, P, K] (no float32 planes needed)
+void rot_fir_k_cplx(const float* x, int Np, int P, int K, const float* c0, const float* sl, int Cn,
+                    const float* taps, int L, int pl, int D, int Ko, double kc, float* yre, float* yim)
+{
+    rot_fir_k_impl<2>(x, x + 1, Np, P, K, c0, sl, Cn, taps, L, pl, D, Ko, kc, yre, yim);
 }
 
 // yre, yim [B, P, Ko]; taps [L]; zre, zim [B, Po, Ko].  z[i] = sum_r taps[r] y[D i + r - pl] (rows), zero outside.
