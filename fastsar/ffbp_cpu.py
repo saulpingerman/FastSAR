@@ -200,9 +200,12 @@ def make_ffbp_cpu(plan, coll, wf=None):
     def form(S, ng=8):
         """S [P, K] complex64 (already windowed) -> complex64 image [nx, ny]."""
         S = np.asarray(S)
-        scale = float(np.abs(S).max())
-        pre = np.ascontiguousarray((S.real / scale).astype(np.float32))[None]
-        pim = np.ascontiguousarray((S.imag / scale).astype(np.float32))[None]
+        # in row blocks and in place: a long spotlight's history is tens of GB, and each full-size temporary as much
+        scale = max(float(np.abs(S[i:i + 4096]).max()) for i in range(0, S.shape[0], 4096))
+        pre = np.empty((1,) + S.shape, np.float32); pim = np.empty((1,) + S.shape, np.float32)
+        for i in range(0, S.shape[0], 4096):
+            np.multiply(S[i:i + 4096].real, np.float32(1.0 / scale), out=pre[0, i:i + 4096])
+            np.multiply(S[i:i + 4096].imag, np.float32(1.0 / scale), out=pim[0, i:i + 4096])
         lv0, la0 = levels[0], host[0]
         full = np.empty((plan['Nx'], plan['Ny']), np.complex64)
         for g0 in range(0, G, ng):

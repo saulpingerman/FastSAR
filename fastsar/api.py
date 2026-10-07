@@ -164,7 +164,7 @@ class ImageFormer:
         S = np.asarray(S)
         if S.shape != (self.P, self.K):
             raise ValueError(f'phase history must be {(self.P, self.K)}, got {S.shape}')
-        S = (S * self.wp[:, None] * self.wk[None, :]).astype(np.complex64) if self.window else S.astype(np.complex64)
+        S = (S * self.wp[:, None] * self.wk[None, :]).astype(np.complex64) if self.window else S.astype(np.complex64, copy=False)
         if self.backend == 'cuda':
             import cupy as cp
             return cp.asnumpy(self._form(cp.asarray(S), ng=8)).astype(np.complex64)
