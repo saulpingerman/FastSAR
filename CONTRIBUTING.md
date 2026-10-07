@@ -42,8 +42,8 @@ python tests/test_insar.py         # change detection and interferometric height
 has (`fastsar.available_backends()`) or use the CPU. The tests use small simulated scenes and take seconds to a few
 minutes each. For the CPU kernels, set `OMP_NUM_THREADS` to the number of physical cores.
 
-`test_ffbp_cpu.py`, `test_ffbp_cuda.py` and the three `test_pallas_*.py` scripts print errors without asserting
-on them; read their output.
+`test_ffbp_cpu.py`, `test_ffbp_cuda.py` and the three `test_pallas_*.py` scripts compare each error with a limit
+set about 5 dB above the value measured when the limit was set, and exit with a list of the failed cases.
 
 ## Pull requests
 

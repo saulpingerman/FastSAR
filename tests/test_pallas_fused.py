@@ -12,6 +12,15 @@ import jax.numpy as jnp
 from fastsar.pallas_ffbp import band_blocks, pad_columns, fused_rotate_dec_k
 
 jax.config.update('jax_platform_name', 'cpu')
+bad = []                  # thresholds about 5 dB above the values measured on the CPU (interpret mode) when they were set
+
+
+def check(label, e, lim):
+    if not e < lim:
+        bad.append(f'{label}: {e:.1f} dB (limit {lim} dB)')
+    return e
+
+
 rng = np.random.default_rng(0)
 P, K, D, L = 64, 1536, 6, 44
 Ko = (K + D - 1) // D
@@ -41,7 +50,7 @@ for passes in (1, 3):
     yr, yi = fused_rotate_dec_k(Sre, Sim, jnp.asarray(c0), jnp.asarray(slope), band, kc, pb=32, chunk=512, passes=passes, interpret=True)
     Y = np.asarray(yr)[:, :Ko] + 1j * np.asarray(yi)[:, :Ko]
     err = 10 * np.log10(np.sum(np.abs(Y - Yref) ** 2) / np.sum(np.abs(Yref) ** 2))
-    print(f'passes {passes}: error {err:.1f} dB relative to float64 (expect about -45 single-pass, below -70 three-pass)')
+    print(f'passes {passes}: error {check(f"kernel1 {passes}", err, -45 if passes == 1 else -55):.1f} dB relative to float64')
 
 # second-generation kernel: two parents, three children each, against the same float64 reference per child
 from fastsar.pallas_ffbp import band_blocks2, fused_rotate_dec_k2
@@ -61,7 +70,7 @@ for passes in (1, 3):
             ref = (Ss[n].astype(np.complex128) * np.exp(1j * (cyc - np.round(cyc)) * 2 * np.pi)) @ Fk
             Y = np.asarray(yr)[n, c, :, :Ko] + 1j * np.asarray(yi)[n, c, :, :Ko]
             num += np.sum(np.abs(Y - ref) ** 2); den += np.sum(np.abs(ref) ** 2)
-    print(f'kernel2 passes {passes}: error {10 * np.log10(num / den):.1f} dB')
+    print(f'kernel2 passes {passes}: error {check(f"kernel2 {passes}", 10 * np.log10(num / den), -45 if passes == 1 else -55):.1f} dB')
 
 # multi-block form of the second kernel (forced small output blocks)
 band3 = band_blocks2(Fk, D, kob=128)
@@ -75,7 +84,7 @@ for n in range(N):
         ref = (Ss[n].astype(np.complex128) * np.exp(1j * (cyc - np.round(cyc)) * 2 * np.pi)) @ Fk
         Y = np.asarray(yr)[n, c, :, :Ko] + 1j * np.asarray(yi)[n, c, :, :Ko]
         num += np.sum(np.abs(Y - ref) ** 2); den += np.sum(np.abs(ref) ** 2)
-print(f'kernel2 multi-block: error {10 * np.log10(num / den):.1f} dB')
+print(f'kernel2 multi-block: error {check("kernel2 multi-block", 10 * np.log10(num / den), -45):.1f} dB')
 
 # third kernel: precomputed coarse tables, with and without the fused pulse decimation
 from fastsar.pallas_ffbp import fused_rotate_dec_k3
@@ -102,4 +111,8 @@ for fused in (False, True):
                 else:
                     Y = np.asarray(yr)[n, c, :, :Ko] + 1j * np.asarray(yi)[n, c, :, :Ko]
                 num += np.sum(np.abs(Y - ref) ** 2); den += np.sum(np.abs(ref) ** 2)
-        print(f'kernel3 fused_p={fused} passes {passes}: error {10 * np.log10(num / den):.1f} dB')
+        print(f'kernel3 fused_p={fused} passes {passes}: error {check(f"kernel3 {fused} {passes}", 10 * np.log10(num / den), -44 if passes == 1 else -55):.1f} dB')
+
+if bad:
+    sys.exit('FAILED: ' + '; '.join(bad))
+print('ok')

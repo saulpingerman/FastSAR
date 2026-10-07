@@ -6,6 +6,15 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np, jax, jax.numpy as jnp
 jax.config.update('jax_platform_name', 'cpu')
 from fastsar import sim, ffbp2, pallas_ffbp
+bad = []                  # thresholds about 5 dB above the values measured on the CPU (interpret mode) when they were set
+
+
+def check(label, e, lim):
+    if not e < lim:
+        bad.append(f'{label}: {e:.1f} dB (limit {lim} dB)')
+    return e
+
+
 for name in ('fused_rotate_dec_k2', 'fused_rotate_dec_k3', 'fused_final', 'fused_final2', 'fused_final3'):
     _o = getattr(pallas_ffbp, name)
     setattr(pallas_ffbp, name, (lambda o: lambda *a, **k: o(*a, **{**k, 'interpret': True}))(_o))
@@ -30,4 +39,8 @@ for pol in ('fp32_fast', 'fp32_high'):
         re, im = fn(hre, him, arrs)
         out[filt] = np.asarray(re) + 1j * np.asarray(im)
     d = out['pallas2'] - out['dense']
-    print(pol, 'pallas2 (tpu kernels, interpret) vs dense: %.1f dB' % (10 * np.log10(np.sum(np.abs(d) ** 2) / np.sum(np.abs(out['dense']) ** 2))))
+    print(pol, 'pallas2 (tpu kernels, interpret) vs dense: %.1f dB' % check(pol, 10 * np.log10(np.sum(np.abs(d) ** 2) / np.sum(np.abs(out['dense']) ** 2)), -40 if pol == 'fp32_fast' else -90))
+
+if bad:
+    sys.exit('FAILED: ' + '; '.join(bad))
+print('ok')

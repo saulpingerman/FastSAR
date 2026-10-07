@@ -5,6 +5,15 @@ import numpy as np, jax, jax.numpy as jnp
 jax.config.update('jax_platform_name', 'cpu')
 from fastsar.pallas_ffbp import fused_final
 rng = np.random.default_rng(0)
+bad = []                  # thresholds about 5 dB above the values measured on the CPU (interpret mode) when they were set
+
+
+def check(label, e, lim):
+    if not e < lim:
+        bad.append(f'{label}: {e:.1f} dB (limit {lim} dB)')
+    return e
+
+
 B, Pf, Qf, T = 3, 16, 79, 32
 Qpad = 128
 a0, a1 = 2 * 9.6e9 / 3e8, 2 * 1.2e6 / 3e8                      # cycles per metre and per metre per sample
@@ -26,7 +35,7 @@ qvp = np.zeros((1, Qpad), np.float32); qvp[0, :Qf] = qv
 for passes in (1, 3):
     cre, cim = fused_final(jnp.asarray(tre), jnp.asarray(tim), jnp.asarray(gx, jnp.float32), jnp.asarray(gy, jnp.float32), jnp.asarray(qvp), passes=passes, interpret=True)
     out = np.asarray(cre) + 1j * np.asarray(cim)
-    print(f'final kernel passes {passes}: error {10 * np.log10(np.sum(np.abs(out - ref) ** 2) / np.sum(np.abs(ref) ** 2)):.1f} dB')
+    print(f'final kernel passes {passes}: error {check(f"final {passes}", 10 * np.log10(np.sum(np.abs(out - ref) ** 2) / np.sum(np.abs(ref) ** 2)), -48 if passes == 1 else -78):.1f} dB')
 
 # the recurrence version: data transposed (q on rows, p on columns)
 from fastsar.pallas_ffbp import fused_final2
@@ -38,7 +47,7 @@ gyp = np.zeros((B, T, Pl), np.float32); gyp[..., :Pf] = gy
 for passes in (1, 3):
     cre, cim = fused_final2(jnp.asarray(dT.real, jnp.float32), jnp.asarray(dT.imag, jnp.float32), jnp.asarray(gxp), jnp.asarray(gyp), float(a0), float(a1), Qf, passes=passes, interpret=True)
     out = np.asarray(cre) + 1j * np.asarray(cim)
-    print(f'final kernel 2 (recurrence) passes {passes}: error {10 * np.log10(np.sum(np.abs(out - ref) ** 2) / np.sum(np.abs(ref) ** 2)):.1f} dB')
+    print(f'final kernel 2 (recurrence) passes {passes}: error {check(f"final2 {passes}", 10 * np.log10(np.sum(np.abs(out - ref) ** 2) / np.sum(np.abs(ref) ** 2)), -48 if passes == 1 else -84):.1f} dB')
 
 # the stacked-tile version (B = 3 tiles here -> pad to 4)
 from fastsar.pallas_ffbp import fused_final3
@@ -47,4 +56,8 @@ pad = lambda x: np.concatenate([x, np.zeros((Bp - B,) + x.shape[1:], x.dtype)], 
 for passes in (1, 3):
     cre, cim = fused_final3(jnp.asarray(pad(dT.real.astype(np.float32))), jnp.asarray(pad(dT.imag.astype(np.float32))), jnp.asarray(pad(gxp)), jnp.asarray(pad(gyp)), float(a0), float(a1), Qf, passes=passes, interpret=True)
     out = (np.asarray(cre) + 1j * np.asarray(cim))[:B]
-    print(f'final kernel 3 (stacked tiles) passes {passes}: error {10 * np.log10(np.sum(np.abs(out - ref) ** 2) / np.sum(np.abs(ref) ** 2)):.1f} dB')
+    print(f'final kernel 3 (stacked tiles) passes {passes}: error {check(f"final3 {passes}", 10 * np.log10(np.sum(np.abs(out - ref) ** 2) / np.sum(np.abs(ref) ** 2)), -48 if passes == 1 else -84):.1f} dB')
+
+if bad:
+    sys.exit('FAILED: ' + '; '.join(bad))
+print('ok')

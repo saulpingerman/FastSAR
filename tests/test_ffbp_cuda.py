@@ -11,6 +11,7 @@ pos = np.stack([rng.uniform(-25, 25, 40), rng.uniform(-25, 25, 40), np.zeros(40)
 amp = rng.standard_normal(40) + 1j * rng.standard_normal(40)
 S = sim.simulate_brute(col, pos, amp).astype(np.complex64)
 n = 128
+bad = []                       # thresholds about 5 dB above the values measured when they were set (-86, -79 dB)
 for nlev in (2, 3):
     plan = ffbp2.make_plan(col, n, n, 0.5, 0.5, T=16, nlev=nlev, pmax=0.4)
     print('levels', [(l['P'], l['K'], l['Dk'], l['Dp'], l['C']) for l in plan['levels']])
@@ -24,4 +25,10 @@ for nlev in (2, 3):
     form = ffbp_cuda.make_ffbp_cuda(plan, coll)
     img = cp.asnumpy(form(S, ng=2))
     d = img - ref
+    e = 10 * np.log10(np.sum(np.abs(d) ** 2) / np.sum(np.abs(ref) ** 2))
+    if e > -70 or abs(np.abs(img).max() / np.abs(ref).max() - 1) > 1e-3:
+        bad.append(f'nlev {nlev}: {e:.1f} dB')
     print(f'nlev {nlev}: cuda vs dense float32: {10 * np.log10(np.sum(np.abs(d) ** 2) / np.sum(np.abs(ref) ** 2)):.1f} dB, peak ratio {np.abs(img).max() / np.abs(ref).max():.4f}')
+if bad:
+    sys.exit('FAILED: ' + '; '.join(bad))
+print('ok')
