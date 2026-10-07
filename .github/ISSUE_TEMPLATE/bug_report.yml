@@ -1,0 +1,40 @@
+name: Bug report
+description: Something fails, crashes or forms a wrong image
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you ran, what you expected and what you got. Paste the full traceback or warning.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce
+      description: >
+        A short script, ideally on a simulated scene (fastsar.sim) so that no data file is needed.
+        For a real collection, name the public dataset and file.
+      render: python
+  - type: input
+    id: version
+    attributes:
+      label: FastSAR commit
+      placeholder: output of git rev-parse --short HEAD
+    validations:
+      required: true
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Backend
+      options: [cpu, cuda, tpu, jax, auto, not applicable]
+    validations:
+      required: true
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: Device (CPU model, GPU, TPU version), OS, and the Python, numpy, JAX, CuPy and sarpy versions.
+      placeholder: |
+        python -c "import sys, numpy, jax; print(sys.version, numpy.__version__, jax.__version__)"
