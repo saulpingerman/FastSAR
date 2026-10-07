@@ -63,6 +63,15 @@ def rereference(S, fmin, df, dref):
     return (S * np.exp(-4j * np.pi * f[None, :] / C * np.asarray(dref, np.float64)[:, None])).astype(S.dtype)
 
 
+def _opt(m, path, conv=None):
+    """An optional metadata field by dotted path, or None when any part is missing."""
+    for k in path.split('.'):
+        m = getattr(m, k, None)
+        if m is None:
+            return None
+    return conv(m) if conv else m
+
+
 def read_cphd(cphd, sicd=None, channel=0, meta=False, regrid_tol=1e-3, drop_flagged=False, troposphere=False, phase_sign=None):
     """-> dict(S, ant, fmin, df[, nx, ny, spx, spy, e1, e2]) ready for form_image(**d), and with meta=True also a
     dict of tx, rcv [P, 3] and ref [P] (local frame), R (local axes in ECF rows), srp (ECF origin), times (s from the
@@ -223,8 +232,8 @@ def read_cphd(cphd, sicd=None, channel=0, meta=False, regrid_tol=1e-3, drop_flag
                 R=R, origin=origin, srp=s0, sicd_transpose=None if sicd is None else grid['transpose'], tx_time=pv('TxTime')[lo:hi], rcv_time=pv('RcvTime')[lo:hi], pulses=(lo, hi),
                 polarization=None if pol is None else f'{pol.TxPol}{pol.RcvPol}', channel=ch.Identifier,
                 mode=getattr(m.CollectionID.RadarMode, 'ModeType', None),   # None for modes outside the CPHD enumeration (ICEYE: EXPERIMENTAL)
-                notes=notes, start=str(m.Global.Timeline.CollectionStart), collector=m.CollectionID.CollectorName,
-                core_name=m.CollectionID.CoreName)
+                notes=notes, start=_opt(m, 'Global.Timeline.CollectionStart', str),
+                collector=_opt(m, 'CollectionID.CollectorName'), core_name=_opt(m, 'CollectionID.CoreName'))
     return out, info
 
 
