@@ -299,12 +299,17 @@ def _children(kern, pre, pim, c0, sl, lv):
         zre = cp.empty((Np * Cn, Po, Ko), kern['dtype'])
         zim = cp.empty((Np * Cn, Po, Ko), kern['dtype'])
         nout = 16                                        # outputs per block: the input rows must fit in 40 KB
-        while nout > 4 and (2 * ((nout - 1) * Dp + fp['L']) * 64 + fp['L']) * 4 > 40 * 1024:
+        while nout > 4 and (2 * ((nout - 1) * Dp + fp['L']) * 64 + fp['L']) * 4 > 40 * 1024:      # a multiple of 4
             nout -= 4
         rows = (nout - 1) * Dp + fp['L']
+        smem = (2 * rows * 64 + fp['L']) * 4
+        if smem > 48 * 1024:                             # large decimation factors: opt in to more shared memory
+            smax = int(cp.cuda.Device().attributes.get('MaxSharedMemoryPerBlockOptin', 48 * 1024))
+            assert smem <= smax, (Dp, fp['L'], smem, smax)
+            kern['fir_p'].max_dynamic_shared_size_bytes = smem
         kern['fir_p'](((Ko + 63) // 64, (Po + nout - 1) // nout, Np * Cn), (256,),
                       (yre, yim, taps, zre, zim, np.int32(P), np.int32(Ko), np.int32(Po), np.int32(Dp), np.int32(fp['L']), np.int32(fp['pl']), np.int32(nout)),
-                      shared_mem=(2 * rows * 64 + fp['L']) * 4)
+                      shared_mem=smem)
         _mark('fir_p', t0)
         return zre, zim
     return yre, yim
