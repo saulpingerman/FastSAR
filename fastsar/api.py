@@ -155,15 +155,17 @@ class ImageFormer:
             filt = 'pallas2' if self.backend == 'tpu' else 'conv'
             self._pol = pol
             # one compiled program per plan signature: patches of a mosaic with equal shapes and filters share it
+            # (with the device arrays that depend on the plan alone: filters, tile geometry)
             key = (pol, filt, ffbp2.plan_signature(plan))
-            self._fn = _JAX_PROGRAMS.get(key)
-            if self._fn is None:
-                self._fn = ffbp2.make_ffbp(pol, plan, filt, 1 << 26, 'direct', pallas_pb=256, pallas_nc=8, pallas_ng=16,
-                                           pallas_final=2, pallas_gen=3)
+            hit = _JAX_PROGRAMS.get(key)
+            if hit is None:
+                hit = (ffbp2.make_ffbp(pol, plan, filt, 1 << 26, 'direct', pallas_pb=256, pallas_nc=8, pallas_ng=16,
+                                       pallas_final=2, pallas_gen=3), ffbp2.static_arrays(pol, plan, filt))
                 if len(_JAX_PROGRAMS) >= 16:
                     _JAX_PROGRAMS.pop(next(iter(_JAX_PROGRAMS)))
-                _JAX_PROGRAMS[key] = self._fn
-            self._arrs = ffbp2.device_arrays(pol, plan, coll, ffbp2.static_arrays(pol, plan, filt))
+                _JAX_PROGRAMS[key] = hit
+            self._fn, static = hit
+            self._arrs = ffbp2.device_arrays(pol, plan, coll, static)
             if wf is not None:
                 import jax.numpy as jnp
                 self._arrs['final']['w'] = jnp.asarray(wf if wf.ndim == 3 else np.stack([wf, 0 * wf, 0 * wf]))
