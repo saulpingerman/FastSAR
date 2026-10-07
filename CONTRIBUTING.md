@@ -12,8 +12,9 @@ pip install -e ".[io]"          # add cuda on a machine with an Nvidia GPU: ".[c
 ```
 
 or `uv sync`, which installs the versions pinned in `uv.lock`. The CPU backend needs `g++` with OpenMP. Some
-tests need packages that are not dependencies of the library: `finufft` (`tests/test_insar.py`) and `rasterio`
-(only for `products.write_geotiff`).
+tests need packages that are not dependencies of the library: `finufft` (`tests/test_insar.py`), `rasterio`
+(`products.write_geotiff`, `read_dem` and map projections other than latitude/longitude) and `sarkit` (optional
+consistency checks in `tests/test_chain.py`).
 
 ## Running the tests
 
@@ -36,6 +37,7 @@ python tests/test_bp.py            # exact backprojection: backends, bistatic, o
 python tests/test_io.py            # CPHD helpers: frequency resampling, re-referencing, geodetic conversions
 python tests/test_wide_angle.py    # 10 to 360 degree apertures against exact backprojection
 python tests/test_insar.py         # change detection and interferometric height (needs finufft)
+python tests/test_chain.py         # simulated CPHD to geolocation, map GeoTIFFs, SICD and autofocus (needs sarpy)
 ```
 
 `test_autofocus.py` is the only script that takes a backend argument. The others pick the backends this machine

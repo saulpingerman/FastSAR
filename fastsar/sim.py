@@ -98,6 +98,116 @@ def add_noise(S, sigma, rng):
     return S + (sigma / np.sqrt(2.0)) * n
 
 
+
+def enu_axes(lat, lon):
+    """East, north and up unit vectors (rows, ECF) of the ellipsoid at a geodetic latitude and longitude (degrees)."""
+    la, lo = np.radians(lat), np.radians(lon)
+    return np.array([[-np.sin(lo), np.cos(lo), 0.0],
+                     [-np.sin(la) * np.cos(lo), -np.sin(la) * np.sin(lo), np.cos(la)],
+                     [np.cos(la) * np.cos(lo), np.cos(la) * np.sin(lo), np.sin(la)]])
+
+
+def to_ecf(points, lat, lon, height=0.0, heading=0.0):
+    """Points [..., 3] of the simulator's frame (x across track toward the scene, y along track, z up, origin at the
+    scene center) -> ECF, for a scene center at (lat, lon, height) and a track heading in degrees clockwise from
+    north. The frame's ground plane is the ellipsoid's tangent plane there; the radar looks right."""
+    from .io import geodetic_to_ecf
+    h = np.radians(heading)
+    M = np.array([[np.cos(h), np.sin(h), 0.0], [-np.sin(h), np.cos(h), 0.0], [0.0, 0.0, 1.0]])   # columns: x, y in ENU
+    return np.asarray(points, np.float64) @ M.T @ enu_axes(lat, lon) + geodetic_to_ecf(lat, lon, height)
+
+
+def _reference_geometry(arp, varp, srp):
+    """CPHD ReferenceGeometry/Monostatic angles (CPHD 1.0.1, section 6.5.2) of an aperture position and velocity
+    seen from a scene reference point (ECF)."""
+    from .io import ecf_to_geodetic
+    E, N, U = enu_axes(*(float(np.ravel(v)[0]) for v in ecf_to_geodetic(srp)[:2]))
+    r = np.linalg.norm(arp - srp)
+    ua, uv = (arp - srp) / r, varp / np.linalg.norm(varp)
+    look = 1 if np.cross(arp / np.linalg.norm(arp), uv) @ ua < 0 else -1
+    gpy = np.cross(U, ua)
+    gpy /= np.linalg.norm(gpy)
+    gpx = np.cross(gpy, U)
+    spn = look * np.cross(ua, uv)
+    spn /= np.linalg.norm(spn)
+    graze = np.degrees(np.arccos(ua @ gpx))
+    deg = lambda y, x: np.degrees(np.arctan2(y, x)) % 360
+    return dict(SideOfTrack='L' if look == 1 else 'R', SlantRange=r,
+                GroundRange=np.linalg.norm(srp) * np.arccos(arp @ srp / np.linalg.norm(arp) / np.linalg.norm(srp)),
+                DopplerConeAngle=np.degrees(np.arccos(-ua @ uv)), GrazeAngle=graze, IncidenceAngle=90 - graze,
+                AzimuthAngle=deg(gpx @ E, gpx @ N), TwistAngle=-np.degrees(np.arcsin(spn @ gpy)),
+                SlopeAngle=np.degrees(np.arccos(U @ spn)), LayoverAngle=deg(-spn @ E, -spn @ N))
+
+
+def write_cphd(path, col, S, lat, lon, height=0.0, heading=0.0, speed=200.0, srp=None, scene=None, pol='VV',
+               start='2026-01-01T00:00:00.000000Z'):
+    """Write a simulated phase history S [Np, K] (this module's convention: compensated to the scene center, phase
+    exp(-j 4 pi f dR / c)) as a monostatic frequency-domain CPHD 1.0.1 file, placed by to_ecf, with the pulses
+    `speed` m/s apart in time along the track. srp: per-pulse scene reference points [Np, 3] in the simulator's
+    frame for a moving beam (S compensated to them), default the scene center. scene: side (m) of the square image
+    area, default the extent the collection's frequency step leaves unambiguous. Needs sarpy."""
+    from sarpy.io.phase_history.cphd1_elements.CPHD import CPHDType
+    from sarpy.io.phase_history.cphd import CPHDWriter1
+    from .io import ecf_to_geodetic
+    P, K = S.shape
+    ant = np.asarray(col.ant, np.float64)
+    srp = np.zeros_like(ant) if srp is None else np.asarray(srp, np.float64)
+    tx, sr = to_ecf(ant, lat, lon, height, heading), to_ecf(srp, lat, lon, height, heading)
+    s0 = to_ecf(np.zeros(3), lat, lon, height, heading)
+    t = 1.0 + (np.cumsum(np.r_[0.0, np.linalg.norm(np.diff(ant, axis=0), axis=1)]) / speed)
+    vel = np.gradient(tx, t, axis=0)
+    rng = np.linalg.norm(tx - sr, axis=1)
+    half = 0.5 * (C / (2 * col.df) / np.sqrt(2) if scene is None else scene)
+    E, N, U = enu_axes(lat, lon)
+    h = np.radians(heading)
+    ux, uy = np.cos(h) * E - np.sin(h) * N, np.sin(h) * E + np.cos(h) * N      # across and along track
+    corners = [s0 + a * ux + b * uy for a, b in ((-half, -half), (-half, half), (half, half), (half, -half))]
+    ll = lambda x: tuple(float(np.ravel(v)[0]) for v in ecf_to_geodetic(x))
+    g = lambda v: repr(float(v))
+    xyz = lambda tag, v: f'<{tag}><X>{g(v[0])}</X><Y>{g(v[1])}</Y><Z>{g(v[2])}</Z></{tag}>'
+    m = P // 2
+    geom = _reference_geometry(tx[m], vel[m], sr[m])
+    names = ['TxTime', 'TxPos', 'TxVel', 'RcvTime', 'RcvPos', 'RcvVel', 'SRPPos', 'aFDOP', 'aFRR1', 'aFRR2', 'FX1',
+             'FX2', 'TOA1', 'TOA2', 'TDTropoSRP', 'SC0', 'SCSS']
+    pvp, off = [], 0
+    for n in names:
+        size = 3 if n.endswith(('Pos', 'Vel')) else 1
+        pvp.append(f'<{n}><Offset>{off}</Offset><Size>{size}</Size><Format>{"X=F8;Y=F8;Z=F8;" if size == 3 else "F8"}</Format></{n}>')
+        off += size
+    fmin, fmax = col.fmin, col.fmin + (K - 1) * col.df
+    poly = lambda tag, v: f'<{tag} order1="0" order2="0"><Coef exponent1="0" exponent2="0">{g(v)}</Coef></{tag}>'
+    xml = f"""<CPHD xmlns="http://api.nsgreg.nga.mil/schema/cphd/1.0.1">
+<CollectionID><CollectorName>FastSAR simulator</CollectorName><CoreName>SIMULATED</CoreName><CollectType>MONOSTATIC</CollectType>
+<RadarMode><ModeType>{'SPOTLIGHT' if not np.any(srp) else 'STRIPMAP'}</ModeType></RadarMode><Classification>UNCLASSIFIED</Classification><ReleaseInfo>UNRESTRICTED</ReleaseInfo></CollectionID>
+<Global><DomainType>FX</DomainType><SGN>-1</SGN><Timeline><CollectionStart>{start}</CollectionStart><TxTime1>{g(t[0])}</TxTime1><TxTime2>{g(t[-1])}</TxTime2></Timeline>
+<FxBand><FxMin>{g(fmin)}</FxMin><FxMax>{g(fmax)}</FxMax></FxBand><TOASwath><TOAMin>{g(-0.45 / col.df)}</TOAMin><TOAMax>{g(0.45 / col.df)}</TOAMax></TOASwath></Global>
+<SceneCoordinates><EarthModel>WGS_84</EarthModel><IARP>{xyz('ECF', s0)}<LLH><Lat>{g(lat)}</Lat><Lon>{g(lon)}</Lon><HAE>{g(height)}</HAE></LLH></IARP>
+<ReferenceSurface><Planar>{xyz('uIAX', ux)}{xyz('uIAY', uy)}</Planar></ReferenceSurface>
+<ImageArea><X1Y1><X>{g(-half)}</X><Y>{g(-half)}</Y></X1Y1><X2Y2><X>{g(half)}</X><Y>{g(half)}</Y></X2Y2></ImageArea>
+<ImageAreaCornerPoints>{''.join(f'<IACP index="{k + 1}"><Lat>{g(ll(c)[0])}</Lat><Lon>{g(ll(c)[1])}</Lon></IACP>' for k, c in enumerate(corners))}</ImageAreaCornerPoints></SceneCoordinates>
+<Data><SignalArrayFormat>CF8</SignalArrayFormat><NumBytesPVP>{8 * off}</NumBytesPVP><NumCPHDChannels>1</NumCPHDChannels>
+<Channel><Identifier>{pol}</Identifier><NumVectors>{P}</NumVectors><NumSamples>{K}</NumSamples><SignalArrayByteOffset>0</SignalArrayByteOffset><PVPArrayByteOffset>0</PVPArrayByteOffset></Channel><NumSupportArrays>0</NumSupportArrays></Data>
+<Channel><RefChId>{pol}</RefChId><FXFixedCPHD>true</FXFixedCPHD><TOAFixedCPHD>true</TOAFixedCPHD><SRPFixedCPHD>{'false' if np.any(srp) else 'true'}</SRPFixedCPHD>
+<Parameters><Identifier>{pol}</Identifier><RefVectorIndex>{m}</RefVectorIndex><FXFixed>true</FXFixed><TOAFixed>true</TOAFixed><SRPFixed>{'false' if np.any(srp) else 'true'}</SRPFixed>
+<Polarization><TxPol>{pol[0]}</TxPol><RcvPol>{pol[1]}</RcvPol></Polarization><FxC>{g(0.5 * (fmin + fmax))}</FxC><FxBW>{g(fmax - fmin)}</FxBW><TOASaved>{g(0.9 / col.df)}</TOASaved>
+<DwellTimes><CODId>COD</CODId><DwellId>DWELL</DwellId></DwellTimes></Parameters></Channel>
+<PVP>{''.join(pvp)}</PVP>
+<Dwell><NumCODTimes>1</NumCODTimes><CODTime><Identifier>COD</Identifier>{poly('CODTimePoly', 0.5 * (t[0] + t[-1]))}</CODTime>
+<NumDwellTimes>1</NumDwellTimes><DwellTime><Identifier>DWELL</Identifier>{poly('DwellTimePoly', t[-1] - t[0])}</DwellTime></Dwell>
+<ReferenceGeometry><SRP>{xyz('ECF', sr[m])}{xyz('IAC', (sr[m] - s0) @ np.stack([ux, uy, U]).T)}</SRP><ReferenceTime>{g(t[m] + rng[m] / C)}</ReferenceTime>
+<SRPCODTime>{g(0.5 * (t[0] + t[-1]))}</SRPCODTime><SRPDwellTime>{g(t[-1] - t[0])}</SRPDwellTime><Monostatic>{xyz('ARPPos', tx[m])}{xyz('ARPVel', vel[m])}
+<SideOfTrack>{geom.pop('SideOfTrack')}</SideOfTrack>{''.join(f'<{k}>{g(v)}</{k}>' for k, v in geom.items())}</Monostatic></ReferenceGeometry>
+</CPHD>"""
+    meta = CPHDType.from_xml_string(xml)
+    v = np.zeros(P, meta.PVP.get_vector_dtype())
+    v['TxTime'], v['TxPos'], v['TxVel'] = t, tx, vel
+    v['RcvTime'], v['RcvPos'], v['RcvVel'] = t + 2 * rng / C, tx, vel
+    v['SRPPos'], v['FX1'], v['FX2'], v['SC0'], v['SCSS'] = sr, fmin, fmax, fmin, col.df
+    v['TOA1'], v['TOA2'] = -0.45 / col.df, 0.45 / col.df
+    with CPHDWriter1(path, meta, check_existence=False) as w:
+        w.write_file({pol: v}, {pol: np.asarray(S, np.complex64)})
+
+
 # ---------------------------------------------------------------- scenes
 
 def change_mask(x, y, scene, part='all'):

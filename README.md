@@ -62,6 +62,11 @@ import fastsar
 
 out = fastsar.form_cphd('scene_CPHD.cphd')          # any mode: spotlight, stripmap, sliding spotlight
 img = out['image']                                  # ground-plane grid: out['origin'], out['e1'], out['e2'], spacing
+
+from fastsar import products
+lat, lon, h = products.geolocate(out, i, j, height=0.0)                 # pixel -> ground (and products.locate back)
+products.write_geotiff('amp.tif', **products.geocode_image(out))       # amplitude on a UTM map grid
+products.write_sicd('scene.nitf', out)                                  # complex image with its geometry
 ```
 
 `form_cphd` picks the mode, window and grid from the file (or from the vendor's SICD with `sicd=`). For control over

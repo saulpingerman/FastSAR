@@ -49,7 +49,9 @@ at the height of the scene reference point (the SICD's scene center point, else 
 point; `height=` overrides it). A spotlight is formed as one image by factorized backprojection; a moving beam as a
 mosaic of range-gated patches, each pixel weighted by a Hann window over the azimuth band around its beam center
 (the SICD's processed band, else 0.8 of the band the PRF samples). The result carries the image, its origin, axes
-and spacing in `read_cphd`'s local frame, the mode, and the reader's notes.
+and spacing in `read_cphd`'s local frame, the mode, and the reader's notes. `autofocus=True` runs phase gradient
+autofocus on a spotlight (two rounds, three image formations). The products in [products.md](products.md) take the
+result directly: latitude and longitude of pixels, map GeoTIFFs and SICD.
 
 Checks against the vendors' SICD images, on 600 m grids around the scene center (correlation over 256 by 256 vendor
 pixels, with the vendor pixels projected to the grid's height):
