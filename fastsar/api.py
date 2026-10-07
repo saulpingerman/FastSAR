@@ -186,7 +186,7 @@ class ImageFormer:
             S = S.astype(np.complex64, copy=False)
         if self.backend == 'cuda':
             import cupy as cp
-            return cp.asnumpy(self._form(cp.asarray(S), ng=8)).astype(np.complex64)
+            return cp.asnumpy(self._form(S)).astype(np.complex64, copy=False)       # a host S may stream (ffbp_cuda)
         if self.backend == 'cpu':
             return self._form(S).astype(np.complex64, copy=False)
         from . import ffbp2

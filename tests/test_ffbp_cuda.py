@@ -29,6 +29,15 @@ for nlev in (2, 3):
     if e > -70 or abs(np.abs(img).max() / np.abs(ref).max() - 1) > 1e-3:
         bad.append(f'nlev {nlev}: {e:.1f} dB')
     print(f'nlev {nlev}: cuda vs dense float32: {10 * np.log10(np.sum(np.abs(d) ** 2) / np.sum(np.abs(ref) ** 2)):.1f} dB, peak ratio {np.abs(img).max() / np.abs(ref).max():.4f}')
+    # the first level streamed from the host in blocks of 97 pulses (as for a history larger than the device memory)
+    os.environ['FASTSAR_CUDA_STREAM'] = '1'
+    keep, ffbp_cuda.STREAM_PULSES = ffbp_cuda.STREAM_PULSES, 97
+    img_s = cp.asnumpy(form(S, ng=2))
+    os.environ.pop('FASTSAR_CUDA_STREAM'); ffbp_cuda.STREAM_PULSES = keep
+    es = 10 * np.log10(np.sum(np.abs(img_s - img) ** 2) / np.sum(np.abs(img) ** 2))
+    if es > -100:
+        bad.append(f'nlev {nlev} streamed: {es:.1f} dB')
+    print(f'nlev {nlev}: streamed first level vs in memory: {es:.1f} dB')
 if bad:
     sys.exit('FAILED: ' + '; '.join(bad))
 print('ok')

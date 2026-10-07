@@ -354,6 +354,10 @@ def _children(kern, pre, pim, c0, sl, lv):
     return yre, yim
 
 
+STREAM_PULSES = 4096       # pulses per uploaded block when the first level streams a host phase history
+STREAM_FRACTION = 0.3      # stream when the history exceeds this fraction of the free device memory
+
+
 def _device_phases(la, refs, lv):
     """Band-centre phase and slope of every child of every parent (float64 on the device): refs [Np, 3] ->
     c0, slope [Np, C, P] float32. Same formula as ffbp2.device_phases."""
@@ -501,25 +505,73 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
 
     ox, oy, nx, ny = plan['ox'], plan['oy'], plan['nx'], plan['ny']
 
-    def form(S, ng=8):
-        """S [P, K] complex64 (host or device, already windowed) -> complex64 image [nx, ny] on the device."""
-        S = cp.asarray(S)
-        scale = float(cp.abs(S).max())
-        pre = cp.ascontiguousarray((S.real / scale).astype(kern['dtype']))[None]
-        pim = cp.ascontiguousarray((S.imag / scale).astype(kern['dtype']))[None]
+    def level0_streamed(S, scale, c0, sl, lv):
+        """The first level from a host phase history S [P, K] too large for the device: pulse blocks (with the
+        pulse filter's halo) are uploaded, rotated and range-filtered, and pulse-filtered into their output rows.
+        c0, sl [1, ng, P] (device) -> [ng, Po, Ko] planes."""
+        P_, K_ = S.shape
+        ngc, Po, Ko = c0.shape[1], lv['Po'], lv['Ko']
+        Dp = lv['Dp']
+        fp = lv['fir_p'] if Dp > 1 else dict(L=1, pl=0, kern=np.ones(1))
+        L, pl = fp['L'], fp['pl']
+        zre = cp.empty((ngc, Po, Ko), kern['dtype']); zim = cp.empty((ngc, Po, Ko), kern['dtype'])
+        nb = max(1, (STREAM_PULSES - L) // Dp + 1)                    # output rows per block
+        for i0 in range(0, Po, nb):
+            i1 = min(Po, i0 + nb)
+            p0, p1 = Dp * i0 - pl, Dp * (i1 - 1) - pl + L               # input pulses read by these outputs
+            a, b = max(p0, 0), min(p1, P_)
+            blk = cp.zeros((p1 - p0, K_), cp.complex64)
+            if b > a:
+                blk[a - p0:b - p0] = cp.asarray(S[a:b])
+            pre = cp.ascontiguousarray((blk.real / scale).astype(kern['dtype']))[None]
+            pim = cp.ascontiguousarray((blk.imag / scale).astype(kern['dtype']))[None]
+            del blk
+            cb = cp.zeros((1, ngc, p1 - p0), cp.float32); sb = cp.zeros((1, ngc, p1 - p0), cp.float32)
+            if b > a:
+                cb[:, :, a - p0:b - p0] = c0[:, :, a:b]; sb[:, :, a - p0:b - p0] = sl[:, :, a:b]
+            # the block's outputs read its rows D j + r (j < i1 - i0); with D = 1 the rows are the outputs
+            y = _children(kern, pre, pim, cb, sb, dict(lv, P=p1 - p0, Po=i1 - i0, fir_p=dict(fp, pl=0, n_out=i1 - i0)))
+            zre[:, i0:i1], zim[:, i0:i1] = y[0], y[1]
+            del pre, pim, y
+        return zre, zim
+
+    def form(S, ng=None):
+        """S [P, K] complex64 (host or device, already windowed) -> complex64 image [nx, ny] on the device. A host
+        history larger than STREAM_FRACTION of the free device memory is streamed through the first level in pulse
+        blocks (FASTSAR_CUDA_STREAM=1 forces it). ng: first-level children per group (default: up to 8, within a
+        quarter of the free memory)."""
         lv0, la0 = levels[0], dev[0]
+        free = cp.cuda.Device().mem_info[0]
+        stream = isinstance(S, np.ndarray) and (S.nbytes > STREAM_FRACTION * free or os.environ.get('FASTSAR_CUDA_STREAM') == '1')
+        isz = 2 * np.dtype(kern['dtype']).itemsize
+        if ng is None:
+            per = isz * lv0['Ko'] * (lv0['Po'] + (STREAM_PULSES if stream else lv0['P']))
+            ng = int(max(1, min(8, (0.25 * free) // per)))
+        if stream:
+            scale = 1.0
+            if kern['dtype'] != cp.float32:          # float16 storage: scale to the peak (on the host, in row blocks)
+                scale = max(float(np.abs(S[i:i + 4096]).max()) for i in range(0, S.shape[0], 4096))
+        else:
+            S = cp.asarray(S)
+            scale = float(cp.abs(S).max())
+            pre = cp.ascontiguousarray((S.real / scale).astype(kern['dtype']))[None]
+            pim = cp.ascontiguousarray((S.imag / scale).astype(kern['dtype']))[None]
+            del S
         full = cp.empty((plan['Nx'], plan['Ny']), cp.complex64)
         for g0 in range(0, G, ng):
             gs = list(range(g0, min(G, g0 + ng)))
             c0 = cp.ascontiguousarray(la0['c0'][0, gs][None])
             sl = cp.ascontiguousarray(la0['slope'][0, gs][None])
-            A, Bm = _children(kern, pre, pim, c0, sl, lv0)                           # [ng, Po, Ko]
+            if stream:
+                A, Bm = level0_streamed(S, scale, c0, sl, lv0)
+            else:
+                A, Bm = _children(kern, pre, pim, c0, sl, lv0)                       # [ng, Po, Ko]
             for k, g in enumerate(gs):
                 re, im = one_tile(A[k], Bm[k], g)
                 x, y = g // sy0, g % sy0
                 full[x * mx:(x + 1) * mx, y * my:(y + 1) * my] = re + 1j * im
             del A, Bm
-        return full[ox:ox + nx, oy:oy + ny] * np.float32(scale)
+        return full[ox:ox + nx, oy:oy + ny] if scale == 1.0 else full[ox:ox + nx, oy:oy + ny] * np.float32(scale)
 
     return form
 
