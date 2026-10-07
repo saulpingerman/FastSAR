@@ -1,113 +1,88 @@
 # API reference
 
-Public functions and classes, by module. Arrays are numpy unless stated. Positions are in meters in the local frame
-of `io.read_cphd` (x along track, y along ground range away from the radar, z up). The docstrings give every
-argument.
+`...` marks keywords the docstrings describe. Positions are in meters in `io.read_cphd`'s local frame
+([real-data.md](real-data.md#reading-cphd)). Invalid inputs raise `ValueError` or `TypeError`.
 
-## Top level (`fastsar`)
+## `fastsar`
 
 - `form_cphd(cphd, sicd=None, mode='auto', backend='auto', window=True, spacing=None, channel=0, patch=1024,
-  azimuth_fraction=0.8, extent=None, height=None, precision='float32', target_db=-40.0, info=None)`:
-  forms the image of a CPHD file in one call. `mode`: `'auto'`, `'spotlight'` or `'moving'`. `sicd`: path,
-  `.xml` metadata or sarpy SICDType, optional. `spacing`, `extent`: (along track, across track) in meters.
-  `height`: grid height above the ellipsoid. Returns a dict with `image` [nx, ny] complex64, `origin` (pixel
-  (0, 0)), `e1`, `e2`, `spx`, `spy`, `mode`, `meta` and `notes`.
+  azimuth_fraction=0.8, extent=None, height=None, precision='float32', target_db=-40.0, info=None,
+  autofocus=False)`: the image of a CPHD file ([processing-chain.md](processing-chain.md#2-form)). `mode`:
+  `'auto'`, `'spotlight'`, `'moving'`. `sicd`: path, `.xml` or sarpy SICDType. `spacing`, `extent`: (along, across
+  track) in m. `height`: grid height above the ellipsoid. Returns a dict: `image` [nx, ny] complex64, `origin`
+  (pixel (0, 0)), `e1`, `e2`, `spx`, `spy`, `mode`, `band` (first and last frequency), `bandwidth` (spatial
+  frequency support along e1, e2), `window`, `phase_error` (or None), `meta` (from `read_cphd`), `notes`.
 - `form_image(S, ant, fmin, df, nx, ny, spx, spy, e1, e2, algorithm='ffbp', backend='auto', precision='float32',
-  window=True, T='auto', levels=3, pmax=0.4, pfa_guard=300.0, target_db=-40.0)`: forms a spotlight image
-  [nx, ny] complex64 on a grid centered on the frame origin. `algorithm`: `'ffbp'` or `'pfa'`.
-- `ImageFormer(ant, fmin, df, K, nx, ny, spx, spy, e1, e2, backend='auto', precision='float32', window=True,
-  T='auto', levels=3, pmax=0.4, target_db=-40.0, aperture_weight=None)`: plans and compiles factorized
-  backprojection once for one geometry; `former(S)` forms each image. Attributes `T`, `predicted_error_db`.
-  `aperture_weight(points, pulses) -> W [n, m]` weights pulses per pixel in the final stage.
-- `backproject(S, ant, fmin, df, points, rcv=None, ref=None, backend='auto', upsample=8, window=True,
-  chunk=256)`: exact backprojection at any points [..., 3]. `rcv`: receiver positions (bistatic). `ref`: per-pulse
-  reference ranges for a moving reference point.
-- `plane_points(nx, ny, spx, spy, e1, e2, height=None)`: the points [nx, ny, 3] of the `form_image` grid,
-  optionally lifted by a height map.
-- `available_backends()`: the backends this machine can run, in the order `'auto'` tries them.
+  window=True, T='auto', ..., target_db=-40.0)`: a spotlight image on a grid centered on the frame origin
+  ([algorithms.md](algorithms.md)). `algorithm`: `'ffbp'` or `'pfa'`.
+- `ImageFormer(ant, fmin, df, K, nx, ny, spx, spy, e1, e2, backend='auto', precision='float32', ...,
+  aperture_weight=None)`: plans and compiles once; `former(S)` forms each image. Attributes `T`,
+  `predicted_error_db`. `aperture_weight(points, pulses) -> W [n, m]` weights pulses per pixel.
+- `backproject(S, ant, fmin, df, points, rcv=None, ref=None, backend='auto', upsample=8, window=True, chunk=256)`:
+  exact backprojection at points [..., 3]; `rcv` for bistatic, `ref` for per-pulse reference ranges.
+- `plane_points(nx, ny, spx, spy, e1, e2, height=None)`: the `form_image` grid as points [nx, ny, 3].
+  `available_backends()`: backends this machine runs, in `'auto'` order.
 
 Backends: `'cpu'`, `'cuda'`, `'tpu'`, `'jax'`, `'auto'`. Precision: `'float32'`, `'float16'` (CUDA),
-`'single-pass'`, `'three-pass'` (TPU). See [precision.md](precision.md).
+`'single-pass'`, `'three-pass'` (TPU) ([precision.md](precision.md)).
 
 ## `fastsar.io`
 
 - `read_cphd(cphd, sicd=None, channel=0, meta=False, regrid_tol=1e-3, drop_flagged=False, troposphere=False,
-  phase_sign=None)`: reads a frequency-domain CPHD channel into `dict(S, ant, fmin, df)`, plus the SICD grid
-  `nx, ny, spx, spy, e1, e2` when `sicd` is given. `channel`: index, identifier or polarization. With `meta=True`
-  also returns `tx`, `rcv`, `ref`, `R`, `origin`, `srp`, `tx_time`, `rcv_time`, `pulses`, `polarization`,
-  `channel`, `mode` and `notes`.
+  phase_sign=None)`: one channel as `dict(S, ant, fmin, df)`, plus `nx, ny, spx, spy, e1, e2` with a SICD.
+  `channel`: index, identifier or polarization. `meta=True` also returns `tx`, `rcv`, `ref`, `R`, `origin`, `srp`,
+  `tx_time`, `rcv_time`, `pulses`, `polarization`, `channel`, `mode`, `start`, `collector`, `core_name`, `notes`.
 - `sicd_points(sicd, rows, cols, meta, hae=None)`: local positions of SICD pixels on any grid type.
-- `local_to_ecf(points, meta)`, `ecf_to_local(points, meta)`: frame conversions.
-- `ecf_to_geodetic(ecf)`, `geodetic_to_ecf(lat, lon, h)`: WGS-84 conversions (degrees, meters).
-- `rereference(S, fmin, df, dref)`: moves each pulse's motion-compensation point by `dref` meters of range.
-
-## `fastsar.patches` (long apertures and any track)
-
-- `form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1, e2, patch=(128, 128), crop=0, beam=None, umax=1.0,
-  awin=None, pulses=None, margin=None, guard=None, backend='cpu', T='auto', levels='auto', target_db=-40.0,
-  sub='auto', wtol_db=None, exact=False, info=None)`: image [nx, ny] on the grid `origin + i spx e1 + j spy e2`,
-  formed patch by patch. `fx`: `dict(S, fmin, df, ref, band)`. `beam(idx, points) -> u`: normalized azimuth
-  coordinate; pulses with |u| <= `umax` serve a patch. `awin`: azimuth window (`stripmap.window` names).
-  `exact=True`: exact backprojection per patch.
-- `form_stripmap(data, p, compressed=False, rwin=None, awin=None, umax=1.0, rows=None, cols=None, patch=(128, 128),
-  crop=0, backend='cpu', **kw)`: patch mosaic of straight-track echoes on the zero-Doppler grid; returns
-  `(image, r, x)`.
-- `echoes_to_fx(data, p, compressed=False, rwin=None)`: time-domain echoes to a frequency-domain phase history
-  with per-pulse reference ranges.
-- `stripmap_beam(p, ant, direction=(1, 0, 0))`: the `beam` function of a stripmap antenna on any track.
-- `straight_track(p, height=0.0)`, `simulate(p, ant, targets, amp=None, beam=None)`,
-  `backproject(data, p, ant, points, ...)`: track, simulator and float64 reference for any track.
-- `range_profiles(fx, guard=None)`, `patch_history(fx, ant, center, pts, lo, hi, margin=None, guard=None,
-  prof=None)`: the shared range profiles and one patch's gated phase history.
-- `tile_plan(...)`, `beam_span(beam, P, pts, umax, step=64)`, `weight_terms(W, wtol_db=-50.0, most=8)`,
-  `fill_gaps(a)`: final tile choice, pulse span, separable weight terms, dropped-pulse filling.
-- `report_timing()`: the step times collected with `FASTSAR_TIMING=1`, as text.
-
-## `fastsar.stripmap` (straight-track stripmap)
-
-- `make_params(fc=9.6e9, B=100e6, Tp=2e-6, fs=125e6, prf=650.0, v=200.0, r0=5000.0, La=1.5, beamwidth_deg=None,
-  squint_deg=0.0, swath=200.0, na=1024, pattern='sinc2', extent=None)`: a `StripParams` with airborne X-band
-  defaults.
-- `simulate(p, targets, amp=None)`: raw echoes of point targets at (x, zero-Doppler range).
-- `focus_stripmap(data, p, algorithm='omegak', compressed=False, rows=None, cols=None, **kw)`: focuses with
-  `'omegak'`, `'rda'` or `'bp'`; returns `(image, r, x)`. Keywords `rwin`, `awin`, `umax`, `r_ref`, `dtype`,
-  `taps`, `src`.
-- `omegak(...)`, `rda(...)`, `backproject(...)`: the three algorithms called directly.
-- `window(spec)`: window function from `None`, `'taylor'`, `'hann'`, `'kaiser'`, a tuple or a callable.
-- `range_compress`, `matched_filter`, `axes`, `doppler`, `pattern`, `resolution`, `irf_width`: helpers.
-
-## `fastsar.burst` (ScanSAR and TOPS)
-
-- `make_bursts(mode='tops', nburst=1, n=None, gap=None, kpsi=None, alpha=0.25, subswaths=None, el_width=None,
-  **kw)`: a list of `BurstParams`.
-- `simulate(bp, targets, amp=None)`: one burst's echoes.
-- `focus_burst(raw, bp, algorithm='omegak', compressed=False, rwin=None, awin=None, umax=1.0, r_ref=None,
-  dtype='float32', taps=16, up=None, margin=32)`: focuses one burst; returns `(image, r, x)`.
-- `mosaic(images, bursts, r_ref=None, umax=1.0)`: combines burst images of one subswath.
-- `backproject`, `coverage`, `resolution`, `upsampling`, `elevation`: reference and helpers.
-
-## `fastsar.autofocus`
-
-- `autofocus(S, ant, fmin, df, nx, ny, spx, spy, e1, e2, rounds=2, pga_kwargs=None, **form_kwargs)`: forms,
-  estimates and removes a per-pulse phase error; returns `(image, phi)`.
-- `pga(img, iterations=20, ...)`: phase gradient autofocus on an image in the polar-format convention.
-- `deramp_phase(ant, fmin, df, K, nx, ny, spx, spy, e1, e2)`, `pulse_bins(ant, fmin, df, K, nx, spx, e1)`:
-  the deramp phase and the azimuth bin of each pulse.
+- `local_to_ecf(points, meta)`, `ecf_to_local(points, meta)`, `ecf_to_geodetic(ecf)`, `geodetic_to_ecf(lat, lon,
+  h)`: frame and WGS-84 conversions (degrees, meters).
+- `rereference(S, fmin, df, dref)`: moves each pulse's reference point by `dref` m of range.
 
 ## `fastsar.products`
 
-- `multilook(img, la=1, lr=1)`, `to_db(power, floor=1e-30)`: detected power and decibels.
-- `interferogram(a, b, la=1, lr=1)`, `coherence(a, b, w1=5, w2=5)`, `pauli(hh, hv, vv, vh=None, la=1, lr=1)`:
-  interferometric, change detection and polarimetric products.
+- `multilook(img, la=1, lr=1)`, `to_db(power)`, `interferogram(a, b, la=1, lr=1)`, `coherence(a, b, w1=5, w2=5)`,
+  `pauli(hh, hv, vv, vh=None, ...)`.
+- `geolocate(out, i, j, height=None, iterations=10, tol=1e-4)`: latitude, longitude, ellipsoid height of pixels of
+  a `form_cphd` output, on the image plane or on a surface (number or `dem(lat, lon)`).
+- `locate(out, lat, lon, height=0.0)`: fractional pixel coordinates [..., 2] of ground points.
+- `geocode_image(out, data=None, spacing=None, crs=None, height=None, order=1)`: data on a north-up map grid (default
+  the scene's UTM zone) as `dict(data, transform, crs)`, the arguments of `write_geotiff`.
+- `read_dem(path, offset=0.0)`: a DEM GeoTIFF as `dem(lat, lon)`; `offset` adds the geoid height.
 - `project(points, ant, nx, ny, spx, spy, e1, e2)`, `sample(img, ij, order=1)`, `geocode(img, grid, ant, points,
-  order=1)`: range-Doppler projection, sampling and terrain-corrected geocoding.
-- `write_sicd(path, img, template, transpose=None)`, `write_geotiff(path, data, transform, crs='EPSG:4326',
-  nodata=nan)`: output (sarpy, rasterio).
+  order=1)`: the same model on a `form_image` grid.
+- `write_sicd(path, out)`, `write_sicd(path, img, template, transpose=None)`: SICD of a `form_cphd` output, or of
+  an image on a template SICD's grid. `sicd_meta(out)`: the metadata and the SICD-ordered array.
+- `write_geotiff(path, data, transform, crs='EPSG:4326', nodata=nan)`: [rows, cols] or [bands, rows, cols].
 
-## `fastsar.quality` and `fastsar.sim`
+SICD needs sarpy; GeoTIFFs, DEMs and map projections other than `EPSG:4326` need rasterio.
 
-- `quality.point_target(img, ij, d_az=1.0, d_rg=1.0, half=32, up=16)`: resolution, PSLR, ISLR and peak of a point
-  target.
-- `quality.upsample(patch, up=16)`: band-limited upsampling.
-- `sim.make_collect(...)`, `sim.simulate(col, pos, amp)`: a simulated spotlight collection for tests (needs
-  finufft).
+## `fastsar.autofocus`
+
+- `autofocus(S, ant, fmin, df, nx, ny, spx, spy, e1, e2, rounds=2, pga_kwargs=None, **form_kwargs)`: returns
+  `(image, phi)`, phi per pulse. `pga(img, ...)` works on an image in the polar-format convention; `deramp_phase`
+  and `pulse_bins` support it.
+
+## `fastsar.patches`
+
+- `form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1, e2, patch=(128, 128), beam=None, umax=1.0, awin=None, ...,
+  backend='cpu', exact=False, ...)`: image on the grid `origin + i spx e1 + j spy e2`. `fx`: `dict(S, fmin, df,
+  ref, band)`. `beam(idx, points) -> u`: normalized azimuth coordinate; pulses with |u| <= `umax` serve a patch.
+- `form_stripmap(data, p, ...)`: mosaic of straight-track echoes; returns `(image, r, x)`.
+- `echoes_to_fx`, `stripmap_beam`, `straight_track`, `simulate`, `backproject`; the mosaic steps `range_profiles`,
+  `patch_history`, `tile_plan`, `beam_span`, `weight_terms`, `fill_gaps`; `report_timing()` (with
+  `FASTSAR_TIMING=1`).
+
+## `fastsar.stripmap`, `fastsar.burst`
+
+- `stripmap.make_params(...)` (X-band airborne defaults), `stripmap.simulate(p, targets, amp=None)`,
+  `stripmap.focus_stripmap(data, p, algorithm='omegak', ...)` with `'omegak'`, `'rda'` or `'bp'`, returning
+  `(image, r, x)`; also `omegak`, `rda`, `backproject`, `window(spec)`.
+- `burst.make_bursts(mode='tops', nburst=1, ...)`, `burst.simulate(bp, targets, amp=None)`,
+  `burst.focus_burst(raw, bp, algorithm='omegak', ...)` returning `(image, r, x)`, `burst.mosaic(images, bursts,
+  ...)`.
+
+## `fastsar.quality`, `fastsar.sim`
+
+- `quality.point_target(img, ij, d_az=1.0, d_rg=1.0, ...)`: resolution, PSLR, ISLR, peak. `quality.upsample`.
+- `sim.make_collect(...)`, `sim.simulate(col, pos, amp)` (needs finufft), `sim.simulate_brute(col, pos, amp)`.
+- `sim.write_cphd(path, col, S, lat, lon, height=0.0, heading=0.0, ...)`: a simulated collection as a CPHD 1.0.1
+  file placed on the Earth. `sim.to_ecf(points, lat, lon, height=0.0, heading=0.0)`.
