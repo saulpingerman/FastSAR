@@ -67,8 +67,7 @@ pixels, with the vendor pixels projected to the grid's height):
 
 Amplitude correlation pixel by pixel is limited by speckle wherever the two processors' windows or azimuth bands
 differ; the averaged intensity measures whether the same structure appears in the same place. The sliding spotlight
-image is offset from the vendor's by about two pixels; FastSAR's own image of it agrees with a float64 exact
-backprojection over the same aperture to -62 dB.
+is the collection of the section below: correct near the scene center only.
 
 ## Umbra spotlight
 
@@ -129,14 +128,16 @@ SGN = -1: with the declared sign the images do not focus or do not match the ven
 0.05). `read_cphd` therefore takes SGN = -1 for Capella collectors and records this in `notes`. Pass
 `phase_sign=+1` or `-1` to override.
 
-### Capella dynamic stripmap: not supported
+### Capella dynamic stripmap: scene center only
 
-A Capella dynamic stripmap (sliding spotlight) collection of 2022 is not supported. Its CPHD declares a valid
-delay window (TOA1 to TOA2) 2,962 m long and 4.1 to 7.1 km beyond the scene reference point, while its frequency
-spacing (114.3 kHz) gives an unambiguous range of 1,311 m. The samples cannot hold that window as a plain
-frequency-domain phase history, so the file follows a convention FastSAR does not model, and `read_cphd` warns.
-Exact backprojection matches the vendor's image near the scene center only after a 2-pixel registration
-(amplitude correlation 0.40 to 0.51 on low-contrast terrain) and fails near the edge of the swath.
+A Capella dynamic stripmap (sliding spotlight) collection of 2022 forms correctly only near the scene center. Its
+CPHD declares a valid delay window (TOA1 to TOA2) 2,962 m long and 4.1 to 7.1 km beyond the scene reference point,
+while its frequency spacing (114.3 kHz) gives an unambiguous range of 1,311 m. The samples cannot hold that window
+as a plain frequency-domain phase history, so the file follows a convention FastSAR does not model, and `read_cphd`
+warns. Near the scene center `form_cphd` and exact backprojection match the vendor's image after a 2-pixel
+registration (intensity correlation 0.75 after 5 by 5 averaging); near the edge of the swath they fail. FastSAR's
+mosaic agrees with a float64 backprojection of the same samples to -62 dB, which checks consistency, not the
+convention.
 
 ## ICEYE dwell spotlight
 
