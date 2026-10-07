@@ -8,7 +8,7 @@ kernel or the public API, so the approach can be agreed before the code is writt
 ```bash
 git clone https://github.com/saulpingerman/FastSAR
 cd FastSAR
-pip install -e ".[io]"          # add cuda on a machine with an Nvidia GPU: ".[cuda,io]"
+pip install -e ".[io,test]"     # add cuda on a machine with an Nvidia GPU: ".[cuda,io,test]"
 ```
 
 or `uv sync`, which installs the versions pinned in `uv.lock`. The CPU backend needs `g++` with OpenMP. Some

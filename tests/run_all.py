@@ -3,8 +3,9 @@
     python tests/run_all.py                    # all scripts, 600 s each
     python tests/run_all.py -t 180 api units   # the scripts whose names contain 'api' or 'units'
 
-A script that needs hardware or a package this machine lacks (a GPU with CuPy, a TPU, finufft, rasterio) is reported
-as SKIP with the reason. --max-rss-gb stops a script whose resident memory (with its children) exceeds the limit, so
+A script whose test package is missing (install them with `pip install -e ".[io,test]"`) fails. A script that needs
+hardware this machine lacks (a GPU with CuPy, a TPU) is reported as SKIP; `--require cuda,tpu` makes that a failure
+too, for runs on those machines. Scripts that test every backend the machine has also cover CUDA and TPU there. --max-rss-gb stops a script whose resident memory (with its children) exceeds the limit, so
 a runaway test fails instead of exhausting the machine. Each script's output is printed after it finishes (all of it
 with -v, else the last lines of a failure).
 """
@@ -17,7 +18,9 @@ ROOT = os.path.dirname(HERE)
 NEEDS = {
     'test_ffbp_cuda.py': ('cuda',),
     'test_insar.py': ('finufft',),
+    'test_chain.py': ('sarpy', 'rasterio'),
 }
+HARDWARE = ('cuda', 'tpu')
 
 
 def _have(need):
@@ -97,6 +100,7 @@ def main():
     ap.add_argument('--max-rss-gb', type=float, default=float(os.environ.get('FASTSAR_TEST_MAX_GB', 6.0)),
                     help='resident memory limit per script (default 6, or FASTSAR_TEST_MAX_GB)')
     ap.add_argument('-v', '--verbose', action='store_true', help='print the full output of every script')
+    ap.add_argument('--require', default='', help='hardware that must be present, e.g. cuda,tpu (absent: failure)')
     a = ap.parse_args()
     scripts = sorted(glob.glob(os.path.join(HERE, 'test_*.py')))
     if a.names:
@@ -104,10 +108,13 @@ def main():
     rows = []
     for s in scripts:
         name = os.path.basename(s)
-        why = next((r for r in map(_have, NEEDS.get(name, ())) if r), None)
+        need = NEEDS.get(name, ())
+        why = next((r for r in map(_have, need) if r), None)
         if why:
-            print(f'SKIP  {name}: {why}', flush=True)
-            rows.append((name, 'SKIP', 0.0, 0))
+            hw = all(n in HARDWARE for n in need) and not any(n in a.require.split(',') for n in need)
+            status = 'SKIP' if hw else f'FAIL ({why}; pip install -e ".[io,test]")' if not any(n in HARDWARE for n in need) else f'FAIL ({why})'
+            print(f'{status.split()[0]:5s} {name}: {why}', flush=True)
+            rows.append((name, status, 0.0, 0))
             continue
         status, dt, peak, out = run(s, a.timeout, a.max_rss_gb * 1e9)
         print(f'{status.split()[0]:5s} {name}  {dt:6.1f} s  {peak / 1e9:4.1f} GB' +
@@ -121,6 +128,9 @@ def main():
     nskip = sum(r[1] == 'SKIP' for r in rows)
     bad = [r for r in rows if r[1] not in ('PASS', 'SKIP')]
     print(f'\n{npass} passed, {len(bad)} failed, {nskip} skipped, {sum(r[2] for r in rows):.0f} s')
+    absent = [h for h in HARDWARE if _have(h)]
+    if absent:
+        print(f'not tested on this machine: {", ".join(absent)} (run this script on such a machine with --require)')
     for r in bad:
         print(f'  {r[0]}: {r[1]}')
     sys.exit(1 if bad else 0)
