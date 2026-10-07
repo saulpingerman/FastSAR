@@ -197,9 +197,20 @@ def make_ffbp_cpu(plan, coll, wf=None):
 
     ox, oy, nx, ny = plan['ox'], plan['oy'], plan['nx'], plan['ny']
 
-    def form(S, ng=8):
-        """S [P, K] complex64 (already windowed) -> complex64 image [nx, ny]."""
+    def form(S, ng=None):
+        """S [P, K] complex64 (already windowed) -> complex64 image [nx, ny]. ng: level-0 children per group (default:
+        up to 8, fewer when a group's buffers, pulses x range samples per child, would exceed a quarter of the memory or
+        FASTSAR_CPU_GROUP_GB)."""
         S = np.asarray(S)
+        if ng is None:
+            lv = levels[0]
+            per = 8.0 * lv['Ko'] * (lv['P'] + lv['Po'])                       # yre, yim and zre, zim of one child
+            try:
+                mem = os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES')
+            except (ValueError, OSError, AttributeError):
+                mem = 64e9
+            budget = float(os.environ.get('FASTSAR_CPU_GROUP_GB', 0)) * 1e9 or 0.25 * mem
+            ng = int(max(1, min(8, budget // per)))
         # in row blocks and in place: a long spotlight's history is tens of GB, and each full-size temporary as much
         scale = max(float(np.abs(S[i:i + 4096]).max()) for i in range(0, S.shape[0], 4096))
         pre = np.empty((1,) + S.shape, np.float32); pim = np.empty((1,) + S.shape, np.float32)

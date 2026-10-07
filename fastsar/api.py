@@ -169,7 +169,7 @@ class ImageFormer:
             import cupy as cp
             return cp.asnumpy(self._form(cp.asarray(S), ng=8)).astype(np.complex64)
         if self.backend == 'cpu':
-            return self._form(S, ng=8).astype(np.complex64)
+            return self._form(S).astype(np.complex64, copy=False)
         from . import ffbp2
         hre, him, scale = ffbp2.prepare(self._pol, S)
         re, im = self._fn(hre, him, self._arrs)
