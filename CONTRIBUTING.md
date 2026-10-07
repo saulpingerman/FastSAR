@@ -21,6 +21,7 @@ The tests are plain scripts, not pytest functions. Each prints its measurements,
 when a check fails, and exits 0 when it passes. Run them from the repository root:
 
 ```bash
+python tests/run_all.py            # every script below, with a timeout and a memory limit, and a summary
 python tests/test_api.py           # every backend this machine has against the JAX program, and polar format
 python tests/test_ffbp_cpu.py      # C++ kernels against the dense JAX image, two and three levels
 python tests/test_ffbp_cuda.py     # CUDA kernels against the dense JAX image (needs a GPU)
@@ -36,7 +37,13 @@ python tests/test_bp.py            # exact backprojection: backends, bistatic, o
 python tests/test_io.py            # CPHD helpers: frequency resampling, re-referencing, geodetic conversions
 python tests/test_wide_angle.py    # 10 to 360 degree apertures against exact backprojection
 python tests/test_insar.py         # change detection and interferometric height (needs finufft)
+python tests/test_units.py         # filters, program cache, aperture weights, mosaic pieces, input checks
+python tests/test_cphd.py          # read_cphd and form_cphd on simulated collections (stand-in CPHD reader)
 ```
+
+`run_all.py` skips a script that needs hardware or a package this machine lacks (`test_ffbp_cuda.py`,
+`test_insar.py`) with a SKIP line, stops a script that runs past `-t` seconds (default 600) or holds more than
+`--max-rss-gb` of memory (default 6), and exits non-zero if any script fails. `-v` prints every script's output.
 
 `test_autofocus.py` is the only script that takes a backend argument. The others pick the backends this machine
 has (`fastsar.available_backends()`) or use the CPU. The tests use small simulated scenes and take seconds to a few
