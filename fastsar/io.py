@@ -96,7 +96,7 @@ def read_cphd(cphd, sicd=None, channel=0, meta=False, regrid_tol=1e-3, drop_flag
         collector = str(getattr(m.CollectionID, 'CollectorName', '') or '')
         if collector.lower().startswith('capella') and sgn > 0:
             # Capella's open-data CPHDs declare SGN = +1, but their phase follows -1: a 2021 stripmap and a 2024 spotlight
-            # collection focus and match the vendor's SICD (amplitude correlation 0.94 and 0.78) only without conjugation
+            # collection focus and match the vendor's SICD (amplitude correlation 0.96 and 0.78) only without conjugation
             sgn = -1
             notes.append('Capella collection: SGN = +1 declared, phase taken as SGN = -1')
     if sgn > 0:

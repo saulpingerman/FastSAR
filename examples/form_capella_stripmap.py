@@ -29,7 +29,8 @@ def main():
     S, ant, f0, df = col['S'], col['ant'], col['fmin'], col['df']
     P, K = S.shape
     srp = io.ecf_to_local(open_phase_history(a.cphd).read_pvp_variable('SRPPos', 0), meta)
-    srp = srp[:P] if len(srp) >= P else srp
+    lo, hi = meta['pulses']                      # the pulses read_cphd kept
+    srp = srp[lo:hi]
     rd = open_complex(a.sicd)
     sm = rd.sicd_meta
     dsin = float(sm.Grid.Col.ImpRespBW) * C / (f0 + K / 2 * df) / 2      # processed spread of sin(look angle)
