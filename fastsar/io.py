@@ -215,7 +215,7 @@ def read_cphd(cphd, sicd=None, channel=0, meta=False, regrid_tol=1e-3, drop_flag
     info = dict(tx=(tx - origin) @ R.T, rcv=(rcv - origin) @ R.T, ref=ref if not fixed_ref else ref0, fixed_ref=fixed_ref,
                 R=R, origin=origin, srp=s0, sicd_transpose=None if sicd is None else grid['transpose'], tx_time=pv('TxTime')[lo:hi], rcv_time=pv('RcvTime')[lo:hi], pulses=(lo, hi),
                 polarization=None if pol is None else f'{pol.TxPol}{pol.RcvPol}', channel=ch.Identifier,
-                mode=m.CollectionID.RadarMode.ModeType, notes=notes)
+                mode=getattr(m.CollectionID.RadarMode, 'ModeType', None), notes=notes)   # None for modes outside the CPHD enumeration (ICEYE: EXPERIMENTAL)
     return out, info
 
 
