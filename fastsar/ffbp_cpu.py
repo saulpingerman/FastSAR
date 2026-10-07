@@ -224,7 +224,7 @@ def make_ffbp_cpu(plan, coll, wf=None):
             scale, pre, pim = 1.0, S[None], None
         else:
             # in row blocks and in place: each full-size temporary is as large as the history
-            scale = max(float(np.abs(S[i:i + 4096]).max()) for i in range(0, S.shape[0], 4096))
+            scale = max(float(np.abs(S[i:i + 4096]).max()) for i in range(0, S.shape[0], 4096)) or 1.0     # all zero: 1
             pre = np.empty((1,) + S.shape, np.float32); pim = np.empty((1,) + S.shape, np.float32)
             for i in range(0, S.shape[0], 4096):
                 np.multiply(S[i:i + 4096].real, np.float32(1.0 / scale), out=pre[0, i:i + 4096])

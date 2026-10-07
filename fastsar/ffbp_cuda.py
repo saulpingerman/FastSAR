@@ -550,10 +550,10 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
         if stream:
             scale = 1.0
             if kern['dtype'] != cp.float32:          # float16 storage: scale to the peak (on the host, in row blocks)
-                scale = max(float(np.abs(S[i:i + 4096]).max()) for i in range(0, S.shape[0], 4096))
+                scale = max(float(np.abs(S[i:i + 4096]).max()) for i in range(0, S.shape[0], 4096)) or 1.0
         else:
             S = cp.asarray(S)
-            scale = float(cp.abs(S).max())
+            scale = float(cp.abs(S).max()) or 1.0
             pre = cp.ascontiguousarray((S.real / scale).astype(kern['dtype']))[None]
             pim = cp.ascontiguousarray((S.imag / scale).astype(kern['dtype']))[None]
             del S

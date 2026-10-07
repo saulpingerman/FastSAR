@@ -107,7 +107,8 @@ def decimator_fir(n_in, D, pass_frac, atten=70.0):
     beta = 0.1102 * (atten - 8.7)
 
     def K(d):
-        return np.where(np.abs(d) <= half, np.sinc(d / D) * np.i0(beta * np.sqrt(np.clip(1.0 - (d / half) ** 2, 0.0, 1.0))) / np.i0(beta), 0.0)
+        # the operations of ffbp.decimator in its order, so that the kernel equals its column bit for bit
+        return np.where(np.abs(d) <= half, np.sinc(d / D) * (np.i0(beta * np.sqrt(np.clip(1.0 - (d / half) ** 2, 0.0, 1.0))) / np.i0(beta)), 0.0)
     j0 = n_out // 2
     cj = D * (j0 - m) + (D - 1) / 2.0
     i = np.arange(max(0, int(math.floor(cj - half))), min(n_in, int(math.ceil(cj + half)) + 1))
@@ -338,7 +339,7 @@ def prepare(policy, S):
     """Phase history [P, K] -> real and imaginary planes in the element-wise type, scaled to unit peak, and the scale."""
     p = POLICIES[policy]
     h = np.float64 if p['ew'] == 'float64' else np.float32
-    scale = float(np.abs(S).max())
+    scale = float(np.abs(S).max()) or 1.0          # an all-zero history: zero planes, not 0/0
     return (jnp.asarray((S.real / scale).astype(h)).astype(p['ew']), jnp.asarray((S.imag / scale).astype(h)).astype(p['ew']), scale)
 
 

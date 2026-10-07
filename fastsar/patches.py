@@ -382,7 +382,10 @@ def fill_gaps(a):
     the inserted positions keep the spacing even and add nothing to the image."""
     a = np.asarray(a, np.float64)
     step = np.linalg.norm(np.diff(a, axis=0), axis=1)
-    m = np.maximum(np.rint(step / np.median(step)).astype(np.int64), 1)
+    med = float(np.median(step)) if len(step) else 0.0
+    if not med > 0:                       # one position, or a platform that does not move: no spacing to keep
+        return a, np.arange(len(a))
+    m = np.maximum(np.rint(step / med).astype(np.int64), 1)
     if m.max() < 2:
         return a, np.arange(len(a))
     idx = np.concatenate([[0], np.cumsum(m)])
@@ -416,13 +419,23 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
     info: a list to which a dict per patch is appended (center, pulse range, K, T, sub, levels, predicted error,
     number of weight terms)."""
     from scipy.interpolate import RectBivariateSpline
-    from .api import ImageFormer
+    from .api import ImageFormer, _backend, _check_history, _check_positions, _check_grid
+    backend = _backend(backend)
+    missing = [k for k in ('S', 'fmin', 'df', 'ref') if k not in fx]
+    if missing:
+        raise ValueError(f'fx lacks {missing}: a dict(S, fmin, df, ref[, band]) as echoes_to_fx returns')
+    _check_history(fx['S'], len(_check_positions(ant)))
+    if np.shape(fx['ref']) != (len(ant),):
+        raise ValueError(f"fx['ref'] must hold one reference range per pulse, shape ({len(ant)},), got {np.shape(fx['ref'])}")
+    nx, ny, e1, e2 = _check_grid(nx, ny, spx, spy, e1, e2)
+    if len(patch) != 2 or min(patch) < 1 or crop < 0:
+        raise ValueError(f'patch must be two positive pixel counts and crop >= 0, got patch={patch!r}, crop={crop!r}')
     tiles = ((32, 16, 8) if backend == 'jax' else (32, 16)) if T == 'auto' else (T,)
     subs = SUBS if sub == 'auto' else (tuple(sub),)
     wtol_db = target_db - 10.0 if wtol_db is None else wtol_db
     ant = np.asarray(ant, np.float64)
-    o, e1, e2 = (np.asarray(v, np.float64) for v in (origin, e1, e2))
-    mx, my = patch
+    o = np.asarray(origin, np.float64)
+    mx, my = (int(v) for v in patch)
     px, py = mx + 2 * crop, my + 2 * crop
     wa = sm.window(awin)
     si, sj = np.linspace(0, px - 1, 9), np.linspace(0, py - 1, 9)          # sample points, in patch pixels
@@ -502,34 +515,35 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
     from concurrent.futures import ThreadPoolExecutor
     ex = ThreadPoolExecutor(1) if prefetch else None
     nxt = ex.submit(prep, *order[0]) if prefetch else None
-    for k in range(len(order)):
-        if prefetch:
-            job = nxt.result()
-            if k + 1 < len(order):
-                nxt = ex.submit(prep, *order[k + 1])
-        else:
-            job = prep(*order[k])
-        if job is None:
-            continue
-        i0, j0, c, lo, hi, S, df, wt, form = (job[q] for q in ('i0', 'j0', 'c', 'lo', 'hi', 'S', 'df', 'wt', 'form'))
-        Tp, s12, nlev, err = (job[q] for q in ('Tp', 's12', 'nlev', 'err'))
-        tm = _Timer('form_mosaic')
-        if wt is None:
-            img = form(S)
-            tm('form')
-        else:
-            img = 0
-            for at, bt in zip(*wt):
-                img = img + form(S * at[:, None]) * RectBivariateSpline(si, sj, bt.reshape(len(si), len(sj)))(
-                    np.arange(px), np.arange(py))
-        ci, cj = min(mx, nx - i0), min(my, ny - j0)
-        out[i0:i0 + ci, j0:j0 + cj] = img[crop:crop + ci, crop:crop + cj]
-        if info is not None:
-            info.append(dict(center=c, pulses=(lo, hi), K=S.shape[1], df=df, T=Tp, sub=s12, levels=nlev,
-                             predicted_error_db=err, terms=1 if wt is None else len(wt[0])))
-
-    if ex is not None:
-        ex.shutdown()
+    try:
+        for k in range(len(order)):
+            if prefetch:
+                job = nxt.result()
+                if k + 1 < len(order):
+                    nxt = ex.submit(prep, *order[k + 1])
+            else:
+                job = prep(*order[k])
+            if job is None:
+                continue
+            i0, j0, c, lo, hi, S, df, wt, form = (job[q] for q in ('i0', 'j0', 'c', 'lo', 'hi', 'S', 'df', 'wt', 'form'))
+            Tp, s12, nlev, err = (job[q] for q in ('Tp', 's12', 'nlev', 'err'))
+            tm = _Timer('form_mosaic')
+            if wt is None:
+                img = form(S)
+                tm('form')
+            else:
+                img = 0
+                for at, bt in zip(*wt):
+                    img = img + form(S * at[:, None]) * RectBivariateSpline(si, sj, bt.reshape(len(si), len(sj)))(
+                        np.arange(px), np.arange(py))
+            ci, cj = min(mx, nx - i0), min(my, ny - j0)
+            out[i0:i0 + ci, j0:j0 + cj] = img[crop:crop + ci, crop:crop + cj]
+            if info is not None:
+                info.append(dict(center=c, pulses=(lo, hi), K=S.shape[1], df=df, T=Tp, sub=s12, levels=nlev,
+                                 predicted_error_db=err, terms=1 if wt is None else len(wt[0])))
+    finally:
+        if ex is not None:            # after an error in either thread, a patch not yet started is dropped
+            ex.shutdown(cancel_futures=True)
     return out
 
 

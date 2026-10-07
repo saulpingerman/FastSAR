@@ -5,6 +5,37 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Fas
 
 ## Unreleased
 
+### Fixed
+
+- An all-zero phase history gave a NaN image on the JAX and TPU paths and with polar format, and a
+  ZeroDivisionError on the CPU path; it now gives a zero image.
+- `api.final_weights` gave weight zero to the final subapertures centred beyond the collection, which hold the
+  decimation filters' tails of the edge pulses: a unit `aperture_weight` changed the image by -32 dB. They now
+  take the weight of the nearest pulse, and a unit weight leaves the image unchanged.
+- `ffbp2.decimator_fir` differed from the column of `ffbp.decimator` by up to 3e-16; it is now equal bit for bit.
+- `backproject` with a `ref` shorter than the pulse count read past its end in the C++ kernel.
+- `patches.fill_gaps` divided by zero for a single position or a platform at rest.
+- `sim.simulate_brute` held a [pulses, samples, scatterers] array (5.8 GB for the dropped-pulse case of
+  `tests/test_patches.py`); it now sums in blocks of scatterers.
+- A failure while the mosaic prefetches the next patch now shuts its thread down.
+
+### Changed
+
+- `form_image`, `ImageFormer`, `backproject`, `patches.form_mosaic`, `io.read_cphd` and `form_cphd` check their
+  inputs: a phase history that is not 2-D or not complex, has NaN or inf samples, fewer than 2 pulses or a pulse
+  count different from the antenna path; antenna positions not [pulses, 3]; pixel counts that are not positive
+  integers, non-positive spacings, axes that are not orthonormal; unknown backends, and `cuda` or `tpu` on a
+  machine without one, raise `ValueError` or `TypeError` with the reason. complex128 and non-contiguous histories
+  are converted.
+
+### Tests
+
+- `tests/run_all.py` runs every test script with a timeout and a memory limit and prints a summary.
+- `tests/test_units.py`: decimation kernels, the JAX program cache, the C++ input paths and group sizes, aperture
+  weights, shared range profiles, pulse spans, gap filling, mosaic prefetch, input checks.
+- `tests/test_cphd.py`: `read_cphd` and `form_cphd` end to end on simulated spotlight and stripmap collections
+  through a stand-in for sarpy's CPHD reader.
+
 ### Documentation
 
 - Shorter README with figures; the long-form material moved to `docs/`.
