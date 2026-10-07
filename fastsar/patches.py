@@ -35,10 +35,12 @@ Azimuth weighting. stripmap.backproject weights pulse p at pixel x by W_a(u_p(x)
 is the normalized Doppler of the two-way pattern. Without an azimuth window every pulse of a patch has weight 1; with
 umax at the simulated extent of the pattern (the first null of the sinc^2 pattern, the default) the per-pixel mask
 then only drops pulses that hold other scatterers' returns near the pattern null, and the two agree to about -65 dB.
-With a window the weight W_a(u_p(x)/umax) (the window clipped at its edges, no mask) on the patch's pulses and 9 x 9
-points is split by its SVD into separable terms a_t(p) b_t(x); each term is one FFBP of the phase history weighted
-by a_t, multiplied by b_t interpolated to the pixels. Three or four terms reach -50 dB on 40 m patches of the
-airborne scene in tests/test_patches.py.
+With a window the weight W_a(u_p(x)/umax) (the window clipped at its edges, no mask) is applied in the final stage of
+one FFBP per patch (ImageFormer's aperture_weight: each final subaperture's mean weight at each final tile, with its
+first-order variation across the tile). With exact=True or FASTSAR_WEIGHT_TERMS=1 the weight on the patch's pulses
+and 9 x 9 points is instead split by its SVD into separable terms a_t(p) b_t(x); each term is one FFBP (or exact
+backprojection) of the phase history weighted by a_t, multiplied by b_t interpolated to the pixels. Three or four
+terms reach -50 dB on 40 m patches of the airborne scene in tests/test_patches.py.
 
 Factorized backprojection. Each patch is an ImageFormer with window=False (its Taylor windows are not used; the
 range window is applied in range compression, as in stripmap). The final tile size T and an optional finer grid
