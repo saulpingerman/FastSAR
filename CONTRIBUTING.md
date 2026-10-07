@@ -1,7 +1,7 @@
 # Contributing to FastSAR
 
 Bug reports, questions and pull requests are welcome. Please open an issue first for a change that touches a
-kernel or the public API, so the approach can be agreed before you write it.
+kernel or the public API, so the approach can be agreed before the code is written.
 
 ## Development setup
 
@@ -56,7 +56,7 @@ set about 5 dB above the value measured when the limit was set, and exit with a 
 
 ## Pull requests
 
-- Keep a pull request to one change, and say in the description which tests you ran and on which devices.
+- Keep a pull request to one change, and state in the description which tests ran and on which devices.
 - A change to a kernel should report the error against the JAX program or exact backprojection before and after,
   as the tests print it.
 - A change that adds a result to the documentation should say what data it comes from. Results from simulated

@@ -8,8 +8,9 @@ Three modules cover data that is not a single spotlight aperture:
   patches.
 - `fastsar.burst`: ScanSAR and TOPS burst modes.
 
-The numbers on this page are test results on simulated point targets. The patch mosaic has also been run on a
-real Capella stripmap collection ([real-data.md](real-data.md)).
+The numbers on this page are test results on simulated point targets unless a Capella collection is named.
+`fastsar.form_cphd` uses the patch mosaic for real stripmap and sliding spotlight CPHD files
+([real-data.md](real-data.md)); this page covers the calls underneath.
 
 ## Stripmap
 
@@ -79,7 +80,7 @@ backprojection on 64 by 64 pixel neighborhoods of the five targets:
 
 - broadside: -48.0 to -60.4 dB (CPU), -54.8 to -60.2 dB (JAX, which uses T = 8 where needed)
 - 5 degrees of squint: -48.0 to -62.6 dB
-- Taylor azimuth window: -48.5 to -58.8 dB with three or four terms per patch
+- Taylor azimuth window, applied in the final stage: -49.4 to -61.2 dB (CPU), -55.9 to -62.5 dB (JAX)
 - the same patches by exact backprojection: -65.3 to -66.7 dB without an azimuth window, -54.7 to -67.6 dB with
   the Taylor window
 
@@ -88,6 +89,15 @@ vertical motion (1.68 m and 1.57 m peak to peak), which changes the range to the
 Omega-k on the nominal straight track does not focus these data (error about 0 dB). The patch mosaic with the true
 positions, on a ground-plane grid of 0.31 by 1.5 m, matches exact backprojection with the true positions to
 -49.9 to -64.9 dB.
+
+On a 4-patch sub-mosaic of the 2021 Capella stripmap collection, moving the azimuth window into the final stage
+(one factorized backprojection per patch instead of one per SVD term) improved the error on a seam crop against the
+float64 reference from -59.9 to -65.7 dB and cut the time per patch on 16 shared cores from 4.3 s to about 1.8 s.
+`FASTSAR_WEIGHT_TERMS=1` restores the SVD terms. The range profiles are computed once per mosaic, which made the
+patch histories of that collection 7 times faster with the same error (-59.9 dB); `FASTSAR_SHARED_PROFILES=0`
+restores the per-patch transform. The next patch is prepared on a second thread while the current one forms
+(`FASTSAR_MOSAIC_PREFETCH=0` turns this off). On the JAX and TPU backends, patches with equal plans share one
+compiled program ([performance.md](performance.md#large-collections-and-mosaics)).
 
 Limitations: each pulse enters every patch its beam covers, so longer patches lower the cost per pixel.
 `echoes_to_fx` assumes one fast-time grid for all pulses. `stripmap_beam` models an antenna held along a fixed

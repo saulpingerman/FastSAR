@@ -43,15 +43,17 @@ out = fastsar.form_cphd(path, sicd=None, mode='auto', backend='auto', spacing=No
 ```
 
 `form_cphd` tells a spotlight (one scene reference point for all pulses) from stripmap, sliding spotlight and
-dynamic stripmap collections (a moving one), applies a Taylor window, and forms the image on a ground-plane grid
-along and across track. The grid covers the SICD footprint when a SICD is given, else the CPHD image area, and lies
-at the height of the scene reference point (the SICD's scene center point, else the CPHD's image area reference
-point; `height=` overrides it). A spotlight is formed as one image by factorized backprojection; a moving beam as a
-mosaic of range-gated patches, each pixel weighted by a Hann window over the azimuth band around its beam center
-(the SICD's processed band, else 0.8 of the band the PRF samples). The result carries the image, its origin, axes
-and spacing in `read_cphd`'s local frame, the mode, and the reader's notes. `autofocus=True` runs phase gradient
-autofocus on a spotlight (two rounds, three image formations). The products in [products.md](products.md) take the
-result directly: latitude and longitude of pixels, map GeoTIFFs and SICD.
+dynamic stripmap collections (one that moves by more than a range resolution), applies a Taylor window,
+and forms the image on a ground-plane grid along and across track. The grid covers the SICD footprint when a SICD is
+given, else the CPHD image area, and lies at the height of the scene reference point (the SICD's scene center point,
+else the CPHD's image area reference point; `height=` overrides it). A spotlight is formed as one image by
+factorized backprojection; a moving beam as a mosaic of range-gated patches, each pixel weighted by a Hann window
+over the azimuth band around its beam center (the SICD's processed band, else 0.8 of the band the PRF samples),
+applied in the final stage of each patch's factorized backprojection
+([stripmap-burst.md](stripmap-burst.md#long-apertures-and-arbitrary-tracks)). The SICD is optional. The result
+carries the image, its origin, axes and spacing in `read_cphd`'s local frame, the mode, and the reader's notes. `autofocus=True` runs phase gradient autofocus on a spotlight (two rounds, three
+image formations). The products in [products.md](products.md) take the result directly: latitude and longitude of
+pixels, map GeoTIFFs and SICD.
 
 Checks against the vendors' SICD images, on 600 m grids around the scene center (correlation over 256 by 256 vendor
 pixels, with the vendor pixels projected to the grid's height):
@@ -67,8 +69,7 @@ pixels, with the vendor pixels projected to the grid's height):
 
 Amplitude correlation pixel by pixel is limited by speckle wherever the two processors' windows or azimuth bands
 differ; the averaged intensity measures whether the same structure appears in the same place. The sliding spotlight
-image is offset from the vendor's by about two pixels; FastSAR's own image of it agrees with a float64 exact
-backprojection over the same aperture to -62 dB.
+is the collection of the section below: correct near the scene center only.
 
 ## Umbra spotlight
 
@@ -85,8 +86,8 @@ Three Umbra open-data spotlight collections were formed from the CPHD as deliver
 *The three collections as formed by the float64 exact backprojection, downsampled (amplitude over 45 dB, azimuth
 horizontal, range vertical, 1 km bar). The boxes are the regions of [precision.md](precision.md).*
 
-On Panama our pixels coincide with the vendor's to a quarter pixel near the scene center. The vendor forms its
-SICD by polar format without correcting the planar-wavefront displacement, so its image is displaced from ours by
+On Panama, FastSAR's pixels coincide with the vendor's to a quarter pixel near the scene center. The vendor forms its
+SICD by polar format without correcting the planar-wavefront displacement, so its image is displaced from FastSAR's by
 up to 13.2 pixels in azimuth and 9.0 in range on Panama, against 13.2 and 9.1 predicted from the collection
 geometry alone. After resampling the vendor image through that model, the residual displacement is at most
 0.25 pixel rms on all three collections.
@@ -129,11 +130,22 @@ SGN = -1: with the declared sign the images do not focus or do not match the ven
 0.05). `read_cphd` therefore takes SGN = -1 for Capella collectors and records this in `notes`. Pass
 `phase_sign=+1` or `-1` to override.
 
-### Capella dynamic stripmap: not supported
+### Capella dynamic stripmap: scene center only
 
-A Capella dynamic stripmap (sliding spotlight) collection of 2022 is not supported. Its CPHD declares a valid
-delay window (TOA1 to TOA2) 2,962 m long and 4.1 to 7.1 km beyond the scene reference point, while its frequency
-spacing (114.3 kHz) gives an unambiguous range of 1,311 m. The samples cannot hold that window as a plain
-frequency-domain phase history, so the file follows a convention FastSAR does not model, and `read_cphd` warns.
-Exact backprojection matches the vendor's image near the scene center only after a 2-pixel registration
-(amplitude correlation 0.40 to 0.51 on low-contrast terrain) and fails near the edge of the swath.
+A Capella dynamic stripmap (sliding spotlight) collection of 2022 forms correctly only near the scene center. Its
+CPHD declares a valid delay window (TOA1 to TOA2) 2,962 m long and 4.1 to 7.1 km beyond the scene reference point,
+while its frequency spacing (114.3 kHz) gives an unambiguous range of 1,311 m. The samples cannot hold that window
+as a plain frequency-domain phase history, so the file follows a convention FastSAR does not model, and `read_cphd`
+warns. Near the scene center `form_cphd` and exact backprojection match the vendor's image after a 2-pixel
+registration (intensity correlation 0.75 after 5 by 5 averaging); near the edge of the swath they fail. FastSAR's
+mosaic agrees with a float64 backprojection of the same samples to -62 dB, which checks consistency, not the
+convention.
+
+## ICEYE dwell spotlight
+
+ICEYE dwell CPHD files declare the radar mode EXPERIMENTAL, outside the CPHD enumeration; `read_cphd` accepts them
+and reports `meta['mode']` as None. `form_cphd` takes the SICD metadata that ICEYE publishes as an `.xml` file
+beside the image (`sicd='scene_SICD.xml'`). A dwell of 91,426 pulses holds 28 GB of complex64 phase history: the
+CPU former reads it in place, the CUDA former streams it through the first level
+([performance.md](performance.md#large-collections-and-mosaics)), and the plan of a 71,790 by 10,000 pixel image
+takes 0.1 s and 2.7 GB. No comparison with ICEYE's own image is published here.

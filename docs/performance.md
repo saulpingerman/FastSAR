@@ -31,16 +31,41 @@ On the TPUs its final resampling, a scattered gather, is slow: 97.4 s on the v5e
 The L4 processor uses 0.07 kWh per 1000 float32 images (mean `nvidia-smi` draw during the timed loop; host
 excluded).
 
-## Running on the CPU
+## Large collections and mosaics
 
-Run one OpenMP thread per physical core:
+A long spotlight or a stripmap collection can hold tens of gigabytes of phase history (28 GB for a 91,426-pulse
+ICEYE dwell, 10 GB for a Capella spotlight). The formers avoid full-size copies:
 
-```bash
-OMP_NUM_THREADS=<cores> OMP_PLACES=cores OMP_PROC_BIND=close python my_script.py
-```
+- CPU: the first level reads a C-contiguous complex64 history in place, and the first-level group holds up to 8
+  tiles within a quarter of the physical memory (`FASTSAR_CPU_GROUP_GB` sets the budget).
+- CUDA: a host history larger than 30% of the free device memory is streamed through the first level in blocks of
+  4,096 pulses (`FASTSAR_CUDA_STREAM=1` forces it); the later levels work per first-level tile.
+- JAX and TPU: `ImageFormer` keeps up to 16 compiled programs, keyed by the plan's signature, with the filters and
+  tile geometry that depend on the plan alone. `patches.form_mosaic` pads each patch to a multiple of 256 pulses so
+  that patches share programs: in `tests/test_patches.py`, 24 JAX formers compile 8 programs. Before the plan's
+  arrays were cached, the 2021 Capella stripmap mosaic on a TPU v6e spent 19 s of 52 s rebuilding them for its 84
+  patches.
+- Mosaics: the range profiles of the whole history are computed once and each patch is gated from them; on the
+  `cuda` backend they stay in GPU memory when they fit, and the range gate runs on the GPU. The next patch's host
+  work runs on a second thread while the current patch forms: 0.91 s per patch against 1.08 s without, on a 2 by 4
+  patch sub-mosaic of the 2021 Capella stripmap on 16 CPU cores.
 
-The kernels are compiled for the host CPU (`-march=native`) on first use. `CXX` selects another compiler and
-`FFBP_CPU_FLAGS` replaces the flags.
+## Environment variables
+
+| Variable | Default | Effect |
+|---|---|---|
+| `OMP_NUM_THREADS`, `OMP_PLACES`, `OMP_PROC_BIND` | OpenMP's | run one thread per physical core: `<cores>`, `cores`, `close` |
+| `CXX` | `g++` | compiler for the CPU kernels, built for the host CPU on first use and cached in `~/.cache/fastsar` |
+| `FFBP_CPU_FLAGS` | `-O3 -march=native -mprefer-vector-width=512 -funroll-loops` | compiler flags for the factorized kernels |
+| `FASTSAR_CPU_GROUP_GB` | a quarter of physical memory | memory budget (GB) of the CPU first-level group |
+| `FASTSAR_CUDA_STREAM` | stream above 30% of free GPU memory | `1` streams every host history |
+| `FASTSAR_SHARED_PROFILES` | `1` | `0` re-transforms the full history for every mosaic patch |
+| `FASTSAR_WEIGHT_TERMS` | `0` | `1` applies a mosaic's azimuth window as separable SVD terms, one factorized backprojection each |
+| `FASTSAR_WEIGHT_GRAD` | `1` | `0` drops the first-order variation of the aperture weight across a final tile |
+| `FASTSAR_MOSAIC_PREFETCH` | `1` | `0` prepares mosaic patches one at a time |
+| `FASTSAR_TIMING` | off | `1` times each mosaic step; `patches.report_timing()` returns the totals as text |
+
+`FASTSAR_FIRP_GLOBAL` and `FFBP_FORCE_TPU_KERNELS` exist for the tests only.
 
 ## Where the time goes
 

@@ -13,9 +13,10 @@ products.write_sicd('out.nitf', img, 'vendor_SICD.nitf')   # image formed on the
 products.write_geotiff('out.tif', data, transform)          # needs rasterio
 ```
 
-`grid` is the dict of `nx, ny, spx, spy, e1, e2` the image was formed on (the output of `read_cphd` carries
-them), and `ant` the antenna positions in the same local frame. The output of `form_cphd` goes to products
-directly; see [From form_cphd to map and SICD](#from-form_cphd-to-map-and-sicd).
+`grid` is a dict of exactly `nx, ny, spx, spy, e1, e2`, the centered grid of `form_image` that the image was formed
+on, and `ant` the antenna positions in the same local frame. The output of `read_cphd` carries these keys but also
+`ant`, so pass `{k: col[k] for k in ('nx', 'ny', 'spx', 'spy', 'e1', 'e2')}`, not `col` itself. The output of
+`form_cphd` goes to products directly; see [From form_cphd to map and SICD](#from-form_cphd-to-map-and-sicd).
 
 ## Interferometry and change detection
 

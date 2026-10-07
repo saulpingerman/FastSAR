@@ -1,4 +1,4 @@
-# Algorithms and API
+# Spotlight image formation
 
 This page covers spotlight image formation: the coordinate convention, factorized backprojection and its tile
 size, exact backprojection, polar format, wide-angle apertures and autofocus. Numbers marked as test results come
@@ -23,7 +23,9 @@ the SICD's grid when one is given ([real-data.md](real-data.md)). A Taylor windo
 along both axes unless `window=False`.
 
 `form_image` plans and compiles on every call. For repeated images of one geometry, build an `ImageFormer` once
-and call it on each phase history; a different antenna path needs a new former.
+and call it on each phase history; a different antenna path needs a new former. On the JAX and TPU backends,
+formers with equal plans reuse one compiled program. `fastsar.form_cphd` builds these arguments and the grid from
+the file itself ([real-data.md](real-data.md#any-collection-mode-in-one-call)).
 
 ## Factorized backprojection
 
@@ -45,9 +47,8 @@ level; the JAX program and the TPU kernels compute the last level's geometry in 
 float32 images agree with each other to about -87 dB. `backend='auto'` picks the TPU if JAX sees one, else a GPU
 if CuPy sees one, else the CPU. `fastsar.available_backends()` lists what the machine can run.
 
-The CPU kernels are compiled with `g++` (override with `CXX`) and the flags in `FFBP_CPU_FLAGS`, default
-`-O3 -march=native -mprefer-vector-width=512 -funroll-loops`. The compiled library is cached under
-`~/.cache/fastsar`.
+The CPU kernels are compiled on first use; [performance.md](performance.md#environment-variables) lists the
+compiler settings and the other environment variables.
 
 ### Tile size and range
 
