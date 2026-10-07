@@ -6,11 +6,11 @@
 FastSAR forms synthetic aperture radar (SAR) images from phase history data on x86 CPUs, Nvidia GPUs and Google
 Cloud TPUs, with the same Python call on each.
 
-![Umbra spotlight SAR image of the Pacific entrance of the Panama Canal, showing the canal, the Cocolí Locks, a ship in the channel and the Port of Balboa](docs/images/hero_panama.png)
+![FastSAR image of the Pacific entrance of the Panama Canal from an Umbra spotlight collection, showing the Cocolí Locks, the channel with a ship, and the Port of Balboa](docs/images/hero_panama.jpg)
 
-*Pacific entrance of the Panama Canal (Umbra open data, 2023-07-18), 12,207 by 8,808 pixels, downsampled for
-display. Shown is the float64 exact backprojection that FastSAR is scored against; FastSAR's float32 factorized
-image differs from it by -59.5 dB on an Nvidia L4, a difference not visible at this scale.*
+*FastSAR's image of the Pacific entrance of the Panama Canal (Umbra open data, 2023-07-18): 12,207 by 8,808
+pixels formed in 3.6 s on an Nvidia L4 by float32 factorized backprojection, downsampled for display. Its error
+against a float64 exact backprojection is -59.5 dB.*
 
 ## What it does
 
