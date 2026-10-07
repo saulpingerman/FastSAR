@@ -3,5 +3,6 @@
 from .api import form_image, available_backends, ImageFormer  # noqa: F401
 from . import io, autofocus, stripmap, burst, patches, quality, products  # noqa: F401
 from .bp import backproject, plane_points  # noqa: F401
+from .cphd import form_cphd  # noqa: F401
 
 __version__ = '0.1.0'

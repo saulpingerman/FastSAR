@@ -157,7 +157,7 @@ def _taylor_fn(sll=35.0, nbar=4):
 
 def window(spec):
     """Window as a function of t in [-1, 1] (zero outside): None, 'taylor' (35 dB, nbar 4), ('taylor', sll, nbar),
-    'kaiser' (beta 2.5), ('kaiser', beta), or a callable."""
+    'hann', 'kaiser' (beta 2.5), ('kaiser', beta), or a callable."""
     if spec is None or spec == 'none':
         fn = lambda t: np.ones_like(t)
     elif callable(spec):
@@ -166,6 +166,8 @@ def window(spec):
         name, *arg = (spec,) if isinstance(spec, str) else spec
         if name == 'taylor':
             fn = _taylor_fn(*arg)
+        elif name == 'hann':
+            fn = lambda t: 0.5 * (1 + np.cos(np.pi * np.clip(t, -1, 1)))
         elif name == 'kaiser':
             beta = arg[0] if arg else 2.5
             fn = lambda t: np.i0(beta * np.sqrt(np.clip(1 - t * t, 0, 1))) / np.i0(beta)
