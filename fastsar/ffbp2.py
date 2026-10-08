@@ -403,6 +403,7 @@ def make_ffbp(policy, plan, filt='dense', budget=1 << 26, trig='split', pallas_p
     f = jnp.float64 if p['ew'] == 'float64' else jnp.float32
     T, levels = plan['T'], plan['levels']
     L = len(levels)
+    lv0_pad = {}             # first-level rows on a TPU with a banded pulse filter (front, Pp), set with form.pad below
     two_pi = 2.0 * math.pi
     npass = 1 if p['prec'] is None else 3            # the fused kernel: one bfloat16 pass or the three-pass split
     if filt in ('pallas', 'pallas2') and p['prec'] == lax.Precision.HIGHEST:
@@ -477,6 +478,20 @@ def make_ffbp(policy, plan, filt='dense', budget=1 << 26, trig='split', pallas_p
             return z[:, 0, :fr['n_out'], :]
         return jnp.swapaxes(fir_last(jnp.swapaxes(y, 1, 2), la['kp'], lv['fir_p'], lv['Dp']), 1, 2)
 
+    def dec_p_rows(y4, la, lv, Ko):
+        """Banded pulse decimation of kernel output y4 [Np, nc, Pp, Kq] whose rows already start with the filter's
+        pl leading zeros (lv['front']) and run to at least nb blocks: -> [Np, nc, Po, Ko]."""
+        b = banded_fir(lv['fir_p'], lv['Dp'], lv['P'])
+        Np, nc, Pp, Kq = y4.shape
+        assert lv['front'] == b['pl'] and Pp >= b['nb'] * b['block'], (lv['front'], b['pl'], Pp, b['nb'] * b['block'])
+        x = y4.reshape(Np * nc, Pp, Kq)
+        z = None
+        for t in range(b['w']):
+            xt = lax.slice_in_dim(x, t * b['block'], (t + b['nbo']) * b['block'], axis=1).reshape(Np * nc, b['nbo'], b['block'], Kq)
+            zt = jnp.einsum('nbqk,qg->nbgk', xt.astype(mm), la['Wp'][t], precision=prec, preferred_element_type=f)
+            z = zt if z is None else z + zt
+        return z.reshape(Np * nc, b['nbo'] * b['G'], Kq)[:, :b['n_out'], :Ko].reshape(Np, nc, b['n_out'], Ko)
+
     def ramp(c0, sl, n, centre):
         """cos and sin of 2 pi (c0 + (k - centre) sl) for k = 0 .. n - 1; c0 and sl of one shape, result [..., n]."""
         if trig == 'direct':
@@ -534,15 +549,18 @@ def make_ffbp(policy, plan, filt='dense', budget=1 << 26, trig='split', pallas_p
             nc = min(pallas_nc, Cn)
             if fuse_p_for(lv, band, nc):
                 pb = 128 * -(-pb // 128)
-            Pp = -(-P // pb) * pb
+            # the first level on a TPU with a banded pulse filter: lv['front'] zero rows before the pulses and lv['Pp']
+            # rows in all (form.pad), so that the kernel's output is the filter's padded input
+            front = lv.get('front', 0)
+            Pp = lv.get('Pp') or -(-P // pb) * pb
             Cp = -(-Cn // nc) * nc                                  # children padded to whole groups (zero ramps, discarded)
             if pre.shape == (Pp, band['Kpad']) and pre.dtype == jnp.float32:   # padded once by form.pad
                 pre_p, pim_p = pre[None], pim[None]
             else:
-                pre_p = pad_columns(jnp.pad(pre.astype(jnp.float32), ((0, Pp - P), (0, 0))), band)[None]
-                pim_p = pad_columns(jnp.pad(pim.astype(jnp.float32), ((0, Pp - P), (0, 0))), band)[None]
-            c0g = jnp.pad(c0.astype(jnp.float32), ((0, Cp - Cn), (0, Pp - P))).reshape(Cp // nc, 1, nc, Pp)
-            slg = jnp.pad(sl.astype(jnp.float32), ((0, Cp - Cn), (0, Pp - P))).reshape(Cp // nc, 1, nc, Pp)
+                pre_p = pad_columns(jnp.pad(pre.astype(jnp.float32), ((front, Pp - P - front), (0, 0))), band)[None]
+                pim_p = pad_columns(jnp.pad(pim.astype(jnp.float32), ((front, Pp - P - front), (0, 0))), band)[None]
+            c0g = jnp.pad(c0.astype(jnp.float32), ((0, Cp - Cn), (front, Pp - P - front))).reshape(Cp // nc, 1, nc, Pp)
+            slg = jnp.pad(sl.astype(jnp.float32), ((0, Cp - Cn), (front, Pp - P - front))).reshape(Cp // nc, 1, nc, Pp)
 
             def one_group(cs):
                 if on_tpu:
@@ -629,6 +647,12 @@ def make_ffbp(policy, plan, filt='dense', budget=1 << 26, trig='split', pallas_p
             yr, yi = fused_rotate_dec_k2(pre_p, pim_p, c0g, slg, band, (K - 1) / 2.0, pb=pb, passes=npass)
         if fuse_p:
             return yr[:, :, :Po, :Ko].astype(ew), yi[:, :, :Po, :Ko].astype(ew)
+        if lv.get('front') and 'Wp' in la:
+            # the history carries the banded filter's leading zeros (form.pad), so the kernel's output rows are the
+            # filter's padded input: each plane is decimated where it lies, without the copies that slicing,
+            # joining and padding it would make (four copies of every child's output, 6 GB per child at 74,203
+            # pulses)
+            return dec_p_rows(yr, la, lv, Ko).astype(ew), dec_p_rows(yi, la, lv, Ko).astype(ew)
         y = jnp.concatenate([yr[:, :, :P, :Ko], yi[:, :, :P, :Ko]], 1).reshape(Np * 2 * nc, P, Ko).astype(f)
         z = dec_p(y, la, lv).reshape(Np, 2 * nc, Po, Ko)
         return z[:, :nc].astype(ew), z[:, nc:].astype(ew)
@@ -790,7 +814,7 @@ def make_ffbp(policy, plan, filt='dense', budget=1 << 26, trig='split', pallas_p
     def one_tile(hre, him, arrs, g):
         """One first-level tile carried through every level: -> its mx x my block of the image."""
         la, lv = arrs['levels'][0], levels[0]
-        a, b = children(hre, him, la['c0'][0, g][None], la['slope'][0, g][None], la, dict(lv, C=1))
+        a, b = children(hre, him, la['c0'][0, g][None], la['slope'][0, g][None], la, dict(lv, C=1, **lv0_pad))
         for i in range(1, L):
             la, lv = arrs['levels'][i], levels[i]
             if i < HOST_LEVELS:
@@ -834,7 +858,7 @@ def make_ffbp(policy, plan, filt='dense', budget=1 << 26, trig='split', pallas_p
     def one_group(hre, him, arrs, gs):
         """ng first-level tiles at once: the phase history is read once per group of their first-level children."""
         la, lv = arrs['levels'][0], levels[0]
-        a0, b0 = children(hre, him, la['c0'][0, gs], la['slope'][0, gs], la, dict(lv, C=ng))
+        a0, b0 = children(hre, him, la['c0'][0, gs], la['slope'][0, gs], la, dict(lv, C=ng, **lv0_pad))
 
         def rest(x):
             a, b, g = x
@@ -877,11 +901,17 @@ def make_ffbp(policy, plan, filt='dense', budget=1 << 26, trig='split', pallas_p
         if fuse_p_for(lv0, band0, min(pallas_nc, ng if ng > 1 else 1)):
             pb0 = 128 * -(-pb0 // 128)
         Pp0 = -(-lv0['P'] // pb0) * pb0
+        if lv0['Dp'] > 1 and not dense_pulse_filter(lv0) and not fuse_p_for(lv0, band0, min(pallas_nc, ng if ng > 1 else 1)):
+            # banded pulse filter: the filter's leading zeros go in front of the pulses and its blocks fit the rows
+            b0 = banded_fir(lv0['fir_p'], lv0['Dp'], lv0['P'])
+            lv0_pad.update(front=b0['pl'], Pp=-(-max(lv0['P'] + b0['pl'], b0['nb'] * b0['block']) // pb0) * pb0)
+            Pp0 = lv0_pad['Pp']
+        front0 = lv0_pad.get('front', 0)
 
         @jax.jit
         def pad1(x):
             from .pallas_ffbp import pad_columns
-            return pad_columns(jnp.pad(x.astype(jnp.float32), ((0, Pp0 - lv0['P']), (0, 0))), band0)
+            return pad_columns(jnp.pad(x.astype(jnp.float32), ((front0, Pp0 - lv0['P'] - front0), (0, 0))), band0)
 
         def pad(hre, him):
             """The phase history planes padded once for the first-level kernel, which then reads them in place
