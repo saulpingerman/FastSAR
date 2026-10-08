@@ -66,7 +66,7 @@ warnings.simplefilter('ignore', fastsar.MemoryWarning)   # silence the fallback 
 | `FASTSAR_SHARED_PROFILES` | `1` | `0` re-transforms the history per mosaic patch |
 | `FASTSAR_WEIGHT_TERMS` | `0` | `1` applies the mosaic window as SVD terms |
 | `FASTSAR_WEIGHT_GRAD` | `1` | `0` drops the weight's variation across a final tile |
-| `FASTSAR_MOSAIC_PREFETCH` | `1` | `0` prepares patches one at a time |
+| `FASTSAR_MOSAIC_PREFETCH` | 1 on the CPU, up to 4 on a GPU or TPU | worker threads preparing the next patches; `0` prepares them one at a time |
 | `FASTSAR_TIMING` | off | `1` times mosaic steps; `patches.report_timing()` returns them |
 
 `FASTSAR_FIRP_GLOBAL` and `FFBP_FORCE_TPU_KERNELS` exist for the tests only.

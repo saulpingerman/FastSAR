@@ -261,23 +261,26 @@ def patch_history(fx, ant, center, pts, lo, hi, margin=None, guard=None, prof=No
         m = np.rint(sft).astype(np.int64)
         tm('host geometry')
         win = prof.get('win')
-        if isinstance(Q, np.ndarray) and win is not None and hi - lo <= win['rows']:
-            # a window of the profiles on the GPU, moved along the strip when a patch's pulses leave it (patches run
-            # along track, so a window serves many of them)
-            if not (win['w0'] <= lo and hi <= win['w1']):
-                win['buf'] = None
-                win['w0'], win['w1'] = lo, min(Q.shape[0], lo + win['rows'])
-                win['buf'] = cp.asarray(Q[win['w0']:win['w1']])
-                win['loads'] = win.get('loads', 0) + 1
-            Q, lo_q = win['buf'], lo - win['w0']
-        else:
-            lo_q = lo
-        if isinstance(Q, np.ndarray):
-            u = cp.asarray(Q[lo + np.arange(hi - lo)[:, None], (j[None, :] - m[:, None]) % K2])
-        else:
-            md = cp.asarray(m)
-            cols = (cp.asarray(j)[None, :] - md[:, None]) % K2
-            u = Q[cp.arange(lo_q, lo_q + hi - lo)[:, None], cols]
+        with prof['lock']:               # patches are prepared on several threads; the window is shared
+            if isinstance(Q, np.ndarray) and win is not None and hi - lo <= win['rows']:
+                # a window of the profiles on the GPU, moved along the strip when a patch's pulses leave it (patches
+                # run along track, so a window serves many of them; it starts an eighth of its length behind the
+                # patch, for patches prepared slightly out of order)
+                if not (win['w0'] <= lo and hi <= win['w1']):
+                    win['buf'] = None
+                    w0 = max(0, min(lo - win['rows'] // 8, hi - win['rows']))
+                    win['w0'], win['w1'] = w0, min(Q.shape[0], w0 + win['rows'])
+                    win['buf'] = cp.asarray(Q[win['w0']:win['w1']])
+                    win['loads'] = win.get('loads', 0) + 1
+                Q, lo_q = win['buf'], lo - win['w0']
+            else:
+                lo_q = lo
+            if isinstance(Q, np.ndarray):
+                u = cp.asarray(Q[lo + np.arange(hi - lo)[:, None], (j[None, :] - m[:, None]) % K2])
+            else:
+                md = cp.asarray(m)
+                cols = (cp.asarray(j)[None, :] - md[:, None]) % K2
+                u = Q[cp.arange(lo_q, lo_q + hi - lo)[:, None], cols]
         tm('gather')
         U = cp.fft.fft(u, axis=1)[:, k0:k1]
         tm('fft')
@@ -462,7 +465,8 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
     prof = range_profiles(fx, guard) if npatch > 1 and os.environ.get('FASTSAR_SHARED_PROFILES', '1') != '0' else None
     if prof is not None and backend == 'cuda' and not exact:
         import cupy as cp
-        prof['device'] = True
+        import threading
+        prof['device'], prof['lock'] = True, threading.Lock()
         free = cp.cuda.Device().mem_info[0]
         row = prof['Q'].shape[1] * 8
         force = int(os.environ.get('FASTSAR_PROFILE_WINDOW_ROWS') or 0)          # testing: the window, of this many rows
@@ -537,19 +541,30 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
         tm('plan and former')
         return dict(i0=i0, j0=j0, c=c, lo=lo, hi=hi, S=S, df=df, wt=wt, form=form, Tp=Tp, s12=s12, nlev=nlev, err=err)
 
-    # the next patch is prepared (pulse span, range gate, plan, weights; host work) on a second thread while the
-    # current one forms (FASTSAR_MOSAIC_PREFETCH=0: one at a time)
+    # the next patches are prepared (pulse span, range gate, plan, weights; host work) on worker threads while the
+    # current one forms: FASTSAR_MOSAIC_PREFETCH workers (0: one patch at a time, in turn), by default 1 on the CPU,
+    # whose formation uses every core, and up to 4 (a quarter of the cores) for a GPU or TPU, whose formation would
+    # otherwise wait on the host
     order = [(i0, j0) for i0 in range(0, nx, mx) for j0 in range(0, ny, my)]
-    prefetch = os.environ.get('FASTSAR_MOSAIC_PREFETCH', '1') != '0' and len(order) > 1
+    nw = os.environ.get('FASTSAR_MOSAIC_PREFETCH')
+    nw = int(nw) if nw else (1 if backend == 'cpu' else max(1, min(4, (os.cpu_count() or 4) // 4)))
+    nw = nw if len(order) > 1 else 0
     from concurrent.futures import ThreadPoolExecutor
-    ex = ThreadPoolExecutor(1) if prefetch else None
-    nxt = ex.submit(prep, *order[0]) if prefetch else None
+    from collections import deque
+    ex = ThreadPoolExecutor(nw) if nw else None
+    pending, nxt = deque(), 0
+
+    def submit():
+        nonlocal nxt
+        while nxt < len(order) and len(pending) < nw:
+            pending.append(ex.submit(prep, *order[nxt]))
+            nxt += 1
     try:
         for k in range(len(order)):
-            if prefetch:
-                job = nxt.result()
-                if k + 1 < len(order):
-                    nxt = ex.submit(prep, *order[k + 1])
+            if ex is not None:
+                submit()
+                job = pending.popleft().result()
+                submit()
             else:
                 job = prep(*order[k])
             if job is None:
