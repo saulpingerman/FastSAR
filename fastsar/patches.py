@@ -417,6 +417,30 @@ def fill_gaps(a):
     return out, idx
 
 
+def choose_buckets(counts, compile_cost, step=256):
+    """Pulse counts for the compiled programs of a JAX or TPU mosaic: counts [n] (the patches' pulse counts) ->
+    sorted bucket counts (multiples of step), each patch to take the smallest bucket at least its count. Minimizes
+    compile_cost x (number of buckets) + the patches' padding work, sum of (bucket / count - 1), both in units of one
+    patch's formation (dynamic programming over the distinct counts)."""
+    u, w = np.unique(step * -(-np.asarray(counts, np.int64) // step), return_counts=True)
+    if len(u) == 0:
+        return []
+    m = len(u)
+    best, prev = np.full(m, np.inf), np.full(m, -1)
+    for j in range(m):
+        # items k+1 .. j padded to u[j]; k = -1: every count up to j
+        for k in range(-1, j):
+            pad = float(np.sum(w[k + 1:j + 1] * (u[j] / u[k + 1:j + 1] - 1.0)))
+            c = compile_cost + pad + (best[k] if k >= 0 else 0.0)
+            if c < best[j]:
+                best[j], prev[j] = c, k
+    out, j = [], m - 1
+    while j >= 0:
+        out.append(int(u[j]))
+        j = prev[j]
+    return out[::-1]
+
+
 def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 1.0, 0.0), patch=(128, 128), crop=0,
                 beam=None, umax=1.0, awin=None, pulses=None, margin=None, guard=None, backend='cpu', T='auto',
                 levels='auto', target_db=-40.0, sub='auto', wtol_db=None, exact=False, info=None):
@@ -513,8 +537,13 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
             gates.append(v)
             return v
 
+    planned = []                          # bucket counts chosen from every patch's span before forming (choose_buckets)
+
     def padded_pulses(n):
         with taken_lock:
+            fit = [v for v in planned if v >= n]
+            if fit:
+                return min(fit)
             fit = [v for v in taken if n <= v <= n * (1 + slack) + 256]
             if fit:
                 return min(fit)
@@ -527,21 +556,24 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
             taken.append(v)
             return v
 
-    def prep(i0, j0):
-        """Everything for patch (i0, j0) up to its former: -> dict, or None when no pulse serves it."""
-        tm = _Timer('form_mosaic')
+    def span_of(i0, j0):
+        """Center, points and pulse span (lo, hi) of patch (i0, j0); span None when no pulse serves it."""
         c = o + (i0 - crop + px / 2) * spx * e1 + (j0 - crop + py / 2) * spy * e2
         pts = c + (gi.ravel() * spx)[:, None] * e1 + (gj.ravel() * spy)[:, None] * e2
-        wt = None
         if beam is not None:
-            span = beam_span(beam, len(ant), pts, umax)
-            if span is None:
-                return None
-            lo, hi = span
-            if awin is not None and not in_kernel:
-                wt = weight_terms(wa(np.clip(beam(slice(lo, hi), pts) / umax, -1, 1)), wtol_db)
-        else:
-            lo, hi = (0, len(ant)) if pulses is None else (pulses(c) if callable(pulses) else pulses)
+            return c, pts, beam_span(beam, len(ant), pts, umax)
+        return c, pts, ((0, len(ant)) if pulses is None else (pulses(c) if callable(pulses) else pulses))
+
+    def prep(i0, j0, span=None):
+        """Everything for patch (i0, j0) up to its former: -> dict, or None when no pulse serves it."""
+        tm = _Timer('form_mosaic')
+        c, pts, span = span_of(i0, j0) if span is None else span
+        if span is None:
+            return None
+        lo, hi = span
+        wt = None
+        if beam is not None and awin is not None and not in_kernel:
+            wt = weight_terms(wa(np.clip(beam(slice(lo, hi), pts) / umax, -1, 1)), wtol_db)
         tm('beam span')
         S, a, f0, df = patch_history(fx, ant, c, pts, lo, hi, margin, guard, prof,
                                      gate_len=padded_gate if backend in ('jax', 'tpu') and not exact else None)
@@ -597,11 +629,22 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
     from collections import deque
     ex = ThreadPoolExecutor(nw) if nw else None
     pending, nxt = deque(), 0
+    spans = {}
+    if backend in ('jax', 'tpu') and not exact and len(order) > 1:
+        # every patch's span first (cheap), so that the pulse counts of the compiled programs are chosen for the
+        # whole mosaic: FASTSAR_COMPILE_PATCHES is the compile time of one program in patch formations
+        # (about 11 on a v6e, where a program compiles in about 8 s and a sliding-spotlight patch forms in 0.7 s)
+        tm = _Timer('form_mosaic')
+        spans = dict(zip(order, (ex.map if ex is not None else map)(lambda q: span_of(*q), order)))
+        cc = float(os.environ.get('FASTSAR_COMPILE_PATCHES', '11' if backend == 'tpu' else '3'))
+        counts = [len(fill_gaps(ant[sp[2][0]:sp[2][1]])[0]) for sp in spans.values() if sp[2] is not None]
+        planned[:] = choose_buckets(counts, cc) if counts else []
+        tm('pulse buckets')
 
     def submit():
         nonlocal nxt
         while nxt < len(order) and len(pending) < nw:
-            pending.append(ex.submit(prep, *order[nxt]))
+            pending.append(ex.submit(prep, *order[nxt], spans.get(order[nxt])))
             nxt += 1
     try:
         for k in range(len(order)):
@@ -610,7 +653,7 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
                 job = pending.popleft().result()
                 submit()
             else:
-                job = prep(*order[k])
+                job = prep(*order[k], spans.get(order[k]))
             if job is None:
                 continue
             i0, j0, c, lo, hi, S, df, wt, form = (job[q] for q in ('i0', 'j0', 'c', 'lo', 'hi', 'S', 'df', 'wt', 'form'))
