@@ -815,9 +815,16 @@ def make_ffbp(policy, plan, filt='dense', budget=1 << 26, trig='split', pallas_p
     ox, oy, nx, ny = plan['ox'], plan['oy'], plan['nx'], plan['ny']
 
     @jax.jit
-    def assemble(blocks):
-        full = jnp.concatenate([jnp.concatenate(blocks[x * sy0:(x + 1) * sy0], axis=1) for x in range(sx0)], axis=0)
-        return full[ox:ox + nx, oy:oy + ny]
+    @jax.jit
+    def assemble(re, im):
+        """The image from the tiles' outputs in tile order (x major), given as arrays of one tile [mx, my] or of a
+        group [ng, mx, my]: one program, not one eager slice per tile, which costs milliseconds of host time each."""
+        def one(blocks):
+            a = jnp.concatenate([b.reshape((-1,) + b.shape[-2:]) for b in blocks], 0)        # [G, mx, my]
+            mx, my = a.shape[1:]
+            full = a.reshape(sx0, sy0, mx, my).transpose(0, 2, 1, 3).reshape(sx0 * mx, sy0 * my)
+            return full[ox:ox + nx, oy:oy + ny]
+        return one(re), one(im)
 
     ng = min(pallas_ng, G) if filt == 'pallas2' else 1
     while G % ng:
@@ -857,14 +864,11 @@ def make_ffbp(policy, plan, filt='dense', budget=1 << 26, trig='split', pallas_p
 
     def form(hre, him, arrs):
         if ng > 1:
-            parts = []
-            for g0 in range(0, G, ng):
-                re, im = one_group(hre, him, arrs, jnp.arange(g0, g0 + ng, dtype=jnp.int32))
-                parts += [(re[i], im[i]) for i in range(ng)]
+            parts = [one_group(hre, him, arrs, np.arange(g0, g0 + ng, dtype=np.int32)) for g0 in range(0, G, ng)]
         else:
             parts = [one_tile(hre, him, arrs, np.int32(g)) for g in range(G)]
         del hre, him
-        return assemble([q[0] for q in parts]), assemble([q[1] for q in parts])
+        return assemble(tuple(q[0] for q in parts), tuple(q[1] for q in parts))
 
     lv0 = levels[0]
     if filt == 'pallas2' and lv0['Dk'] > 1 and on_tpu:
