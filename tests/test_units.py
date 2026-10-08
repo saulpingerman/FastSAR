@@ -247,6 +247,14 @@ print(f'  (whole gated history: {rel_db(s, d):.1f} dB)')
 check('patch_history with profiles: central half of the gate', rel_db(qs[:, h4:-h4], qd[:, h4:-h4]), -90)
 check('their antenna paths and frequency grids (max abs difference)',
       float(np.abs(rest_s[0] - rest_d[0]).max() + abs(rest_s[1] - rest_d[1]) + abs(rest_s[2] - rest_d[2])), 0, '{:.2g}')
+# a wider gate (gate_len, as the JAX and TPU mosaics use to share programs) keeps the patch's image: exact
+# backprojection of both gated histories at the patch points
+from fastsar.bp import backproject
+w, *rest_w = pt.patch_history(fx, col.ant, c, pts9, lo, hi, prof=prof, gate_len=lambda n: n + 40)
+assert w.shape[1] > s.shape[1]
+im_s = backproject(s, rest_s[0], rest_s[1], rest_s[2], pts9 - c, backend='cpu', window=False)
+im_w = backproject(w, rest_w[0], rest_w[1], rest_w[2], pts9 - c, backend='cpu', window=False)
+check(f'patch_history: gate widened by 40 bins ({s.shape[1]} -> {w.shape[1]} samples), image at the patch', rel_db(im_w, im_s), -60)
 o = -32.0 * e1v - 32.0 * e2v
 mos = {}
 for v in ('1', '0'):

@@ -224,10 +224,11 @@ def range_profiles(fx, guard=None):
     return dict(Q=Q, guard=guard, K2=K2, npl=npl, f0=f0)
 
 
-def patch_history(fx, ant, center, pts, lo, hi, margin=None, guard=None, prof=None):
+def patch_history(fx, ant, center, pts, lo, hi, margin=None, guard=None, prof=None, gate_len=None):
     """Phase history of one patch: pulses lo:hi of fx re-referenced to center [3] and gated in range to the extent
     of the points pts [m, 3] (the patch outline) plus margin (m), with the guard taper. prof: range_profiles(fx, guard)
-    computed once for all patches (faster; the same result up to the gate's edge samples).
+    computed once for all patches (faster; the same result up to the gate's edge samples). gate_len: maps the gate's
+    length in range bins to a length at least as long (a wider gate), so that patches share frequency samples.
     -> (S [hi - lo, K'] complex128, ant - center, fmin', df')."""
     S, df = fx['S'], float(fx['df'])
     K = S.shape[1]
@@ -243,6 +244,8 @@ def patch_history(fx, ant, center, pts, lo, hi, margin=None, guard=None, prof=No
     from scipy.fft import next_fast_len
     N = next_fast_len(2 * int(np.ceil(half * 2 * K2 * df / C)))
     N += N % 2
+    if gate_len is not None and N < K2:
+        N = min(gate_len(N), K2)
     gate = N < K2
     df2 = K2 * df / N if gate else df
     f2 = f0 + df2 * np.arange(N if gate else K2)
@@ -484,19 +487,43 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
                 warn(f'cuda mosaic: a patch\'s range profiles ({gb(need * row)}) do not fit a quarter of the free GPU '
                      f'memory, so each patch\'s gate is cut in host memory, which is slower; full speed needs about '
                      f'{gb(4 * need * row)} of GPU memory, {gb(free)} is free')
-    # JAX and TPU: each pulse count compiles a program. Counts are padded to multiples of 256; once a second count
-    # appears (a sliding spotlight's patches see different spans), a new count is padded FASTSAR_PULSE_SLACK (default
-    # 0.04) further, and a later patch reuses any count already taken that exceeds its own by no more than that
+    # JAX and TPU: each pulse count compiles a program. The first count is padded to a multiple of 256; a patch
+    # reuses any count already taken that exceeds its own by no more than FASTSAR_PULSE_SLACK (default 0.04), and
+    # otherwise takes the next count on the grid first count x (1 + slack)^k (a sliding spotlight's patches see
+    # different spans). The grid bounds the programs by the spread of the spans, whatever order patches arrive in
     import threading
     slack = float(os.environ.get('FASTSAR_PULSE_SLACK', '0.04'))
-    taken, taken_lock = [], threading.Lock()
+    taken, gates, taken_lock = [], [], threading.Lock()
+
+    def padded_gate(n):
+        """A range gate of n bins widened as padded_pulses pads pulses (same slack and grid), to an even fast FFT
+        length: patches of one gate length share their frequency samples and so their compiled program."""
+        from scipy.fft import next_fast_len
+        with taken_lock:
+            fit = [v for v in gates if n <= v <= n * (1 + slack) + 16]
+            if fit:
+                return min(fit)
+            v = n
+            if gates and slack > 0:
+                k = np.ceil(np.log(n / gates[0]) / np.log1p(slack) - 1e-9)
+                v = max(n, int(np.ceil(gates[0] * (1 + slack) ** k)))
+            v = next_fast_len(v)
+            while v % 2:
+                v = next_fast_len(v + 1)
+            gates.append(v)
+            return v
 
     def padded_pulses(n):
         with taken_lock:
-            fit = [v for v in taken if n <= v <= n * (1 + slack)]
+            fit = [v for v in taken if n <= v <= n * (1 + slack) + 256]
             if fit:
                 return min(fit)
-            v = 256 * -(-int(np.ceil(n * (1 + slack) if taken else n)) // 256)
+            if taken and slack > 0:
+                k = np.ceil(np.log(n / taken[0]) / np.log1p(slack) - 1e-9)
+                v = max(n, int(np.ceil(taken[0] * (1 + slack) ** k)))
+            else:
+                v = n
+            v = 256 * -(-v // 256)
             taken.append(v)
             return v
 
@@ -516,7 +543,8 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
         else:
             lo, hi = (0, len(ant)) if pulses is None else (pulses(c) if callable(pulses) else pulses)
         tm('beam span')
-        S, a, f0, df = patch_history(fx, ant, c, pts, lo, hi, margin, guard, prof)
+        S, a, f0, df = patch_history(fx, ant, c, pts, lo, hi, margin, guard, prof,
+                                     gate_len=padded_gate if backend in ('jax', 'tpu') and not exact else None)
         tm('patch history')
         if exact:
             from .bp import backproject as bpx, plane_points
