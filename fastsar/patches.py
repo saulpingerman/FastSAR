@@ -49,9 +49,12 @@ so where T = 16 misses target_db the patch is formed on a grid finer by 2 in one
 halves the final tiles; the JAX program also takes T = 8.
 """
 import os
+import threading
+
 import numpy as np
 
 from . import stripmap as sm
+from .memory import _env_number
 
 C = 299792458.0
 
@@ -188,6 +191,7 @@ def _window_start(lo, hi, rows):
 
 
 _ROWS_POOL = []
+_ROWS_LOCK = threading.Lock()
 
 
 def _rows(fn, n, chunk=256):
@@ -199,8 +203,9 @@ def _rows(fn, n, chunk=256):
     if len(sl) == 1:
         fn(sl[0])
         return
-    if not _ROWS_POOL:
-        _ROWS_POOL.append(ThreadPoolExecutor(os.cpu_count() or 1, thread_name_prefix='fastsar-rows'))
+    with _ROWS_LOCK:
+        if not _ROWS_POOL:
+            _ROWS_POOL.append(ThreadPoolExecutor(os.cpu_count() or 1, thread_name_prefix='fastsar-rows'))
     list(_ROWS_POOL[0].map(fn, sl))
 
 
@@ -486,6 +491,9 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
     (weight_terms, down to wtol_db, default target_db - 10), each formed by one FFBP of the weighted phase history
     and multiplied by its pixel factor, interpolated by bicubic splines.
     pulses: (lo, hi) or a function of the patch center returning (lo, hi), used when beam is None (default: all).
+    beam, pulses and the window are evaluated on the prefetch worker threads, several at once when
+    FASTSAR_MOSAIC_PREFETCH is above 1 (the default on a GPU or TPU), so callables must be thread-safe (a pure NumPy
+    function is; one reading a file through a shared handle may not be) or FASTSAR_MOSAIC_PREFETCH set to 0 or 1.
     margin, guard: range gate margin (m) and spectral guard (Hz), see patch_history. T, target_db: as for ImageFormer,
     with sub (s1, s2) or 'auto' chosen with T by tile_plan (T = 8 only on 'jax'; the C++ and CUDA final stages take 16
     or 32). levels: 'auto' takes up to 3, as many as the patch allows without padding. exact=True forms each patch by
@@ -522,32 +530,19 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
     prof = range_profiles(fx, guard) if npatch > 1 and os.environ.get('FASTSAR_SHARED_PROFILES', '1') != '0' else None
     if prof is not None and backend == 'cuda' and not exact:
         import cupy as cp
-        import threading
         prof['device'], prof['lock'] = True, threading.Lock()
-        from .memory import cuda_free, _env_number
+        from .memory import cuda_free
         free = cuda_free()
         row = prof['Q'].shape[1] * 8
         force = _env_number('FASTSAR_PROFILE_WINDOW_ROWS', 0) or 0              # testing: the window, of this many rows
         if prof['Q'].nbytes < 0.4 * free and not force:      # profiles in GPU memory when they fit
             prof['Qd'] = cp.asarray(prof['Q'])
         else:                                  # else a window of them, a quarter of the free memory
-            prof['win'] = dict(w0=0, w1=0, buf=None, rows=force or int(0.25 * free // row))
-            need = len(ant)                    # pulses serving one patch: a patch-wide stretch at the middle of the grid
-            if beam is not None:
-                q = o + ((nx / 2 + np.array([-0.5, 0.5]) * mx) * spx)[:, None] * e1 + (ny / 2 * spy) * e2
-                span = beam_span(beam, len(ant), q, umax)
-                need = 0 if span is None else span[1] - span[0]
-            if need > prof['win']['rows']:
-                from .memory import _warn as warn, _gb as gb
-                warn(f'cuda mosaic: a patch\'s range profiles ({gb(need * row)}) do not fit a quarter of the free GPU '
-                     f'memory, so each patch\'s gate is cut in host memory, which is slower; full speed needs about '
-                     f'{gb(4 * need * row)} of GPU memory, {gb(free)} is free')
+            prof['win'] = dict(w0=0, w1=0, buf=None, rows=force or int(0.25 * free // row), free=free, row=row)
     # JAX and TPU: each pulse count compiles a program. The first count is padded to a multiple of 256; a patch
     # reuses any count already taken that exceeds its own by no more than FASTSAR_PULSE_SLACK (default 0.04), and
     # otherwise takes the next count on the grid first count x (1 + slack)^k (a sliding spotlight's patches see
     # different spans). The grid bounds the programs by the spread of the spans, whatever order patches arrive in
-    import threading
-    from .memory import _env_number
     slack = _env_number('FASTSAR_PULSE_SLACK', 0.0, float)
     slack = 0.04 if slack is None else slack
     taken, gates, taken_lock = [], [], threading.Lock()
@@ -679,12 +674,24 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
     ex = ThreadPoolExecutor(nw) if nw else None
     pending, nxt = deque(), 0
     spans = {}
-    if backend in ('jax', 'tpu') and not exact and len(order) > 1:
-        # every patch's span first (cheap), so that the pulse counts of the compiled programs are chosen for the
-        # whole mosaic: FASTSAR_COMPILE_PATCHES is the compile time of one program in patch formations
-        # (about 11 on a v6e, where a program compiles in about 8 s and a sliding-spotlight patch forms in 0.7 s)
+    plan_programs = backend in ('jax', 'tpu') and not exact and len(order) > 1
+    win = prof.get('win') if prof is not None else None
+    if plan_programs or win is not None:
+        # every patch's span first (cheap; in turn, on this thread), so that the pulse counts of the compiled programs
+        # are chosen for the whole mosaic and the GPU window is checked against the longest span
         tm = _Timer('form_mosaic')
-        spans = dict(zip(order, (ex.map if ex is not None else map)(lambda q: span_of(*q), order)))
+        spans = {q: span_of(*q) for q in order}
+        tm('pulse spans')
+    if win is not None:
+        need = max((sp[2][1] - sp[2][0] for sp in spans.values() if sp[2] is not None), default=0)
+        if need > win['rows']:
+            from .memory import _warn, _gb
+            _warn(f'cuda mosaic: a patch\'s range profiles ({_gb(need * win["row"])}) do not fit a quarter of the free '
+                  f'GPU memory, so the gates of such patches are cut in host memory, which is slower; full speed needs '
+                  f'about {_gb(4 * need * win["row"])} of GPU memory, {_gb(win["free"])} is free')
+    if plan_programs:
+        # FASTSAR_COMPILE_PATCHES: the compile time of one program in patch formations (docs/performance.md)
+        tm = _Timer('form_mosaic')
         cc = _env_number('FASTSAR_COMPILE_PATCHES', 0.0, float)
         cc = (11.0 if backend == 'tpu' else 3.0) if cc is None else cc
         counts = [len(fill_gaps(ant[sp[2][0]:sp[2][1]])[0]) for sp in spans.values() if sp[2] is not None]
@@ -692,18 +699,21 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
         # and the gate lengths, as fast FFT lengths at least the chosen ones
         from scipy.fft import next_fast_len
         g = [gate_bins(fx, ant, sp[0], sp[1], sp[2][0], sp[2][1], margin, guard) for sp in spans.values() if sp[2] is not None]
-        g = [n for n, K2 in g if n < K2]
+        K2 = g[0][1] if g else 0
+        g = [n for n, _ in g if n < K2]
         fl = []
-        for v in (choose_buckets(g, cc, step=2) if g else []):
-            v = next_fast_len(v)
+        for u in (choose_buckets(g, cc, step=2) if g else []):
+            v = next_fast_len(u)
             while v % 2:
                 v = next_fast_len(v + 1)
-            fl.append(v)
+            fl.append(v if v < K2 else u)       # a gate of K2 or more is no gate: keep the bucket's own length
         planned_gates[:] = sorted(set(fl))
         tm('pulse buckets')
 
-    # on the GPU, a patch forms while no worker holds GPU memory in flight (patch_history takes the same lock), so the
-    # former's first-level groups, sized to the free memory, are not undercut
+    # on the GPU, a patch forms while no worker gathers a patch history on the device (patch_history takes the same
+    # lock), so the former's first-level groups, sized to the memory free when it starts, are not undercut by those
+    # gathers. Histories already prepared stay on the device (at most one per worker) and count as used memory; a
+    # former built meanwhile uploads only its plan arrays, which are small
     import contextlib
     gpu_turn = prof['lock'] if prof is not None and prof.get('device') is not None else contextlib.nullcontext()
 
