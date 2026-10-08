@@ -674,7 +674,9 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
                     x, y = g // sy0, g % sy0
                     full[x * mx:(x + 1) * mx, y * my:(y + 1) * my] = re + 1j * im
             else:
-                bt = int(max(1, min(len(gs), (0.9 * cuda_free()) // rest)))
+                # (the batch does not set the speed: on the L4, 1, 2 and 4 children per pass of the 2025 Capella
+                # spotlight formed in the same time within 1%, so it is sized with room to spare and halved quietly)
+                bt = int(max(1, min(len(gs), (0.45 * cuda_free()) // rest)))
                 if os.environ.get('FASTSAR_CUDA_BATCH'):               # testing: first-level children per later pass
                     bt = int(os.environ['FASTSAR_CUDA_BATCH'])
                 k0 = 0
@@ -687,9 +689,6 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
                             raise
                         cp.get_default_memory_pool().free_all_blocks()
                         bt //= 2
-                        from .memory import warn, gb
-                        warn(f'cuda: out of GPU memory in the later levels; FastSAR continues {bt} first-level '
-                             f'children at a time, which is slower ({gb(cuda_free())} free)')
                         continue
                     k0 += len(sub)
                     for k, g in enumerate(sub):
