@@ -9,7 +9,7 @@ backprojection, and makes products: autofocus, interferometry, geolocation, map 
 
 ![FastSAR image of the Panama Canal's Pacific entrance from an Umbra spotlight collection](docs/images/hero_panama.jpg)
 
-*Panama Canal, Pacific entrance (Umbra open data, 2023-07-18): 12,207 by 8,808 pixels in 3.6 s on an Nvidia L4
+*Panama Canal, Pacific entrance (Umbra open data, 2023-07-18): 12,207 by 8,808 pixels in 4.3 s on an Nvidia L4, host memory to host memory
 (float32, -59.5 dB against float64 exact backprojection), downsampled. A 16-vCPU AMD EPYC 9B45 takes 12.4 s. ISCE3,
 the fastest open-source code that forms this collection, would take an estimated 4.8 h on that CPU and 27 min on
 the L4.*

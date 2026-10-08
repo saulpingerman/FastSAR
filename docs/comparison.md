@@ -5,7 +5,7 @@ vCPUs) or one Nvidia L4, from the same Taylor-windowed phase history and antenna
 
 Errors are against float64 exact backprojection over the lock, port and ship regions of
 [precision.md](precision.md), worst to best; ISCE3 was scored on three 256 by 256 patches of its own grid after
-removal of a common linear phase ramp. Times are for the full image. Estimates (est.) scale one region's time by the
+removal of a common linear phase ramp. Times are for the full image, from host memory to host memory. Estimates (est.) scale one region's time by the
 pixel count and overstate: the same estimate for FastSAR's exact backprojection gives 2.4 h against 46 min
 measured.
 
@@ -22,11 +22,11 @@ measured.
 | GPU (Nvidia L4) | Error (dB) | Time |
 |---|---|---|
 | ISCE3 `backproject`, CUDA | -31.5 to -52.2 | 27 min (est.) |
-| torchbp, exact | no image | 15.2 s |
+| torchbp, exact | no image | 16.0 s |
 | torchbp, factorized | out of memory | |
 | FastSAR, exact backprojection, 8x | -54.7 to -58.3 | 67 s |
-| FastSAR, factorized, float32 | -55.7 to -61.2 | 3.6 s |
-| FastSAR, factorized, float16 | -54.6 to -60.4 | 2.9 s |
+| FastSAR, factorized, float32 | -55.7 to -61.2 | 4.3 s |
+| FastSAR, factorized, float16 | -54.6 to -60.4 | 3.7 s |
 
 - RITSAR: a `linspace` range axis too coarse by one part in N_fft - 1, and a frequency axis that assumes an even
   sample count (the collection has 14,399).
