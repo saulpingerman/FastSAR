@@ -180,6 +180,13 @@ def tile_plan(ant, fmax, px, py, spx, spy, e1, e2, target_db=-40.0, tiles=(32, 1
     return best
 
 
+def _window_start(lo, hi, rows):
+    """First pulse of a GPU window of `rows` profiles for a patch serving pulses lo:hi: an eighth of the window
+    behind lo (patches run forward along track, a few out of order on the prefetch threads), always covering lo:hi
+    when it fits."""
+    return max(0, min(lo, max(hi - rows, lo - rows // 8)))
+
+
 _ROWS_POOL = []
 
 
@@ -291,7 +298,7 @@ def patch_history(fx, ant, center, pts, lo, hi, margin=None, guard=None, prof=No
                 # patch, for patches prepared slightly out of order)
                 if not (win['w0'] <= lo and hi <= win['w1']):
                     win['buf'] = None
-                    w0 = max(0, min(lo - win['rows'] // 8, hi - win['rows']))
+                    w0 = _window_start(lo, hi, win['rows'])
                     win['w0'], win['w1'] = w0, min(Q.shape[0], w0 + win['rows'])
                     win['buf'] = cp.asarray(Q[win['w0']:win['w1']])
                     win['loads'] = win.get('loads', 0) + 1

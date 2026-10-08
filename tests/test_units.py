@@ -255,6 +255,18 @@ assert w.shape[1] > s.shape[1]
 im_s = backproject(s, rest_s[0], rest_s[1], rest_s[2], pts9 - c, backend='cpu', window=False)
 im_w = backproject(w, rest_w[0], rest_w[1], rest_w[2], pts9 - c, backend='cpu', window=False)
 check(f'patch_history: gate widened by 40 bins ({s.shape[1]} -> {w.shape[1]} samples), image at the patch', rel_db(im_w, im_s), -60)
+# the GPU window of profiles: covers the patch, starts an eighth behind it, and a forward sweep of patches of
+# 1,000 pulses each 500 apart moves a 10,000-row window about every 17 patches (once per patch before the fix)
+for lo_, hi_, rows_ in ((5000, 6000, 10000), (5000, 6000, 1000), (0, 900, 4000), (100, 600, 600)):
+    w0_ = pt._window_start(lo_, hi_, rows_)
+    assert w0_ <= lo_ and w0_ + rows_ >= hi_ and w0_ >= 0, (lo_, hi_, rows_, w0_)
+w, moves = (0, 0), 0
+for k in range(400):
+    lo_, hi_ = 500 * k, 500 * k + 1000
+    if not (w[0] <= lo_ and hi_ <= w[1]):
+        w0_ = pt._window_start(lo_, hi_, 10000)
+        w, moves = (w0_, w0_ + 10000), moves + 1
+check('profile window moves for 400 patches advancing 500 pulses (10,000 rows; 382 with the old start)', moves, 30, '{:.0f}')
 o = -32.0 * e1v - 32.0 * e2v
 mos = {}
 for v in ('1', '0'):
