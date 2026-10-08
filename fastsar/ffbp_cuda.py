@@ -675,6 +675,8 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
                     full[x * mx:(x + 1) * mx, y * my:(y + 1) * my] = re + 1j * im
             else:
                 bt = int(max(1, min(len(gs), (0.9 * cuda_free()) // rest)))
+                if os.environ.get('FASTSAR_CUDA_BATCH'):               # testing: first-level children per later pass
+                    bt = int(os.environ['FASTSAR_CUDA_BATCH'])
                 k0 = 0
                 while k0 < len(gs):
                     sub = gs[k0:k0 + bt]
