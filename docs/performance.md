@@ -36,8 +36,8 @@ Phase histories of tens of gigabytes (28 GB for an ICEYE dwell, 10 GB for a Cape
 - TPU: the history is padded once per image for the first-level kernel, and a level's pulse decimation is a
   blocked banded product of its filter kernel once the dense matrix would exceed 2^24 entries (2.8 GB at 74,203
   pulses, with work growing as the square of the pulse count).
-- JAX and TPU: up to 16 compiled programs and their plan arrays are cached by plan signature; mosaic patches are
-  padded to multiples of 256 pulses to share them (24 formers, 8 programs in `tests/test_patches.py`). Without the
+- JAX and TPU: up to 32 compiled programs and their plan arrays are cached by plan signature; mosaic patches are
+  padded to multiples of 256 pulses to share them, and where patches see different pulse spans (sliding spotlight) up to 4% further to reuse a program already compiled (`FASTSAR_PULSE_SLACK`; 38 programs to 16 on a 78-patch Capella sliding spotlight) (24 formers, 8 programs in `tests/test_patches.py`). Without the
   cache, the 2021 Capella stripmap mosaic on a v6e spent 19 s of 52 s rebuilding plan arrays.
 - Mosaics: range profiles are computed once and stay in GPU memory on `cuda` when they fit, with the range gate on
   the GPU. The next patches are prepared on worker threads while one forms (one on the CPU, whose formation uses

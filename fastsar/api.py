@@ -341,7 +341,7 @@ class ImageFormer:
         if hit is None:
             hit = (ffbp2.make_ffbp(self._pol, self._plan, self._filt, 1 << 26, 'direct', pallas_pb=256, pallas_nc=8,
                                    pallas_ng=ng, pallas_final=2, pallas_gen=3), ffbp2.static_arrays(self._pol, self._plan, self._filt))
-            if len(_JAX_PROGRAMS) >= 16:
+            if len(_JAX_PROGRAMS) >= 32:
                 _JAX_PROGRAMS.pop(next(iter(_JAX_PROGRAMS)))
             _JAX_PROGRAMS[key] = hit
         return hit

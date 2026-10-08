@@ -484,6 +484,22 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
                 warn(f'cuda mosaic: a patch\'s range profiles ({gb(need * row)}) do not fit a quarter of the free GPU '
                      f'memory, so each patch\'s gate is cut in host memory, which is slower; full speed needs about '
                      f'{gb(4 * need * row)} of GPU memory, {gb(free)} is free')
+    # JAX and TPU: each pulse count compiles a program. Counts are padded to multiples of 256; once a second count
+    # appears (a sliding spotlight's patches see different spans), a new count is padded FASTSAR_PULSE_SLACK (default
+    # 0.04) further, and a later patch reuses any count already taken that exceeds its own by no more than that
+    import threading
+    slack = float(os.environ.get('FASTSAR_PULSE_SLACK', '0.04'))
+    taken, taken_lock = [], threading.Lock()
+
+    def padded_pulses(n):
+        with taken_lock:
+            fit = [v for v in taken if n <= v <= n * (1 + slack)]
+            if fit:
+                return min(fit)
+            v = 256 * -(-int(np.ceil(n * (1 + slack) if taken else n)) // 256)
+            taken.append(v)
+            return v
+
     def prep(i0, j0):
         """Everything for patch (i0, j0) up to its former: -> dict, or None when no pulse serves it."""
         tm = _Timer('form_mosaic')
@@ -509,10 +525,10 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
             Tp, s12, nlev, err = None, None, None, None
         else:
             af, idx = fill_gaps(a)
-            if backend in ('jax', 'tpu'):         # pulses padded to a multiple of 256 so that patches share compiled
+            if backend in ('jax', 'tpu'):         # pulses padded (padded_pulses) so that patches share compiled
                 # programs: zero pulses continuing the track, half before and half after (the final stage centres
                 # its plane-wave model on the mean over the aperture)
-                extra = -len(af) % 256
+                extra = padded_pulses(len(af)) - len(af)
                 if extra:
                     e0, e1_ = extra // 2, extra - extra // 2
                     af = np.concatenate([af[0] - (af[1] - af[0]) * np.arange(e0, 0, -1)[:, None], af,
