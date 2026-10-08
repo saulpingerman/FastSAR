@@ -372,7 +372,7 @@ def _children(kern, pre, pim, c0, sl, lv):
 
 
 STREAM_PULSES = 4096       # pulses per uploaded block when the first level streams a host phase history
-from .memory import CUDA_CHILD  # noqa: E402  (device bytes of a first-level child over its planes)
+from .memory import CUDA_CHILD, cuda_free  # noqa: E402  (device bytes of a first-level child over its planes)
 STREAM_FRACTION = 0.5      # stream when the history's device planes exceed this fraction of the free device memory
 
 
@@ -605,7 +605,7 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
         lv0, la0 = levels[0], dev[0]
         isz = 2 * np.dtype(kern['dtype']).itemsize
         planes = isz * S.shape[0] * S.shape[1]                # the history as device planes
-        stream = isinstance(S, np.ndarray) and (planes > STREAM_FRACTION * cp.cuda.Device().mem_info[0]
+        stream = isinstance(S, np.ndarray) and (planes > STREAM_FRACTION * cuda_free()
                                                 or os.environ.get('FASTSAR_CUDA_STREAM') == '1')
         scale = 1.0
         if kern['dtype'] != cp.float32:              # float16 storage: scale to the peak (in row blocks)
@@ -618,19 +618,19 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
                 b = cp.asarray(S[i:i + 4096])
                 pre[0, i:i + 4096] = (b.real / scale).astype(kern['dtype']); pim[0, i:i + 4096] = (b.imag / scale).astype(kern['dtype'])
                 del b
-        free0 = cp.cuda.Device().mem_info[0]
+        free0 = cuda_free()
         forced = ng is not None or bool(os.environ.get('FASTSAR_CUDA_GROUP'))
         if ng is None and os.environ.get('FASTSAR_CUDA_GROUP'):
             ng = int(os.environ['FASTSAR_CUDA_GROUP'])
         # each first-level child takes about CUDA_CHILD times its planes of all pulses at the decimated range length
         per = CUDA_CHILD * isz * lv0['Ko'] * (STREAM_PULSES if stream else lv0['P'])
-        if ng is None:                                 # children per group: 8, 4, 2 or 1, within 95% of the memory left
+        if ng is None:                                 # children per group: 8, 4, 2 or 1, within the memory left
             ng = 8
-            while ng > 1 and ng * per > 0.95 * free0:
+            while ng > 1 and ng * per > free0:
                 ng //= 2
         if (stream and os.environ.get('FASTSAR_CUDA_STREAM') != '1') or (ng < min(8, G) and not forced):
             from .memory import warn, gb, children
-            need = (planes + 8 * CUDA_CHILD * isz * lv0['Ko'] * lv0['P']) / 0.95
+            need = planes + 8 * CUDA_CHILD * isz * lv0['Ko'] * lv0['P']
             how = []
             if stream:
                 how.append(f'streams the {gb(planes)} phase history from host memory through the first level')
@@ -639,21 +639,35 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
             warn(f'cuda: for lack of GPU memory FastSAR ' + ' and '.join(how) + ', which is slower; full speed needs about '
                  f'{gb(need)} of GPU memory, {gb(free0 + (0 if stream else planes))} is free')
         full = cp.empty((plan['Nx'], plan['Ny']), cp.complex64)
-        for g0 in range(0, G, ng):
+        g0 = 0
+        while g0 < G:
             gs = list(range(g0, min(G, g0 + ng)))
             c0 = cp.ascontiguousarray(la0['c0'][0, g0:g0 + len(gs)][None])       # a slice: no index upload
             sl = cp.ascontiguousarray(la0['slope'][0, g0:g0 + len(gs)][None])
-            if stream:
-                A, Bm = level0_streamed(S, scale, c0, sl, lv0)
-            else:
-                A, Bm = _children(kern, pre, pim, c0, sl, lv0)                       # [ng, Po, Ko]
+            try:
+                if stream:
+                    A, Bm = level0_streamed(S, scale, c0, sl, lv0)
+                else:
+                    A, Bm = _children(kern, pre, pim, c0, sl, lv0)                   # [ng, Po, Ko]
+            except cp.cuda.memory.OutOfMemoryError:
+                if ng == 1:
+                    raise
+                # the model sized the groups too large for this device: half the group, from this one on
+                del c0, sl
+                cp.get_default_memory_pool().free_all_blocks()
+                ng //= 2
+                from .memory import warn, children, gb
+                warn(f'cuda: out of GPU memory in the first level; FastSAR continues in groups of {children(ng)}, '
+                     f'which is slower ({gb(cuda_free())} free)')
+                continue
+            g0 += len(gs)
             if os.environ.get('FASTSAR_CUDA_PER_TILE') == '1':          # the previous loop, one child at a time
                 for k, g in enumerate(gs):
                     re, im = one_tile(A[k], Bm[k], g)
                     x, y = g // sy0, g % sy0
                     full[x * mx:(x + 1) * mx, y * my:(y + 1) * my] = re + 1j * im
             else:
-                bt = int(max(1, min(len(gs), (0.25 * cp.cuda.Device().mem_info[0]) // rest)))
+                bt = int(max(1, min(len(gs), (0.25 * cuda_free()) // rest)))
                 for k0 in range(0, len(gs), bt):
                     sub = gs[k0:k0 + bt]
                     re, im = tiles(A[k0:k0 + len(sub)], Bm[k0:k0 + len(sub)], sub)

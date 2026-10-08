@@ -291,7 +291,8 @@ def patch_history(fx, ant, center, pts, lo, hi, margin=None, guard=None, prof=No
         m = np.rint(sft).astype(np.int64)
         tm('host geometry')
         win = prof.get('win')
-        with prof['lock']:               # patches are prepared on several threads; the window is shared
+        with prof['lock']:               # patches are prepared on several threads; the window is shared, and the
+            # GPU work takes turns with the patch forming (form_mosaic), whose groups are sized to the memory left
             if isinstance(Q, np.ndarray) and win is not None and hi - lo <= win['rows']:
                 # a window of the profiles on the GPU, moved along the strip when a patch's pulses leave it (patches
                 # run along track, so a window serves many of them; it starts an eighth of its length behind the
@@ -311,16 +312,16 @@ def patch_history(fx, ant, center, pts, lo, hi, margin=None, guard=None, prof=No
                 md = cp.asarray(m)
                 cols = (cp.asarray(j)[None, :] - md[:, None]) % K2
                 u = Q[cp.arange(lo_q, lo_q + hi - lo)[:, None], cols]
-        tm('gather')
-        U = cp.fft.fft(u, axis=1)[:, k0:k1]
-        tm('fft')
-        kk = cp.arange(k0, k1, dtype=cp.float32)
-        dd = cp.asarray((sft - m).astype(np.float32))
-        cph = cp.asarray((np.exp(-4j * np.pi * f0 * shift / C) * (K2 / N)).astype(np.complex64))
-        ramp = cp.exp((-2j * np.pi / N) * dd[:, None] * kk[None, :]).astype(cp.complex64)
-        out = U * ramp * (cph[:, None] * cp.asarray(T[k0:k1].astype(np.float32))[None, :])
-        tm('ramp')
-        return out.astype(cp.complex64), a - center, float(f2[k0]), float(df2)
+            tm('gather')
+            U = cp.fft.fft(u, axis=1)[:, k0:k1]
+            tm('fft')
+            kk = cp.arange(k0, k1, dtype=cp.float32)
+            dd = cp.asarray((sft - m).astype(np.float32))
+            cph = cp.asarray((np.exp(-4j * np.pi * f0 * shift / C) * (K2 / N)).astype(np.complex64))
+            ramp = cp.exp((-2j * np.pi / N) * dd[:, None] * kk[None, :]).astype(cp.complex64)
+            out = U * ramp * (cph[:, None] * cp.asarray(T[k0:k1].astype(np.float32))[None, :])
+            tm('ramp')
+            return out.astype(cp.complex64), a - center, float(f2[k0]), float(df2)
 
     if gate and prof is not None:
         # exp(-j 4 pi f shift / c) with f = f0 + k df is a delay of s = 2 df K2 shift / c bins of the profile times the
@@ -521,7 +522,8 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
         import cupy as cp
         import threading
         prof['device'], prof['lock'] = True, threading.Lock()
-        free = cp.cuda.Device().mem_info[0]
+        from .memory import cuda_free
+        free = cuda_free()
         row = prof['Q'].shape[1] * 8
         force = int(os.environ.get('FASTSAR_PROFILE_WINDOW_ROWS') or 0)          # testing: the window, of this many rows
         if prof['Q'].nbytes < 0.4 * free and not force:      # profiles in GPU memory when they fit
@@ -695,6 +697,11 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
         planned_gates[:] = sorted(set(fl))
         tm('pulse buckets')
 
+    # on the GPU, a patch forms while no worker holds GPU memory in flight (patch_history takes the same lock), so the
+    # former's first-level groups, sized to the free memory, are not undercut
+    import contextlib
+    gpu_turn = prof['lock'] if prof is not None and prof.get('device') is not None else contextlib.nullcontext()
+
     def submit():
         nonlocal nxt
         while nxt < len(order) and len(pending) < nw:
@@ -714,13 +721,15 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
             Tp, s12, nlev, err = (job[q] for q in ('Tp', 's12', 'nlev', 'err'))
             tm = _Timer('form_mosaic')
             if wt is None:
-                img = job['staged']() if job.get('staged') else form(S)
+                with gpu_turn:
+                    img = job['staged']() if job.get('staged') else form(S)
                 tm('form')
             else:
                 img = 0
-                for at, bt in zip(*wt):
-                    img = img + form(S * at[:, None]) * RectBivariateSpline(si, sj, bt.reshape(len(si), len(sj)))(
-                        np.arange(px), np.arange(py))
+                with gpu_turn:
+                    for at, bt in zip(*wt):
+                        img = img + form(S * at[:, None]) * RectBivariateSpline(si, sj, bt.reshape(len(si), len(sj)))(
+                            np.arange(px), np.arange(py))
             ci, cj = min(mx, nx - i0), min(my, ny - j0)
             out[i0:i0 + ci, j0:j0 + cj] = img[crop:crop + ci, crop:crop + cj]
             if info is not None:

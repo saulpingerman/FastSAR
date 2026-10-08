@@ -48,11 +48,17 @@ def host_available():
         return 64e9
 
 
+def cuda_free():
+    """Free bytes on the current CUDA device, counting the blocks CuPy's memory pool holds cached but unused (an
+    earlier call's arrays, freed to the pool and not to the driver)."""
+    import cupy as cp
+    return cp.cuda.Device().mem_info[0] + cp.get_default_memory_pool().free_bytes()
+
+
 def device_available(backend):
     """Free bytes on the backend's device (host memory for 'cpu')."""
     if backend == 'cuda':
-        import cupy as cp
-        return float(cp.cuda.Device().mem_info[0])
+        return float(cuda_free())
     if backend in ('tpu', 'jax'):
         import jax
         try:
@@ -97,9 +103,9 @@ def full_speed(plan, K, backend):
         hist, groups = tpu_history_bytes(plan, K) + TPU_FIXED, TPU_GROUP * child_bytes(plan, backend)
         return (hist + groups) / 0.95, dict(history=hist, first_level=groups, image=8.0 * plan['Nx'] * plan['Ny'])
     if backend == 'cuda':
-        # as ffbp_cuda sizes its groups: 8 children of CUDA_CHILD times their planes, within 95% of the device
+        # as ffbp_cuda sizes its groups: 8 children of CUDA_CHILD times their planes, within the free memory
         hist, groups = 8.0 * lv['P'] * K, 8 * CUDA_CHILD * 8.0 * lv['Ko'] * lv['P']
-        return (hist + groups) / 0.95, dict(history=hist, first_level=groups, image=8.0 * plan['Nx'] * plan['Ny'])
+        return hist + groups, dict(history=hist, first_level=groups, image=8.0 * plan['Nx'] * plan['Ny'])
     hist = 0.0
     groups = 8 * child_bytes(plan, backend)
     image = 8.0 * plan['Nx'] * plan['Ny']
