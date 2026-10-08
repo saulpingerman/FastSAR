@@ -298,6 +298,20 @@ def _kernels(store='fp32', pb=32):
     return out
 
 
+_TAPS = {}
+
+
+def _dev_taps(kern_h):
+    """A filter's taps on the device, uploaded once (a copy from the host makes the host wait for the GPU)."""
+    key = (id(kern_h), len(kern_h))
+    t = _TAPS.get(key)
+    if t is None or t[0] is not kern_h:
+        if len(_TAPS) > 256:
+            _TAPS.clear()
+        t = _TAPS[key] = (kern_h, cp.asarray(kern_h, cp.float32))
+    return t[1]
+
+
 def _children(kern, pre, pim, c0, sl, lv):
     """pre, pim [Np, P, K] float32 (device); c0, sl [Np, C, P] float32 (device) -> [Np C, Po, Ko] planes."""
     Np, P, K = pre.shape
@@ -306,7 +320,7 @@ def _children(kern, pre, pim, c0, sl, lv):
     t0 = _tick()
     if Dk > 1:
         fk = lv['fir_k']
-        taps = cp.asarray(fk['kern'], cp.float32)
+        taps = _dev_taps(fk['kern'])
         L, pl = fk['L'], fk['pl']
         yre = cp.empty((Np * Cn, P, Ko), kern['dtype'])
         yim = cp.empty((Np * Cn, P, Ko), kern['dtype'])
@@ -332,7 +346,7 @@ def _children(kern, pre, pim, c0, sl, lv):
     t0 = _tick()
     if Dp > 1:
         fp = lv['fir_p']
-        taps = cp.asarray(fp['kern'], cp.float32)
+        taps = _dev_taps(fp['kern'])
         zre = cp.empty((Np * Cn, Po, Ko), kern['dtype'])
         zim = cp.empty((Np * Cn, Po, Ko), kern['dtype'])
         nout = 16                                        # outputs per block: the input rows must fit in 40 KB
@@ -420,6 +434,7 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
     fcen = cp.asarray(fin['cen'])
     wfd = None if wf is None else cp.asarray(wf)
     dlxw, dlyw = cp.asarray(dlx_h, cp.float32), cp.asarray(dly_h, cp.float32)
+    dlx64, dly64 = cp.asarray(dlx_h), cp.asarray(dly_h)        # uploaded once: a host copy per call waits for the GPU
     dummy_w = cp.zeros(1, cp.float32)
     e1d, e2d, end = cp.asarray(e1), cp.asarray(e2), cp.asarray(en)
     sx0, sy0 = levels[0]['sx'], levels[0]['sy']
@@ -460,7 +475,7 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
                                                 np.int32(0 if wts is None else 1)), shared_mem=smem_final)
         _mark('final_tile', t0)
         t0 = _tick()
-        dx, dy = cp.asarray(dlx_h)[None, :, None], cp.asarray(dly_h)[None, None, :]
+        dx, dy = dlx64[None, :, None], dly64[None, None, :]
         los = ucx[:, None, None] * dx + ucy[:, None, None] * dy
         qc = (dx * dx + dy * dy - los * los) * (fc2 / (2.0 * rc[:, None, None]))
         ang = ((qc - cp.rint(qc)) * (2 * np.pi)).astype(cp.float32)
@@ -488,7 +503,7 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
         if wfd is not None and wfd.ndim == 3 and final_mode != 'f16tc':     # weights in the final kernel
             w = wfd.reshape(3, G, -1, Pf)[:, g]
             w0 = w[0]
-            big = cp.abs(w0) > 1e-6 * max(float(cp.abs(w0).max()), 1e-30)
+            big = cp.abs(w0) > 1e-6 * cp.maximum(cp.abs(w0).max(), 1e-30)
             gyr = cp.where(big, w[2] / cp.where(w0 == 0, 1, w0), 0.0)
             re, im = final(a, b, cen, (w0, w[1], gyr))
         elif wfd is not None and wfd.ndim == 3:    # final subaperture weights per tile and their gradient across it
@@ -503,6 +518,51 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
                 a, b = (a * w).astype(a.dtype), (b * w).astype(b.dtype)
             re, im = final(a, b, cen)
         return (re.reshape(shape_g).transpose(perm_g).reshape(mx, my), im.reshape(shape_g).transpose(perm_g).reshape(mx, my))
+
+    def tiles(a, b, gs):
+        """Level-0 children gs [n, Po0, Ko0] through the remaining levels together (one launch per level and stage for
+        all of them) -> their mx x my blocks [n, mx, my] (re, im)."""
+        n = len(gs)
+        assert list(gs) == list(range(gs[0], gs[0] + n))
+        gi = slice(gs[0], gs[0] + n)                          # contiguous children: slices, no index upload
+        for i in range(1, L):
+            lv, la = levels[i], dev[i]
+            if i < HOST_LEVELS:
+                c0 = la['c0'][gi].reshape((-1,) + la['c0'].shape[1:])
+                sl = la['slope'][gi].reshape((-1,) + la['slope'].shape[1:])
+                a, b = _children(kern, a, b, c0, sl, lv)
+            else:
+                nb_par = a.shape[0] // n
+                refs = la['ref'].reshape(G, nb_par, 3)[gi].reshape(-1, 3)
+                t0 = _tick()
+                c0, sl = _device_phases(la, refs, lv)
+                _mark('device_phases', t0)
+                a, b = _children(kern, a, b, c0, sl, lv)
+        cen = fcen.reshape(G, -1, 3)[gi].reshape(-1, 3)
+        if wfd is not None and wfd.ndim == 3 and final_mode != 'f16tc':     # weights in the final kernel
+            w = wfd.reshape(3, G, -1, Pf)[:, gi].reshape(3, -1, Pf)
+            w0 = w[0]
+            big = cp.abs(w0) > 1e-6 * cp.maximum(cp.abs(w0).max(), 1e-30)    # on the device: no wait for the host
+            gyr = cp.where(big, w[2] / cp.where(w0 == 0, 1, w0), 0.0)
+            re, im = final(a, b, cen, (w0, w[1], gyr))
+        elif wfd is not None and wfd.ndim == 3:
+            w = wfd.reshape(3, G, -1, Pf)[:, gi].reshape(3, -1, Pf)[..., None]
+            re, im = final((a * w[0]).astype(a.dtype), (b * w[0]).astype(b.dtype), cen)
+            for k, dl in ((1, dlxw[None, :, None]), (2, dlyw[None, None, :])):
+                r_, i_ = final((a * w[k]).astype(a.dtype), (b * w[k]).astype(b.dtype), cen)
+                re, im = re + dl * r_, im + dl * i_
+        else:
+            if wfd is not None:
+                w = wfd.reshape(G, -1, Pf)[gi].reshape(-1, Pf)[:, :, None]
+                a, b = (a * w).astype(a.dtype), (b * w).astype(b.dtype)
+            re, im = final(a, b, cen)
+        perm = [0] + [q + 1 for q in perm_g]
+        return (re.reshape([n] + shape_g).transpose(perm).reshape(n, mx, my),
+                im.reshape([n] + shape_g).transpose(perm).reshape(n, mx, my))
+
+    # level-0 children carried through the later levels together: as many as fit in a quarter of the free memory at
+    # the largest level (its input and output planes)
+    rest = max(2 * 2 * np.dtype(kern['dtype']).itemsize * lv['C'] * lv['Po'] * lv['Ko'] for lv in levels[1:]) if L > 1 else 1
 
     ox, oy, nx, ny = plan['ox'], plan['oy'], plan['nx'], plan['ny']
 
@@ -574,16 +634,25 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
         full = cp.empty((plan['Nx'], plan['Ny']), cp.complex64)
         for g0 in range(0, G, ng):
             gs = list(range(g0, min(G, g0 + ng)))
-            c0 = cp.ascontiguousarray(la0['c0'][0, gs][None])
-            sl = cp.ascontiguousarray(la0['slope'][0, gs][None])
+            c0 = cp.ascontiguousarray(la0['c0'][0, g0:g0 + len(gs)][None])       # a slice: no index upload
+            sl = cp.ascontiguousarray(la0['slope'][0, g0:g0 + len(gs)][None])
             if stream:
                 A, Bm = level0_streamed(S, scale, c0, sl, lv0)
             else:
                 A, Bm = _children(kern, pre, pim, c0, sl, lv0)                       # [ng, Po, Ko]
-            for k, g in enumerate(gs):
-                re, im = one_tile(A[k], Bm[k], g)
-                x, y = g // sy0, g % sy0
-                full[x * mx:(x + 1) * mx, y * my:(y + 1) * my] = re + 1j * im
+            if os.environ.get('FASTSAR_CUDA_PER_TILE') == '1':          # the previous loop, one child at a time
+                for k, g in enumerate(gs):
+                    re, im = one_tile(A[k], Bm[k], g)
+                    x, y = g // sy0, g % sy0
+                    full[x * mx:(x + 1) * mx, y * my:(y + 1) * my] = re + 1j * im
+            else:
+                bt = int(max(1, min(len(gs), (0.25 * cp.cuda.Device().mem_info[0]) // rest)))
+                for k0 in range(0, len(gs), bt):
+                    sub = gs[k0:k0 + bt]
+                    re, im = tiles(A[k0:k0 + len(sub)], Bm[k0:k0 + len(sub)], sub)
+                    for k, g in enumerate(sub):
+                        x, y = g // sy0, g % sy0
+                        full[x * mx:(x + 1) * mx, y * my:(y + 1) * my] = re[k] + 1j * im[k]
             del A, Bm
         return full[ox:ox + nx, oy:oy + ny] if scale == 1.0 else full[ox:ox + nx, oy:oy + ny] * np.float32(scale)
 

@@ -38,6 +38,16 @@ for nlev in (2, 3):
     if es > -100:
         bad.append(f'nlev {nlev} streamed: {es:.1f} dB')
     print(f'nlev {nlev}: streamed first level vs in memory: {es:.1f} dB')
+# the later levels carried through for a batch of first-level children together against one child at a time
+os.environ['FASTSAR_CUDA_PER_TILE'] = '1'
+img_pt = cp.asnumpy(ffbp_cuda.make_ffbp_cuda(plan, coll)(S, ng=2))
+os.environ.pop('FASTSAR_CUDA_PER_TILE')
+img_bt = cp.asnumpy(ffbp_cuda.make_ffbp_cuda(plan, coll)(S, ng=2))
+eb = 10 * np.log10(np.sum(np.abs(img_bt - img_pt) ** 2) / np.sum(np.abs(img_pt) ** 2))
+if eb > -100:
+    bad.append(f'batched children: {eb:.1f} dB')
+print(f'later levels batched over children vs one child at a time: {eb:.1f} dB')
+
 # stripmap mosaic with the range profiles in a moving GPU window (as when they exceed the GPU memory) against all of
 # them resident: the same image
 from fastsar import stripmap as sm, patches as pt
