@@ -391,11 +391,16 @@ print('\nmemory fallback')
 import warnings
 from fastsar import memory as fmem
 fm = fastsar.ImageFormer(colr.ant, colr.fmin, colr.df, colr.K, 128, 128, 0.3, 0.3, backend='cpu', window=False)
-check('memory(): full speed reported on this machine', 0.0 if fm.memory()['full_speed'] else 1.0, 0.0, '{:.0f}')
-with warnings.catch_warnings(record=True) as wl:
-    warnings.simplefilter('always')
-    im_full = fm(Sr)
 keep_avail = fmem.host_available
+need_fm = fm.memory()['needed']
+fmem.host_available = lambda: 4 * need_fm                      # a host with room to spare, whatever runs the test
+try:
+    check('memory(): full speed reported when the memory suffices', 0.0 if fm.memory()['full_speed'] else 1.0, 0.0, '{:.0f}')
+    with warnings.catch_warnings(record=True) as wl:
+        warnings.simplefilter('always')
+        im_full = fm(Sr)
+finally:
+    fmem.host_available = keep_avail
 fmem.host_available = lambda: 1e6                      # a host out of memory
 try:
     with warnings.catch_warnings(record=True) as wl2:
