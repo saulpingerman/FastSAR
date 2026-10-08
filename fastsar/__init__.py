@@ -3,6 +3,7 @@
 from .api import form_image, available_backends, ImageFormer  # noqa: F401
 from . import io, autofocus, stripmap, burst, patches, quality, products  # noqa: F401
 from .bp import backproject, plane_points  # noqa: F401
+from .exact import ExactFormer  # noqa: F401
 from .cphd import form_cphd  # noqa: F401
 from .memory import MemoryWarning  # noqa: F401
 
