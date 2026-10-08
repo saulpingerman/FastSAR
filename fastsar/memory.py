@@ -63,6 +63,10 @@ def device_available(backend):
     return float(host_available())
 
 
+# device bytes of a CUDA first-level child over its planes (all pulses at the decimated range length), measured on
+# the L4: the 2025 Capella spotlight peaked at 22.7 GB in groups of 8, the 2024 one needed 25.4 GB
+CUDA_CHILD = 1.8
+
 # first-level children per group at full speed on a TPU (api._jax_group: groups of 4 and 8 are equally fast), and
 # XLA's temporaries of the TPU program besides the first-level children (5.7 GB with one child at 74,203 pulses)
 TPU_GROUP = 4
@@ -92,7 +96,11 @@ def full_speed(plan, K, backend):
     if backend == 'tpu':
         hist, groups = tpu_history_bytes(plan, K) + TPU_FIXED, TPU_GROUP * child_bytes(plan, backend)
         return (hist + groups) / 0.95, dict(history=hist, first_level=groups, image=8.0 * plan['Nx'] * plan['Ny'])
-    hist = 0.0 if backend == 'cpu' else 8.0 * lv['P'] * K
+    if backend == 'cuda':
+        # as ffbp_cuda sizes its groups: 8 children of CUDA_CHILD times their planes, within 95% of the device
+        hist, groups = 8.0 * lv['P'] * K, 8 * CUDA_CHILD * 8.0 * lv['Ko'] * lv['P']
+        return (hist + groups) / 0.95, dict(history=hist, first_level=groups, image=8.0 * plan['Nx'] * plan['Ny'])
+    hist = 0.0
     groups = 8 * child_bytes(plan, backend)
     image = 8.0 * plan['Nx'] * plan['Ny']
     parts = dict(history=hist, first_level=groups, image=image)

@@ -372,6 +372,7 @@ def _children(kern, pre, pim, c0, sl, lv):
 
 
 STREAM_PULSES = 4096       # pulses per uploaded block when the first level streams a host phase history
+from .memory import CUDA_CHILD  # noqa: E402  (device bytes of a first-level child over its planes)
 STREAM_FRACTION = 0.5      # stream when the history's device planes exceed this fraction of the free device memory
 
 
@@ -621,12 +622,15 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
         forced = ng is not None or bool(os.environ.get('FASTSAR_CUDA_GROUP'))
         if ng is None and os.environ.get('FASTSAR_CUDA_GROUP'):
             ng = int(os.environ['FASTSAR_CUDA_GROUP'])
-        if ng is None:                                 # children per group, within a quarter of the memory left
-            per = isz * lv0['Ko'] * (lv0['Po'] + (STREAM_PULSES if stream else lv0['P']))
-            ng = int(max(1, min(8, (0.25 * free0) // per)))
+        # each first-level child takes about CUDA_CHILD times its planes of all pulses at the decimated range length
+        per = CUDA_CHILD * isz * lv0['Ko'] * (STREAM_PULSES if stream else lv0['P'])
+        if ng is None:                                 # children per group: 8, 4, 2 or 1, within 95% of the memory left
+            ng = 8
+            while ng > 1 and ng * per > 0.95 * free0:
+                ng //= 2
         if (stream and os.environ.get('FASTSAR_CUDA_STREAM') != '1') or (ng < min(8, G) and not forced):
             from .memory import warn, gb, children
-            need = planes + 4 * 8 * isz * lv0['Ko'] * (lv0['Po'] + lv0['P']) + 8.0 * plan['Nx'] * plan['Ny']
+            need = (planes + 8 * CUDA_CHILD * isz * lv0['Ko'] * lv0['P']) / 0.95
             how = []
             if stream:
                 how.append(f'streams the {gb(planes)} phase history from host memory through the first level')
