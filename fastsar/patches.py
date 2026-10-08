@@ -451,8 +451,14 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
     if prof is not None and backend == 'cuda' and not exact:
         import cupy as cp
         prof['device'] = True
-        if prof['Q'].nbytes < 0.4 * cp.cuda.Device().mem_info[0]:      # profiles in GPU memory when they fit
+        free = cp.cuda.Device().mem_info[0]
+        if prof['Q'].nbytes < 0.4 * free:      # profiles in GPU memory when they fit
             prof['Qd'] = cp.asarray(prof['Q'])
+        else:
+            from .memory import warn, gb
+            warn(f'cuda mosaic: the shared range profiles ({gb(prof["Q"].nbytes)}) stay in host memory and each patch\'s '
+                 f'gate is cut there, which is slower; keeping them on the GPU needs about {gb(prof["Q"].nbytes / 0.4)} of '
+                 f'GPU memory, {gb(free)} is free')
     def prep(i0, j0):
         """Everything for patch (i0, j0) up to its former: -> dict, or None when no pulse serves it."""
         tm = _Timer('form_mosaic')

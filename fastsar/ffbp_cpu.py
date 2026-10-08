@@ -207,18 +207,21 @@ def make_ffbp_cpu(plan, coll, wf=None):
 
     def form(S, ng=None):
         """S [P, K] complex64 (already windowed) -> complex64 image [nx, ny]. ng: level-0 children per group (default:
-        up to 8, fewer when a group's buffers, pulses x range samples per child, would exceed a quarter of the memory or
-        FASTSAR_CPU_GROUP_GB)."""
+        up to 8, fewer when a group's buffers, pulses x range samples per child, would exceed a quarter of the available memory
+        or FASTSAR_CPU_GROUP_GB)."""
         S = np.asarray(S)
         if ng is None:
             lv = levels[0]
             per = 8.0 * lv['Ko'] * (lv['P'] + lv['Po'])                       # yre, yim and zre, zim of one child
-            try:
-                mem = os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES')
-            except (ValueError, OSError, AttributeError):
-                mem = 64e9
-            budget = float(os.environ.get('FASTSAR_CPU_GROUP_GB', 0)) * 1e9 or 0.25 * mem
+            from .memory import host_available
+            mem = host_available()                                              # available, not installed: a shared host
+            budget = float(os.environ.get('FASTSAR_CPU_GROUP_GB') or 0) * 1e9 or 0.25 * mem
             ng = int(max(1, min(8, budget // per)))
+            if ng < min(8, G) and not os.environ.get('FASTSAR_CPU_GROUP_GB'):
+                from .memory import warn, gb, host_available, children
+                warn(f'cpu: first-level groups of {children(ng)} instead of 8 for lack of memory, so the phase history is '
+                     f'read {-(-G // ng)} times instead of {-(-G // 8)}; full speed needs about {gb(4 * 8 * per)} of host '
+                     f'memory, {gb(host_available())} is available')
         if S.dtype == np.complex64 and S.flags.c_contiguous and levels[0]['Dk'] > 1:
             # the first level reads the complex64 history in place (a long spotlight's history is tens of GB)
             scale, pre, pim = 1.0, S[None], None

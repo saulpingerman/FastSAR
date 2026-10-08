@@ -7,6 +7,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Fas
 
 ### Added
 
+- `fastsar.MemoryWarning` when a former falls back to a slower path for lack of memory (smaller first-level
+  groups, CUDA streaming, mosaic range profiles on the host), stating the memory full speed needs;
+  `ImageFormer.memory()`; a TPU that cannot hold the history raises `MemoryError` with the estimate.
+
+### Added
+
 - `products.geolocate` and `products.locate`: latitude, longitude and height of `form_cphd` pixels on the image
   plane, at a height or on a DEM, and the inverse; `products.read_dem` for DEM GeoTIFFs.
 - `products.geocode_image`: a `form_cphd` image, or data from it, on a north-up map grid (UTM, any rasterio CRS,

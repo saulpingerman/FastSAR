@@ -40,6 +40,21 @@ Phase histories of tens of gigabytes (28 GB for an ICEYE dwell, 10 GB for a Cape
   the GPU. The next patch is prepared on a second thread: 0.91 s per patch against 1.08 s without, on a 2 by 4
   patch Capella sub-mosaic on 16 CPU cores.
 
+## Memory
+
+Full speed keeps the phase history on the device and forms the first level in groups of 8 children (16 on a TPU).
+With less memory FastSAR falls back instead of failing: smaller groups on CPU, GPU and TPU (the history is read more
+often), streaming of the history from host memory through the first level on CUDA, and shared range profiles kept
+on the host in a CUDA mosaic. Each fallback issues a `fastsar.MemoryWarning` naming it, with the memory full speed
+needs and the memory free. A TPU that cannot hold the history raises `MemoryError` with the same estimate.
+`former.memory()` reports the requirement before running (15 us; the free-memory query costs 13 us per image).
+
+```python
+former = fastsar.ImageFormer(...)
+former.memory()     # {'backend': 'cuda', 'needed': ..., 'available': ..., 'full_speed': True, 'parts': {...}} (bytes)
+warnings.simplefilter('ignore', fastsar.MemoryWarning)   # silence the fallback warnings
+```
+
 ## Environment variables
 
 | Variable | Default | Effect |

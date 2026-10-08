@@ -229,6 +229,7 @@ class ImageFormer:
             self.predicted_error_db = float(err)
         self.T = T
         plan = ffbp2.make_plan(col, nx, ny, spx, spy, T=T, nlev=levels, pmax=pmax, e1=e1, e2=e2)
+        self._plan, self._grid, self._levels, self._e1, self._e2 = plan, (nx, ny, spx, spy), levels, e1, e2
         if ref is not None and np.shape(ref) != (self.P,):
             raise ValueError(f'ref must hold one range per pulse ({self.P}), got shape {np.shape(ref)}')
         coll = ffbp2.collection_arrays(plan, self.ant, ref)
@@ -261,6 +262,11 @@ class ImageFormer:
             # (with the device arrays that depend on the plan alone: filters, tile geometry)
             self._plan, self._filt = plan, filt
             self._ng = _jax_group(plan, self.K) if filt == 'pallas2' else 1
+            if filt == 'pallas2' and self._ng < min(16, plan['levels'][0]['C']) and not os.environ.get('FASTSAR_TPU_GROUP'):
+                from .memory import warn, gb, full_speed, device_available, children
+                warn(f'tpu: first-level groups of {children(self._ng)} instead of 16 for lack of device memory, which is '
+                     f'slower; full speed needs about {gb(full_speed(plan, self.K, "tpu")[0])} of TPU memory, '
+                     f'{gb(device_available("tpu"))} is free')
             self._fn, static = self._program(self._ng)
             self._arrs = ffbp2.device_arrays(pol, plan, coll, static)
             if wf is not None:
@@ -298,11 +304,31 @@ class ImageFormer:
                 re, im = self._fn(hre, him, self._arrs)
                 break
             except Exception as e:        # device memory: fewer first-level children per group, down to one
-                if self._ng <= 1 or not any(m in str(e) for m in ('RESOURCE_EXHAUSTED', 'Ran out of memory', 'OOM')):
+                if not any(m in str(e) for m in ('RESOURCE_EXHAUSTED', 'Ran out of memory', 'OOM')):
                     raise
+                from .memory import warn, gb, full_speed, child_bytes, children
+                if self._ng <= 1:
+                    need = 8.0 * self.P * self.K + 2 * child_bytes(self._plan, 'tpu')
+                    raise MemoryError(f'{self.backend}: the phase history ({gb(8.0 * self.P * self.K)} as float32 planes) and '
+                                      f'one first-level child do not fit in device memory; this needs about {gb(need)}. '
+                                      'Use the cuda or cpu backend (both stream or read the history in place), a device '
+                                      'with more memory, or fewer pulses.') from e
                 self._ng //= 2
+                warn(f'{self.backend}: out of device memory; retrying with first-level groups of {children(self._ng)} '
+                     f'(slower); full speed needs about {gb(full_speed(self._plan, self.K, "tpu")[0])}')
                 self._fn = self._program(self._ng)[0]
         return ((np.asarray(re) + 1j * np.asarray(im)) * scale).astype(np.complex64)
+
+    def memory(self):
+        """What full speed needs on this former's device and what is free: dict(backend, needed, available,
+        full_speed, parts) in bytes (fastsar.memory)."""
+        from . import memory as mem
+        from . import ffbp2
+        plan = getattr(self, '_plan', None) or ffbp2.make_plan(Collect(fmin=1.0, df=1.0, K=self.K, ant=self.ant, res=0.5),
+                                                                 *self._grid, T=self.T, nlev=self._levels, e1=self._e1, e2=self._e2)
+        need, parts = mem.full_speed(plan, self.K, self.backend)
+        avail = mem.device_available(self.backend)
+        return dict(backend=self.backend, needed=need, available=avail, full_speed=need <= avail, parts=parts)
 
     def _program(self, ng):
         """The compiled JAX/TPU program for ng first-level children per group, with the plan's device arrays: one per

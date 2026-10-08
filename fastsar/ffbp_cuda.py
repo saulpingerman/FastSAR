@@ -556,9 +556,20 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
                 b = cp.asarray(S[i:i + 4096])
                 pre[0, i:i + 4096] = (b.real / scale).astype(kern['dtype']); pim[0, i:i + 4096] = (b.imag / scale).astype(kern['dtype'])
                 del b
+        free0 = cp.cuda.Device().mem_info[0]
         if ng is None:                                 # children per group, within a quarter of the memory left
             per = isz * lv0['Ko'] * (lv0['Po'] + (STREAM_PULSES if stream else lv0['P']))
-            ng = int(max(1, min(8, (0.25 * cp.cuda.Device().mem_info[0]) // per)))
+            ng = int(max(1, min(8, (0.25 * free0) // per)))
+        if (stream and os.environ.get('FASTSAR_CUDA_STREAM') != '1') or ng < min(8, G):
+            from .memory import warn, gb, children
+            need = planes + 4 * 8 * isz * lv0['Ko'] * (lv0['Po'] + lv0['P']) + 8.0 * plan['Nx'] * plan['Ny']
+            how = []
+            if stream:
+                how.append(f'streams the {gb(planes)} phase history from host memory through the first level')
+            if ng < min(8, G):
+                how.append(f'forms the first level in groups of {children(ng)} instead of 8')
+            warn(f'cuda: for lack of GPU memory FastSAR ' + ' and '.join(how) + ', which is slower; full speed needs about '
+                 f'{gb(need)} of GPU memory, {gb(free0 + (0 if stream else planes))} is free')
         full = cp.empty((plan['Nx'], plan['Ny']), cp.complex64)
         for g0 in range(0, G, ng):
             gs = list(range(g0, min(G, g0 + ng)))

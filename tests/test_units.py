@@ -360,6 +360,29 @@ ir = fastsar.form_image(Sr, colr.ant, colr.fmin, colr.df, **kwr)
 ir2 = fastsar.form_image(Sr2, colr.ant, colr.fmin, colr.df, ref=refr, **kwr)
 check('form_image with ref against the |ant|-referenced image', 10 * np.log10(np.sum(abs(ir2 - ir) ** 2) / np.sum(abs(ir) ** 2)), -90)
 
+# memory: full speed when it fits, a MemoryWarning naming the fallback and the memory needed when it does not
+print('\nmemory fallback')
+import warnings
+from fastsar import memory as fmem
+fm = fastsar.ImageFormer(colr.ant, colr.fmin, colr.df, colr.K, 128, 128, 0.3, 0.3, backend='cpu', window=False)
+check('memory(): full speed reported on this machine', 0.0 if fm.memory()['full_speed'] else 1.0, 0.0, '{:.0f}')
+with warnings.catch_warnings(record=True) as wl:
+    warnings.simplefilter('always')
+    im_full = fm(Sr)
+keep_avail = fmem.host_available
+fmem.host_available = lambda: 1e6                      # a host out of memory
+try:
+    with warnings.catch_warnings(record=True) as wl2:
+        warnings.simplefilter('always')
+        im_low = fastsar.ImageFormer(colr.ant, colr.fmin, colr.df, colr.K, 128, 128, 0.3, 0.3, backend='cpu', window=False)(Sr)
+finally:
+    fmem.host_available = keep_avail
+mw = [w for w in wl2 if issubclass(w.category, fastsar.MemoryWarning)]
+check('memory: warnings at full speed', float(sum(issubclass(w.category, fastsar.MemoryWarning) for w in wl)), 0.0, '{:.0f}')
+check('memory: one MemoryWarning in the fallback', abs(len(mw) - 1.0), 0.0, '{:.0f}')
+check('memory: the warning states the memory full speed needs', 0.0 if mw and 'full speed needs about' in str(mw[0].message) else 1.0, 0.0, '{:.0f}')
+check('memory: fallback image equals the full-speed image', float(np.abs(im_low - im_full).max()), 0.0, '{:.1e}')
+
 print(f'\n{time.perf_counter() - t_start:.0f} s')
 if bad:
     sys.exit('FAILED: ' + '; '.join(bad))
