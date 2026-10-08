@@ -4,7 +4,12 @@
                                counts, the compile-cost trade-off, and its time for thousands of distinct lengths
   memory (CUDA sizing)         full_speed('cuda') is the least free memory at which ffbp_cuda's sizing (streaming
                                threshold, group size, image) runs at full speed, for float32 and float16 storage
+  memory (TPU sizing)          _jax_group from the device's limit, not its free memory; full_speed('tpu')
   ImageFormer.memory()         full_speed against the free memory reported for cuda and tpu (patched)
+  TPU out-of-memory retry      a program that raises RESOURCE_EXHAUSTED (at once, or when its result is read) is
+                               rebuilt for half its effective group, with a MemoryWarning; groups of 1 raise
+                               MemoryError; other errors pass through
+  program cache                formers built on several threads at once build one program per signature
   environment variables        integer and float FASTSAR_* settings below their minimum or not numbers raise ValueError
 
 Each check prints its value and limit; the script exits non-zero if any fails."""
@@ -114,6 +119,26 @@ print(f'  (history {parts["history"] / 1e9:.1f} GB, groups {parts["first_level"]
 check('a history above half the free memory is not reported as full speed', float(need <= 16e9), 0)
 check('float16 storage halves the history part', abs(fmem.full_speed(plan, 17282, 'cuda', 4)[1]['history'] * 2 - parts['history']), 0)
 
+# ---------------------------------------------------------------------------------------------- TPU sizing
+print('\nTPU memory model (api._jax_group, memory.full_speed)')
+plan = fake_plan(74203, 17282, 2200, 9300, 64, 20000, 20000)
+keep_cap, keep_dev = fmem.tpu_capacity, fmem.device_available
+need = fmem.full_speed(plan, 17282, 'tpu')[0]
+try:
+    fmem.device_available = lambda b: (_ for _ in ()).throw(AssertionError('sized from the free memory'))
+    fmem.tpu_capacity = lambda: need * 1.0001
+    g_full = api._jax_group(plan, 17282)
+    fmem.tpu_capacity = lambda: need * 0.98
+    g_short = api._jax_group(plan, 17282)
+    fmem.tpu_capacity = lambda: 1e9
+    g_none = api._jax_group(plan, 17282)
+finally:
+    fmem.tpu_capacity, fmem.device_available = keep_cap, keep_dev
+print(f'  (full speed needs {need / 1e9:.1f} GB; groups at that limit {g_full}, 2% below {g_short}, at 1 GB {g_none})')
+check('groups of TPU_GROUP at the full-speed limit', abs(g_full - fmem.TPU_GROUP), 0)
+check('smaller groups below it', float(g_short >= fmem.TPU_GROUP), 0)
+check('groups of 1 when nothing fits', abs(g_none - 1), 0)
+
 # ---------------------------------------------------------------------------------------------- ImageFormer.memory()
 print('\nImageFormer.memory() on cuda and tpu (patched free memory)')
 rng = np.random.default_rng(3)
@@ -147,6 +172,95 @@ check('cuda float16: needs less than float32', float(m16['needed'] >= m_at['need
 check('tpu: full speed when the free memory covers the need', float(not m_tpu['full_speed']), 0)
 check('tpu: not full speed when other arrays take the margin', float(m_tpu_busy['full_speed']), 0)
 
+# ---------------------------------------------------------------------------------------------- TPU retry
+print('\nout-of-memory retry of the JAX/TPU former (stub programs)')
+from jax.errors import JaxRuntimeError
+img_ref = fj(S)
+real = fj._fn
+
+
+class Stub:
+    """A program that runs the real one, reporting group size ng, failing as told: 'now' at the call, 'later'
+    when its result is read (asynchronous dispatch), or with another error."""
+
+    def __init__(self, ng, fail=None, msg='RESOURCE_EXHAUSTED: Out of memory while trying to allocate 2.0G'):
+        self.stages, self.pad, self.fail, self.msg = dict(real.stages, ng=ng), real.pad, fail, msg
+
+    def __call__(self, hre, him, arrs):
+        if self.fail == 'now':
+            raise JaxRuntimeError(self.msg)
+        if self.fail == 'later':
+            msg = self.msg
+
+            class Pending:
+                def block_until_ready(self):
+                    raise JaxRuntimeError(msg)
+            return Pending(), Pending()
+        return real(hre, him, arrs)
+
+
+def run(first, next_fail=None):
+    """fj(S) with fj._fn = first and every rebuilt program a Stub failing as next_fail says (by its group): ->
+    (image or exception, groups asked for, MemoryWarning messages)."""
+    asked = []
+
+    def program(ng):
+        asked.append(ng)
+        return Stub(ng, (next_fail or {}).get(ng)), None
+    fj._fn, fj._program = first, program
+    try:
+        with warnings.catch_warnings(record=True) as wl:
+            warnings.simplefilter('always')
+            try:
+                out = fj(S)
+            except Exception as e:
+                out = e
+    finally:
+        fj._fn = real
+        del fj._program
+    return out, asked, [str(w.message) for w in wl if issubclass(w.category, fastsar.MemoryWarning)]
+
+
+out, asked, msgs = run(Stub(4, 'now'))
+print(f'  groups of 4 out of memory: rebuilt for {asked}; {msgs}')
+check('retried once, for half the group', float(asked != [2]), 0)
+check('one MemoryWarning naming groups of 2', float(len(msgs) != 1 or 'groups of 2' not in msgs[0]), 0)
+check('the retried image equals the image', float(np.abs(out - img_ref).max()) if isinstance(out, np.ndarray) else 1.0, 0, '{:.1e}')
+out, asked, msgs = run(Stub(4, 'later'))
+check('an error raised when the result is read is retried too', float(asked != [2] or not isinstance(out, np.ndarray)), 0)
+out, asked, msgs = run(Stub(3, 'now'), {1: 'now'})
+print(f'  effective group of 3 out of memory, then 1: rebuilt for {asked}; {type(out).__name__}')
+check('halves the effective group (3 -> 1), then MemoryError at 1', float(asked != [1] or not isinstance(out, MemoryError)), 0)
+out, asked, msgs = run(Stub(1, 'now'))
+check('groups of 1 out of memory: MemoryError, no rebuild', float(asked != [] or not isinstance(out, MemoryError)), 0)
+out, asked, msgs = run(Stub(4, 'now', 'RESOURCE_EXHAUSTED: Ran out of memory in memory space vmem'))
+check('a VMEM error passes through, no rebuild', float(asked != [] or not isinstance(out, JaxRuntimeError)), 0)
+out, asked, msgs = run(Stub(4, 'now', 'INTERNAL: something else'))
+check('another runtime error passes through', float(asked != [] or not isinstance(out, JaxRuntimeError)), 0)
+
+# ---------------------------------------------------------------------------------------------- program cache
+print('\nJAX program cache under concurrent formers')
+from concurrent.futures import ThreadPoolExecutor
+calls = []
+real_make = ffbp2.make_ffbp
+
+
+def slow_make(*a, **k):
+    calls.append(1)
+    time.sleep(0.2)                       # a build long enough for the other threads to look up the same key
+    return real_make(*a, **k)
+
+
+api._JAX_PROGRAMS.clear()
+ffbp2.make_ffbp = slow_make
+try:
+    with ThreadPoolExecutor(4) as ex:
+        got = list(ex.map(lambda _: fj._program(1)[0], range(4)))
+finally:
+    ffbp2.make_ffbp = real_make
+check('4 threads, one signature: programs built', abs(len(calls) - 1), 0)
+check('every thread got the same program', float(any(g is not got[0] for g in got)), 0)
+
 # ---------------------------------------------------------------------------------------------- environment
 print('\nenvironment variables')
 nbad = 0
@@ -167,6 +281,15 @@ for name, value, least, kind, ok in (('FASTSAR_TPU_GROUP', '0', 1, int, False), 
     nbad += (res == 'accepted') != ok
     print(f'    {name}={value}: {res}')
 check('settings outside their range raise ValueError, others are accepted', nbad, 0)
+os.environ['FASTSAR_TPU_GROUP'] = '0'
+try:
+    api._jax_group(plan, 17282)
+    r = 'no error'
+except ValueError:
+    r = 'ValueError'
+finally:
+    os.environ.pop('FASTSAR_TPU_GROUP')
+check('FASTSAR_TPU_GROUP=0 raises ValueError in the TPU sizing', float(r != 'ValueError'), 0)
 
 print(f'\n{time.perf_counter() - t_start:.0f} s')
 if bad:

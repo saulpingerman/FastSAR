@@ -34,8 +34,11 @@ square of the tile size and falls with range, so orbital collections keep T=32 a
 drop to 16. The prediction is kept as ImageFormer.predicted_error_db.
 """
 import os
+import threading
+
 import numpy as np
 
+from . import memory as _mem
 from .sim import Collect
 
 
@@ -64,6 +67,7 @@ def available_backends():
 
 
 _JAX_PROGRAMS = {}         # compiled JAX/TPU programs by plan signature (ImageFormer)
+_JAX_LOCK = threading.Lock()   # mosaic workers build formers concurrently: one build per signature, no torn eviction
 
 BACKENDS = ('auto', 'tpu', 'cuda', 'cpu', 'jax')
 
@@ -138,19 +142,17 @@ def _check_grid(nx, ny, spx, spy, e1, e2):
 
 
 def _jax_group(plan, K):
-    """First-level children per group on a TPU: 4, fewer when they do not fit (FASTSAR_TPU_GROUP overrides;
-    ImageFormer halves it again if the device still runs out of memory). On a v6e the 2025 Capella spotlight formed
-    in 9.9 s with groups of 4 and of 8, 1% slower with 2 and 5% slower with 1, and 16 did not fit. The fit is
-    memory.full_speed's model (the padded history planes and XLA's temporaries per child) within 95% of the
-    device memory: groups of 4 for both 2024 and 2025 Capella spotlights on a 32 GB v6e."""
-    from .memory import _env_number
-    forced = _env_number('FASTSAR_TPU_GROUP', 1)
+    """First-level children per group on a TPU: memory.TPU_GROUP (groups of 4 are as fast as 8; docs/performance.md),
+    halved until memory.full_speed's model (the padded history planes and XLA's temporaries per child) fits in 95% of
+    the device's memory limit. The limit, not the memory free at this moment, so that patches of a mosaic with equal
+    plans get equal groups (and share a program) however many histories the workers have staged. FASTSAR_TPU_GROUP
+    overrides it; ImageFormer halves it again if the device still runs out of memory."""
+    forced = _mem._env_number('FASTSAR_TPU_GROUP', 1)
     if forced:
         return forced
-    from .memory import device_available, child_bytes, TPU_GROUP, TPU_FIXED, tpu_history_bytes
-    hbm = device_available('tpu')
-    hist, per = tpu_history_bytes(plan, K) + TPU_FIXED, child_bytes(plan, 'tpu')
-    ng = TPU_GROUP
+    hbm = _mem.tpu_capacity()
+    hist, per = _mem.tpu_history_bytes(plan, K) + _mem.TPU_FIXED, _mem.child_bytes(plan, 'tpu')
+    ng = _mem.TPU_GROUP
     while ng > 1 and hist + ng * per > 0.95 * hbm:
         ng //= 2
     return ng
@@ -183,6 +185,15 @@ def final_weights(plan, weight, P, grad=False, points=None):
     # outputs past each end): it takes the weight of the nearest pulse (its nodes clip to it), not zero
     m = np.tensordot(gw, W, axes=(0, 1))                                          # [Pf, ntiles]
     return np.ascontiguousarray(m.T, np.float32)
+
+
+def _jax_runtime_error():
+    """The exception type JAX raises for a failed computation (JaxRuntimeError; XlaRuntimeError in older releases)."""
+    import jax
+    err = getattr(jax.errors, 'JaxRuntimeError', None)
+    if err is None:
+        from jaxlib.xla_extension import XlaRuntimeError as err
+    return err
 
 
 class _Staged:
@@ -270,15 +281,13 @@ class ImageFormer:
             self._pol = pol
             # one compiled program per plan signature: patches of a mosaic with equal shapes and filters share it
             # (with the device arrays that depend on the plan alone: filters, tile geometry)
-            self._plan, self._filt = plan, filt
-            self._ng = _jax_group(plan, self.K) if filt == 'pallas2' else 1
-            from .memory import TPU_GROUP
-            if filt == 'pallas2' and self._ng < min(TPU_GROUP, plan['levels'][0]['C']) and not os.environ.get('FASTSAR_TPU_GROUP'):
-                from .memory import _warn, _gb, full_speed, device_available, _nchildren
-                _warn(f'tpu: first-level groups of {_nchildren(self._ng)} instead of {TPU_GROUP} for lack of device memory, which '
-                      f'is slower; full speed needs about {_gb(full_speed(plan, self.K, "tpu")[0])} of TPU memory, '
-                      f'{_gb(device_available("tpu"))} is free')
-            self._fn, static = self._program(self._ng)
+            self._filt = filt
+            ng = _jax_group(plan, self.K) if filt == 'pallas2' else 1
+            if filt == 'pallas2' and ng < min(_mem.TPU_GROUP, plan['levels'][0]['C']) and not os.environ.get('FASTSAR_TPU_GROUP'):
+                _mem._warn(f'tpu: first-level groups of {_mem._nchildren(ng)} instead of {_mem.TPU_GROUP} for lack of device '
+                           f'memory, which is slower; full speed needs about {_mem._gb(_mem.full_speed(plan, self.K, "tpu")[0])} '
+                           f'of TPU memory, the device has {_mem._gb(_mem.tpu_capacity())}')
+            self._fn, static = self._program(ng)
             self._arrs = ffbp2.device_arrays(pol, plan, coll, static)
             if wf is not None:
                 import jax.numpy as jnp
@@ -326,7 +335,9 @@ class ImageFormer:
             return cp.asnumpy(self._form(S)).astype(np.complex64, copy=False)       # a host S may stream (ffbp_cuda)
         if self.backend == 'cpu':
             return self._form(S).astype(np.complex64, copy=False)
+        import jax
         from . import ffbp2
+        runtime_error = _jax_runtime_error()
         while True:
             if staged is not None and staged.fn is self._fn:
                 hre, him, scale = staged.hre, staged.him, staged.scale
@@ -336,33 +347,33 @@ class ImageFormer:
                 hre, him, scale = ffbp2.prepare(self._pol, S)
                 hre, him = self._fn.pad(hre, him)
             try:
-                re, im = self._fn(hre, him, self._arrs)
+                # dispatch is asynchronous: a device that runs out of memory may say so only when the result is read
+                re, im = jax.block_until_ready(self._fn(hre, him, self._arrs))
                 break
-            except Exception as e:        # device memory: fewer first-level children per group, down to one
+            except runtime_error as e:      # device memory: fewer first-level children per group, down to one
                 # a kernel's on-chip scratch (VMEM) is sized at compile time and does not depend on the group size
-                if not any(m in str(e) for m in ('RESOURCE_EXHAUSTED', 'Ran out of memory', 'OOM')) or 'Vmem' in str(e):
+                if 'RESOURCE_EXHAUSTED' not in str(e) or 'vmem' in str(e).lower():
                     raise
-                from .memory import _warn as warn, _gb as gb, full_speed, child_bytes, _nchildren as children, tpu_history_bytes
-                if self._ng <= 1:
-                    need = tpu_history_bytes(self._plan, self.K) + child_bytes(self._plan, 'tpu')
-                    raise MemoryError(f'{self.backend}: the phase history ({gb(8.0 * self.P * self.K)} as float32 planes) and '
-                                      f'one first-level child do not fit in device memory; this needs about {gb(need)}. '
-                                      'Use the cuda or cpu backend (both stream or read the history in place), a device '
-                                      'with more memory, or fewer pulses.') from e
-                self._ng //= 2
-                warn(f'{self.backend}: out of device memory; retrying with first-level groups of {children(self._ng)} '
-                     f'(slower); full speed needs about {gb(full_speed(self._plan, self.K, "tpu")[0])}')
+                ng = self._fn.stages['ng']          # the group the program runs (a divisor of the children)
+                if ng <= 1:
+                    need = _mem.tpu_history_bytes(self._plan, self.K) + _mem.child_bytes(self._plan, 'tpu')
+                    raise MemoryError(f'{self.backend}: the phase history ({_mem._gb(8.0 * self.P * self.K)} as float32 '
+                                      f'planes) and one first-level child do not fit in device memory; this needs about '
+                                      f'{_mem._gb(need)}. Use the cuda or cpu backend (both stream or read the history in '
+                                      'place), a device with more memory, or fewer pulses.') from e
                 del hre, him
-                self._fn = self._program(self._ng)[0]
+                self._fn = self._program(ng // 2)[0]
+                _mem._warn(f'{self.backend}: out of device memory; retrying with first-level groups of '
+                           f'{_mem._nchildren(self._fn.stages["ng"])} (slower); full speed needs about '
+                           f'{_mem._gb(_mem.full_speed(self._plan, self.K, "tpu")[0])}')
         return ((np.asarray(re) + 1j * np.asarray(im)) * scale).astype(np.complex64)
 
     def memory(self):
         """What full speed needs on this former's device and what is free: dict(backend, needed, available,
         full_speed, parts) in bytes (fastsar.memory)."""
-        from . import memory as mem
         isz = 4 if self.backend == 'cuda' and self.precision == 'float16' else 8
-        need, parts = mem.full_speed(self._plan, self.K, self.backend, isz)
-        avail = mem.device_available(self.backend)
+        need, parts = _mem.full_speed(self._plan, self.K, self.backend, isz)
+        avail = _mem.device_available(self.backend)
         return dict(backend=self.backend, needed=need, available=avail, full_speed=need <= avail, parts=parts)
 
     def _program(self, ng):
@@ -370,13 +381,15 @@ class ImageFormer:
         plan signature, so that patches of a mosaic with equal shapes and filters share it."""
         from . import ffbp2
         key = (self._pol, self._filt, ng, ffbp2.plan_signature(self._plan))
-        hit = _JAX_PROGRAMS.get(key)
-        if hit is None:
-            hit = (ffbp2.make_ffbp(self._pol, self._plan, self._filt, 1 << 26, 'direct', pallas_pb=256, pallas_nc=8,
-                                   pallas_ng=ng, pallas_final=2, pallas_gen=3), ffbp2.static_arrays(self._pol, self._plan, self._filt))
-            if len(_JAX_PROGRAMS) >= 32:
-                _JAX_PROGRAMS.pop(next(iter(_JAX_PROGRAMS)))
-            _JAX_PROGRAMS[key] = hit
+        with _JAX_LOCK:
+            hit = _JAX_PROGRAMS.get(key)
+            if hit is None:
+                hit = (ffbp2.make_ffbp(self._pol, self._plan, self._filt, 1 << 26, 'direct', pallas_pb=256, pallas_nc=8,
+                                       pallas_ng=ng, pallas_final=2, pallas_gen=3),
+                       ffbp2.static_arrays(self._pol, self._plan, self._filt))
+                if len(_JAX_PROGRAMS) >= 32:
+                    _JAX_PROGRAMS.pop(next(iter(_JAX_PROGRAMS)))
+                _JAX_PROGRAMS[key] = hit
         return hit
 
 
