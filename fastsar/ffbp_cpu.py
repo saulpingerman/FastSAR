@@ -109,6 +109,41 @@ def _children(pre, pim, c0, sl, lv, pool, tag=''):
     return yre, yim
 
 
+BLOCK_PULSES = 2048       # pulses per block of the CPU's first level (with the pulse filter's halo)
+
+
+def _level0_blocked(pre, pim, c0, sl, lv, pool):
+    """The first level in pulse blocks: pre, pim [1, P, K] (or pre complex64 and pim None), c0, sl [1, C, P] ->
+    [C, Po, Ko] planes. Each block of output rows reads its input pulses (with the halo of the pulse filter), rotates
+    and range-filters them and pulse-filters them into place; the result equals _children's."""
+    P = pre.shape[1]
+    C, Po, Ko, Dp = c0.shape[1], lv['Po'], lv['Ko'], lv['Dp']
+    fp = lv['fir_p']
+    L, pl = fp['L'], fp['pl']
+    zre = pool.get('zre0b', (C, Po, Ko)); zim = pool.get('zim0b', (C, Po, Ko))
+    nb = max(1, (max(BLOCK_PULSES, 4 * L) - L) // Dp + 1)                   # output rows per block
+
+    def take(a, p0, p1, axis):
+        """Pulses p0:p1 of a along axis, zero outside [0, P)."""
+        lo, hi = max(p0, 0), min(p1, P)
+        if lo == p0 and hi == p1:
+            return a[(slice(None),) * axis + (slice(p0, p1),)]
+        shp = list(a.shape); shp[axis] = p1 - p0
+        out = np.zeros(shp, a.dtype)
+        out[(slice(None),) * axis + (slice(lo - p0, hi - p0),)] = a[(slice(None),) * axis + (slice(lo, hi),)]
+        return out
+
+    for i0 in range(0, Po, nb):
+        i1 = min(Po, i0 + nb)
+        p0, p1 = Dp * i0 - pl, Dp * (i1 - 1) - pl + L                          # input pulses these outputs read
+        bp = np.ascontiguousarray(take(pre, p0, p1, 1))
+        bq = None if pim is None else np.ascontiguousarray(take(pim, p0, p1, 1))
+        cb = np.ascontiguousarray(take(c0, p0, p1, 2)); sb = np.ascontiguousarray(take(sl, p0, p1, 2))
+        a, b = _children(bp, bq, cb, sb, dict(lv, P=p1 - p0, Po=i1 - i0, fir_p=dict(fp, pl=0, n_out=i1 - i0)), pool, tag='0b')
+        zre[:, i0:i1] = a; zim[:, i0:i1] = b
+    return zre, zim
+
+
 def _device_phases(la, refs, lv):
     """Band-center phase and slope of every child of every parent (float64): refs [Np, 3] -> c0, slope [Np, C, P]
     float32. Same formula as ffbp2.device_phases and ffbp_cuda._device_phases."""
@@ -210,18 +245,29 @@ def make_ffbp_cpu(plan, coll, wf=None):
         up to 8, fewer when a group's buffers, pulses x range samples per child, would exceed a quarter of the available memory
         or FASTSAR_CPU_GROUP_GB)."""
         S = np.asarray(S)
+        # full speed: groups of 8 children, each holding all pulses at the decimated range length. With less memory,
+        # groups of at least 4 the same way, else the first level in pulse blocks (BLOCK_PULSES plus the pulse filter's
+        # halo, each decimated straight into its output rows; a child then holds its output only), which costs about 19%
+        # on Umbra Panama but beats groups of 2 or 1 (58% and 140% slower on a Capella spotlight)
+        blocked = False
         if ng is None:
             lv = levels[0]
-            per = 8.0 * lv['Ko'] * (lv['P'] + lv['Po'])                       # yre, yim and zre, zim of one child
+            per = 8.0 * lv['Ko'] * (lv['P'] + lv['Po'])                         # yre, yim and zre, zim of one child
+            per_b = 8.0 * lv['Ko'] * (lv['Po'] + BLOCK_PULSES)                 # zre, zim and a block of yre, yim
             from .memory import host_available
             mem = host_available()                                              # available, not installed: a shared host
             budget = float(os.environ.get('FASTSAR_CPU_GROUP_GB') or 0) * 1e9 or 0.25 * mem
             ng = int(max(1, min(8, budget // per)))
-            if ng < min(8, G) and not os.environ.get('FASTSAR_CPU_GROUP_GB'):
-                from .memory import warn, gb, host_available, children
-                warn(f'cpu: first-level groups of {children(ng)} instead of 8 for lack of memory, so the phase history is '
-                     f'read {-(-G // ng)} times instead of {-(-G // 8)}; full speed needs about {gb(4 * 8 * per)} of host '
-                     f'memory, {gb(host_available())} is available')
+            force = os.environ.get('FASTSAR_CPU_BLOCKED')
+            if lv['Dp'] > 1 and (force == '1' or (force != '0' and ng < min(4, G))):
+                blocked, ng = True, int(max(1, min(8, budget // per_b)))
+            if (ng < min(8, G) or blocked) and not os.environ.get('FASTSAR_CPU_GROUP_GB') and force != '1':
+                from .memory import warn, gb, children
+                how = (f'forms the first level in pulse blocks (about 19% slower) with groups of {children(ng)}' if blocked
+                       else f'forms the first level in groups of {children(ng)} instead of 8, so the phase history is read '
+                            f'{-(-G // ng)} times instead of {-(-G // 8)}')
+                warn(f'cpu: for lack of memory FastSAR {how}; full speed needs about {gb(4 * 8 * per)} of host memory, '
+                     f'{gb(mem)} is available')
         if S.dtype == np.complex64 and S.flags.c_contiguous and levels[0]['Dk'] > 1:
             # the first level reads the complex64 history in place (a long spotlight's history is tens of GB)
             scale, pre, pim = 1.0, S[None], None
@@ -238,7 +284,10 @@ def make_ffbp_cpu(plan, coll, wf=None):
             gs = list(range(g0, min(G, g0 + ng)))
             c0 = np.ascontiguousarray(la0['c0'][0, gs][None])
             sl = np.ascontiguousarray(la0['slope'][0, gs][None])
-            A, Bm = _children(pre, pim, c0, sl, lv0, pool, tag='0')                  # [ng, Po, Ko]
+            if blocked:
+                A, Bm = _level0_blocked(pre, pim, c0, sl, lv0, pool)                  # [ng, Po, Ko]
+            else:
+                A, Bm = _children(pre, pim, c0, sl, lv0, pool, tag='0')
             for k, g in enumerate(gs):
                 re, im = one_tile(A[k], Bm[k], g)
                 x, y = g // sy0, g % sy0

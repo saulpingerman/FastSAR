@@ -383,6 +383,18 @@ check('memory: one MemoryWarning in the fallback', abs(len(mw) - 1.0), 0.0, '{:.
 check('memory: the warning states the memory full speed needs', 0.0 if mw and 'full speed needs about' in str(mw[0].message) else 1.0, 0.0, '{:.0f}')
 check('memory: fallback image equals the full-speed image', float(np.abs(im_low - im_full).max()), 0.0, '{:.1e}')
 
+# the CPU's pulse-blocked first level (used when memory allows fewer than 4 children per group) equals the unblocked one
+print('\nCPU first level in pulse blocks')
+from fastsar import ffbp_cpu as fcpu
+keep_bp = fcpu.BLOCK_PULSES
+fcpu.BLOCK_PULSES = 128                                  # several blocks, with halos at both ends of the aperture
+os.environ['FASTSAR_CPU_BLOCKED'] = '1'
+im_blk = fastsar.ImageFormer(colr.ant, colr.fmin, colr.df, colr.K, 128, 128, 0.3, 0.3, backend='cpu', window=False)(Sr)
+os.environ['FASTSAR_CPU_BLOCKED'] = '0'
+im_unb = fastsar.ImageFormer(colr.ant, colr.fmin, colr.df, colr.K, 128, 128, 0.3, 0.3, backend='cpu', window=False)(Sr)
+os.environ.pop('FASTSAR_CPU_BLOCKED'); fcpu.BLOCK_PULSES = keep_bp
+check('cpu: blocked first level against unblocked', 10 * np.log10(np.sum(abs(im_blk - im_unb) ** 2) / np.sum(abs(im_unb) ** 2)), -100)
+
 print(f'\n{time.perf_counter() - t_start:.0f} s')
 if bad:
     sys.exit('FAILED: ' + '; '.join(bad))
