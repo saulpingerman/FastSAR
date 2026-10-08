@@ -561,9 +561,16 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
         return (re.reshape([n] + shape_g).transpose(perm).reshape(n, mx, my),
                 im.reshape([n] + shape_g).transpose(perm).reshape(n, mx, my))
 
-    # level-0 children carried through the later levels together: as many as fit in a quarter of the free memory at
-    # the largest level (its input and output planes)
-    rest = max(2 * 2 * np.dtype(kern['dtype']).itemsize * lv['C'] * lv['Po'] * lv['Ko'] for lv in levels[1:]) if L > 1 else 1
+    # level-0 children carried through the later levels together: as many as fit in the free memory at the largest
+    # level, per level-0 child its input planes, the range-decimated intermediate of all its input pulses (_children)
+    # and the output planes; the deeper levels multiply the children by the earlier levels' C
+    def _rest():
+        isz, n, worst = 2 * np.dtype(kern['dtype']).itemsize, 1, 1
+        for lv in levels[1:]:
+            worst = max(worst, n * isz * (lv['P'] * lv['K'] + lv['C'] * (lv['P'] + lv['Po']) * lv['Ko']))
+            n *= lv['C']
+        return worst
+    rest = _rest() if L > 1 else 1
 
     ox, oy, nx, ny = plan['ox'], plan['oy'], plan['nx'], plan['ny']
 
@@ -667,10 +674,22 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
                     x, y = g // sy0, g % sy0
                     full[x * mx:(x + 1) * mx, y * my:(y + 1) * my] = re + 1j * im
             else:
-                bt = int(max(1, min(len(gs), (0.25 * cuda_free()) // rest)))
-                for k0 in range(0, len(gs), bt):
+                bt = int(max(1, min(len(gs), (0.9 * cuda_free()) // rest)))
+                k0 = 0
+                while k0 < len(gs):
                     sub = gs[k0:k0 + bt]
-                    re, im = tiles(A[k0:k0 + len(sub)], Bm[k0:k0 + len(sub)], sub)
+                    try:
+                        re, im = tiles(A[k0:k0 + len(sub)], Bm[k0:k0 + len(sub)], sub)
+                    except cp.cuda.memory.OutOfMemoryError:
+                        if bt == 1:
+                            raise
+                        cp.get_default_memory_pool().free_all_blocks()
+                        bt //= 2
+                        from .memory import warn, gb
+                        warn(f'cuda: out of GPU memory in the later levels; FastSAR continues {bt} first-level '
+                             f'children at a time, which is slower ({gb(cuda_free())} free)')
+                        continue
+                    k0 += len(sub)
                     for k, g in enumerate(sub):
                         x, y = g // sy0, g % sy0
                         full[x * mx:(x + 1) * mx, y * my:(y + 1) * my] = re[k] + 1j * im[k]
