@@ -38,6 +38,21 @@ for nlev in (2, 3):
     if es > -100:
         bad.append(f'nlev {nlev} streamed: {es:.1f} dB')
     print(f'nlev {nlev}: streamed first level vs in memory: {es:.1f} dB')
+# stripmap mosaic with the range profiles in a moving GPU window (as when they exceed the GPU memory) against all of
+# them resident: the same image
+from fastsar import stripmap as sm, patches as pt
+p = sm.make_params(squint_deg=0.0)
+r, x = sm.axes(p)
+raw = sm.simulate(p, np.array([[x[len(x) // 2], r[len(r) // 2]]]))
+rows = (len(x) // 2 - 140, len(x) // 2 + 140)
+img_res, _, _ = pt.form_stripmap(raw, p, rows=rows, backend='cuda', rwin='taylor', awin='taylor')
+os.environ['FASTSAR_PROFILE_WINDOW_ROWS'] = '1200'
+img_win, _, _ = pt.form_stripmap(raw, p, rows=rows, backend='cuda', rwin='taylor', awin='taylor')
+os.environ.pop('FASTSAR_PROFILE_WINDOW_ROWS')
+ew = 10 * np.log10(np.sum(np.abs(img_win - img_res) ** 2) / np.sum(np.abs(img_res) ** 2))
+if ew > -100:
+    bad.append(f'profile window: {ew:.1f} dB')
+print(f'mosaic, profiles in a moving GPU window vs resident: {ew:.1f} dB')
 if bad:
     sys.exit('FAILED: ' + '; '.join(bad))
 print('ok')

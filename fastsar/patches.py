@@ -260,12 +260,24 @@ def patch_history(fx, ant, center, pts, lo, hi, margin=None, guard=None, prof=No
         sft = 2 * df * K2 * shift / C
         m = np.rint(sft).astype(np.int64)
         tm('host geometry')
+        win = prof.get('win')
+        if isinstance(Q, np.ndarray) and win is not None and hi - lo <= win['rows']:
+            # a window of the profiles on the GPU, moved along the strip when a patch's pulses leave it (patches run
+            # along track, so a window serves many of them)
+            if not (win['w0'] <= lo and hi <= win['w1']):
+                win['buf'] = None
+                win['w0'], win['w1'] = lo, min(Q.shape[0], lo + win['rows'])
+                win['buf'] = cp.asarray(Q[win['w0']:win['w1']])
+                win['loads'] = win.get('loads', 0) + 1
+            Q, lo_q = win['buf'], lo - win['w0']
+        else:
+            lo_q = lo
         if isinstance(Q, np.ndarray):
             u = cp.asarray(Q[lo + np.arange(hi - lo)[:, None], (j[None, :] - m[:, None]) % K2])
         else:
             md = cp.asarray(m)
             cols = (cp.asarray(j)[None, :] - md[:, None]) % K2
-            u = Q[cp.arange(lo, hi)[:, None], cols]
+            u = Q[cp.arange(lo_q, lo_q + hi - lo)[:, None], cols]
         tm('gather')
         U = cp.fft.fft(u, axis=1)[:, k0:k1]
         tm('fft')
@@ -452,13 +464,22 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
         import cupy as cp
         prof['device'] = True
         free = cp.cuda.Device().mem_info[0]
-        if prof['Q'].nbytes < 0.4 * free:      # profiles in GPU memory when they fit
+        row = prof['Q'].shape[1] * 8
+        force = int(os.environ.get('FASTSAR_PROFILE_WINDOW_ROWS') or 0)          # testing: the window, of this many rows
+        if prof['Q'].nbytes < 0.4 * free and not force:      # profiles in GPU memory when they fit
             prof['Qd'] = cp.asarray(prof['Q'])
-        else:
-            from .memory import warn, gb
-            warn(f'cuda mosaic: the shared range profiles ({gb(prof["Q"].nbytes)}) stay in host memory and each patch\'s '
-                 f'gate is cut there, which is slower; keeping them on the GPU needs about {gb(prof["Q"].nbytes / 0.4)} of '
-                 f'GPU memory, {gb(free)} is free')
+        else:                                  # else a window of them, a quarter of the free memory
+            prof['win'] = dict(w0=0, w1=0, buf=None, rows=force or int(0.25 * free // row))
+            need = len(ant)                    # pulses serving one patch: a patch-wide stretch at the middle of the grid
+            if beam is not None:
+                q = o + ((nx / 2 + np.array([-0.5, 0.5]) * mx) * spx)[:, None] * e1 + (ny / 2 * spy) * e2
+                span = beam_span(beam, len(ant), q, umax)
+                need = 0 if span is None else span[1] - span[0]
+            if need > prof['win']['rows']:
+                from .memory import warn, gb
+                warn(f'cuda mosaic: a patch\'s range profiles ({gb(need * row)}) do not fit a quarter of the free GPU '
+                     f'memory, so each patch\'s gate is cut in host memory, which is slower; full speed needs about '
+                     f'{gb(4 * need * row)} of GPU memory, {gb(free)} is free')
     def prep(i0, j0):
         """Everything for patch (i0, j0) up to its former: -> dict, or None when no pulse serves it."""
         tm = _Timer('form_mosaic')
