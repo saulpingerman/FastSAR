@@ -134,6 +134,26 @@ def _check_grid(nx, ny, spx, spy, e1, e2):
     return int(nx), int(ny), e1, e2
 
 
+def _jax_group(plan, K):
+    """First-level children per group on a TPU: up to 16, as many as fit in 60% of the device memory after the
+    phase history (two float32 planes), at two float32 planes over each child's input and output pulses
+    (FASTSAR_TPU_GROUP overrides). A 74,203-pulse Capella spotlight needed 48 GB for 16 on a 31 GB v6e."""
+    if os.environ.get('FASTSAR_TPU_GROUP'):
+        return int(os.environ['FASTSAR_TPU_GROUP'])
+    import jax
+    try:
+        hbm = float(jax.devices()[0].memory_stats()['bytes_limit'])
+    except Exception:
+        hbm = 16e9
+    lv = plan['levels'][0]
+    per = 8.0 * lv['Ko'] * (lv['P'] + lv['Po'])
+    free = 0.6 * hbm - 8.0 * lv['P'] * K
+    ng = 16
+    while ng > 1 and ng * per > free:
+        ng //= 2
+    return ng
+
+
 def final_weights(plan, weight, P, grad=False, points=None):
     """Weight of each final subaperture at each final tile [ntiles, Pf] (float32), for ImageFormer's aperture_weight:
     weight(points [m, 3], pulses [n] int) -> [n, m], the per-pulse weights at the tile centers, averaged over the
@@ -233,10 +253,11 @@ class ImageFormer:
             self._pol = pol
             # one compiled program per plan signature: patches of a mosaic with equal shapes and filters share it
             # (with the device arrays that depend on the plan alone: filters, tile geometry)
-            key = (pol, filt, ffbp2.plan_signature(plan))
+            ng = _jax_group(plan, self.K) if filt == 'pallas2' else 1
+            key = (pol, filt, ng, ffbp2.plan_signature(plan))
             hit = _JAX_PROGRAMS.get(key)
             if hit is None:
-                hit = (ffbp2.make_ffbp(pol, plan, filt, 1 << 26, 'direct', pallas_pb=256, pallas_nc=8, pallas_ng=16,
+                hit = (ffbp2.make_ffbp(pol, plan, filt, 1 << 26, 'direct', pallas_pb=256, pallas_nc=8, pallas_ng=ng,
                                        pallas_final=2, pallas_gen=3), ffbp2.static_arrays(pol, plan, filt))
                 if len(_JAX_PROGRAMS) >= 16:
                     _JAX_PROGRAMS.pop(next(iter(_JAX_PROGRAMS)))
