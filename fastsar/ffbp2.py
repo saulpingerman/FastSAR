@@ -128,6 +128,32 @@ def decimator_fir(n_in, D, pass_frac, atten=70.0):
     return dict(kern=kern, pl=int(pl), pr=int(pr), n_out=int(n_out), L=int(L)), m
 
 
+
+def banded_fir(fr, D, n_in, G=128):
+    """The decimation of decimator_fir's kernel (fr) as a blocked banded product: inputs in blocks of D G samples,
+    outputs in blocks of G; output block b is the sum over t of input block b + t times W[t] [D G, G]. Equal to the
+    dense matrix (edges included), at a cost of a few blocks per output block instead of all n_in inputs."""
+    kern, pl, n_out, L = fr['kern'], fr['pl'], fr['n_out'], fr['L']
+    G = max(1, min(G, n_out))
+    block = D * G
+    w = -(-(block - D + L) // block)
+    nbo = -(-n_out // G)
+    nb = nbo + w - 1
+    pr = nb * block - pl - n_in
+    while pr < 0:
+        nb, pr = nb + 1, pr + block
+    W = np.zeros((w, block, G))
+    g = np.arange(G)[:, None]
+    t, q = np.divmod(D * g + np.arange(L)[None, :], block)
+    W[t, q, np.broadcast_to(g, t.shape)] = np.broadcast_to(kern, t.shape)
+    return dict(W=W, pl=int(pl), pr=int(pr), nb=int(nb), nbo=int(nbo), block=int(block), G=int(G), w=int(w), n_out=int(n_out))
+
+
+def dense_pulse_filter(lv):
+    """Whether a level's pulse decimation is applied as its dense matrix (short apertures; one matrix product)
+    rather than banded_fir (the dense matrix grows with the square of the pulse count: 2.8 GB at 74,203 pulses)."""
+    return lv['P'] * lv['Po'] <= (1 << 24)
+
 def fir(F, D, m):
     """The decimation matrix F [n_in, n_out] as one kernel: out[j] = sum_r kern[r] * xpad[D j + r],
     with xpad the input padded by pl zeros on the left and pr on the right. Exact, edges included."""
@@ -303,8 +329,10 @@ def static_arrays(policy, plan, filt='dense'):
     for i, l in enumerate(plan['levels']):
         e = {}
         if filt in ('pallas', 'pallas2'):
-            if l['Dp'] > 1:
+            if l['Dp'] > 1 and dense_pulse_filter(l):
                 e['Fp'] = dev(l['Fp']).astype(mm)
+            elif l['Dp'] > 1:
+                e['Wp'] = dev(banded_fir(l['fir_p'], l['Dp'], l['P'])['W']).astype(mm)
         elif filt == 'dense':
             if l['Dk'] > 1:
                 e['Fk'] = dev(l['Fk']).astype(mm)
@@ -425,6 +453,15 @@ def make_ffbp(policy, plan, filt='dense', budget=1 << 26, trig='split', pallas_p
         """y [N, P, Ko] -> [N, Po, Ko]."""
         if lv['Dp'] == 1:
             return y.astype(f)
+        if 'Wp' in la:                                       # long apertures: banded
+            b = banded_fir(lv['fir_p'], lv['Dp'], lv['P'])
+            N, Ko = y.shape[0], y.shape[2]
+            xb = jnp.pad(y.astype(mm), ((0, 0), (b['pl'], b['pr']), (0, 0))).reshape(N, b['nb'], b['block'], Ko)
+            z = None
+            for t in range(b['w']):
+                zt = jnp.einsum('nbqk,qg->nbgk', xb[:, t:t + b['nbo']], la['Wp'][t], precision=prec, preferred_element_type=f)
+                z = zt if z is None else z + zt
+            return z.reshape(N, b['nbo'] * b['G'], Ko)[:, :b['n_out']]
         if filt in ('dense', 'pallas', 'pallas2'):
             return jnp.swapaxes(mmul(jnp.swapaxes(y, 1, 2), la['Fp']), 1, 2)
         if filt == 'conv':
@@ -568,7 +605,8 @@ def make_ffbp(policy, plan, filt='dense', budget=1 << 26, trig='split', pallas_p
         """Whether the level kernel fuses the pulse decimation for nc children (the decimated block must fit in vector
         memory); the fused form needs 128-pulse blocks because the filter operand's lane dimension is the pulse block."""
         Po_pad = 8 * -(-lv['Po'] // 8)
-        return on_tpu and pallas_gen >= 3 and lv['Dp'] > 1 and Po_pad * band['kob'] * nc * 16 <= 40 << 20
+        return (on_tpu and pallas_gen >= 3 and lv['Dp'] > 1 and Po_pad * band['kob'] * nc * 16 <= 40 << 20
+                and dense_pulse_filter(lv))
 
     def level_kernel(pre_p, pim_p, c0g, slg, band, K, P, Ko, Po, pb, la, lv):
         """pre_p, pim_p [Np, Pp, Kpad]; c0g, slg [Np, nc, Pp] -> (re, im) [Np, 2 nc .. ] pulse-decimated children
