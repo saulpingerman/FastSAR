@@ -41,11 +41,13 @@ python tests/test_insar.py         # change detection and interferometric height
 python tests/test_chain.py         # simulated CPHD to geolocation, map GeoTIFFs, SICD and autofocus (needs sarpy)
 python tests/test_units.py         # filters, program cache, aperture weights, mosaic pieces, input checks
 python tests/test_cphd.py          # read_cphd and form_cphd on simulated collections (stand-in CPHD reader)
+python tests/test_planning.py      # bucket planning, memory models, TPU out-of-memory retry, program cache
+python tests/test_accuracy.py      # tile-size and oversampling errors against exact backprojection
 ```
 
-`run_all.py` skips a script that needs hardware or a package this machine lacks (`test_ffbp_cuda.py`,
-`test_insar.py`) with a SKIP line, stops a script that runs past `-t` seconds (default 600) or holds more than
-`--max-rss-gb` of memory (default 6), and exits non-zero if any script fails. `-v` prints every script's output.
+`run_all.py` skips a script that needs hardware or a package this machine lacks (`test_ffbp_cuda.py`, `test_insar.py`)
+with a SKIP line, stops a script that runs past `-t` seconds (default 600) or holds more than `--max-rss-gb` of memory
+(default 6, or `FASTSAR_TEST_MAX_GB`), and exits non-zero if any script fails. `-v` prints every script's output.
 
 `test_autofocus.py` is the only script that takes a backend argument. The others pick the backends this machine
 has (`fastsar.available_backends()`) or use the CPU. The tests use small simulated scenes and take seconds to a few
