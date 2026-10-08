@@ -36,9 +36,13 @@ Phase histories of tens of gigabytes (28 GB for an ICEYE dwell, 10 GB for a Cape
 - TPU: the history is padded once per image for the first-level kernel, and a level's pulse decimation is a
   blocked banded product of its filter kernel once the dense matrix would exceed 2^24 entries (2.8 GB at 74,203
   pulses, with work growing as the square of the pulse count).
-- JAX and TPU: up to 32 compiled programs and their plan arrays are cached by plan signature; mosaic patches are
-  padded to multiples of 256 pulses to share them, and where patches see different pulse spans (sliding spotlight) up to 4% further to reuse a program already compiled (`FASTSAR_PULSE_SLACK`; 38 programs to 16 on a 78-patch Capella sliding spotlight) (24 formers, 8 programs in `tests/test_patches.py`). Without the
-  cache, the 2021 Capella stripmap mosaic on a v6e spent 19 s of 52 s rebuilding plan arrays.
+- JAX and TPU: up to 32 compiled programs and their plan arrays are cached by plan signature. A mosaic first finds
+  every patch's pulse span and chooses the pulse counts of its programs for the whole mosaic, trading a program's
+  compile time against the padding of the patches that share it (`FASTSAR_COMPILE_PATCHES`, the compile time in
+  patch formations, default 11 on a TPU); range gates are widened onto shared lengths (`FASTSAR_PULSE_SLACK`, 4%).
+  A 78-patch Capella sliding spotlight compiles 2 programs instead of 38, where a v6e spends about 8 s per program.
+  Each patch's history is checked, scaled and uploaded on a worker thread (`ImageFormer.stage`). Without the
+  program cache, the 2021 Capella stripmap mosaic on a v6e spent 19 s of 52 s rebuilding plan arrays.
 - Mosaics: range profiles are computed once and stay in GPU memory on `cuda` when they fit, with the range gate on
   the GPU. The next patches are prepared on worker threads while one forms (one on the CPU, whose formation uses
   every core: 0.91 s per patch against 1.08 s without, on a 2 by 4 patch Capella sub-mosaic on 16 cores; up to
@@ -71,6 +75,8 @@ warnings.simplefilter('ignore', fastsar.MemoryWarning)   # silence the fallback 
 | `FASTSAR_WEIGHT_TERMS` | `0` | `1` applies the mosaic window as SVD terms |
 | `FASTSAR_WEIGHT_GRAD` | `1` | `0` drops the weight's variation across a final tile |
 | `FASTSAR_MOSAIC_PREFETCH` | 1 on the CPU, up to 4 on a GPU or TPU | worker threads preparing the next patches; `0` prepares them one at a time |
+| `FASTSAR_COMPILE_PATCHES` | 11 on a TPU, 3 on JAX | a program's compile time in patch formations, for the pulse counts a mosaic compiles |
+| `FASTSAR_PULSE_SLACK` | `0.04` | widening of mosaic range gates (and of pulse counts not planned) to share programs |
 | `FASTSAR_TIMING` | off | `1` times mosaic steps; `patches.report_timing()` returns them |
 
 `FASTSAR_FIRP_GLOBAL` and `FFBP_FORCE_TPU_KERNELS` exist for the tests only.
