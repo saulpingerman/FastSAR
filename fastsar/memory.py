@@ -63,8 +63,10 @@ def device_available(backend):
     return float(host_available())
 
 
-# first-level children per group at full speed on a TPU (api._jax_group: groups of 4 and 8 are equally fast)
+# first-level children per group at full speed on a TPU (api._jax_group: groups of 4 and 8 are equally fast), and
+# XLA's temporaries of the TPU program besides the first-level children (5.7 GB with one child at 74,203 pulses)
 TPU_GROUP = 4
+TPU_FIXED = 4e9
 
 
 def tpu_history_bytes(plan, K):
@@ -75,10 +77,10 @@ def tpu_history_bytes(plan, K):
 
 def child_bytes(plan, backend):
     """Device bytes of one first-level child: all pulses and its output pulses at the decimated range length. On a
-    TPU, XLA's temporaries per child as compiled for the 2024 Capella spotlight on a v6e (6.1 GB per child, about 30
-    bytes per output range sample and pulse)."""
+    TPU, XLA's temporaries per child as compiled for the Capella spotlights on a v6e (2.4 GB per child at 74,203
+    pulses, about 12 bytes per output range sample and pulse), beside TPU_FIXED for the later levels."""
     lv = plan['levels'][0]
-    per = 30.0 if backend == 'tpu' else 8.0
+    per = 12.0 if backend == 'tpu' else 8.0
     return per * lv['Ko'] * (lv['P'] + lv['Po'])
 
 
@@ -88,7 +90,7 @@ def full_speed(plan, K, backend):
     holds the history and groups of TPU_GROUP children within 95% of the device memory."""
     lv = plan['levels'][0]
     if backend == 'tpu':
-        hist, groups = tpu_history_bytes(plan, K), TPU_GROUP * child_bytes(plan, backend)
+        hist, groups = tpu_history_bytes(plan, K) + TPU_FIXED, TPU_GROUP * child_bytes(plan, backend)
         return (hist + groups) / 0.95, dict(history=hist, first_level=groups, image=8.0 * plan['Nx'] * plan['Ny'])
     hist = 0.0 if backend == 'cpu' else 8.0 * lv['P'] * K
     groups = 8 * child_bytes(plan, backend)

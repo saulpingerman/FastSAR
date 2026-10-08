@@ -139,12 +139,12 @@ def _jax_group(plan, K):
     ImageFormer halves it again if the device still runs out of memory). On a v6e the 2025 Capella spotlight formed
     in 9.9 s with groups of 4 and of 8, 1% slower with 2 and 5% slower with 1, and 16 did not fit. The fit is
     memory.full_speed's model (the padded history planes and XLA's temporaries per child) within 95% of the
-    device memory: groups of 2 for the 74,203-pulse 2024 spotlight on a 32 GB v6e, 4 for the 2025 one."""
+    device memory: groups of 4 for both 2024 and 2025 Capella spotlights on a 32 GB v6e."""
     if os.environ.get('FASTSAR_TPU_GROUP'):
         return int(os.environ['FASTSAR_TPU_GROUP'])
-    from .memory import device_available, child_bytes, TPU_GROUP, tpu_history_bytes
+    from .memory import device_available, child_bytes, TPU_GROUP, TPU_FIXED, tpu_history_bytes
     hbm = device_available('tpu')
-    hist, per = tpu_history_bytes(plan, K), child_bytes(plan, 'tpu')
+    hist, per = tpu_history_bytes(plan, K) + TPU_FIXED, child_bytes(plan, 'tpu')
     ng = TPU_GROUP
     while ng > 1 and hist + ng * per > 0.95 * hbm:
         ng //= 2
