@@ -50,7 +50,8 @@ Phase histories of tens of gigabytes (28 GB for an ICEYE dwell, 10 GB for a Cape
 
 ## Memory
 
-Full speed keeps the phase history on the device and forms the first level in groups of 8 children (16 on a TPU).
+Full speed keeps the phase history on the device and forms the first level in groups of 8 children (4 on a TPU,
+where groups of 4 and 8 formed the 2025 Capella spotlight equally fast and groups of 2 took 1% longer).
 With less memory FastSAR falls back instead of failing: smaller groups on CPU, GPU and TPU (the history is read more
 often), streaming of the history from host memory through the first level on CUDA, and shared range profiles kept
 on the host in a CUDA mosaic. Each fallback issues a `fastsar.MemoryWarning` naming it, with the memory full speed

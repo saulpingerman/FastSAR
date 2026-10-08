@@ -5,7 +5,7 @@ FastSAR falls back to a slower path for lack of memory.
     former.memory()          # dict(backend, needed, available, full_speed, note)
 
 Full speed keeps the phase history on the device (two float32 planes; the CPU reads complex64 in place) and forms
-the first level in groups of 8 children (16 on a TPU), each holding all pulses at the decimated range length. With
+the first level in groups of 8 children (4 on a TPU), each holding all pulses at the decimated range length. With
 less memory the CPU and GPU use smaller groups (the history is read more often), the GPU streams the history from
 host memory through the first level, and a mosaic keeps its shared range profiles on the host. Each fallback raises
 a MemoryWarning that names it and the memory full speed needs; filter it with
@@ -63,21 +63,35 @@ def device_available(backend):
     return float(host_available())
 
 
+# first-level children per group at full speed on a TPU (api._jax_group: groups of 4 and 8 are equally fast)
+TPU_GROUP = 4
+
+
+def tpu_history_bytes(plan, K):
+    """Device bytes of the phase history as the TPU program holds it: two float32 planes padded for the first-level
+    kernel and its plan arrays (12.2 GB for the 74,203 x 17,282 Capella spotlight, 1.18 times the bare planes)."""
+    return 1.2 * 8.0 * plan['levels'][0]['P'] * K
+
+
 def child_bytes(plan, backend):
-    """Device bytes of one first-level child: all pulses and its output pulses at the decimated range length."""
+    """Device bytes of one first-level child: all pulses and its output pulses at the decimated range length. On a
+    TPU, XLA's temporaries per child as compiled for the 2024 Capella spotlight on a v6e (6.1 GB per child, about 30
+    bytes per output range sample and pulse)."""
     lv = plan['levels'][0]
-    planes = 16.0 if backend == 'tpu' else 8.0
-    return planes * lv['Ko'] * (lv['P'] + lv['Po'])
+    per = 30.0 if backend == 'tpu' else 8.0
+    return per * lv['Ko'] * (lv['P'] + lv['Po'])
 
 
 def full_speed(plan, K, backend):
     """Device memory the full-speed configuration requires, with the headroom FastSAR's sizing keeps: (total, parts
     dict of what full speed holds). CPU and CUDA give the first-level groups a quarter of the free memory; the TPU
-    sizes its groups within half the device memory."""
+    holds the history and groups of TPU_GROUP children within 95% of the device memory."""
     lv = plan['levels'][0]
+    if backend == 'tpu':
+        hist, groups = tpu_history_bytes(plan, K), TPU_GROUP * child_bytes(plan, backend)
+        return (hist + groups) / 0.95, dict(history=hist, first_level=groups, image=8.0 * plan['Nx'] * plan['Ny'])
     hist = 0.0 if backend == 'cpu' else 8.0 * lv['P'] * K
-    groups = (16 if backend == 'tpu' else 8) * child_bytes(plan, backend)
+    groups = 8 * child_bytes(plan, backend)
     image = 8.0 * plan['Nx'] * plan['Ny']
     parts = dict(history=hist, first_level=groups, image=image)
-    total = 2 * (hist + groups) if backend == 'tpu' else hist + 4 * groups + image
-    return total, parts
+    return hist + 4 * groups + image, parts

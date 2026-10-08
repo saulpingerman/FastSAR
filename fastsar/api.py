@@ -135,22 +135,18 @@ def _check_grid(nx, ny, spx, spy, e1, e2):
 
 
 def _jax_group(plan, K):
-    """First-level children per group on a TPU: up to 16, as many as fit in half the device memory after the
-    phase history (two float32 planes), at four float32 planes over each child's input and output pulses
-    (FASTSAR_TPU_GROUP overrides; ImageFormer halves it again if the device still runs out of memory). A 74,203-pulse
-    Capella spotlight needed 48 GB for 16 on a 31 GB v6e."""
+    """First-level children per group on a TPU: 4, fewer when they do not fit (FASTSAR_TPU_GROUP overrides;
+    ImageFormer halves it again if the device still runs out of memory). On a v6e the 2025 Capella spotlight formed
+    in 9.9 s with groups of 4 and of 8, 1% slower with 2 and 5% slower with 1, and 16 did not fit. The fit is
+    memory.full_speed's model (the padded history planes and XLA's temporaries per child) within 95% of the
+    device memory: groups of 2 for the 74,203-pulse 2024 spotlight on a 32 GB v6e, 4 for the 2025 one."""
     if os.environ.get('FASTSAR_TPU_GROUP'):
         return int(os.environ['FASTSAR_TPU_GROUP'])
-    import jax
-    try:
-        hbm = float(jax.devices()[0].memory_stats()['bytes_limit'])
-    except Exception:
-        hbm = 16e9
-    lv = plan['levels'][0]
-    per = 16.0 * lv['Ko'] * (lv['P'] + lv['Po'])
-    free = 0.5 * hbm - 8.0 * lv['P'] * K
-    ng = 16
-    while ng > 1 and ng * per > free:
+    from .memory import device_available, child_bytes, TPU_GROUP, tpu_history_bytes
+    hbm = device_available('tpu')
+    hist, per = tpu_history_bytes(plan, K), child_bytes(plan, 'tpu')
+    ng = TPU_GROUP
+    while ng > 1 and hist + ng * per > 0.95 * hbm:
         ng //= 2
     return ng
 
@@ -271,9 +267,10 @@ class ImageFormer:
             # (with the device arrays that depend on the plan alone: filters, tile geometry)
             self._plan, self._filt = plan, filt
             self._ng = _jax_group(plan, self.K) if filt == 'pallas2' else 1
-            if filt == 'pallas2' and self._ng < min(16, plan['levels'][0]['C']) and not os.environ.get('FASTSAR_TPU_GROUP'):
+            from .memory import TPU_GROUP
+            if filt == 'pallas2' and self._ng < min(TPU_GROUP, plan['levels'][0]['C']) and not os.environ.get('FASTSAR_TPU_GROUP'):
                 from .memory import warn, gb, full_speed, device_available, children
-                warn(f'tpu: first-level groups of {children(self._ng)} instead of 16 for lack of device memory, which is '
+                warn(f'tpu: first-level groups of {children(self._ng)} instead of {TPU_GROUP} for lack of device memory, which is '
                      f'slower; full speed needs about {gb(full_speed(plan, self.K, "tpu")[0])} of TPU memory, '
                      f'{gb(device_available("tpu"))} is free')
             self._fn, static = self._program(self._ng)
@@ -340,9 +337,9 @@ class ImageFormer:
                 # a kernel's on-chip scratch (VMEM) is sized at compile time and does not depend on the group size
                 if not any(m in str(e) for m in ('RESOURCE_EXHAUSTED', 'Ran out of memory', 'OOM')) or 'Vmem' in str(e):
                     raise
-                from .memory import warn, gb, full_speed, child_bytes, children
+                from .memory import warn, gb, full_speed, child_bytes, children, tpu_history_bytes
                 if self._ng <= 1:
-                    need = 8.0 * self.P * self.K + 2 * child_bytes(self._plan, 'tpu')
+                    need = tpu_history_bytes(self._plan, self.K) + child_bytes(self._plan, 'tpu')
                     raise MemoryError(f'{self.backend}: the phase history ({gb(8.0 * self.P * self.K)} as float32 planes) and '
                                       f'one first-level child do not fit in device memory; this needs about {gb(need)}. '
                                       'Use the cuda or cpu backend (both stream or read the history in place), a device '
