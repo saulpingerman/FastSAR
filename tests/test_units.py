@@ -379,6 +379,12 @@ kwr = dict(nx=128, ny=128, spx=0.3, spy=0.3, backend='cpu', window=False)
 ir = fastsar.form_image(Sr, colr.ant, colr.fmin, colr.df, **kwr)
 ir2 = fastsar.form_image(Sr2, colr.ant, colr.fmin, colr.df, ref=refr, **kwr)
 check('form_image with ref against the |ant|-referenced image', 10 * np.log10(np.sum(abs(ir2 - ir) ** 2) / np.sum(abs(ir) ** 2)), -90)
+kwp = dict(kwr, algorithm='pfa', pfa_guard=10.0, e1=(0.0, 1.0, 0.0), e2=(1.0, 0.0, 0.0))     # e1 along the track
+ipr = fastsar.form_image(Sr, colr.ant, colr.fmin, colr.df, **kwp)
+ipr2 = fastsar.form_image(Sr2, colr.ant, colr.fmin, colr.df, ref=refr, **kwp)
+check("algorithm='pfa' with ref against the |ant|-referenced image", rel_db(ipr2, ipr), -90)
+expect("algorithm='pfa': ref of the wrong length", lambda: fastsar.form_image(Sr2, colr.ant, colr.fmin, colr.df, ref=refr[:5], **kwp),
+       ValueError)
 
 # memory: full speed when it fits, a MemoryWarning naming the fallback and the memory needed when it does not
 print('\nmemory fallback')

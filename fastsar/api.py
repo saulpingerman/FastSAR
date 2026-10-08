@@ -18,6 +18,9 @@ Backends for factorized backprojection (the same plan, filters and float64 geome
     'jax'   the plain JAX program, on whatever device JAX has
     'auto'  tpu if JAX sees a TPU, else cuda if CuPy sees a GPU, else cpu
 
+ref [P]: the range (one way) each pulse's samples are referenced to, when it is not |ant| (a bistatic collection's
+half path, a vendor's reference point); both algorithms honor it (polar format re-references the samples to |ant|).
+
 pfa_guard: margin (m) around the scene that polar format keeps free of wrap-around; 300 m suits orbital scenes of a
 few kilometers and must be smaller for small simulated scenes.
 
@@ -389,6 +392,11 @@ def form_image(S, ant, fmin, df, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
         nx, ny, e1, e2 = _check_grid(nx, ny, spx, spy, e1, e2)
         P, K = S.shape
         col = Collect(fmin=float(fmin), df=float(df), K=K, ant=np.asarray(ant, np.float64), res=0.5)
+        if ref is not None:               # polar format needs the samples referenced to |ant|: move them there
+            from .io import rereference
+            if np.shape(ref) != (P,):
+                raise ValueError(f'ref must hold one range per pulse ({P}), got shape {np.shape(ref)}')
+            S = rereference(S, float(fmin), float(df), np.asarray(ref, np.float64) - np.linalg.norm(col.ant, axis=1))
         if window:
             wp, wk = _window(P, K)
             S = (S * wp[:, None] * wk[None, :]).astype(np.complex64)
