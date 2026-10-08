@@ -358,18 +358,16 @@ def device_arrays(policy, plan, coll, static):
     """Add the per-collection arrays (from `collection_arrays`) to the static ones."""
     h = np.float64 if POLICIES[policy]['ew'] == 'float64' else np.float32
 
-    def dev(x):
-        return jnp.asarray(np.asarray(x).astype(h))
+    def host(x):
+        return np.asarray(x).astype(h)
 
-    lv = []
-    for i, (e, c) in enumerate(zip(static['levels'], coll['levels'])):
-        e = dict(e)
-        if i < HOST_LEVELS:
-            e.update(c0=dev(c['c0']), slope=dev(c['slope']))
-        else:
-            e.update(u=dev(c['u']), r0=dev(c['r0']))
-        lv.append(e)
-    return dict(levels=lv, final=dict(static['final'], u=dev(coll['final']['u']), r0=dev(coll['final']['r0'])))
+    # the per-collection arrays in one transfer (one device_put of the tree, not one per array)
+    up = dict(levels=[dict(c0=host(c['c0']), slope=host(c['slope'])) if i < HOST_LEVELS else dict(u=host(c['u']), r0=host(c['r0']))
+                      for i, c in enumerate(coll['levels'])],
+              final=dict(u=host(coll['final']['u']), r0=host(coll['final']['r0'])))
+    up = jax.device_put(up)
+    lv = [dict(e, **u) for e, u in zip(static['levels'], up['levels'])]
+    return dict(levels=lv, final=dict(static['final'], **up['final']))
 
 
 def prepare(policy, S):

@@ -180,16 +180,21 @@ def tile_plan(ant, fmax, px, py, spx, spy, e1, e2, target_db=-40.0, tiles=(32, 1
     return best
 
 
+_ROWS_POOL = []
+
+
 def _rows(fn, n, chunk=256):
-    """fn(slice) over row chunks of n rows on a thread pool (NumPy releases the GIL in its ufuncs)."""
+    """fn(slice) over row chunks of n rows on a thread pool shared by all calls (NumPy releases the GIL in its
+    ufuncs; starting a pool per call cost 50 ms per mosaic patch)."""
     from concurrent.futures import ThreadPoolExecutor
     import os
     sl = [slice(i, min(n, i + chunk)) for i in range(0, n, chunk)]
     if len(sl) == 1:
         fn(sl[0])
         return
-    with ThreadPoolExecutor(min(len(sl), os.cpu_count() or 1)) as ex:
-        list(ex.map(fn, sl))
+    if not _ROWS_POOL:
+        _ROWS_POOL.append(ThreadPoolExecutor(os.cpu_count() or 1, thread_name_prefix='fastsar-rows'))
+    list(_ROWS_POOL[0].map(fn, sl))
 
 
 def _padding(fx, guard=None):
@@ -227,7 +232,9 @@ def range_profiles(fx, guard=None):
 def _gate_bins(a, rc, center, pts, margin, K2, df):
     """Range bins (of c / (2 K2 df)) a patch's gate keeps: the points' extent in range from the antenna positions a
     [n, 3] (rc their distances to center) plus margin on each side, an even fast FFT length."""
-    dR = np.linalg.norm(pts[None, :, :] - a[:, None, :], axis=2) - rc[:, None]
+    # range changes smoothly along the track: up to 513 evenly spaced pulses (the ends included) set the extent
+    k = np.unique(np.linspace(0, len(a) - 1, min(len(a), 513)).astype(np.int64))
+    dR = np.linalg.norm(pts[None, :, :] - a[k, None, :], axis=2) - rc[k, None]
     half = np.abs(dR).max() + margin
     from scipy.fft import next_fast_len
     N = next_fast_len(2 * int(np.ceil(half * 2 * K2 * df / C)))
