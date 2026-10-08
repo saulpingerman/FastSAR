@@ -449,19 +449,21 @@ def choose_buckets(counts, compile_cost, step=256):
     """Pulse counts for the compiled programs of a JAX or TPU mosaic: counts [n] (the patches' pulse counts) ->
     sorted bucket counts (multiples of step), each patch to take the smallest bucket at least its count. Minimizes
     compile_cost x (number of buckets) + the patches' padding work, sum of (bucket / count - 1), both in units of one
-    patch's formation (dynamic programming over the distinct counts)."""
-    u, w = np.unique(step * -(-np.asarray(counts, np.int64) // step), return_counts=True)
-    if len(u) == 0:
-        return []
+    patch's formation (dynamic programming over the distinct counts; counts below 1 are ignored)."""
+    c = np.asarray(counts, np.int64).ravel()
+    u, w = np.unique(step * -(-c[c > 0] // step), return_counts=True)
     m = len(u)
-    best, prev = np.full(m, np.inf), np.full(m, -1)
+    if m == 0:
+        return []
+    # padding of the counts i .. j to u[j]: u[j] (A[j+1] - A[i]) - (W[j+1] - W[i]) with prefix sums A of w / u and W of w
+    A = np.concatenate([[0.0], np.cumsum(w / u)])
+    W = np.concatenate([[0.0], np.cumsum(w.astype(np.float64))])
+    before = np.zeros(m + 1)               # before[i]: the best cost of the counts below i (0 for none)
+    prev = np.empty(m, np.int64)
     for j in range(m):
-        # items k+1 .. j padded to u[j]; k = -1: every count up to j
-        for k in range(-1, j):
-            pad = float(np.sum(w[k + 1:j + 1] * (u[j] / u[k + 1:j + 1] - 1.0)))
-            c = compile_cost + pad + (best[k] if k >= 0 else 0.0)
-            if c < best[j]:
-                best[j], prev[j] = c, k
+        cost = compile_cost + u[j] * (A[j + 1] - A[:j + 1]) - (W[j + 1] - W[:j + 1]) + before[:j + 1]
+        i = int(np.argmin(cost))
+        before[j + 1], prev[j] = cost[i], i - 1
     out, j = [], m - 1
     while j >= 0:
         out.append(int(u[j]))
