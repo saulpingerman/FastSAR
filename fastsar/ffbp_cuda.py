@@ -18,6 +18,7 @@ import os
 import numpy as np
 import cupy as cp
 
+from . import memory
 from .ffbp import C, _positions
 from .ffbp2 import HOST_LEVELS, make_plan, collection_arrays  # noqa: F401  (re-exported for callers)
 
@@ -357,12 +358,9 @@ def _children(kern, pre, pim, c0, sl, lv):
         name = 'fir_p'
         if os.environ.get('FASTSAR_FIRP_GLOBAL'):        # testing: force the global-memory kernel
             name, smem = 'fir_p_g', 0
-        elif smem > 48 * 1024:                             # large decimation factors: opt in to more shared memory
-            smax = int(cp.cuda.Device().attributes.get('MaxSharedMemoryPerBlockOptin', 48 * 1024))
-            if smem <= smax:
-                pass                                       # the kernels opt in to smax when created (_kernels)
-            else:                                        # still too large: read the rows from global memory
-                name, smem = 'fir_p_g', 0
+        elif smem > int(cp.cuda.Device().attributes.get('MaxSharedMemoryPerBlockOptin', 96 * 1024)):
+            # beyond what the kernels opted in to (_kernels): read the rows from global memory
+            name, smem = 'fir_p_g', 0
         kern[name](((Ko + 63) // 64, (Po + nout - 1) // nout, Np * Cn), (256,),
                    (yre, yim, taps, zre, zim, np.int32(P), np.int32(Ko), np.int32(Po), np.int32(Dp), np.int32(fp['L']), np.int32(fp['pl']), np.int32(nout)),
                    shared_mem=smem)
@@ -370,10 +368,6 @@ def _children(kern, pre, pim, c0, sl, lv):
         return zre, zim
     return yre, yim
 
-
-STREAM_PULSES = 4096       # pulses per uploaded block when the first level streams a host phase history
-from .memory import CUDA_CHILD, cuda_free  # noqa: E402  (device bytes of a first-level child over its planes)
-STREAM_FRACTION = 0.5      # stream when the history's device planes exceed this fraction of the free device memory
 
 
 def _device_phases(la, refs, lv):
@@ -398,13 +392,17 @@ PROFILE = {}
 def _mark(name, start):
     """Accumulate the device time since `start` (an Event) under `name` when profiling is on."""
     if PROFILE.get('on'):
-        e = cp.cuda.Event(); e.record(); e.synchronize()
+        e = cp.cuda.Event()
+        e.record()
+        e.synchronize()
         PROFILE[name] = PROFILE.get(name, 0.0) + cp.cuda.get_elapsed_time(start, e) * 1e-3
 
 
 def _tick():
     if PROFILE.get('on'):
-        e = cp.cuda.Event(); e.record(); return e
+        e = cp.cuda.Event()
+        e.record()
+        return e
     return None
 
 
@@ -485,41 +483,6 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
         _mark('final_corr', t0)
         return out
 
-    def one_tile(a, b, g):
-        """Level-0 child g [Po0, Ko0] through the remaining levels -> its mx x my block."""
-        a, b = a[None], b[None]
-        for i in range(1, L):
-            lv, la = levels[i], dev[i]
-            if i < HOST_LEVELS:
-                c0, sl = la['c0'][g][None], la['slope'][g][None]
-                a, b = _children(kern, a, b, c0, sl, lv)
-            else:
-                nb_par = a.shape[0]
-                refs = la['ref'].reshape(G, nb_par, 3)[g]
-                t0 = _tick()
-                c0, sl = _device_phases(la, refs, lv)
-                _mark('device_phases', t0)
-                a, b = _children(kern, a, b, c0, sl, lv)
-        cen = fcen.reshape(G, -1, 3)[g]
-        if wfd is not None and wfd.ndim == 3 and final_mode != 'f16tc':     # weights in the final kernel
-            w = wfd.reshape(3, G, -1, Pf)[:, g]
-            w0 = w[0]
-            big = cp.abs(w0) > 1e-6 * cp.maximum(cp.abs(w0).max(), 1e-30)
-            gyr = cp.where(big, w[2] / cp.where(w0 == 0, 1, w0), 0.0)
-            re, im = final(a, b, cen, (w0, w[1], gyr))
-        elif wfd is not None and wfd.ndim == 3:    # final subaperture weights per tile and their gradient across it
-            w = wfd.reshape(3, G, -1, Pf)[:, g][..., None]
-            re, im = final((a * w[0]).astype(a.dtype), (b * w[0]).astype(b.dtype), cen)
-            for k, dl in ((1, dlxw[None, :, None]), (2, dlyw[None, None, :])):
-                r_, i_ = final((a * w[k]).astype(a.dtype), (b * w[k]).astype(b.dtype), cen)
-                re, im = re + dl * r_, im + dl * i_
-        else:
-            if wfd is not None:            # final subaperture weights per tile (api.final_weights)
-                w = wfd.reshape(G, -1, Pf)[g][:, :, None]
-                a, b = (a * w).astype(a.dtype), (b * w).astype(b.dtype)
-            re, im = final(a, b, cen)
-        return (re.reshape(shape_g).transpose(perm_g).reshape(mx, my), im.reshape(shape_g).transpose(perm_g).reshape(mx, my))
-
     def tiles(a, b, gs):
         """Level-0 children gs [n, Po0, Ko0] through the remaining levels together (one launch per level and stage for
         all of them) -> their mx x my blocks [n, mx, my] (re, im)."""
@@ -583,8 +546,9 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
         Dp = lv['Dp']
         fp = lv['fir_p'] if Dp > 1 else dict(L=1, pl=0, kern=np.ones(1))
         L, pl = fp['L'], fp['pl']
-        zre = cp.empty((ngc, Po, Ko), kern['dtype']); zim = cp.empty((ngc, Po, Ko), kern['dtype'])
-        nb = max(1, (STREAM_PULSES - L) // Dp + 1)                    # output rows per block
+        zre = cp.empty((ngc, Po, Ko), kern['dtype'])
+        zim = cp.empty((ngc, Po, Ko), kern['dtype'])
+        nb = max(1, (memory.STREAM_PULSES - L) // Dp + 1)                    # output rows per block
         for i0 in range(0, Po, nb):
             i1 = min(Po, i0 + nb)
             p0, p1 = Dp * i0 - pl, Dp * (i1 - 1) - pl + L               # input pulses read by these outputs
@@ -595,24 +559,29 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
             pre = cp.ascontiguousarray((blk.real / scale).astype(kern['dtype']))[None]
             pim = cp.ascontiguousarray((blk.imag / scale).astype(kern['dtype']))[None]
             del blk
-            cb = cp.zeros((1, ngc, p1 - p0), cp.float32); sb = cp.zeros((1, ngc, p1 - p0), cp.float32)
+            cb = cp.zeros((1, ngc, p1 - p0), cp.float32)
+            sb = cp.zeros((1, ngc, p1 - p0), cp.float32)
             if b > a:
-                cb[:, :, a - p0:b - p0] = c0[:, :, a:b]; sb[:, :, a - p0:b - p0] = sl[:, :, a:b]
+                cb[:, :, a - p0:b - p0] = c0[:, :, a:b]
+                sb[:, :, a - p0:b - p0] = sl[:, :, a:b]
             # the block's outputs read its rows D j + r (j < i1 - i0); with D = 1 the rows are the outputs
             y = _children(kern, pre, pim, cb, sb, dict(lv, P=p1 - p0, Po=i1 - i0, fir_p=dict(fp, pl=0, n_out=i1 - i0)))
             zre[:, i0:i1], zim[:, i0:i1] = y[0], y[1]
             del pre, pim, y
         return zre, zim
 
-    def form(S, ng=None):
+    def form(S, ng=None, batch=None):
         """S [P, K] complex64 (host or device, already windowed) -> complex64 image [nx, ny] on the device. A host
-        history whose device planes exceed STREAM_FRACTION of the free device memory is streamed through the first
-        level in pulse blocks (FASTSAR_CUDA_STREAM=1 forces it); a smaller one is uploaded once. ng: first-level
-        children per group (default: up to 8, within a quarter of the memory left after the upload)."""
+        history whose device planes exceed memory.STREAM_FRACTION of the free device memory is streamed through the
+        first level in pulse blocks (FASTSAR_CUDA_STREAM=1 forces it); a smaller one is uploaded once. ng: first-level
+        children per group (default: up to 8, within the memory left after the image and the upload; FASTSAR_CUDA_GROUP
+        sets it). batch: first-level children carried through the later levels together (default: as many as fit)."""
         lv0, la0 = levels[0], dev[0]
         isz = 2 * np.dtype(kern['dtype']).itemsize
         planes = isz * S.shape[0] * S.shape[1]                # the history as device planes
-        stream = isinstance(S, np.ndarray) and (planes > STREAM_FRACTION * cuda_free()
+        full = cp.empty((plan['Nx'], plan['Ny']), cp.complex64)  # first, so that the sizing below leaves room for it
+        free = memory.cuda_free()
+        stream = isinstance(S, np.ndarray) and (memory.cuda_streams(planes, free)
                                                 or os.environ.get('FASTSAR_CUDA_STREAM') == '1')
         scale = 1.0
         if kern['dtype'] != cp.float32:              # float16 storage: scale to the peak (in row blocks)
@@ -620,32 +589,25 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
             scale = max(float(xp.abs(S[i:i + 4096]).max()) for i in range(0, S.shape[0], 4096)) or 1.0
         if not stream:
             # uploaded in row blocks straight into the planes (no full complex copy on the device)
-            pre = cp.empty((1,) + S.shape, kern['dtype']); pim = cp.empty((1,) + S.shape, kern['dtype'])
+            pre = cp.empty((1,) + S.shape, kern['dtype'])
+            pim = cp.empty((1,) + S.shape, kern['dtype'])
             for i in range(0, S.shape[0], 4096):
                 b = cp.asarray(S[i:i + 4096])
-                pre[0, i:i + 4096] = (b.real / scale).astype(kern['dtype']); pim[0, i:i + 4096] = (b.imag / scale).astype(kern['dtype'])
+                pre[0, i:i + 4096] = (b.real / scale).astype(kern['dtype'])
+                pim[0, i:i + 4096] = (b.imag / scale).astype(kern['dtype'])
                 del b
-        free0 = cuda_free()
         forced = ng is not None or bool(os.environ.get('FASTSAR_CUDA_GROUP'))
-        if ng is None and os.environ.get('FASTSAR_CUDA_GROUP'):
-            ng = int(os.environ['FASTSAR_CUDA_GROUP'])
-        # each first-level child takes about CUDA_CHILD times its planes of all pulses at the decimated range length
-        per = CUDA_CHILD * isz * lv0['Ko'] * (STREAM_PULSES if stream else lv0['P'])
-        if ng is None:                                 # children per group: 8, 4, 2 or 1, within the memory left
-            ng = 8
-            while ng > 1 and ng * per > free0:
-                ng //= 2
-        if (stream and os.environ.get('FASTSAR_CUDA_STREAM') != '1') or (ng < min(8, G) and not forced):
-            from .memory import warn, gb, children
-            need = planes + 8 * CUDA_CHILD * isz * lv0['Ko'] * lv0['P']
+        if ng is None:
+            ng = memory._env_number('FASTSAR_CUDA_GROUP', 1) or memory.cuda_group(lv0, S.shape[1], isz, memory.cuda_free(), stream)
+        if (stream and os.environ.get('FASTSAR_CUDA_STREAM') != '1') or (ng < min(memory.CUDA_GROUP, G) and not forced):
             how = []
             if stream:
-                how.append(f'streams the {gb(planes)} phase history from host memory through the first level')
-            if ng < min(8, G):
-                how.append(f'forms the first level in groups of {children(ng)} instead of 8')
-            warn(f'cuda: for lack of GPU memory FastSAR ' + ' and '.join(how) + ', which is slower; full speed needs about '
-                 f'{gb(need)} of GPU memory, {gb(free0 + (0 if stream else planes))} is free')
-        full = cp.empty((plan['Nx'], plan['Ny']), cp.complex64)
+                how.append(f'streams the {memory._gb(planes)} phase history from host memory through the first level')
+            if ng < min(memory.CUDA_GROUP, G):
+                how.append(f'forms the first level in groups of {memory._nchildren(ng)} instead of {memory.CUDA_GROUP}')
+            need = memory.full_speed(plan, S.shape[1], 'cuda', isz)[0]
+            memory._warn('cuda: for lack of GPU memory FastSAR ' + ' and '.join(how) + ', which is slower; full speed needs '
+                         f'about {memory._gb(need)} of GPU memory, {memory._gb(free + full.nbytes)} is free')
         g0 = 0
         while g0 < G:
             gs = list(range(g0, min(G, g0 + ng)))
@@ -663,37 +625,27 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
                 del c0, sl
                 cp.get_default_memory_pool().free_all_blocks()
                 ng //= 2
-                from .memory import warn, children, gb
-                warn(f'cuda: out of GPU memory in the first level; FastSAR continues in groups of {children(ng)}, '
-                     f'which is slower ({gb(cuda_free())} free)')
+                memory._warn(f'cuda: out of GPU memory in the first level; FastSAR continues in groups of '
+                             f'{memory._nchildren(ng)}, which is slower ({memory._gb(memory.cuda_free())} free)')
                 continue
             g0 += len(gs)
-            if os.environ.get('FASTSAR_CUDA_PER_TILE') == '1':          # the previous loop, one child at a time
-                for k, g in enumerate(gs):
-                    re, im = one_tile(A[k], Bm[k], g)
+            # the batch does not set the speed (docs/performance.md): sized with room to spare, halved quietly
+            bt = batch or int(max(1, min(len(gs), (0.45 * memory.cuda_free()) // rest)))
+            k0 = 0
+            while k0 < len(gs):
+                sub = gs[k0:k0 + bt]
+                try:
+                    re, im = tiles(A[k0:k0 + len(sub)], Bm[k0:k0 + len(sub)], sub)
+                except cp.cuda.memory.OutOfMemoryError:
+                    if bt == 1:
+                        raise
+                    cp.get_default_memory_pool().free_all_blocks()
+                    bt //= 2
+                    continue
+                k0 += len(sub)
+                for k, g in enumerate(sub):
                     x, y = g // sy0, g % sy0
-                    full[x * mx:(x + 1) * mx, y * my:(y + 1) * my] = re + 1j * im
-            else:
-                # (the batch does not set the speed: on the L4, 1, 2 and 4 children per pass of the 2025 Capella
-                # spotlight formed in the same time within 1%, so it is sized with room to spare and halved quietly)
-                bt = int(max(1, min(len(gs), (0.45 * cuda_free()) // rest)))
-                if os.environ.get('FASTSAR_CUDA_BATCH'):               # testing: first-level children per later pass
-                    bt = int(os.environ['FASTSAR_CUDA_BATCH'])
-                k0 = 0
-                while k0 < len(gs):
-                    sub = gs[k0:k0 + bt]
-                    try:
-                        re, im = tiles(A[k0:k0 + len(sub)], Bm[k0:k0 + len(sub)], sub)
-                    except cp.cuda.memory.OutOfMemoryError:
-                        if bt == 1:
-                            raise
-                        cp.get_default_memory_pool().free_all_blocks()
-                        bt //= 2
-                        continue
-                    k0 += len(sub)
-                    for k, g in enumerate(sub):
-                        x, y = g // sy0, g % sy0
-                        full[x * mx:(x + 1) * mx, y * my:(y + 1) * my] = re[k] + 1j * im[k]
+                    full[x * mx:(x + 1) * mx, y * my:(y + 1) * my] = re[k] + 1j * im[k]
             del A, Bm
         return full[ox:ox + nx, oy:oy + ny] if scale == 1.0 else full[ox:ox + nx, oy:oy + ny] * np.float32(scale)
 

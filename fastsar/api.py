@@ -143,8 +143,10 @@ def _jax_group(plan, K):
     in 9.9 s with groups of 4 and of 8, 1% slower with 2 and 5% slower with 1, and 16 did not fit. The fit is
     memory.full_speed's model (the padded history planes and XLA's temporaries per child) within 95% of the
     device memory: groups of 4 for both 2024 and 2025 Capella spotlights on a 32 GB v6e."""
-    if os.environ.get('FASTSAR_TPU_GROUP'):
-        return int(os.environ['FASTSAR_TPU_GROUP'])
+    from .memory import _env_number
+    forced = _env_number('FASTSAR_TPU_GROUP', 1)
+    if forced:
+        return forced
     from .memory import device_available, child_bytes, TPU_GROUP, TPU_FIXED, tpu_history_bytes
     hbm = device_available('tpu')
     hist, per = tpu_history_bytes(plan, K) + TPU_FIXED, child_bytes(plan, 'tpu')
@@ -237,7 +239,7 @@ class ImageFormer:
             self.predicted_error_db = float(err)
         self.T = T
         plan = ffbp2.make_plan(col, nx, ny, spx, spy, T=T, nlev=levels, pmax=pmax, e1=e1, e2=e2)
-        self._plan, self._grid, self._levels, self._e1, self._e2 = plan, (nx, ny, spx, spy), levels, e1, e2
+        self._plan = plan
         if ref is not None and np.shape(ref) != (self.P,):
             raise ValueError(f'ref must hold one range per pulse ({self.P}), got shape {np.shape(ref)}')
         coll = ffbp2.collection_arrays(plan, self.ant, ref)
@@ -272,10 +274,10 @@ class ImageFormer:
             self._ng = _jax_group(plan, self.K) if filt == 'pallas2' else 1
             from .memory import TPU_GROUP
             if filt == 'pallas2' and self._ng < min(TPU_GROUP, plan['levels'][0]['C']) and not os.environ.get('FASTSAR_TPU_GROUP'):
-                from .memory import warn, gb, full_speed, device_available, children
-                warn(f'tpu: first-level groups of {children(self._ng)} instead of {TPU_GROUP} for lack of device memory, which is '
-                     f'slower; full speed needs about {gb(full_speed(plan, self.K, "tpu")[0])} of TPU memory, '
-                     f'{gb(device_available("tpu"))} is free')
+                from .memory import _warn, _gb, full_speed, device_available, _nchildren
+                _warn(f'tpu: first-level groups of {_nchildren(self._ng)} instead of {TPU_GROUP} for lack of device memory, which '
+                      f'is slower; full speed needs about {_gb(full_speed(plan, self.K, "tpu")[0])} of TPU memory, '
+                      f'{_gb(device_available("tpu"))} is free')
             self._fn, static = self._program(self._ng)
             self._arrs = ffbp2.device_arrays(pol, plan, coll, static)
             if wf is not None:
@@ -340,7 +342,7 @@ class ImageFormer:
                 # a kernel's on-chip scratch (VMEM) is sized at compile time and does not depend on the group size
                 if not any(m in str(e) for m in ('RESOURCE_EXHAUSTED', 'Ran out of memory', 'OOM')) or 'Vmem' in str(e):
                     raise
-                from .memory import warn, gb, full_speed, child_bytes, children, tpu_history_bytes
+                from .memory import _warn as warn, _gb as gb, full_speed, child_bytes, _nchildren as children, tpu_history_bytes
                 if self._ng <= 1:
                     need = tpu_history_bytes(self._plan, self.K) + child_bytes(self._plan, 'tpu')
                     raise MemoryError(f'{self.backend}: the phase history ({gb(8.0 * self.P * self.K)} as float32 planes) and '
@@ -358,10 +360,8 @@ class ImageFormer:
         """What full speed needs on this former's device and what is free: dict(backend, needed, available,
         full_speed, parts) in bytes (fastsar.memory)."""
         from . import memory as mem
-        from . import ffbp2
-        plan = getattr(self, '_plan', None) or ffbp2.make_plan(Collect(fmin=1.0, df=1.0, K=self.K, ant=self.ant, res=0.5),
-                                                                 *self._grid, T=self.T, nlev=self._levels, e1=self._e1, e2=self._e2)
-        need, parts = mem.full_speed(plan, self.K, self.backend)
+        isz = 4 if self.backend == 'cuda' and self.precision == 'float16' else 8
+        need, parts = mem.full_speed(self._plan, self.K, self.backend, isz)
         avail = mem.device_available(self.backend)
         return dict(backend=self.backend, needed=need, available=avail, full_speed=need <= avail, parts=parts)
 

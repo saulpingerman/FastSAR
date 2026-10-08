@@ -247,27 +247,27 @@ def make_ffbp_cpu(plan, coll, wf=None):
         S = np.asarray(S)
         # full speed: groups of 8 children, each holding all pulses at the decimated range length. With less memory,
         # groups of at least 4 the same way, else the first level in pulse blocks (BLOCK_PULSES plus the pulse filter's
-        # halo, each decimated straight into its output rows; a child then holds its output only), which costs about 19%
-        # on Umbra Panama but beats groups of 2 or 1 (58% and 140% slower on a Capella spotlight)
+        # halo, each decimated straight into its output rows; a child then holds its output only), which is slower
+        # than full speed but faster than groups of 2 or 1 (docs/performance.md)
         blocked = False
         if ng is None:
             lv = levels[0]
             per = 8.0 * lv['Ko'] * (lv['P'] + lv['Po'])                         # yre, yim and zre, zim of one child
             per_b = 8.0 * lv['Ko'] * (lv['Po'] + BLOCK_PULSES)                 # zre, zim and a block of yre, yim
-            from .memory import host_available
+            from .memory import host_available, _env_number
             mem = host_available()                                              # available, not installed: a shared host
-            budget = float(os.environ.get('FASTSAR_CPU_GROUP_GB') or 0) * 1e9 or 0.25 * mem
+            budget = (_env_number('FASTSAR_CPU_GROUP_GB', 0.0, float) or 0) * 1e9 or 0.25 * mem
             ng = int(max(1, min(8, budget // per)))
             force = os.environ.get('FASTSAR_CPU_BLOCKED')
             if lv['Dp'] > 1 and (force == '1' or (force != '0' and ng < min(4, G))):
                 blocked, ng = True, int(max(1, min(8, budget // per_b)))
             if (ng < min(8, G) or blocked) and not os.environ.get('FASTSAR_CPU_GROUP_GB') and force != '1':
-                from .memory import warn, gb, children
-                how = (f'forms the first level in pulse blocks (about 19% slower) with groups of {children(ng)}' if blocked
-                       else f'forms the first level in groups of {children(ng)} instead of 8, so the phase history is read '
+                from .memory import _warn, _gb, _nchildren
+                how = (f'forms the first level in pulse blocks (about 19% slower) with groups of {_nchildren(ng)}' if blocked
+                       else f'forms the first level in groups of {_nchildren(ng)} instead of 8, so the phase history is read '
                             f'{-(-G // ng)} times instead of {-(-G // 8)}')
-                warn(f'cpu: for lack of memory FastSAR {how}; full speed needs about {gb(4 * 8 * per)} of host memory, '
-                     f'{gb(mem)} is available')
+                _warn(f'cpu: for lack of memory FastSAR {how}; full speed needs about {_gb(4 * 8 * per)} of host memory, '
+                      f'{_gb(mem)} is available')
         if S.dtype == np.complex64 and S.flags.c_contiguous and levels[0]['Dk'] > 1:
             # the first level reads the complex64 history in place (a long spotlight's history is tens of GB)
             scale, pre, pim = 1.0, S[None], None

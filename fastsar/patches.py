@@ -524,10 +524,10 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
         import cupy as cp
         import threading
         prof['device'], prof['lock'] = True, threading.Lock()
-        from .memory import cuda_free
+        from .memory import cuda_free, _env_number
         free = cuda_free()
         row = prof['Q'].shape[1] * 8
-        force = int(os.environ.get('FASTSAR_PROFILE_WINDOW_ROWS') or 0)          # testing: the window, of this many rows
+        force = _env_number('FASTSAR_PROFILE_WINDOW_ROWS', 0) or 0              # testing: the window, of this many rows
         if prof['Q'].nbytes < 0.4 * free and not force:      # profiles in GPU memory when they fit
             prof['Qd'] = cp.asarray(prof['Q'])
         else:                                  # else a window of them, a quarter of the free memory
@@ -538,7 +538,7 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
                 span = beam_span(beam, len(ant), q, umax)
                 need = 0 if span is None else span[1] - span[0]
             if need > prof['win']['rows']:
-                from .memory import warn, gb
+                from .memory import _warn as warn, _gb as gb
                 warn(f'cuda mosaic: a patch\'s range profiles ({gb(need * row)}) do not fit a quarter of the free GPU '
                      f'memory, so each patch\'s gate is cut in host memory, which is slower; full speed needs about '
                      f'{gb(4 * need * row)} of GPU memory, {gb(free)} is free')
@@ -547,7 +547,9 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
     # otherwise takes the next count on the grid first count x (1 + slack)^k (a sliding spotlight's patches see
     # different spans). The grid bounds the programs by the spread of the spans, whatever order patches arrive in
     import threading
-    slack = float(os.environ.get('FASTSAR_PULSE_SLACK', '0.04'))
+    from .memory import _env_number
+    slack = _env_number('FASTSAR_PULSE_SLACK', 0.0, float)
+    slack = 0.04 if slack is None else slack
     taken, gates, taken_lock = [], [], threading.Lock()
 
     planned_gates = []                    # gate lengths chosen from every patch's gate before forming
@@ -669,8 +671,8 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
     # whose formation uses every core, and up to 4 (a quarter of the cores) for a GPU or TPU, whose formation would
     # otherwise wait on the host
     order = [(i0, j0) for i0 in range(0, nx, mx) for j0 in range(0, ny, my)]
-    nw = os.environ.get('FASTSAR_MOSAIC_PREFETCH')
-    nw = int(nw) if nw else (1 if backend == 'cpu' else max(1, min(4, (os.cpu_count() or 4) // 4)))
+    nw = _env_number('FASTSAR_MOSAIC_PREFETCH', 0)
+    nw = nw if nw is not None else (1 if backend == 'cpu' else max(1, min(4, (os.cpu_count() or 4) // 4)))
     nw = nw if len(order) > 1 else 0
     from concurrent.futures import ThreadPoolExecutor
     from collections import deque
@@ -683,7 +685,8 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
         # (about 11 on a v6e, where a program compiles in about 8 s and a sliding-spotlight patch forms in 0.7 s)
         tm = _Timer('form_mosaic')
         spans = dict(zip(order, (ex.map if ex is not None else map)(lambda q: span_of(*q), order)))
-        cc = float(os.environ.get('FASTSAR_COMPILE_PATCHES', '11' if backend == 'tpu' else '3'))
+        cc = _env_number('FASTSAR_COMPILE_PATCHES', 0.0, float)
+        cc = (11.0 if backend == 'tpu' else 3.0) if cc is None else cc
         counts = [len(fill_gaps(ant[sp[2][0]:sp[2][1]])[0]) for sp in spans.values() if sp[2] is not None]
         planned[:] = choose_buckets(counts, cc) if counts else []
         # and the gate lengths, as fast FFT lengths at least the chosen ones
