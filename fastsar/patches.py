@@ -715,6 +715,8 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
     finally:
         if ex is not None:            # after an error in either thread, a patch not yet started is dropped
             ex.shutdown(cancel_futures=True)
+    if os.environ.get('FASTSAR_TIMING') == '1' and prof is not None and prof.get('win') is not None:
+        _Timer.acc['form_mosaic: profile window moves (count)'] = float(prof['win'].get('loads', 0))
     return out
 
 
