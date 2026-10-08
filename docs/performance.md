@@ -7,22 +7,23 @@ The Umbra Panama image ([real-data.md](real-data.md#umbra-spotlight)) at float32
 
 | Device | Seconds per image | Dollars per 1000 images |
 |---|---|---|
-| TPU v6e-1 (three-pass) | 2.4 | 1.89 |
-| TPU v5e-1 (three-pass) | 4.6 | 1.62 |
-| Nvidia L4 (float32) | 3.6 | 0.76 |
-| Nvidia L4 (float16 storage, float32 accumulation) | 2.9 | 0.61 |
+| TPU v6e-1 (three-pass) | 3.1 | 1.89 |
+| TPU v5e-1 (three-pass) | 5.6 | 1.62 |
+| Nvidia L4 (float32) | 4.3 | 0.75 |
+| Nvidia L4 (float16 storage, float32 accumulation) | 3.7 | 0.62 |
 | 16-vCPU AMD EPYC 9B45 (c4d-highmem-16) | 12.4 | 3.25 |
 
-Times are for a warm `ImageFormer`; `form_image` adds a few seconds of planning and compilation. Cost is the
-hourly price over back-to-back throughput. The v6e is fastest, but the L4 costs 3.8 times less per hour and is the
+Times are for a warm `ImageFormer`, from the phase history in host memory to the image in host memory (transfers
+included); `form_image` adds a few seconds of planning and compilation. Cost is the hourly price over back-to-back
+throughput, where uploads overlap formation. The v6e is fastest, but the L4 costs 3.8 times less per hour and is the
 cheapest. The order holds on Melbourne and Iowa.
 
 ![Cost per 1000 Panama images against error for every FastSAR configuration and the open-source implementations](images/teaser.png)
 
-Single-pass TPU products take 1.7 s (v6e) and 2.8 s (v5e) at -45.8 dB, $1.39 and $1.01 per 1000 images. Float16
-on the L4 and single-pass on the TPUs lower each device's cost by 19 to 38%. Polar format takes 2.1 s on the L4
+Single-pass TPU products take 2.4 s (v6e) and 3.8 s (v5e) at -45.8 dB, $1.39 and $1.01 per 1000 images. Float16
+on the L4 and single-pass on the TPUs lower each device's cost by 18 to 38%. Polar format takes 2.4 s on the L4
 ($0.42 per 1000) and 11.3 s on the CPU, at -32.1 dB; on the TPUs its final resampling, a scattered gather, takes
-97.4 s (v5e) and 105.3 s (v6e). The L4 draws 0.07 kWh per 1000 float32 images (mean `nvidia-smi` power, host
+about 94 s (v5e) and 106 s (v6e). The L4 draws 0.07 kWh per 1000 float32 images (mean `nvidia-smi` power, host
 excluded).
 
 ## Large collections
@@ -84,8 +85,8 @@ warnings.simplefilter('ignore', fastsar.MemoryWarning)   # silence the fallback 
 
 ## Where the time goes
 
-As a single JAX program (`backend='jax'`), the float32-class Panama image takes 4.6, 9.3, 13.7 and 217.4 s on the
-v6e, v5e, L4 and CPU. The kernels cut that by 1.9 to 2.0 times on the TPUs, 3.8 on the L4 and 17.6 on the CPU.
+As a single JAX program (`backend='jax'`), the float32-class Panama image takes 5.3, 10.3, 15.0 and 217.4 s on the
+v6e, v5e, L4 and CPU. The kernels cut that by 1.7 to 1.8 times on the TPUs, 3.4 on the L4 and 17.6 on the CPU.
 Every kernel stage runs within 1.0 to 2.5 times a lower bound set by its limiting hardware unit, measured by
 microbenchmarks on the same device.
 
