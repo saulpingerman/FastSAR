@@ -3,6 +3,7 @@
     import fastsar
     img = fastsar.form_image(S, ant, fmin, df, nx, ny, spx, spy, e1, e2)            # factorized backprojection
     img = fastsar.form_image(..., algorithm='pfa')                                  # polar format
+    img = fastsar.form_image(..., algorithm='bp')                                   # exact backprojection
 
 S is the phase history [pulses, samples] (complex, frequency domain, motion compensated to the scene reference
 point), ant the antenna phase centers [pulses, 3] in a frame whose origin is the scene reference point, fmin and df
@@ -382,9 +383,12 @@ def form_image(S, ant, fmin, df, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
                ref=None):
     """Form the complex image [nx, ny] (complex64). See the module docstring for the arguments. For more than one
     image of the same geometry, build an ImageFormer once and call it; this function sets one up on every call."""
-    if algorithm not in ('ffbp', 'pfa'):
-        raise ValueError("algorithm must be 'ffbp' or 'pfa'")
+    if algorithm not in ('ffbp', 'pfa', 'bp'):
+        raise ValueError("algorithm must be 'ffbp', 'pfa' or 'bp'")
     S = _check_history(np.asarray(S), len(_check_positions(ant)))
+    if algorithm == 'bp':
+        from .exact import ExactFormer
+        return ExactFormer(ant, fmin, df, S.shape[1], nx, ny, spx, spy, e1, e2, backend, window, ref=ref)(S)
     if algorithm == 'pfa':
         nx, ny, e1, e2 = _check_grid(nx, ny, spx, spy, e1, e2)
         P, K = S.shape
