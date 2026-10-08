@@ -57,12 +57,14 @@ raw = sm.simulate(p, np.array([[x[len(x) // 2], r[len(r) // 2]]]))
 rows = (len(x) // 2 - 140, len(x) // 2 + 140)
 img_res, _, _ = pt.form_stripmap(raw, p, rows=rows, backend='cuda', rwin='taylor', awin='taylor')
 os.environ['FASTSAR_PROFILE_WINDOW_ROWS'] = '1200'
-img_win, _, _ = pt.form_stripmap(raw, p, rows=rows, backend='cuda', rwin='taylor', awin='taylor')
-os.environ.pop('FASTSAR_PROFILE_WINDOW_ROWS')
-ew = 10 * np.log10(np.sum(np.abs(img_win - img_res) ** 2) / np.sum(np.abs(img_res) ** 2))
-if ew > -100:
-    bad.append(f'profile window: {ew:.1f} dB')
-print(f'mosaic, profiles in a moving GPU window vs resident: {ew:.1f} dB')
+for nw in ('1', '4'):              # patches prepared on one thread and on four sharing the window
+    os.environ['FASTSAR_MOSAIC_PREFETCH'] = nw
+    img_win, _, _ = pt.form_stripmap(raw, p, rows=rows, backend='cuda', rwin='taylor', awin='taylor')
+    ew = 10 * np.log10(np.sum(np.abs(img_win - img_res) ** 2) / np.sum(np.abs(img_res) ** 2))
+    if ew > -100:
+        bad.append(f'profile window, {nw} prefetch workers: {ew:.1f} dB')
+    print(f'mosaic, profiles in a moving GPU window vs resident, {nw} prefetch workers: {ew:.1f} dB')
+os.environ.pop('FASTSAR_PROFILE_WINDOW_ROWS'); os.environ.pop('FASTSAR_MOSAIC_PREFETCH')
 if bad:
     sys.exit('FAILED: ' + '; '.join(bad))
 print('ok')
