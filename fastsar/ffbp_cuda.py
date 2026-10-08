@@ -355,7 +355,7 @@ def _children(kern, pre, pim, c0, sl, lv):
 
 
 STREAM_PULSES = 4096       # pulses per uploaded block when the first level streams a host phase history
-STREAM_FRACTION = 0.3      # stream when the history exceeds this fraction of the free device memory
+STREAM_FRACTION = 0.5      # stream when the history's device planes exceed this fraction of the free device memory
 
 
 def _device_phases(la, refs, lv):
@@ -537,26 +537,28 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
 
     def form(S, ng=None):
         """S [P, K] complex64 (host or device, already windowed) -> complex64 image [nx, ny] on the device. A host
-        history larger than STREAM_FRACTION of the free device memory is streamed through the first level in pulse
-        blocks (FASTSAR_CUDA_STREAM=1 forces it). ng: first-level children per group (default: up to 8, within a
-        quarter of the free memory)."""
+        history whose device planes exceed STREAM_FRACTION of the free device memory is streamed through the first
+        level in pulse blocks (FASTSAR_CUDA_STREAM=1 forces it); a smaller one is uploaded once. ng: first-level
+        children per group (default: up to 8, within a quarter of the memory left after the upload)."""
         lv0, la0 = levels[0], dev[0]
-        free = cp.cuda.Device().mem_info[0]
-        stream = isinstance(S, np.ndarray) and (S.nbytes > STREAM_FRACTION * free or os.environ.get('FASTSAR_CUDA_STREAM') == '1')
         isz = 2 * np.dtype(kern['dtype']).itemsize
-        if ng is None:
+        planes = isz * S.shape[0] * S.shape[1]                # the history as device planes
+        stream = isinstance(S, np.ndarray) and (planes > STREAM_FRACTION * cp.cuda.Device().mem_info[0]
+                                                or os.environ.get('FASTSAR_CUDA_STREAM') == '1')
+        scale = 1.0
+        if kern['dtype'] != cp.float32:              # float16 storage: scale to the peak (in row blocks)
+            xp = np if isinstance(S, np.ndarray) else cp
+            scale = max(float(xp.abs(S[i:i + 4096]).max()) for i in range(0, S.shape[0], 4096)) or 1.0
+        if not stream:
+            # uploaded in row blocks straight into the planes (no full complex copy on the device)
+            pre = cp.empty((1,) + S.shape, kern['dtype']); pim = cp.empty((1,) + S.shape, kern['dtype'])
+            for i in range(0, S.shape[0], 4096):
+                b = cp.asarray(S[i:i + 4096])
+                pre[0, i:i + 4096] = (b.real / scale).astype(kern['dtype']); pim[0, i:i + 4096] = (b.imag / scale).astype(kern['dtype'])
+                del b
+        if ng is None:                                 # children per group, within a quarter of the memory left
             per = isz * lv0['Ko'] * (lv0['Po'] + (STREAM_PULSES if stream else lv0['P']))
-            ng = int(max(1, min(8, (0.25 * free) // per)))
-        if stream:
-            scale = 1.0
-            if kern['dtype'] != cp.float32:          # float16 storage: scale to the peak (on the host, in row blocks)
-                scale = max(float(np.abs(S[i:i + 4096]).max()) for i in range(0, S.shape[0], 4096)) or 1.0
-        else:
-            S = cp.asarray(S)
-            scale = float(cp.abs(S).max()) or 1.0
-            pre = cp.ascontiguousarray((S.real / scale).astype(kern['dtype']))[None]
-            pim = cp.ascontiguousarray((S.imag / scale).astype(kern['dtype']))[None]
-            del S
+            ng = int(max(1, min(8, (0.25 * cp.cuda.Device().mem_info[0]) // per)))
         full = cp.empty((plan['Nx'], plan['Ny']), cp.complex64)
         for g0 in range(0, G, ng):
             gs = list(range(g0, min(G, g0 + ng)))
