@@ -494,8 +494,11 @@ def make_ffbp(policy, plan, filt='dense', budget=1 << 26, trig='split', pallas_p
                 pb = 128 * -(-pb // 128)
             Pp = -(-P // pb) * pb
             Cp = -(-Cn // nc) * nc                                  # children padded to whole groups (zero ramps, discarded)
-            pre_p = pad_columns(jnp.pad(pre.astype(jnp.float32), ((0, Pp - P), (0, 0))), band)[None]
-            pim_p = pad_columns(jnp.pad(pim.astype(jnp.float32), ((0, Pp - P), (0, 0))), band)[None]
+            if pre.shape == (Pp, band['Kpad']) and pre.dtype == jnp.float32:   # padded once by form.pad
+                pre_p, pim_p = pre[None], pim[None]
+            else:
+                pre_p = pad_columns(jnp.pad(pre.astype(jnp.float32), ((0, Pp - P), (0, 0))), band)[None]
+                pim_p = pad_columns(jnp.pad(pim.astype(jnp.float32), ((0, Pp - P), (0, 0))), band)[None]
             c0g = jnp.pad(c0.astype(jnp.float32), ((0, Cp - Cn), (0, Pp - P))).reshape(Cp // nc, 1, nc, Pp)
             slg = jnp.pad(sl.astype(jnp.float32), ((0, Cp - Cn), (0, Pp - P))).reshape(Cp // nc, 1, nc, Pp)
 
@@ -813,6 +816,28 @@ def make_ffbp(policy, plan, filt='dense', budget=1 << 26, trig='split', pallas_p
         del hre, him
         return assemble([q[0] for q in parts]), assemble([q[1] for q in parts])
 
+    lv0 = levels[0]
+    if filt == 'pallas2' and lv0['Dk'] > 1 and on_tpu:
+        band0 = bands[(lv0['P'], lv0['K'], lv0['Dk'])]
+        pb0 = _pulse_block(lv0['P'], pallas_pb)
+        if fuse_p_for(lv0, band0, min(pallas_nc, ng if ng > 1 else 1)):
+            pb0 = 128 * -(-pb0 // 128)
+        Pp0 = -(-lv0['P'] // pb0) * pb0
+
+        @jax.jit
+        def pad1(x):
+            from .pallas_ffbp import pad_columns
+            return pad_columns(jnp.pad(x.astype(jnp.float32), ((0, Pp0 - lv0['P']), (0, 0))), band0)
+
+        def pad(hre, him):
+            """The phase history planes padded once for the first-level kernel, which then reads them in place
+            instead of padding a copy for every group of children (two planes of temporaries on the device). The
+            caller drops its unpadded planes."""
+            return pad1(hre), pad1(him)
+    else:
+        def pad(hre, him):
+            return hre, him
+    form.pad = pad
     # the stages of one_tile, exposed for per-stage profiling (profile_level0.py)
-    form.stages = dict(children=children, final=final, device_phases=device_phases, levels=levels, G=G, host_levels=HOST_LEVELS, one_group=one_group, ng=ng, bands=bands)
+    form.stages = dict(children=children, final=final, device_phases=device_phases, levels=levels, G=G, host_levels=HOST_LEVELS, one_group=one_group, one_tile=one_tile, ng=ng, bands=bands)
     return form

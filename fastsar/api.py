@@ -298,8 +298,9 @@ class ImageFormer:
         if self.backend == 'cpu':
             return self._form(S).astype(np.complex64, copy=False)
         from . import ffbp2
-        hre, him, scale = ffbp2.prepare(self._pol, S)
         while True:
+            hre, him, scale = ffbp2.prepare(self._pol, S)
+            hre, him = self._fn.pad(hre, him)
             try:
                 re, im = self._fn(hre, him, self._arrs)
                 break
@@ -316,6 +317,7 @@ class ImageFormer:
                 self._ng //= 2
                 warn(f'{self.backend}: out of device memory; retrying with first-level groups of {children(self._ng)} '
                      f'(slower); full speed needs about {gb(full_speed(self._plan, self.K, "tpu")[0])}')
+                del hre, him
                 self._fn = self._program(self._ng)[0]
         return ((np.asarray(re) + 1j * np.asarray(im)) * scale).astype(np.complex64)
 
