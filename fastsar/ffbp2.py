@@ -149,6 +149,11 @@ def banded_fir(fr, D, n_in, G=128):
     return dict(W=W, pl=int(pl), pr=int(pr), nb=int(nb), nbo=int(nbo), block=int(block), G=int(G), w=int(w), n_out=int(n_out))
 
 
+# T Q Pl, products of tile side, frequency rows and lane-padded pulses, that one call of the TPU final-stage kernel
+# keeps in VMEM: 2^21 (T 32, Q 128, Pl 512) fits the v6e's scoped VMEM, 2.5 x 2^21 does not
+FINAL_VMEM_TQP = 1 << 21
+
+
 def dense_pulse_filter(lv):
     """Whether a level's pulse decimation is applied as its dense matrix (short apertures; one matrix product)
     rather than banded_fir (the dense matrix grows with the square of the pulse count: 2.8 GB at 74,203 pulses)."""
@@ -715,10 +720,17 @@ def make_ffbp(policy, plan, filt='dense', budget=1 << 26, trig='split', pallas_p
                 dTi = jnp.pad(jnp.swapaxes(tim, 1, 2).astype(jnp.float32), padt)
                 gxT = jnp.pad(ux[:, None, :] * dlx[None, :, None], padg).astype(jnp.float32)
                 gyT = jnp.pad(uy[:, None, :] * dly[None, :, None], padg).astype(jnp.float32)
-                if fused_fin == 3:
-                    cre, cim = fused_final3(dTr, dTi, gxT, gyT, a0, a1, Qf, passes=npass, tiles=tiles)
-                else:
-                    cre, cim = fused_final2(dTr, dTi, gxT, gyT, a0, a1, Qf, passes=npass)
+                # the kernel holds T x Q x Pl ramp products in VMEM; past FINAL_VMEM_TQP the frequency rows go in
+                # chunks, each starting its ramp at its first row, and the chunks' products are summed
+                Qc = max(8, (FINAL_VMEM_TQP // (T * Pl * tiles)) // 8 * 8)
+                cre = cim = 0.0
+                for q0 in range(0, Qp8, Qc):
+                    q1 = min(Qp8, q0 + Qc)
+                    if fused_fin == 3:
+                        r_, i_ = fused_final3(dTr[:, q0:q1], dTi[:, q0:q1], gxT, gyT, a0, a1, min(Qf, q1) - q0, passes=npass, tiles=tiles, q0=q0)
+                    else:
+                        r_, i_ = fused_final2(dTr[:, q0:q1], dTi[:, q0:q1], gxT, gyT, a0, a1, min(Qf, q1) - q0, passes=npass, q0=q0)
+                    cre, cim = cre + r_, cim + i_
                 cre, cim = cre[:tb].astype(f), cim[:tb].astype(f)
             elif fused_fin:
                 if on_tpu:

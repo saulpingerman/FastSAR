@@ -305,7 +305,8 @@ class ImageFormer:
                 re, im = self._fn(hre, him, self._arrs)
                 break
             except Exception as e:        # device memory: fewer first-level children per group, down to one
-                if not any(m in str(e) for m in ('RESOURCE_EXHAUSTED', 'Ran out of memory', 'OOM')):
+                # a kernel's on-chip scratch (VMEM) is sized at compile time and does not depend on the group size
+                if not any(m in str(e) for m in ('RESOURCE_EXHAUSTED', 'Ran out of memory', 'OOM')) or 'Vmem' in str(e):
                     raise
                 from .memory import warn, gb, full_speed, child_bytes, children
                 if self._ng <= 1:

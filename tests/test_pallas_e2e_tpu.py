@@ -32,10 +32,12 @@ coll = ffbp2.collection_arrays(plan, col.ant)
 for pol in ('fp32_fast', 'fp32_high'):
     hre, him, _ = ffbp2.prepare(pol, S)
     out = {}
-    dense_rule = ffbp2.dense_pulse_filter
+    dense_rule, tqp = ffbp2.dense_pulse_filter, ffbp2.FINAL_VMEM_TQP
     for key, filt, kw in (('dense', 'dense', {}), ('pallas2', 'pallas2', dict(pallas_pb=128, pallas_nc=4, pallas_ng=2)),
-                          ('banded', 'pallas2', dict(pallas_pb=128, pallas_nc=4, pallas_ng=2))):
+                          ('banded', 'pallas2', dict(pallas_pb=128, pallas_nc=4, pallas_ng=2)),
+                          ('qchunks', 'pallas2', dict(pallas_pb=128, pallas_nc=4, pallas_ng=2))):
         ffbp2.dense_pulse_filter = (lambda lv: False) if key == 'banded' else dense_rule   # banded: the long-aperture form
+        ffbp2.FINAL_VMEM_TQP = 8 * 16 * 128 if key == 'qchunks' else tqp                   # final stage in chunks of 8 rows
         static = ffbp2.static_arrays(pol, plan, filt)
         arrs = ffbp2.device_arrays(pol, plan, coll, static)
         fn = ffbp2.make_ffbp(pol, plan, filt, 1 << 24, 'direct', **kw)
@@ -43,8 +45,8 @@ for pol in ('fp32_fast', 'fp32_high'):
         out[key] = np.asarray(re) + 1j * np.asarray(im)
         if key == 'banded':
             assert any('Wp' in la for la in arrs['levels']), 'the banded pulse filter was not used'
-    ffbp2.dense_pulse_filter = dense_rule
-    for key in ('pallas2', 'banded'):
+    ffbp2.dense_pulse_filter, ffbp2.FINAL_VMEM_TQP = dense_rule, tqp
+    for key in ('pallas2', 'banded', 'qchunks'):
         d = out[key] - out['dense']
         print(pol, '%s (tpu kernels, interpret) vs dense: %.1f dB' % (key, check(f'{pol} {key}', 10 * np.log10(np.sum(np.abs(d) ** 2) / np.sum(np.abs(out['dense']) ** 2)), -40 if pol == 'fp32_fast' else -90)))
 
