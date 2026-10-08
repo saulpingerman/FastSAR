@@ -618,10 +618,13 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
                 pre[0, i:i + 4096] = (b.real / scale).astype(kern['dtype']); pim[0, i:i + 4096] = (b.imag / scale).astype(kern['dtype'])
                 del b
         free0 = cp.cuda.Device().mem_info[0]
+        forced = ng is not None or bool(os.environ.get('FASTSAR_CUDA_GROUP'))
+        if ng is None and os.environ.get('FASTSAR_CUDA_GROUP'):
+            ng = int(os.environ['FASTSAR_CUDA_GROUP'])
         if ng is None:                                 # children per group, within a quarter of the memory left
             per = isz * lv0['Ko'] * (lv0['Po'] + (STREAM_PULSES if stream else lv0['P']))
             ng = int(max(1, min(8, (0.25 * free0) // per)))
-        if (stream and os.environ.get('FASTSAR_CUDA_STREAM') != '1') or ng < min(8, G):
+        if (stream and os.environ.get('FASTSAR_CUDA_STREAM') != '1') or (ng < min(8, G) and not forced):
             from .memory import warn, gb, children
             need = planes + 4 * 8 * isz * lv0['Ko'] * (lv0['Po'] + lv0['P']) + 8.0 * plan['Nx'] * plan['Ny']
             how = []
