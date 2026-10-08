@@ -33,12 +33,16 @@ Phase histories of tens of gigabytes (28 GB for an ICEYE dwell, 10 GB for a Cape
   quarter of physical memory.
 - CUDA: a host history larger than 30% of free device memory streams through the first level in blocks of 4,096
   pulses.
+- TPU: the history is padded once per image for the first-level kernel, and a level's pulse decimation is a
+  blocked banded product of its filter kernel once the dense matrix would exceed 2^24 entries (2.8 GB at 74,203
+  pulses, with work growing as the square of the pulse count).
 - JAX and TPU: up to 16 compiled programs and their plan arrays are cached by plan signature; mosaic patches are
   padded to multiples of 256 pulses to share them (24 formers, 8 programs in `tests/test_patches.py`). Without the
   cache, the 2021 Capella stripmap mosaic on a v6e spent 19 s of 52 s rebuilding plan arrays.
 - Mosaics: range profiles are computed once and stay in GPU memory on `cuda` when they fit, with the range gate on
-  the GPU. The next patch is prepared on a second thread: 0.91 s per patch against 1.08 s without, on a 2 by 4
-  patch Capella sub-mosaic on 16 CPU cores.
+  the GPU. The next patches are prepared on worker threads while one forms (one on the CPU, whose formation uses
+  every core: 0.91 s per patch against 1.08 s without, on a 2 by 4 patch Capella sub-mosaic on 16 cores; up to
+  four for a GPU or TPU, which otherwise wait on the host's 0.2 to 0.5 s of preparation per patch).
 
 ## Memory
 
