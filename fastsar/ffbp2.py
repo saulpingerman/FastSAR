@@ -837,7 +837,6 @@ def make_ffbp(policy, plan, filt='dense', budget=1 << 26, trig='split', pallas_p
     ox, oy, nx, ny = plan['ox'], plan['oy'], plan['nx'], plan['ny']
 
     @jax.jit
-    @jax.jit
     def assemble(re, im):
         """The image from the tiles' outputs in tile order (x major), given as arrays of one tile [mx, my] or of a
         group [ng, mx, my]: one program, not one eager slice per tile, which costs milliseconds of host time each."""
