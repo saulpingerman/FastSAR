@@ -180,8 +180,9 @@ def form_cphd(cphd, sicd=None, mode='auto', backend='auto', window=True, spacing
     if spot:
         # phase reference to the grid center, a grid centered on it (as ImageFormer takes it)
         c = origin + (nx / 2.0) * spx * e1 + (ny / 2.0) * spy * e2
-        tx, rcv = np.asarray(meta['tx']) - c, np.asarray(meta['rcv']) - c
-        ref_new = 0.5 * (np.linalg.norm(tx, axis=1) + np.linalg.norm(rcv, axis=1))
+        # referenced to |ant - c|, the range the factorized former assumes (not the bistatic half path, which differs
+        # from it by a near constant 0.19 mm on ICEYE and limited the image to -52 dB at 7 cm resolution)
+        ref_new = np.linalg.norm(ant - c, axis=1)
         dref = np.asarray(meta['ref'], np.float64) - ref_new
         f = f0 + df * np.arange(K)
         for p0 in range(0, P, 1024):

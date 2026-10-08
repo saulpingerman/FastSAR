@@ -258,10 +258,12 @@ def choose_T(ant, fmax, nx, ny, spx, spy, e1, e2, target_db=-40.0, choices=(32, 
 HOST_LEVELS = 2          # levels whose rotation phases are computed in float64 on the host
 
 
-def collection_arrays(plan, ant):
+def collection_arrays(plan, ant, ref=None):
     """Per-collection host work in float64: the antenna path on each level's pulse grid, and for the first
     HOST_LEVELS levels the rotation phase of every child at band centre (wrapped to a cycle) and its slope
-    in cycles per frequency sample."""
+    in cycles per frequency sample. ref [P]: the range each pulse's samples are referenced to (one way), when it
+    is not the antenna's distance to the origin (a bistatic collection's half path, a vendor's reference point);
+    the first level's rotation then starts from it, at no extra cost."""
     ant = np.asarray(ant, np.float64)
     out = dict(levels=[])
     for i, lv in enumerate(plan['levels']):
@@ -274,6 +276,8 @@ def collection_arrays(plan, ant):
             sl = np.empty((B, Cn, lv['P']), np.float32)
             for b in range(B):
                 base = np.linalg.norm(lv['ref'][b][None, :] - ant, axis=1)                       # [P]
+                if i == 0 and ref is not None:
+                    base = np.asarray(ref, np.float64)
                 ddr = np.linalg.norm(lv['cen'][b][:, None, :] - ant[None, :, :], axis=2) - base[None, :]
                 cyc = (2.0 * (lv['f0'] + kc * lv['df']) / C) * ddr
                 c0[b] = cyc - np.round(cyc)

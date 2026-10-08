@@ -192,10 +192,13 @@ class ImageFormer:
     a different antenna path needs a new former. Arguments as for form_image, and
     aperture_weight(points [m, 3], pulses [n]) -> W [n, m]: a per-pixel weight of pulses (int indices) (a stripmap aperture window), applied
     in the final stage as the mean weight of each final subaperture's pulses at each final tile's center, with its
-    first-order variation across the tile (final_weights)."""
+    first-order variation across the tile (final_weights), and
+    ref [P]: the range (one way) each pulse is referenced to, when it is not |ant| (the distance to the origin):
+    a bistatic collection's half path |tx| / 2 + |rcv| / 2, or a reference point other than the origin."""
 
     def __init__(self, ant, fmin, df, K, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 1.0, 0.0), backend='auto',
-                 precision='float32', window=True, T='auto', levels=3, pmax=0.4, target_db=-40.0, aperture_weight=None):
+                 precision='float32', window=True, T='auto', levels=3, pmax=0.4, target_db=-40.0, aperture_weight=None,
+                 ref=None):
         from . import ffbp2
         import warnings
         self.ant = _check_positions(ant)
@@ -225,7 +228,9 @@ class ImageFormer:
             self.predicted_error_db = float(err)
         self.T = T
         plan = ffbp2.make_plan(col, nx, ny, spx, spy, T=T, nlev=levels, pmax=pmax, e1=e1, e2=e2)
-        coll = ffbp2.collection_arrays(plan, self.ant)
+        if ref is not None and np.shape(ref) != (self.P,):
+            raise ValueError(f'ref must hold one range per pulse ({self.P}), got shape {np.shape(ref)}')
+        coll = ffbp2.collection_arrays(plan, self.ant, ref)
         wf = None if aperture_weight is None else final_weights(plan, aperture_weight, self.P, grad=os.environ.get('FASTSAR_WEIGHT_GRAD', '1') == '1')
         if window:
             self.wp, self.wk = _window(self.P, self.K)
@@ -299,7 +304,8 @@ class ImageFormer:
 
 
 def form_image(S, ant, fmin, df, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 1.0, 0.0), algorithm='ffbp',
-               backend='auto', precision='float32', window=True, T='auto', levels=3, pmax=0.4, pfa_guard=300.0, target_db=-40.0):
+               backend='auto', precision='float32', window=True, T='auto', levels=3, pmax=0.4, pfa_guard=300.0, target_db=-40.0,
+               ref=None):
     """Form the complex image [nx, ny] (complex64). See the module docstring for the arguments. For more than one
     image of the same geometry, build an ImageFormer once and call it; this function sets one up on every call."""
     if algorithm not in ('ffbp', 'pfa'):
@@ -313,7 +319,8 @@ def form_image(S, ant, fmin, df, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
             wp, wk = _window(P, K)
             S = (S * wp[:, None] * wk[None, :]).astype(np.complex64)
         return _pfa(S.astype(np.complex64), col, nx, ny, spx, spy, np.asarray(e1, np.float64), np.asarray(e2, np.float64), pfa_guard)
-    return ImageFormer(ant, fmin, df, S.shape[1], nx, ny, spx, spy, e1, e2, backend, precision, window, T, levels, pmax, target_db)(S)
+    return ImageFormer(ant, fmin, df, S.shape[1], nx, ny, spx, spy, e1, e2, backend, precision, window, T, levels, pmax, target_db,
+                       ref=ref)(S)
 
 
 def _pfa(S, col, nx, ny, spx, spy, e1, e2, guard=300.0):

@@ -345,6 +345,21 @@ expect('form_cphd: unknown mode', lambda: fastsar.form_cphd('missing.cphd', mode
 expect('form_cphd: unknown backend', lambda: fastsar.form_cphd('missing.cphd', backend='gpu'), ValueError)
 expect('form_cphd: negative spacing', lambda: fastsar.form_cphd('missing.cphd', spacing=-1.0), ValueError)
 
+# ImageFormer(ref=...): samples referenced to a range other than |ant| (a bistatic half path) form the same image
+print('\nreference range')
+rng_ = np.random.default_rng(3)
+colr = sim.make_collect(res=0.3, scene=60.0, r0=5e3)
+posr = np.stack([rng_.uniform(-25, 25, 30), rng_.uniform(-25, 25, 30), np.zeros(30)], 1)
+Sr = sim.simulate_brute(colr, posr, rng_.standard_normal(30) + 1j * rng_.standard_normal(30)).astype(np.complex64)
+r0r = np.linalg.norm(colr.ant, axis=1)
+refr = r0r + 0.2e-3 + 0.05e-3 * np.sin(np.linspace(0, 3, len(r0r)))
+fr = colr.fmin + colr.df * np.arange(colr.K)
+Sr2 = (Sr * np.exp(-4j * np.pi * fr[None] / 299792458.0 * (r0r - refr)[:, None])).astype(np.complex64)
+kwr = dict(nx=128, ny=128, spx=0.3, spy=0.3, backend='cpu', window=False)
+ir = fastsar.form_image(Sr, colr.ant, colr.fmin, colr.df, **kwr)
+ir2 = fastsar.form_image(Sr2, colr.ant, colr.fmin, colr.df, ref=refr, **kwr)
+check('form_image with ref against the |ant|-referenced image', 10 * np.log10(np.sum(abs(ir2 - ir) ** 2) / np.sum(abs(ir) ** 2)), -90)
+
 print(f'\n{time.perf_counter() - t_start:.0f} s')
 if bad:
     sys.exit('FAILED: ' + '; '.join(bad))
