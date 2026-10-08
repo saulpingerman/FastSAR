@@ -224,6 +224,24 @@ def range_profiles(fx, guard=None):
     return dict(Q=Q, guard=guard, K2=K2, npl=npl, f0=f0)
 
 
+def _gate_bins(a, rc, center, pts, margin, K2, df):
+    """Range bins (of c / (2 K2 df)) a patch's gate keeps: the points' extent in range from the antenna positions a
+    [n, 3] (rc their distances to center) plus margin on each side, an even fast FFT length."""
+    dR = np.linalg.norm(pts[None, :, :] - a[:, None, :], axis=2) - rc[:, None]
+    half = np.abs(dR).max() + margin
+    from scipy.fft import next_fast_len
+    N = next_fast_len(2 * int(np.ceil(half * 2 * K2 * df / C)))
+    return N + N % 2
+
+
+def gate_bins(fx, ant, center, pts, lo, hi, margin=None, guard=None):
+    """The range gate patch_history would keep for this patch, in bins, before any widening: -> (N, K2)."""
+    guard, band, npl, K2, f0 = _padding(fx, guard)
+    margin = 3 * C / (2 * guard) if margin is None else float(margin)
+    a = np.asarray(ant[lo:hi], np.float64)
+    return _gate_bins(a, np.linalg.norm(a - center, axis=1), center, pts, margin, K2, float(fx['df'])), K2
+
+
 def patch_history(fx, ant, center, pts, lo, hi, margin=None, guard=None, prof=None, gate_len=None):
     """Phase history of one patch: pulses lo:hi of fx re-referenced to center [3] and gated in range to the extent
     of the points pts [m, 3] (the patch outline) plus margin (m), with the guard taper. prof: range_profiles(fx, guard)
@@ -238,12 +256,7 @@ def patch_history(fx, ant, center, pts, lo, hi, margin=None, guard=None, prof=No
     a = np.asarray(ant[lo:hi], np.float64)
     rc = np.linalg.norm(a - center, axis=1)
     shift = np.asarray(fx['ref'], np.float64)[lo:hi] - rc
-    # range bins of c/(2 K2 df); the gate keeps N bins centered on the patch center's range
-    dR = np.linalg.norm(pts[None, :, :] - a[:, None, :], axis=2) - rc[:, None]
-    half = np.abs(dR).max() + margin
-    from scipy.fft import next_fast_len
-    N = next_fast_len(2 * int(np.ceil(half * 2 * K2 * df / C)))
-    N += N % 2
+    N = _gate_bins(a, rc, center, pts, margin, K2, df)
     if gate_len is not None and N < K2:
         N = min(gate_len(N), K2)
     gate = N < K2
@@ -519,11 +532,17 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
     slack = float(os.environ.get('FASTSAR_PULSE_SLACK', '0.04'))
     taken, gates, taken_lock = [], [], threading.Lock()
 
+    planned_gates = []                    # gate lengths chosen from every patch's gate before forming
+
     def padded_gate(n):
-        """A range gate of n bins widened as padded_pulses pads pulses (same slack and grid), to an even fast FFT
-        length: patches of one gate length share their frequency samples and so their compiled program."""
+        """A range gate of n bins widened onto the planned lengths, or as padded_pulses pads pulses (same slack and
+        grid), to an even fast FFT length: patches of one gate length share their frequency samples and so their
+        compiled program."""
         from scipy.fft import next_fast_len
         with taken_lock:
+            fit = [v for v in planned_gates if v >= n]
+            if fit:
+                return min(fit)
             fit = [v for v in gates if n <= v <= n * (1 + slack) + 16]
             if fit:
                 return min(fit)
@@ -649,6 +668,17 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
         cc = float(os.environ.get('FASTSAR_COMPILE_PATCHES', '11' if backend == 'tpu' else '3'))
         counts = [len(fill_gaps(ant[sp[2][0]:sp[2][1]])[0]) for sp in spans.values() if sp[2] is not None]
         planned[:] = choose_buckets(counts, cc) if counts else []
+        # and the gate lengths, as fast FFT lengths at least the chosen ones
+        from scipy.fft import next_fast_len
+        g = [gate_bins(fx, ant, sp[0], sp[1], sp[2][0], sp[2][1], margin, guard) for sp in spans.values() if sp[2] is not None]
+        g = [n for n, K2 in g if n < K2]
+        fl = []
+        for v in (choose_buckets(g, cc, step=2) if g else []):
+            v = next_fast_len(v)
+            while v % 2:
+                v = next_fast_len(v + 1)
+            fl.append(v)
+        planned_gates[:] = sorted(set(fl))
         tm('pulse buckets')
 
     def submit():
