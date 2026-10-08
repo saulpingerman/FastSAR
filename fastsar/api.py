@@ -135,9 +135,10 @@ def _check_grid(nx, ny, spx, spy, e1, e2):
 
 
 def _jax_group(plan, K):
-    """First-level children per group on a TPU: up to 16, as many as fit in 60% of the device memory after the
-    phase history (two float32 planes), at two float32 planes over each child's input and output pulses
-    (FASTSAR_TPU_GROUP overrides). A 74,203-pulse Capella spotlight needed 48 GB for 16 on a 31 GB v6e."""
+    """First-level children per group on a TPU: up to 16, as many as fit in half the device memory after the
+    phase history (two float32 planes), at four float32 planes over each child's input and output pulses
+    (FASTSAR_TPU_GROUP overrides; ImageFormer halves it again if the device still runs out of memory). A 74,203-pulse
+    Capella spotlight needed 48 GB for 16 on a 31 GB v6e."""
     if os.environ.get('FASTSAR_TPU_GROUP'):
         return int(os.environ['FASTSAR_TPU_GROUP'])
     import jax
@@ -146,8 +147,8 @@ def _jax_group(plan, K):
     except Exception:
         hbm = 16e9
     lv = plan['levels'][0]
-    per = 8.0 * lv['Ko'] * (lv['P'] + lv['Po'])
-    free = 0.6 * hbm - 8.0 * lv['P'] * K
+    per = 16.0 * lv['Ko'] * (lv['P'] + lv['Po'])
+    free = 0.5 * hbm - 8.0 * lv['P'] * K
     ng = 16
     while ng > 1 and ng * per > free:
         ng //= 2
@@ -258,16 +259,9 @@ class ImageFormer:
             self._pol = pol
             # one compiled program per plan signature: patches of a mosaic with equal shapes and filters share it
             # (with the device arrays that depend on the plan alone: filters, tile geometry)
-            ng = _jax_group(plan, self.K) if filt == 'pallas2' else 1
-            key = (pol, filt, ng, ffbp2.plan_signature(plan))
-            hit = _JAX_PROGRAMS.get(key)
-            if hit is None:
-                hit = (ffbp2.make_ffbp(pol, plan, filt, 1 << 26, 'direct', pallas_pb=256, pallas_nc=8, pallas_ng=ng,
-                                       pallas_final=2, pallas_gen=3), ffbp2.static_arrays(pol, plan, filt))
-                if len(_JAX_PROGRAMS) >= 16:
-                    _JAX_PROGRAMS.pop(next(iter(_JAX_PROGRAMS)))
-                _JAX_PROGRAMS[key] = hit
-            self._fn, static = hit
+            self._plan, self._filt = plan, filt
+            self._ng = _jax_group(plan, self.K) if filt == 'pallas2' else 1
+            self._fn, static = self._program(self._ng)
             self._arrs = ffbp2.device_arrays(pol, plan, coll, static)
             if wf is not None:
                 import jax.numpy as jnp
@@ -299,8 +293,30 @@ class ImageFormer:
             return self._form(S).astype(np.complex64, copy=False)
         from . import ffbp2
         hre, him, scale = ffbp2.prepare(self._pol, S)
-        re, im = self._fn(hre, him, self._arrs)
+        while True:
+            try:
+                re, im = self._fn(hre, him, self._arrs)
+                break
+            except Exception as e:        # device memory: fewer first-level children per group, down to one
+                if self._ng <= 1 or not any(m in str(e) for m in ('RESOURCE_EXHAUSTED', 'Ran out of memory', 'OOM')):
+                    raise
+                self._ng //= 2
+                self._fn = self._program(self._ng)[0]
         return ((np.asarray(re) + 1j * np.asarray(im)) * scale).astype(np.complex64)
+
+    def _program(self, ng):
+        """The compiled JAX/TPU program for ng first-level children per group, with the plan's device arrays: one per
+        plan signature, so that patches of a mosaic with equal shapes and filters share it."""
+        from . import ffbp2
+        key = (self._pol, self._filt, ng, ffbp2.plan_signature(self._plan))
+        hit = _JAX_PROGRAMS.get(key)
+        if hit is None:
+            hit = (ffbp2.make_ffbp(self._pol, self._plan, self._filt, 1 << 26, 'direct', pallas_pb=256, pallas_nc=8,
+                                   pallas_ng=ng, pallas_final=2, pallas_gen=3), ffbp2.static_arrays(self._pol, self._plan, self._filt))
+            if len(_JAX_PROGRAMS) >= 16:
+                _JAX_PROGRAMS.pop(next(iter(_JAX_PROGRAMS)))
+            _JAX_PROGRAMS[key] = hit
+        return hit
 
 
 def form_image(S, ant, fmin, df, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 1.0, 0.0), algorithm='ffbp',
