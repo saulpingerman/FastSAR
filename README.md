@@ -3,21 +3,21 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](pyproject.toml)
 
-FastSAR forms synthetic aperture radar (SAR) images on x86 CPUs, Nvidia GPUs and Google Cloud TPUs with one Python
-call. It reads frequency-domain CPHD files, forms spotlight, stripmap and sliding spotlight images by factorized
+FastSAR forms synthetic aperture radar (SAR) images on x86 CPUs, Nvidia GPUs and Google Cloud TPUs from Python. It
+reads frequency-domain CPHD files, forms spotlight, stripmap and sliding spotlight images by factorized
 backprojection, and makes products: autofocus, interferometry, geolocation, map GeoTIFFs and SICD.
 
 ![FastSAR image of the Panama Canal's Pacific entrance from an Umbra spotlight collection](docs/images/hero_panama.jpg)
 
-*Panama Canal, Pacific entrance (Umbra open data, 2023-07-18): 12,207 by 8,808 pixels in 4.3 s on an Nvidia L4, host memory to host memory
-(float32, -59.5 dB against float64 exact backprojection), downsampled. A 16-vCPU AMD EPYC 9B45 takes 12.4 s. ISCE3,
-the fastest open-source code that forms this collection, would take an estimated 4.8 h on that CPU and 27 min on
-the L4.*
+*Panama Canal, Pacific entrance (Umbra open data, 2023-07-18): 12,207 by 8,808 pixels in 4.3 s on an Nvidia L4
+(warm former, transfers included; float32, -59.5 dB against float64 exact backprojection), downsampled. A
+c4d-highmem-16 CPU instance (16 vCPUs, 8 cores) takes 12.4 s. ISCE3, the fastest open-source code that forms this
+collection, would take an estimated 4.8 h on that CPU and 27 min on the L4.*
 
 ![Cost per 1000 images against error for FastSAR and five open-source implementations](docs/images/teaser.png)
 
-*Cost per 1000 Panama images (October 2026 prices) against error relative to the float64 image
-([performance](docs/performance.md), [comparison](docs/comparison.md)).*
+*Cost per 1000 Panama images (October 2026 prices) against error over the lock, port and ship regions, relative to
+the float64 image ([performance](docs/performance.md), [comparison](docs/comparison.md)).*
 
 ## Install
 
@@ -28,7 +28,7 @@ pip install "fastsar[cuda,io] @ git+https://github.com/saulpingerman/FastSAR"   
 
 From a clone: `pip install -e ".[cuda,io]"` or `uv sync`. The CPU kernels need `g++` with OpenMP and compile on
 first use; the float16 CUDA kernel needs `nvcc`; TPUs need `jax[tpu]`; GeoTIFFs and DEMs need `rasterio`. On the
-CPU set `OMP_NUM_THREADS=<cores> OMP_PLACES=cores OMP_PROC_BIND=close`.
+CPU set `OMP_NUM_THREADS=<physical cores> OMP_PLACES=cores OMP_PROC_BIND=close`.
 
 ## Quickstart
 

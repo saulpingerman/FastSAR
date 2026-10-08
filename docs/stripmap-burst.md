@@ -41,28 +41,28 @@ img = patches.form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1, e2,
                           beam=patches.stripmap_beam(p, ant))  # antenna positions ant [P, 3], any track
 ```
 
-An `ImageFormer` forms each patch from the pulses whose beam covers it (|u| <= `umax`). Each pulse's range
-profile, computed once, is re-referenced to the patch center, gated to the patch plus a margin, and transformed
-back to frequency; a raised-cosine taper keeps the kernel's tail below -60 dB at the default margin (36 m for a
-12.5 MHz guard). The azimuth window enters the final stage per subaperture and tile, with its first-order variation
-across the tile (the JAX program instead evaluates its final stage three times). C++ and CUDA take tiles of 16 or
-32 only, so a patch that misses the target at T=16 is formed twice as fine in range and decimated; JAX also accepts
-T=8. `exact=True` uses exact backprojection, with the window split into separable SVD terms.
+An `ImageFormer` forms each patch from the pulses whose beam covers it (|u| <= `umax`). Each pulse's range profile,
+computed once, is re-referenced to the patch center, gated to the patch plus a margin, and transformed back to
+frequency. A raised-cosine taper keeps the kernel's tail below -60 dB at the default margin (36 m for a 12.5 MHz
+guard). The azimuth window enters the final stage per subaperture and tile, with its first-order variation across the
+tile (the JAX program instead evaluates its final stage three times). C++ and CUDA take tiles of 16 or 32 only, so a
+patch that misses the target at T=16 is formed on a finer grid (2 or 4 times, range first) and decimated; JAX also
+accepts T=8. `exact=True` uses exact backprojection, with the window split into separable SVD terms.
 
 Test results (`tests/test_patches.py`, 12 patches of 128 by 128 pixels, about 1 s on four CPU threads), error
 against float64 backprojection near the targets:
 
-- broadside: -48.0 to -60.4 dB (CPU), -54.8 to -60.2 dB (JAX, T=8 where needed); 5 degree squint: -48.0 to -62.6 dB
+- broadside: -48.0 to -60.4 dB (CPU), -54.7 to -63.4 dB (JAX, T=8 where needed); 5 degree squint: -47.9 to -62.6 dB
 - Taylor azimuth window: -49.4 to -61.2 dB (CPU), -55.9 to -62.5 dB (JAX)
 - exact backprojection per patch: -65.3 to -66.7 dB, or -54.7 to -67.6 dB with the Taylor window
 - a 3 km altitude track with 1.68 m cross-track and 1.57 m vertical motion: omega-k on the nominal track fails
-  (about 0 dB); the mosaic matches exact backprojection to -49.9 to -64.9 dB
+  (about 0 dB); the mosaic matches exact backprojection to -49.9 to -65.0 dB
 
 On a 4-patch 2021 Capella stripmap sub-mosaic, the final-stage window (instead of SVD terms) improved the seam
-error from -59.9 to -65.7 dB and cut the time per patch on 16 cores from 4.3 s to about 1.8 s; shared range profiles
-made patch histories 7 times faster ([switches](performance.md#environment-variables)).
+error from -59.9 to -65.7 dB. It also cut the time per patch on the c4d-highmem-16 from 4.3 s to about 1.8 s. Shared
+range profiles made patch histories 7 times faster ([switches](performance.md#environment-variables)).
 
-Longer patches cost less per pixel. `echoes_to_fx` assumes one fast-time grid. `stripmap_beam` models an antenna
+`echoes_to_fx` assumes one fast-time grid. `stripmap_beam` models an antenna
 held along a fixed direction; `beam` can be any function of pulse and point.
 
 ## Burst modes (ScanSAR and TOPS)

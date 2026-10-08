@@ -5,8 +5,9 @@ Methods and test results; the calls are in [processing-chain.md](processing-chai
 ## Interferometry and change detection
 
 Two passes formed onto one grid are coregistered by construction, and a scatterer on the grid surface has zero
-interferometric phase, so no flat-earth or topographic phase needs removing. `pauli` gives
-double-bounce, volume and surface powers. Test results (`tests/test_insar.py`, X-band clutter at 5 km):
+interferometric phase. No flat-earth phase needs removing, and the remaining phase measures the height above the grid
+surface. `pauli` gives double-bounce, volume and surface powers. Test results (`tests/test_insar.py`, X-band clutter
+at 5 km):
 
 - change detection: median coherence 0.981 on unchanged ground (true value 0.98) and 0.275 inside disturbed areas
   and a vehicle track (7 by 7 windows)
@@ -32,16 +33,16 @@ Test results:
   plane, 0.4 m pixels): peaks lie 0.4 cm from `locate`'s prediction; geolocated on the DEM they lie 0.4 cm from the
   truth, against up to 6.7 m of layover; round trips agree to 1e-8 pixels; UTM and latitude/longitude GeoTIFFs place
   each target to 1e-4 pixels, amplitude peaks within 0.16 m; a stripmap mosaic geolocates to 0.4 cm.
-- `tests/test_chain.py`, `form_cphd(..., autofocus=True)` on a quadratic plus cubic phase error (8 rad at the
-  aperture ends): peaks rise from 0.63 to 0.999 of the focused ones, residual 0.034 rad rms.
+- `tests/test_chain.py`, `form_cphd(..., autofocus=True)` on a quadratic plus cubic phase error (8 and 4 rad at
+  the two aperture ends): peaks rise from 0.63 to 0.999 of the focused ones, residual 0.034 rad rms.
 
 Real-data geolocation is in [real-data.md](real-data.md#geolocation).
 
 ## Amplitude
 
-Images are not normalized: a scatterer of sample amplitude a peaks at a times the window sum (a Np K for the mean-1
-Taylor windows; 0.996 Np K measured in `tests/test_chain.py`), and noise of power s^2 per sample gives s^2 times the
-sum of the squared window. CPHD has no radiometric calibration; beta0 and sigma0 need the vendor's constant.
+Images are not normalized. A scatterer of sample amplitude a peaks at a times the window sum (a Np K for the mean-1
+Taylor windows; 0.996 Np K measured in `tests/test_chain.py`). Noise of power s^2 per sample gives s^2 times the sum
+of the squared window. CPHD has no radiometric calibration; beta0 and sigma0 need the vendor's constant.
 
 ## SICD output
 
@@ -53,6 +54,6 @@ block. ImageFormAlgo is OTHER, which sarpy's `is_valid` rejects; sarkit's consis
 `geolocate` to better than a micrometer.
 
 `write_sicd(path, img, template)` keeps a vendor SICD's metadata, with ImageFormAlgo OTHER and Grid.Type PLANE. A
-round trip of the Umbra Panama SICD keeps every pixel (sarpy 2.1's `is_valid` rejects ImageFormAlgo OTHER here too); its projection matches the
-vendor's at the center and departs by up to about 6 m at the corners, where the vendor's polar-format image carries
-the distortion its own model accounts for.
+round trip of the Umbra Panama SICD keeps every pixel. As with `write_sicd(path, out)`, sarpy 2.1's `is_valid`
+rejects ImageFormAlgo OTHER. The projection matches the vendor's at the center and differs by up to about 6 m at
+the corners. There the vendor's polar-format image carries a distortion that its own projection model includes.

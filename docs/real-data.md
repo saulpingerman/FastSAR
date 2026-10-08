@@ -35,11 +35,11 @@ changed from the geocentric radial to the ellipsoid normal (up to 0.19 degrees a
 | Umbra spotlight, Panama Canal (no) | 0.621 | 0.897 |
 | Capella spotlight, mountains (no) | 0.440 | 0.868 |
 | Capella spotlight, mountains (yes) | 0.605 | 0.904 |
-| Capella sliding spotlight (yes) | 0.224 | 0.752 |
+| Capella dynamic stripmap, 2022 (yes) | 0.224 | 0.752 |
 
 Speckle limits amplitude correlation wherever the processors' windows or azimuth bands differ; averaged intensity
-shows whether the same structure appears in the same place. The sliding spotlight is the 2022 collection
-[below](#capella-dynamic-stripmap-scene-center-only).
+shows whether the same structure appears in the same place. The 2022 dynamic stripmap (Capella's name for sliding
+spotlight) is the collection [below](#capella-dynamic-stripmap-scene-center-only).
 
 ## Umbra spotlight
 
@@ -64,8 +64,10 @@ through that model, the residual is at most 0.25 pixel rms on all three collecti
 ![Panama port, lock and ship regions: reference, vendor SICD, resampled vendor SICD and their coherence](images/sicd_panama.png)
 
 *Port, lock and ship regions (512 by 512 pixels): the reference, the vendor image as delivered and resampled through
-the displacement model, and their 5 by 5 coherence (0 to 1). Coherence at this level reflects processor
-differences (aperture weighting, motion compensation), not precision.*
+the displacement model, and their 5 by 5 coherence (0 to 1).*
+
+The coherence in these panels is limited by differences in aperture weighting and motion compensation between the
+two processors.
 
 ### Geolocation
 
@@ -73,7 +75,7 @@ A 2048 by 2048 Panama crop geocoded onto the vendor's GEC GeoTIFF grid, or forme
 lands 6.98 m from the GEC with the surface at the scene reference point's height (-0.34 m). The offset changes by
 1.33 m per meter of assumed height and vanishes 5.3 m higher, where exact backprojection also focuses best
 (correlation with the GEC 0.75, against 0.13 at -0.34 m). The vendor's SICD projected through its own model lands on
-the GEC with no offset.
+the GEC with no offset. These figures also predate the z-axis change noted above.
 
 ## Capella
 
@@ -87,6 +89,9 @@ Two Capella Open Data collections were compared with the vendor's SICD:
   with the vendor's polar-format image at 0.78 at the scene center and 0.54 off center, where the vendor's image
   carries the polar-format distortion.
 
+A 2025 Capella spotlight (54,267 pulses of 17,282 samples) serves the timings of
+[performance.md](performance.md#memory).
+
 ### Capella phase sign
 
 Capella's open-data CPHDs declare SGN = +1, but both collections follow SGN = -1 (with +1, correlation with the
@@ -94,12 +99,12 @@ vendor's image is -0.01 to 0.05). `read_cphd` takes -1 for Capella and says so i
 
 ### Capella dynamic stripmap: scene center only
 
-A 2022 Capella dynamic stripmap (sliding spotlight) collection forms correctly only near the scene center. Its valid
-delay window is 2,962 m long, 4.1 to 7.1 km beyond the scene reference point, but its 114.3 kHz frequency spacing
-gives an unambiguous range of 1,311 m: a convention FastSAR does not model, and `read_cphd` warns. Near the center
-`form_cphd` and exact backprojection match the vendor's image after a 2-pixel registration (intensity correlation
-0.75 after 5 by 5 averaging); near the swath edge they fail. The mosaic agrees with a float64 backprojection of the
-same samples to -62 dB, which checks consistency, not the convention.
+The 2022 Capella dynamic stripmap collection forms correctly only near the scene center. Its valid delay window is
+2,962 m long, 4.1 to 7.1 km beyond the scene reference point, but its 114.3 kHz frequency spacing gives an unambiguous
+range of 1,311 m. FastSAR does not model this convention, and `read_cphd` warns about it. Near the center `form_cphd`
+and exact backprojection match the vendor's image after a 2-pixel registration (intensity correlation 0.75 after 5 by
+5 averaging); near the swath edge they fail. The mosaic agrees with a float64 backprojection of the same samples to
+-62 dB; this tests internal consistency only.
 
 ## ICEYE dwell spotlight
 

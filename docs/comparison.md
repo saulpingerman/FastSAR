@@ -1,13 +1,14 @@
 # Comparison with open-source implementations
 
-Five open-source codes formed the Umbra Panama image, on one c4d-highmem-16 instance (AMD EPYC 9B45, 8 cores, 16
-vCPUs) or one Nvidia L4, from the same Taylor-windowed phase history and antenna positions.
+Five open-source backprojection codes were run on the Umbra Panama collection, on the c4d-highmem-16 or the L4
+([performance.md](performance.md#timing-protocol-and-devices)), from the same Taylor-windowed phase history and
+antenna positions. Two produced no usable image.
 
-Errors are against float64 exact backprojection over the lock, port and ship regions of
-[precision.md](precision.md), worst to best; ISCE3 was scored on three 256 by 256 patches of its own grid after
-removal of a common linear phase ramp. Times are for the full image, from host memory to host memory. Estimates (est.) scale one region's time by the
-pixel count and overstate: the same estimate for FastSAR's exact backprojection gives 2.4 h against 46 min
-measured.
+Errors are against float64 exact backprojection over the lock, port and ship regions of [precision.md](precision.md),
+worst to best; ISCE3 was scored on three 256 by 256 patches of its own grid after removal of a common linear phase
+ramp. Times are for the full image, host to host; FastSAR's factorized rows use a warm former. Estimates (est.) scale
+one region's time by the pixel count and overstate it: the same estimate for FastSAR's exact backprojection gives 2.4
+h against 46 min measured.
 
 | CPU (c4d-highmem-16) | Error (dB) | Time |
 |---|---|---|

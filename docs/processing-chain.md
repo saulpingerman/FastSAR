@@ -24,8 +24,9 @@ print(out['mode'], out['spx'], out['spy'], out['notes'])
 A collection whose scene reference point moves by more than one range resolution is a moving beam (stripmap,
 sliding spotlight, dynamic stripmap), formed as a mosaic of patches with a Hann azimuth window
 ([stripmap-burst.md](stripmap-burst.md#long-apertures-and-arbitrary-tracks)); otherwise it is a spotlight. The
-image lies on a ground-plane grid along and across track at the scene reference point's height (or `height=`),
-over `extent=` meters if given, else the SICD footprint, else the CPHD image area. The optional SICD also sets the
+image lies on a ground-plane grid along and across track, over `extent=` meters if given, else the SICD footprint,
+else the CPHD image area. Its height is `height=`, else that of the SICD's scene center point, else that of the
+CPHD's image-area reference point. The optional SICD also sets the
 spacing and the azimuth band; without it a moving beam uses 0.8 of the PRF band (`azimuth_fraction`). Pixel (i, j)
 lies at `origin + i*spx*e1 + j*spy*e2` in `read_cphd`'s local frame.
 

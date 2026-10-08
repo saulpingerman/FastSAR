@@ -24,9 +24,9 @@ half path, a vendor's reference point); both algorithms honor it (polar format r
 pfa_guard: margin (m) around the scene that polar format keeps free of wrap-around; 300 m suits orbital scenes of a
 few kilometers and must be smaller for small simulated scenes.
 
-Precision: 'float32' (default), 'float16' (CUDA: float16 storage throughout with float32 accumulation),
-'single-pass' (TPU: one bfloat16 pass per product, the device default), 'three-pass' (TPU: float32-class accuracy).
-On the TPU 'float32' means three-pass.
+Precision: 'float32' (default), 'float16' (CUDA: float16 storage throughout with float32 accumulation; JAX: float16
+throughout), 'single-pass' (TPU: one bfloat16 pass per product, what the matrix unit does by itself), 'three-pass'
+(TPU: float32-class accuracy). On the TPU 'float32' means three-pass.
 
 Tile size: T='auto' (default) picks the largest final tile (32 or 16 pixels) whose predicted error against exact
 backprojection meets target_db (-40 dB by default). The error of the final stage's plane-wave model grows as the

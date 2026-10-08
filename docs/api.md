@@ -13,17 +13,23 @@
   (pixel (0, 0)), `e1`, `e2`, `spx`, `spy`, `mode`, `band` (first and last frequency), `bandwidth` (spatial
   frequency support along e1, e2), `window`, `phase_error` (or None), `meta` (from `read_cphd`), `notes`.
 - `form_image(S, ant, fmin, df, nx, ny, spx, spy, e1, e2, algorithm='ffbp', backend='auto', precision='float32',
-  window=True, T='auto', ..., target_db=-40.0)`: a spotlight image on a grid centered on the frame origin
-  ([algorithms.md](algorithms.md)). `algorithm`: `'ffbp'` or `'pfa'`.
+  window=True, T='auto', ..., target_db=-40.0, ref=None)`: a spotlight image on a grid centered on the frame origin
+  ([algorithms.md](algorithms.md)). `algorithm`: `'ffbp'` or `'pfa'`. `ref` [P]: the one-way range each pulse's
+  samples are referenced to when it is not `|ant|` (a bistatic half path, a vendor's reference point).
 - `ImageFormer(ant, fmin, df, K, nx, ny, spx, spy, e1, e2, backend='auto', precision='float32', ...,
-  aperture_weight=None)`: plans and compiles once; `former(S)` forms each image. Attributes `T`,
-  `predicted_error_db`. `aperture_weight(points, pulses) -> W [n, m]` weights pulses per pixel.
+  aperture_weight=None, ref=None)`: plans and compiles once; `former(S)` forms each image. Attributes `T`,
+  `predicted_error_db`. `aperture_weight(points, pulses) -> W [n, m]` weights pulses per pixel. `memory()`: the
+  bytes full speed needs and the bytes free, as `dict(backend, needed, available, full_speed, parts)`.
+  `stage(S)`: the checks, scaling and upload of `S` ahead of formation on the JAX and TPU backends;
+  `former(former.stage(S))` equals `former(S)`.
+- `MemoryWarning`: a `UserWarning` subclass issued when a former falls back to a slower path for lack of memory
+  ([performance.md](performance.md#memory)). A TPU that cannot hold the history raises `MemoryError`.
 - `backproject(S, ant, fmin, df, points, rcv=None, ref=None, backend='auto', upsample=8, window=True, chunk=256)`:
   exact backprojection at points [..., 3]; `rcv` for bistatic, `ref` for per-pulse reference ranges.
 - `plane_points(nx, ny, spx, spy, e1, e2, height=None)`: the `form_image` grid as points [nx, ny, 3].
   `available_backends()`: backends this machine runs, in `'auto'` order.
 
-Backends: `'cpu'`, `'cuda'`, `'tpu'`, `'jax'`, `'auto'`. Precision: `'float32'`, `'float16'` (CUDA),
+Backends: `'cpu'`, `'cuda'`, `'tpu'`, `'jax'`, `'auto'`. Precision: `'float32'`, `'float16'` (CUDA, JAX),
 `'single-pass'`, `'three-pass'` (TPU) ([precision.md](precision.md)).
 
 ## `fastsar.io`
