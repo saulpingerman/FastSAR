@@ -615,7 +615,17 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
                     S_ = Z
                 return former(S_.astype(np.complex64))[::s1, ::s2]
         tm('plan and former')
-        return dict(i0=i0, j0=j0, c=c, lo=lo, hi=hi, S=S, df=df, wt=wt, form=form, Tp=Tp, s12=s12, nlev=nlev, err=err)
+        staged = None
+        if backend in ('jax', 'tpu') and not exact and wt is None:
+            # checks, scaling and upload of the history here, on the worker thread, not in the formation loop
+            S_ = S
+            if len(af) > len(idx):
+                S_ = np.zeros((len(af), S.shape[1]), np.complex64)
+                S_[idx] = S
+            staged = former.stage(S_)
+            tm('stage')
+        return dict(i0=i0, j0=j0, c=c, lo=lo, hi=hi, S=S, df=df, wt=wt, form=form, Tp=Tp, s12=s12, nlev=nlev, err=err,
+                    staged=staged and (lambda former=former, st=staged, s1=s1, s2=s2: former(st)[::s1, ::s2]))
 
     # the next patches are prepared (pulse span, range gate, plan, weights; host work) on worker threads while the
     # current one forms: FASTSAR_MOSAIC_PREFETCH workers (0: one patch at a time, in turn), by default 1 on the CPU,
@@ -660,7 +670,7 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
             Tp, s12, nlev, err = (job[q] for q in ('Tp', 's12', 'nlev', 'err'))
             tm = _Timer('form_mosaic')
             if wt is None:
-                img = form(S)
+                img = job['staged']() if job.get('staged') else form(S)
                 tm('form')
             else:
                 img = 0

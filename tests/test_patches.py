@@ -232,4 +232,11 @@ os.environ.pop('FASTSAR_MOSAIC_PREFETCH')
 for nw in ('1', '4'):
     assert np.array_equal(imgs[nw], imgs['0']), f'{nw} prefetch workers changed the image'
 print('prefetch workers 0, 1, 4: identical images')
+
+# (e) the JAX backend (histories staged on the worker threads, pulse counts and gates padded onto shared programs)
+# against the CPU backend on the same mosaic, with the dropped pulses
+jx = pt.form_mosaic(fx, col.ant[keep], o, 128, 128, 0.5, 0.5, e1, e2, patch=(64, 64), backend='jax')
+e = 10 * np.log10(np.sum(np.abs(jx - ex) ** 2) / np.sum(np.abs(ex) ** 2))
+print(f'jax mosaic against exact backprojection: {e:.1f} dB')
+assert e < -45, e
 print('ok')

@@ -184,6 +184,15 @@ def final_weights(plan, weight, P, grad=False, points=None):
     return np.ascontiguousarray(m.T, np.float32)
 
 
+class _Staged:
+    """A phase history staged for a JAX or TPU former (ImageFormer.stage): the host array, its device planes and
+    scale, and the program they were padded for."""
+    __slots__ = ('S', 'hre', 'him', 'scale', 'fn')
+
+    def __init__(self, S, hre, him, scale, fn):
+        self.S, self.hre, self.him, self.scale, self.fn = S, hre, him, scale, fn
+
+
 class ImageFormer:
     """Factorized backprojection set up once for a collection geometry and output grid, then called on phase
     histories:  former = ImageFormer(ant, fmin, df, K, nx, ny, spx, spy, e1, e2); img = former(S).
@@ -275,8 +284,19 @@ class ImageFormer:
         else:
             raise ValueError(f'unknown backend {backend!r}')
 
-    def __call__(self, S):
-        """S [P, K] complex phase history (numpy, or cupy on the cuda backend) -> complex64 image [nx, ny]."""
+    def stage(self, S):
+        """The work of a call that precedes formation, done ahead of it: on the JAX and TPU backends the checks of S,
+        its scaling to float32 planes and their upload to the device; former(former.stage(S)) equals former(S).
+        A mosaic stages the next patches on its worker threads while one forms. Other backends return S."""
+        if self.backend not in ('jax', 'tpu'):
+            return S
+        from . import ffbp2
+        S = self._host(S)
+        hre, him, scale = ffbp2.prepare(self._pol, S)
+        hre, him = self._fn.pad(hre, him)
+        return _Staged(S, hre, him, scale, self._fn)
+
+    def _host(self, S):
         if not (self.backend == 'cuda' and type(S).__module__.startswith('cupy')):
             S = np.asarray(S)
         if S.shape != (self.P, self.K):
@@ -292,6 +312,13 @@ class ImageFormer:
             S = S.astype(np.complex64, copy=False)
         if not S.flags.c_contiguous:              # a transposed or strided view (the kernels read rows in place)
             S = S.copy()
+        return S
+
+    def __call__(self, S):
+        """S [P, K] complex phase history (numpy, or cupy on the cuda backend), or former.stage(S) -> complex64
+        image [nx, ny]."""
+        staged = S if isinstance(S, _Staged) else None
+        S = staged.S if staged is not None else self._host(S)
         if self.backend == 'cuda':
             import cupy as cp
             return cp.asnumpy(self._form(S)).astype(np.complex64, copy=False)       # a host S may stream (ffbp_cuda)
@@ -299,8 +326,13 @@ class ImageFormer:
             return self._form(S).astype(np.complex64, copy=False)
         from . import ffbp2
         while True:
-            hre, him, scale = ffbp2.prepare(self._pol, S)
-            hre, him = self._fn.pad(hre, him)
+            if staged is not None and staged.fn is self._fn:
+                hre, him, scale = staged.hre, staged.him, staged.scale
+                staged = None
+            else:
+                staged = None
+                hre, him, scale = ffbp2.prepare(self._pol, S)
+                hre, him = self._fn.pad(hre, him)
             try:
                 re, im = self._fn(hre, him, self._arrs)
                 break
