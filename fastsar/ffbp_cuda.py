@@ -288,8 +288,11 @@ def _kernels(store='fp32', pb=32):
     if key not in _mods:
         _mods[key] = cp.RawModule(code=_SRC, options=('--std=c++14', '--use_fast_math', f'-DSTORE={bits}', f'-DPB={pb}'))
     out = {k: _mods[key].get_function(k) for k in ('rot_fir_k', 'fir_p', 'fir_p_g', 'final_tile')}
+    # opt in once to the device's largest shared memory per block: the limit belongs to the kernel, which every former
+    # shares, so a former must never lower it (a former built on another thread while one runs would break its launch)
+    smax = int(cp.cuda.Device().attributes.get('MaxSharedMemoryPerBlockOptin', 96 * 1024))
     for k in out.values():
-        k.max_dynamic_shared_size_bytes = 96 * 1024          # opt in to more than 48 KB of shared memory per block
+        k.max_dynamic_shared_size_bytes = smax
     out['dtype'] = cp.float16 if bits == 16 else cp.float32
     out['store'] = store
     return out
@@ -343,7 +346,7 @@ def _children(kern, pre, pim, c0, sl, lv):
         elif smem > 48 * 1024:                             # large decimation factors: opt in to more shared memory
             smax = int(cp.cuda.Device().attributes.get('MaxSharedMemoryPerBlockOptin', 48 * 1024))
             if smem <= smax:
-                kern['fir_p'].max_dynamic_shared_size_bytes = smem
+                pass                                       # the kernels opt in to smax when created (_kernels)
             else:                                        # still too large: read the rows from global memory
                 name, smem = 'fir_p_g', 0
         kern[name](((Ko + 63) // 64, (Po + nout - 1) // nout, Np * Cn), (256,),
@@ -429,8 +432,6 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
     pps = 2 if 4 * T * (2 * Qf) * 4 <= 48 * 1024 else 1                   # pulses per table
     smem_final = 4 * T * (pps * Qf) * 4
     assert T % 4 == 0 and T * T // 8 <= 1024 and (T * T // 8) % (2 * T) == 0 and smem_final <= smem_max, (T, Qf, smem_max)
-    if smem_final > 48 * 1024:
-        kern['final_tile'].max_dynamic_shared_size_bytes = smem_final
 
     def final(are, aim, cen, wts=None):
         """are, aim [B, Pf, Qf]; cen [B, 3] float64; wts None or (w0, gx, gyr) [B, Pf] float32 -> (re, im) [B, T, T]."""
@@ -700,7 +701,7 @@ def final_tile_tc(are, aim, ux, uy, dlx, dly, a0, a1, T, store='fp32'):
     KP = (K2 + 15) // 16 * 16
     LD = KP + 8
     smem = max(2 * 2 * T * LD * 2, 2 * T * (2 * T + 4) * 4)
-    if smem > 48 * 1024:                                   # wide final tiles: opt in to more than the default 48 KB
+    if smem > max(48 * 1024, k.max_dynamic_shared_size_bytes):     # wide final tiles: opt in (never lowered)
         k.max_dynamic_shared_size_bytes = smem
     ore = cp.empty((B, T, T), cp.float32)
     oim = cp.empty((B, T, T), cp.float32)
