@@ -13,4 +13,4 @@ from .exact import ExactFormer  # noqa: F401
 from .cphd import form_cphd  # noqa: F401
 from .memory import MemoryWarning  # noqa: F401
 
-__version__ = '0.1.0'
+__version__ = '0.1.1'

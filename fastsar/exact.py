@@ -19,10 +19,11 @@ and 4 x 4 pixels (CUDA: 32 x 32, 16 x 16, 8 x 16, 8 x 8) whose bound h^4 / (2 r^
 distance, gives a phase 4 pi f_max / c times that below PHASE_LIMIT (3e-4 rad); when none does, a UserWarning gives
 the predicted error. Orbital geometries keep 32 x 32 tiles; X band with 1 m pixels takes 8 x 8 at 1 to 2 km and
 32 x 32 from 10 km. The range profiles are read with cubic Lagrange interpolation (four samples) or linear
-interpolation (two). On the 2023 Umbra Panama collection, against the study's float64 reference (16 times
-oversampled, linear), cubic at upsample=4 measures -70 dB, at the reference's own accuracy, and linear at
-upsample=8 -57 dB. On simulated 128 x 128 pixel scenes from 0.5 to 20 km and at 600 km, cubic measures -67 to
--68 dB against a float64 backprojection at 64 times oversampling.
+interpolation (two). On three 512 by 512 pixel regions of the 2023 Umbra Panama collection, against a float64
+backprojection with profiles oversampled 64 times, cubic at upsample=8 (the default) measures -77.5 to -81.5 dB,
+cubic at upsample=4 -59.8 to -69.6 dB and linear at upsample=8 -53.7 to -56.4 dB. On simulated 128 x 128 pixel
+scenes from 0.5 to 20 km and at 600 km, cubic at upsample=4 measures -67 to -68 dB against a float64
+backprojection at 64 times oversampling.
 
 On an Nvidia L4 the CUDA kernel runs at about 87 billion pixel-pulse pairs per second, bound by the L1 cache's
 throughput for its data-dependent reads (86% of it, Nsight Compute), so it forms the 12,207 by 8,808 pixel, 15,186-pulse
@@ -316,7 +317,7 @@ class ExactFormer:
     complex64 image [nx, ny]. ant [P, 3] antenna phase centers (monostatic), fmin, df, K the frequency samples,
     ref [P] the range each pulse is referenced to (default |ant|, the distance to the origin), center a point the
     grid is centered on (default the origin). interp 'cubic' (default) or 'linear'; upsample the range
-    oversampling (default 4 for cubic, 8 for linear); chunk the pulses range compressed at a time.
+    oversampling (default 8); chunk the pulses range compressed at a time.
 
     The tile size is chosen per former from the predicted error of the range expansion (module docstring) and kept
     as former.tile (TX, TY), with the prediction as former.predicted_error_db. One former must not be called from
@@ -357,7 +358,7 @@ class ExactFormer:
             if not np.isfinite(self.ref).all():
                 raise ValueError(f'ref has non-finite values (NaN or inf), the first in pulse {int(np.argmax(~np.isfinite(self.ref)))}')
         self.cubic = interp == 'cubic'
-        self.upsample = (4 if self.cubic else 8) if upsample is None else _integer(upsample, 'upsample', 1)
+        self.upsample = 8 if upsample is None else _integer(upsample, 'upsample', 1)
         self.chunk = _integer(chunk, 'chunk', 1)
         b = _backend(backend)
         self.backend = 'jax' if b == 'tpu' else b

@@ -2,6 +2,15 @@
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 0.1.1 (2026-10-09)
+
+### Changed
+
+- `ExactFormer` (and `form_image(..., algorithm='bp')`) oversamples the range profiles 8 times by default with
+  cubic interpolation, as with linear interpolation (4 before). On three regions of the Umbra Panama collection,
+  against a float64 backprojection with profiles oversampled 64 times, the error falls from -59.8 to -69.6 dB to
+  -77.5 to -81.5 dB; the profile buffers double. Pass `upsample=4` for the previous behaviour.
+
 ## 0.1.0 (2026-10-09)
 
 First release.
