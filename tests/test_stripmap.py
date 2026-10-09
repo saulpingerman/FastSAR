@@ -2,9 +2,11 @@
 and at 5 degrees of squint: omega-k and RDA (with and without secondary range compression) against float64
 time-domain backprojection. Prints, per target, resolution against the expected value, PSLR, ISLR, position error
 and the complex image error against backprojection on a 64 by 64 pixel patch around the target."""
-import os, sys, time
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import time
+
 import numpy as np
+import pytest
+
 from fastsar import stripmap as sm
 from fastsar.quality import point_target
 
@@ -63,7 +65,8 @@ def run(squint):
     return p, (rr, ra), out
 
 
-for squint in (0.0, 5.0):
+@pytest.mark.parametrize('squint', [0.0, 5.0], ids=['broadside', 'squint5'])
+def test_stripmap(squint):
     p, (rr, ra), out = run(squint)
     for (n, name), m in out.items():
         assert abs(m['ex']) < 0.05 * ra and abs(m['er']) < 0.05 * rr, (squint, n, name, m['ex'], m['er'])
@@ -76,4 +79,3 @@ for squint in (0.0, 5.0):
     if squint == 0:
         for n in range(5):
             assert abs(out[n, 'BP']['res_az'] / ra - 1) < 0.03 and abs(out[n, 'BP']['res_rg'] / rr - 1) < 0.03, out[n, 'BP']
-print('ok')

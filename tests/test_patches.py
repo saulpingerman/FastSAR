@@ -15,10 +15,14 @@
 
 Errors are complex, on 64 by 64 pixel patches around the targets, after the best complex gain. Resolution, PSLR and
 position come from fastsar.quality."""
-import os, sys, time
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import time
+from types import SimpleNamespace
+
 import numpy as np
-from fastsar import stripmap as sm, patches as pt, io
+import pytest
+
+from fastsar import stripmap as sm, patches as pt, io, sim
+from fastsar.bp import backproject
 from fastsar.quality import point_target
 
 H = 32                                                       # half-size of the comparison patches (pixels)
@@ -99,152 +103,193 @@ def straight(squint, awin, compressed=False, backends=('cpu',)):
     return p, out
 
 
-for squint, awin in ((0.0, None), (5.0, None), (0.0, 'taylor')):
+@pytest.mark.parametrize('squint, awin', [(0.0, None), (5.0, None), (0.0, 'taylor')],
+                         ids=['broadside', 'squint5', 'broadside-taylor'])
+def test_straight(squint, awin):
     p, out = straight(squint, awin, backends=('cpu', 'jax') if squint == 0.0 else ('cpu',))
     check(out['patches exact'], -50, 'exact')
     for name, res in out.items():
         check(res, -45, name)
-p, out = straight(0.0, None, compressed=True)
-for name, res in out.items():
-    check(res, -45, name)
-print('ok')
 
-# a phase history in the frequency domain: the band only (no room for the guard, so the frequency axis is padded),
-# compensated per pulse to the point at the platform's along-track position and the swath center's range
-p = sm.make_params()
-raw = sm.simulate(p, targets(p))
-fx = pt.echoes_to_fx(raw, p, rwin=RWIN)
-f = fx['fmin'] + fx['df'] * np.arange(fx['S'].shape[1])
-k = np.nonzero((f >= fx['band'][0]) & (f <= fx['band'][1]))[0]
-ant = pt.straight_track(p)
-mov = ant + np.array([0.0, p.r0, 0.0])
-ref = np.linalg.norm(ant - mov, axis=1)
-fx2 = dict(S=io.rereference(fx['S'][:, k], f[k[0]], fx['df'], fx['ref'] - ref), fmin=f[k[0]], df=fx['df'], ref=ref)
-r, x = sm.axes(p)
-grid = ((x[384], r[0], 0.0), 256, p.nr, x[1] - x[0], r[1] - r[0])
-kw = dict(beam=pt.stripmap_beam(p, ant), backend='cpu')
-a, b = pt.form_mosaic(fx, ant, *grid, **kw), pt.form_mosaic(fx2, ant, *grid, **kw)
-e = rel_db(b, a)
-print(f'\nFX input cut to the band, moving reference point: {fx2["S"].shape[1]} of {fx["S"].shape[1]} samples; '
-      f'mosaic against the echo input: {e:.1f} dB over {grid[1]} x {grid[2]} pixels')
-assert e < -60, e
-print('ok')
+
+def test_straight_compressed():
+    p, out = straight(0.0, None, compressed=True)
+    for name, res in out.items():
+        check(res, -45, name)
+
+
+def test_fx_moving_reference():
+    """A phase history in the frequency domain: the band only (no room for the guard, so the frequency axis is
+    padded), compensated per pulse to the point at the platform's along-track position and the swath center's
+    range."""
+    p = sm.make_params()
+    raw = sm.simulate(p, targets(p))
+    fx = pt.echoes_to_fx(raw, p, rwin=RWIN)
+    f = fx['fmin'] + fx['df'] * np.arange(fx['S'].shape[1])
+    k = np.nonzero((f >= fx['band'][0]) & (f <= fx['band'][1]))[0]
+    ant = pt.straight_track(p)
+    mov = ant + np.array([0.0, p.r0, 0.0])
+    ref = np.linalg.norm(ant - mov, axis=1)
+    fx2 = dict(S=io.rereference(fx['S'][:, k], f[k[0]], fx['df'], fx['ref'] - ref), fmin=f[k[0]], df=fx['df'], ref=ref)
+    r, x = sm.axes(p)
+    grid = ((x[384], r[0], 0.0), 256, p.nr, x[1] - x[0], r[1] - r[0])
+    kw = dict(beam=pt.stripmap_beam(p, ant), backend='cpu')
+    a, b = pt.form_mosaic(fx, ant, *grid, **kw), pt.form_mosaic(fx2, ant, *grid, **kw)
+    e = rel_db(b, a)
+    print(f'\nFX input cut to the band, moving reference point: {fx2["S"].shape[1]} of {fx["S"].shape[1]} samples; '
+          f'mosaic against the echo input: {e:.1f} dB over {grid[1]} x {grid[2]} pixels')
+    assert e < -60, e
+
 
 # ------------------------------------------------------------------ (b) non-linear track
 
-h = 3000.0
-p = sm.make_params()
-eta = p.eta
-nom = pt.straight_track(p, h)
-dev = np.stack([np.zeros_like(eta), 0.8 * np.sin(2 * np.pi * eta / 1.3 + 0.4) + 0.25 * np.sin(2 * np.pi * eta / 0.47 + 1.1),
-                0.6 * np.cos(2 * np.pi * eta / 1.7 + 0.2) - 0.2 * np.sin(2 * np.pi * eta / 0.61)], 1)
-true = nom + dev
-tg = targets(p)
-tg3 = np.c_[tg[:, 0], np.sqrt(tg[:, 1] ** 2 - h * h), np.zeros(len(tg))]
-print(f'\nnon-linear track: {h:.0f} m altitude, cross-track motion {np.ptp(dev[:, 1]):.2f} m and vertical '
-      f'{np.ptp(dev[:, 2]):.2f} m peak to peak over the {p.na / p.prf:.2f} s of the scene; range change at the swath '
-      f'center up to {np.abs(np.linalg.norm(true - [0, tg3[2, 1], 0], axis=1) - np.linalg.norm(nom - [0, tg3[2, 1], 0], axis=1)).max():.2f} m')
-a, b = pt.simulate(p, nom, tg3), sm.simulate(p, tg)
-d = np.abs(a - b).max() / np.abs(b).max()
-print(f'echoes on the nominal track (3-D, ground targets) against stripmap.simulate: max difference {d:.1e} of the peak')
-assert d < 1e-8
-raw = pt.simulate(p, true, tg3)
-beam = pt.stripmap_beam(p, true)
-
-# omega-k on the nominal track, on its zero-Doppler grid, against exact backprojection with the true positions
-img, r, x = sm.focus_stripmap(raw, p, 'omegak', rwin=RWIN)
-dr, dx = r[1] - r[0], x[1] - x[0]
-ij = [(int(round((xt - x[0]) / dx)), int(round((rt - r[0]) / dr))) for xt, rt in tg]
+HALT = 3000.0
 
 
 def ground(xs, rs):
     X, R = np.meshgrid(xs, rs, indexing='ij')
-    return np.stack([X, np.sqrt(R * R - h * h), 0 * X], -1)
+    return np.stack([X, np.sqrt(R * R - HALT * HALT), 0 * X], -1)
 
 
-t = time.perf_counter()
-refs = [pt.backproject(raw, p, true, ground(x[i - H:i + H], r[j - H:j + H]), rwin=RWIN, beam=beam) for i, j in ij]
-print(f'exact backprojection with the true positions, zero-Doppler grid: {time.perf_counter() - t:.1f} s')
-ok = compare(img, refs, ij, dx, dr, 'omega-k nominal', metrics=False)
-for e, m, mr in ok:
-    assert e > -10, e
-# the control: echoes from the straight track, omega-k against exact backprojection in the same 3-D geometry
-raw0 = pt.simulate(p, nom, tg3)
-img0 = sm.focus_stripmap(raw0, p, 'omegak', rwin=RWIN)[0]
-refs0 = [pt.backproject(raw0, p, nom, ground(x[i - H:i + H], r[j - H:j + H]), rwin=RWIN) for i, j in ij]
-for e, m, mr in compare(img0, refs0, ij, dx, dr, 'omega-k straight', metrics=False):
-    assert e < -55, e
+@pytest.fixture(scope='module')
+def nonlinear():
+    h = HALT
+    p = sm.make_params()
+    eta = p.eta
+    nom = pt.straight_track(p, h)
+    dev = np.stack([np.zeros_like(eta), 0.8 * np.sin(2 * np.pi * eta / 1.3 + 0.4) + 0.25 * np.sin(2 * np.pi * eta / 0.47 + 1.1),
+                    0.6 * np.cos(2 * np.pi * eta / 1.7 + 0.2) - 0.2 * np.sin(2 * np.pi * eta / 0.61)], 1)
+    true = nom + dev
+    tg = targets(p)
+    tg3 = np.c_[tg[:, 0], np.sqrt(tg[:, 1] ** 2 - h * h), np.zeros(len(tg))]
+    print(f'\nnon-linear track: {h:.0f} m altitude, cross-track motion {np.ptp(dev[:, 1]):.2f} m and vertical '
+          f'{np.ptp(dev[:, 2]):.2f} m peak to peak over the {p.na / p.prf:.2f} s of the scene; range change at the swath '
+          f'center up to {np.abs(np.linalg.norm(true - [0, tg3[2, 1], 0], axis=1) - np.linalg.norm(nom - [0, tg3[2, 1], 0], axis=1)).max():.2f} m')
+    raw = pt.simulate(p, true, tg3)
+    beam = pt.stripmap_beam(p, true)
+    img, r, x = sm.focus_stripmap(raw, p, 'omegak', rwin=RWIN)
+    ij = [(int(round((xt - x[0]) / (x[1] - x[0]))), int(round((rt - r[0]) / (r[1] - r[0])))) for xt, rt in tg]
+    return SimpleNamespace(p=p, nom=nom, true=true, tg=tg, tg3=tg3, raw=raw, beam=beam, img=img, r=r, x=x, ij=ij)
 
-# patch mosaic on a ground-plane grid with the true positions
-spy = 1.5
-y0 = tg3[:, 1].min() - 2 * H * spy
-i0 = min(i for i, _ in ij) - 2 * H
-grid = ((x[i0], y0, 0.0), max(i for i, _ in ij) + 2 * H - i0, int(np.ceil((tg3[:, 1].max() - y0) / spy)) + 2 * H, dx, spy)
-ijg = [(int(round((xt - x[i0]) / dx)), int(round((yt - y0) / spy))) for xt, yt, _ in tg3]
-pts = [ground(x[i0] + np.arange(i - H, i + H) * dx, np.hypot(y0 + np.arange(j - H, j + H) * spy, h)) for i, j in ijg]
-t = time.perf_counter()
-refg = [pt.backproject(raw, p, true, q, rwin=RWIN, beam=beam) for q in pts]
-print(f'exact backprojection with the true positions, ground grid of {dx:.3f} x {spy:.3f} m: {time.perf_counter() - t:.1f} s')
-fx = pt.echoes_to_fx(raw, p, rwin=RWIN)
-res = {}
-for name, track, kw in (('patches true', true, dict(crop=8)), ('patches exact', true, dict(crop=8, exact=True)),
-                        ('patches nominal', nom, dict())):
-    info = []
+
+def test_echoes_on_nominal_track(nonlinear):
+    """Echoes on the nominal track (3-D, ground targets) against stripmap.simulate."""
+    p = nonlinear.p
+    a, b = pt.simulate(p, nonlinear.nom, nonlinear.tg3), sm.simulate(p, nonlinear.tg)
+    d = np.abs(a - b).max() / np.abs(b).max()
+    print(f'echoes on the nominal track (3-D, ground targets) against stripmap.simulate: max difference {d:.1e} of the peak')
+    assert d < 1e-8
+
+
+def test_omegak_nominal(nonlinear):
+    """Omega-k on the nominal track, on its zero-Doppler grid, against exact backprojection with the true positions
+    (no focus), and the control: echoes from the straight track, omega-k against exact backprojection in the same
+    3-D geometry."""
+    nl = nonlinear
+    p, r, x, ij = nl.p, nl.r, nl.x, nl.ij
+    dr, dx = r[1] - r[0], x[1] - x[0]
     t = time.perf_counter()
-    img = pt.form_mosaic(fx, track, *grid, beam=pt.stripmap_beam(p, track), backend='cpu', info=info, **kw)
-    print(f'{name}: {len(info)} patches in {time.perf_counter() - t:.1f} s' + ('' if kw.get('exact') else
-          f', (T, sub) {sorted({(d["T"], d["sub"]) for d in info})}, predicted error '
-          f'{max(d["predicted_error_db"] for d in info):.1f} dB at worst'))
-    res[name] = compare(img, refg, ijg, dx, spy, name, metrics=track is true)
-check(res['patches true'], -45, 'patches true')
-check(res['patches exact'], -50, 'patches exact')
-for e, m, mr in res['patches nominal']:
-    assert e > -10, e
+    refs = [pt.backproject(nl.raw, p, nl.true, ground(x[i - H:i + H], r[j - H:j + H]), rwin=RWIN, beam=nl.beam) for i, j in ij]
+    print(f'exact backprojection with the true positions, zero-Doppler grid: {time.perf_counter() - t:.1f} s')
+    for e, m, mr in compare(nl.img, refs, ij, dx, dr, 'omega-k nominal', metrics=False):
+        assert e > -10, e
+    raw0 = pt.simulate(p, nl.nom, nl.tg3)
+    img0 = sm.focus_stripmap(raw0, p, 'omegak', rwin=RWIN)[0]
+    refs0 = [pt.backproject(raw0, p, nl.nom, ground(x[i - H:i + H], r[j - H:j + H]), rwin=RWIN) for i, j in ij]
+    for e, m, mr in compare(img0, refs0, ij, dx, dr, 'omega-k straight', metrics=False):
+        assert e < -55, e
 
-# (c) dropped pulses
-from fastsar import sim
-from fastsar.bp import backproject
-rng = np.random.default_rng(2)
-col = sim.make_collect(res=0.5, scene=600.0, r0=5e3)
-tg = np.stack([rng.uniform(-25, 25, 80), rng.uniform(-25, 25, 80), np.zeros(80)], 1)
-S = sim.simulate_brute(col, tg, rng.standard_normal(80) + 1j * rng.standard_normal(80)).astype(np.complex64)
-P = len(col.ant)
-keep = np.ones(P, bool)
-for c in (P // 5, P // 2, 4 * P // 5):
-    keep[c:c + rng.integers(5, 11)] = False
-    keep[c + 30:c + 40:2] = False
-e1, e2 = np.array([0, 1.0, 0]), np.array([1.0, 0, 0])
-o = -32.0 * e1 - 32.0 * e2
-X, Y = np.meshgrid(np.arange(128) * 0.5, np.arange(128) * 0.5, indexing='ij')
-ex = backproject(S[keep], col.ant[keep], col.fmin, col.df, o + X[..., None] * e1 + Y[..., None] * e2, backend='cpu', window=False, upsample=16)
-fx = dict(S=S[keep], fmin=col.fmin, df=col.df, ref=np.linalg.norm(col.ant[keep], axis=1))
-img = pt.form_mosaic(fx, col.ant[keep], o, 128, 128, 0.5, 0.5, e1, e2, patch=(64, 64), backend='cpu')
-e = 10 * np.log10(np.sum(np.abs(img - ex) ** 2) / np.sum(np.abs(ex) ** 2))
-print(f'dropped pulses ({(~keep).sum()} of {P}): {e:.1f} dB')
-assert e < -45, e                # -46.4 dB when the limit was set; -43.5 dB without the zero pulses
 
-# (d) the image does not depend on how many threads prepare the patches (FASTSAR_MOSAIC_PREFETCH)
-imgs = {}
-for nw in ('0', '1', '4'):
-    os.environ['FASTSAR_MOSAIC_PREFETCH'] = nw
-    imgs[nw] = pt.form_mosaic(fx, col.ant[keep], o, 128, 128, 0.5, 0.5, e1, e2, patch=(32, 32), backend='cpu')
-os.environ.pop('FASTSAR_MOSAIC_PREFETCH')
-for nw in ('1', '4'):
-    assert np.array_equal(imgs[nw], imgs['0']), f'{nw} prefetch workers changed the image'
-print('prefetch workers 0, 1, 4: identical images')
+def test_mosaic_ground_grid(nonlinear):
+    """The patch mosaic on a ground-plane grid with the true positions."""
+    nl = nonlinear
+    p, x, ij, tg3, raw, true, nom = nl.p, nl.x, nl.ij, nl.tg3, nl.raw, nl.true, nl.nom
+    dx = x[1] - x[0]
+    spy = 1.5
+    y0 = tg3[:, 1].min() - 2 * H * spy
+    i0 = min(i for i, _ in ij) - 2 * H
+    grid = ((x[i0], y0, 0.0), max(i for i, _ in ij) + 2 * H - i0, int(np.ceil((tg3[:, 1].max() - y0) / spy)) + 2 * H, dx, spy)
+    ijg = [(int(round((xt - x[i0]) / dx)), int(round((yt - y0) / spy))) for xt, yt, _ in tg3]
+    pts = [ground(x[i0] + np.arange(i - H, i + H) * dx, np.hypot(y0 + np.arange(j - H, j + H) * spy, HALT)) for i, j in ijg]
+    t = time.perf_counter()
+    refg = [pt.backproject(raw, p, true, q, rwin=RWIN, beam=nl.beam) for q in pts]
+    print(f'exact backprojection with the true positions, ground grid of {dx:.3f} x {spy:.3f} m: {time.perf_counter() - t:.1f} s')
+    fx = pt.echoes_to_fx(raw, p, rwin=RWIN)
+    res = {}
+    for name, track, kw in (('patches true', true, dict(crop=8)), ('patches exact', true, dict(crop=8, exact=True)),
+                            ('patches nominal', nom, dict())):
+        info = []
+        t = time.perf_counter()
+        img = pt.form_mosaic(fx, track, *grid, beam=pt.stripmap_beam(p, track), backend='cpu', info=info, **kw)
+        print(f'{name}: {len(info)} patches in {time.perf_counter() - t:.1f} s' + ('' if kw.get('exact') else
+              f', (T, sub) {sorted({(d["T"], d["sub"]) for d in info})}, predicted error '
+              f'{max(d["predicted_error_db"] for d in info):.1f} dB at worst'))
+        res[name] = compare(img, refg, ijg, dx, spy, name, metrics=track is true)
+    check(res['patches true'], -45, 'patches true')
+    check(res['patches exact'], -50, 'patches exact')
+    for e, m, mr in res['patches nominal']:
+        assert e > -10, e
 
-# (e) the JAX backend (histories staged on the worker threads, pulse counts and gates padded onto shared programs)
-# against the CPU backend on the same mosaic, with the dropped pulses
-jx = pt.form_mosaic(fx, col.ant[keep], o, 128, 128, 0.5, 0.5, e1, e2, patch=(64, 64), backend='jax')
-e = 10 * np.log10(np.sum(np.abs(jx - ex) ** 2) / np.sum(np.abs(ex) ** 2))
-print(f'jax mosaic against exact backprojection: {e:.1f} dB')
-assert e < -45, e
 
-# (f) one patch on the JAX backend: the first and only patch takes its gate and pulse count from the slack path
-# (padded_gate, padded_pulses: no planned lengths, nothing taken yet), its pulses padded to a multiple of 256
-info = []
-j1 = pt.form_mosaic(fx, col.ant[keep], o, 128, 128, 0.5, 0.5, e1, e2, patch=(128, 128), backend='jax', info=info)
-e = 10 * np.log10(np.sum(np.abs(j1 - ex) ** 2) / np.sum(np.abs(ex) ** 2))
-print(f'jax single patch against exact backprojection: {e:.1f} dB; {info}')
-assert len(info) == 1 and e < -45, (info, e)
-print('ok')
+# ------------------------------------------------------------------ (c) dropped pulses
+
+@pytest.fixture(scope='module')
+def dropped():
+    """A spotlight with gaps in its pulses, and exact backprojection of the remaining pulses."""
+    rng = np.random.default_rng(2)
+    col = sim.make_collect(res=0.5, scene=600.0, r0=5e3)
+    tg = np.stack([rng.uniform(-25, 25, 80), rng.uniform(-25, 25, 80), np.zeros(80)], 1)
+    S = sim.simulate_brute(col, tg, rng.standard_normal(80) + 1j * rng.standard_normal(80)).astype(np.complex64)
+    P = len(col.ant)
+    keep = np.ones(P, bool)
+    for c in (P // 5, P // 2, 4 * P // 5):
+        keep[c:c + rng.integers(5, 11)] = False
+        keep[c + 30:c + 40:2] = False
+    e1, e2 = np.array([0, 1.0, 0]), np.array([1.0, 0, 0])
+    o = -32.0 * e1 - 32.0 * e2
+    X, Y = np.meshgrid(np.arange(128) * 0.5, np.arange(128) * 0.5, indexing='ij')
+    ex = backproject(S[keep], col.ant[keep], col.fmin, col.df, o + X[..., None] * e1 + Y[..., None] * e2, backend='cpu', window=False, upsample=16)
+    fx = dict(S=S[keep], fmin=col.fmin, df=col.df, ref=np.linalg.norm(col.ant[keep], axis=1))
+    return SimpleNamespace(col=col, P=P, keep=keep, e1=e1, e2=e2, o=o, ex=ex, fx=fx, ant=col.ant[keep])
+
+
+def test_dropped_pulses(dropped):
+    d = dropped
+    img = pt.form_mosaic(d.fx, d.ant, d.o, 128, 128, 0.5, 0.5, d.e1, d.e2, patch=(64, 64), backend='cpu')
+    e = 10 * np.log10(np.sum(np.abs(img - d.ex) ** 2) / np.sum(np.abs(d.ex) ** 2))
+    print(f'dropped pulses ({(~d.keep).sum()} of {d.P}): {e:.1f} dB')
+    assert e < -45, e                # -46.4 dB when the limit was set; -43.5 dB without the zero pulses
+
+
+def test_prefetch_workers(dropped, monkeypatch):
+    """The image does not depend on how many threads prepare the patches (FASTSAR_MOSAIC_PREFETCH)."""
+    d = dropped
+    imgs = {}
+    for nw in ('0', '1', '4'):
+        monkeypatch.setenv('FASTSAR_MOSAIC_PREFETCH', nw)
+        imgs[nw] = pt.form_mosaic(d.fx, d.ant, d.o, 128, 128, 0.5, 0.5, d.e1, d.e2, patch=(32, 32), backend='cpu')
+    monkeypatch.delenv('FASTSAR_MOSAIC_PREFETCH')
+    for nw in ('1', '4'):
+        assert np.array_equal(imgs[nw], imgs['0']), f'{nw} prefetch workers changed the image'
+    print('prefetch workers 0, 1, 4: identical images')
+
+
+def test_jax_mosaic(dropped):
+    """The JAX backend (histories staged on the worker threads, pulse counts and gates padded onto shared programs)
+    against the CPU backend on the same mosaic, with the dropped pulses."""
+    d = dropped
+    jx = pt.form_mosaic(d.fx, d.ant, d.o, 128, 128, 0.5, 0.5, d.e1, d.e2, patch=(64, 64), backend='jax')
+    e = 10 * np.log10(np.sum(np.abs(jx - d.ex) ** 2) / np.sum(np.abs(d.ex) ** 2))
+    print(f'jax mosaic against exact backprojection: {e:.1f} dB')
+    assert e < -45, e
+
+
+def test_jax_single_patch(dropped):
+    """One patch on the JAX backend: the first and only patch takes its gate and pulse count from the slack path
+    (padded_gate, padded_pulses: no planned lengths, nothing taken yet), its pulses padded to a multiple of 256."""
+    d = dropped
+    info = []
+    j1 = pt.form_mosaic(d.fx, d.ant, d.o, 128, 128, 0.5, 0.5, d.e1, d.e2, patch=(128, 128), backend='jax', info=info)
+    e = 10 * np.log10(np.sum(np.abs(j1 - d.ex) ** 2) / np.sum(np.abs(d.ex) ** 2))
+    print(f'jax single patch against exact backprojection: {e:.1f} dB; {info}')
+    assert len(info) == 1 and e < -45, (info, e)

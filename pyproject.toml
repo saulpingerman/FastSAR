@@ -36,7 +36,11 @@ cuda = ["cupy-cuda12x"]
 io = ["sarpy"]
 tpu = ["jax[tpu]"]
 geo = ["rasterio"]
-test = ["sarpy", "sarkit", "rasterio", "finufft"]
+test = ["sarpy", "sarkit; python_version >= '3.11'", "rasterio", "finufft", "pytest>=8", "pytest-timeout"]
+
+[dependency-groups]
+test = ["pytest>=8", "pytest-timeout", "pytest-xdist", "sarpy", "sarkit; python_version >= '3.11'", "rasterio", "finufft"]
+dev = [{include-group = "test"}, "nox>=2025.2.9"]
 
 [tool.setuptools]
 packages = ["fastsar"]
@@ -46,3 +50,13 @@ version = {attr = "fastsar.__version__"}
 
 [tool.setuptools.package-data]
 fastsar = ["ffbp_cpu.cpp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = ["-ra", "--strict-markers"]
+markers = [
+    "cuda: needs CuPy and an Nvidia GPU (skipped without one; a failure with --require cuda)",
+    "tpu: needs a Cloud TPU (skipped without one; a failure with --require tpu)",
+    "needs(*modules): needs optional packages of the test group (skipped without them; a failure with --require io)",
+]

@@ -114,7 +114,7 @@ warnings.simplefilter('ignore', fastsar.MemoryWarning)   # silence the fallback 
 
 Numeric settings out of range raise `ValueError`. The `FFBP_` prefix is a legacy name. `FASTSAR_CPU_BLOCKED` (`1`
 forces the CPU's pulse blocks, `0` forbids them), `FASTSAR_PROFILE_WINDOW_ROWS`, `FASTSAR_FIRP_GLOBAL`,
-`FFBP_FORCE_TPU_KERNELS` and `FASTSAR_TEST_MAX_GB` (the default of `tests/run_all.py --max-rss-gb`) exist for the
+`FFBP_FORCE_TPU_KERNELS` and `FASTSAR_TEST_MAX_GB` (the default of the tests' `--max-rss-gb` option) exist for the
 tests only.
 
 ## Where the time goes
