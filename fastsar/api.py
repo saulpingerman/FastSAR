@@ -332,23 +332,15 @@ class ImageFormer:
         image [nx, ny]."""
         staged = S if isinstance(S, _Staged) else None
         if self.backend == 'cuda' and staged is None and not type(S).__module__.startswith('cupy'):
+            # a host history is windowed and checked on the device as its row blocks are uploaded (two passes over
+            # 1.75 GB on the host cost a 4-vCPU instance more than the whole formation); one that streams is prepared
+            # on the host
             S = np.asarray(S)
             if S.shape != (self.P, self.K):
                 raise ValueError(f'phase history must be {(self.P, self.K)}, got {S.shape}')
             _check_history(S, finite=False)
-            isz = 4 if self.precision == 'float16' else 8
-            if not _mem.cuda_streams(isz * S.size, _mem.cuda_free()):
-                # a history that fits is uploaded as it is and checked and windowed on the device (two passes over
-                # 1.75 GB on the host cost a 4-vCPU instance more than the whole formation)
-                import cupy as cp
-                Sd = cp.asarray(S.astype(np.complex64, copy=False))
-                _check_history(Sd)
-                if self.window:
-                    if getattr(self, '_wd', None) is None:
-                        self._wd = (cp.asarray(self.wp, cp.float32)[:, None], cp.asarray(self.wk, cp.float32)[None, :])
-                    Sd *= self._wd[0]
-                    Sd *= self._wd[1]
-                return cp.asnumpy(self._form(Sd)).astype(np.complex64, copy=False)
+            import cupy as cp
+            return cp.asnumpy(self._form(S, window=(self.wp, self.wk) if self.window else None, check=True)).astype(np.complex64, copy=False)
         S = staged.S if staged is not None else self._host(S)
         if self.backend == 'cuda':
             import cupy as cp

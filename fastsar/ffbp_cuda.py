@@ -570,8 +570,10 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
             del pre, pim, y
         return zre, zim
 
-    def form(S, ng=None, batch=None):
-        """S [P, K] complex64 (host or device, already windowed) -> complex64 image [nx, ny] on the device. A host
+    def form(S, ng=None, batch=None, window=None, check=False):
+        """S [P, K] complex64 (host or device, already windowed) -> complex64 image [nx, ny] on the device.
+        window: None, or (wp [P], wk [K]) applied here, on the device for a history that is uploaded and on the host
+        for one that streams; check: refuse non-finite samples here (ValueError). A host
         history whose device planes exceed memory.STREAM_FRACTION of the free device memory is streamed through the
         first level in pulse blocks (FASTSAR_CUDA_STREAM=1 forces it); a smaller one is uploaded once. ng: first-level
         children per group (default: up to 8, within the memory left after the image and the upload; FASTSAR_CUDA_GROUP
@@ -583,16 +585,36 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
         free = memory.cuda_free()
         stream = isinstance(S, np.ndarray) and (memory.cuda_streams(planes, free)
                                                 or os.environ.get('FASTSAR_CUDA_STREAM') == '1')
+        if stream and (window is not None or check):        # the streamed blocks are read as they are: prepare on the host
+            if check:
+                _finite(S, np)
+            if window is not None:
+                S = (S * window[0][:, None] * window[1][None, :]).astype(np.complex64)
+            window, check = None, False
+        if window is not None:
+            wpd, wkd = cp.asarray(window[0], cp.float32)[:, None], cp.asarray(window[1], cp.float32)[None, :]
+
+        def block(i):           # rows i .. i + 4096 of S on the device, windowed and checked
+            b = cp.asarray(S[i:i + 4096])
+            if window is not None:
+                b = b * wpd[i:i + 4096] * wkd
+            if check:
+                _finite(b, cp, i)
+            return b
         scale = 1.0
         if kern['dtype'] != cp.float32:              # float16 storage: scale to the peak (in row blocks)
-            xp = np if isinstance(S, np.ndarray) else cp
-            scale = max(float(xp.abs(S[i:i + 4096]).max()) for i in range(0, S.shape[0], 4096)) or 1.0
+            if stream or not (window is not None or check):
+                xp = np if isinstance(S, np.ndarray) else cp
+                scale = max(float(xp.abs(S[i:i + 4096]).max()) for i in range(0, S.shape[0], 4096)) or 1.0
+            else:               # a first pass over the uploaded blocks (the planes need the scale)
+                scale = max(float(cp.abs(block(i)).max()) for i in range(0, S.shape[0], 4096)) or 1.0
+                check = False
         if not stream:
             # uploaded in row blocks straight into the planes (no full complex copy on the device)
             pre = cp.empty((1,) + S.shape, kern['dtype'])
             pim = cp.empty((1,) + S.shape, kern['dtype'])
             for i in range(0, S.shape[0], 4096):
-                b = cp.asarray(S[i:i + 4096])
+                b = block(i)
                 pre[0, i:i + 4096] = (b.real / scale).astype(kern['dtype'])
                 pim[0, i:i + 4096] = (b.imag / scale).astype(kern['dtype'])
                 del b
@@ -650,6 +672,16 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
         return full[ox:ox + nx, oy:oy + ny] if scale == 1.0 else full[ox:ox + nx, oy:oy + ny] * np.float32(scale)
 
     return form
+
+
+def _finite(S, xp, first=0):
+    """Refuse non-finite samples in S (numpy or cupy), checked by sums over blocks of rows; first: the pulse index of
+    S's first row in the history, for the message."""
+    for i in range(0, S.shape[0], 4096):
+        if not np.isfinite(complex(S[i:i + 4096].sum())):
+            bad = i + int(xp.argmax((~xp.isfinite(S[i:i + 4096])).any(1)))
+            raise ValueError(f'phase history has non-finite samples (NaN or inf), the first in pulse {first + bad}; '
+                             'zero them (S[~np.isfinite(S)] = 0) or drop the pulses')
 
 
 # ----------------------------------------------------------------------------------------------------------------------
