@@ -39,6 +39,10 @@ First release.
   first level; the CPU former reads a complex64 history in place and sizes its first-level groups from the memory
   available.
 - JAX and TPU formers cache compiled programs and the plan's device arrays by plan signature (up to 32).
+- Polar format keeps its compiled program and geometry arrays per collection geometry (the last four), and applies
+  the window, the spectral weighting and the scaling on the device.
+- `ExactFormer` on CUDA halves its pulses per chunk on an out-of-memory error instead of failing (with a
+  `MemoryWarning`).
 - Environment variables `FASTSAR_SHARED_PROFILES`, `FASTSAR_WEIGHT_TERMS`, `FASTSAR_WEIGHT_GRAD`,
   `FASTSAR_MOSAIC_PREFETCH`, `FASTSAR_COMPILE_PATCHES`, `FASTSAR_PULSE_SLACK`, `FASTSAR_CPU_GROUP_GB`,
   `FASTSAR_CUDA_GROUP`, `FASTSAR_TPU_GROUP`, `FASTSAR_CUDA_STREAM` and `FASTSAR_TIMING`
@@ -56,6 +60,11 @@ First release.
 - `FASTSAR_MOSAIC_PREFETCH` defaults to up to 4 worker threads on a GPU or TPU (1 before; still 1 on the CPU).
 - The JAX program cache holds 32 programs instead of 16.
 - CUDA float32 histories are no longer scaled to their peak.
+- The CUDA former windows and checks a host history on the GPU as its row blocks are uploaded, without a full
+  complex copy on the device (host-side windowing cost a 4-vCPU instance more than the formation); `ExactFormer`
+  scans for NaN and inf on the GPU.
+- Importing FastSAR sets `XLA_PYTHON_CLIENT_PREALLOCATE=false` unless already set, so that JAX does not take 75% of
+  a GPU's memory that the CUDA formers share.
 - CPU first-level groups follow the available memory (MemAvailable), so they vary on a busy host.
 - `form_image`, `ImageFormer`, `backproject`, `patches.form_mosaic`, `io.read_cphd` and `form_cphd` check their
   inputs: a phase history that is not 2-D or not complex, has NaN or inf samples, fewer than 2 pulses or a pulse

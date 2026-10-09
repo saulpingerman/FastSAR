@@ -32,7 +32,7 @@ of the difference over the whole image.
   bright returns (99th percentile 1.1 degrees). Use three-pass for interferometry.
 - Polar format shows striped coherence below 0.99; its residual grows from -40 dB at the scene center to -30 dB in
   the outer quarter ([algorithms.md](algorithms.md#polar-format)).
-- Exact backprojection with its default cubic interpolation is 10.1 to 13.1 dB more accurate than the float32
+- Exact backprojection with its default cubic interpolation is 10.0 to 13.1 dB more accurate than the float32
   factorized image on the three Umbra collections, at the limit to which the reference has converged; with linear
   interpolation at 8 times oversampling, range interpolation sets its error.
 
