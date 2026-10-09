@@ -149,7 +149,7 @@ _CPU_SRC = r'''
 #include <omp.h>
 // one OpenMP task per tile of TX x TY pixels; per pulse the tile center's terms in float64, then the tile's pixels
 // in float32 in one vectorizable loop (the sines from the vector math library)
-extern "C" void bp_tiles(const float* wre, const float* wim, const float* wc, int P, int W, const int* lo, const double* ant,
+extern "C" void bp_tiles(const float* wre, const float* wim, int P, int W, const int* lo, const double* ant,
                          const double* ref, const double* cen, int ntx, int nty, int TX, int TY, int nx, int ny,
                          float sx, float sy, const float* e1, const float* e2, double inv_dr, double kcyc, int cubic,
                          float* ore, float* oim) {
@@ -189,8 +189,6 @@ extern "C" void bp_tiles(const float* wre, const float* wim, const float* wc, in
           pp[q] = 6.283185307179586f * (ph - std::nearbyint(ph));
         }
         if (cubic) {
-          // interleaved complex samples read as one 64-bit word each: four gathers per pixel instead of eight
-          const double* rc = reinterpret_cast<const double*>(wc) + base;
           #pragma omp simd
           for (int q = 0; q < T; ++q) {
             const float fl = std::floor(tt[q]), w = tt[q] - fl;
@@ -198,11 +196,8 @@ extern "C" void bp_tiles(const float* wre, const float* wim, const float* wc, in
             const float wm1 = w - 1.f, wm2 = w - 2.f, wp1 = w + 1.f;
             const float c0 = -w * wm1 * wm2 * (1.f / 6.f), c1 = wp1 * wm1 * wm2 * 0.5f;
             const float c2 = -wp1 * w * wm2 * 0.5f, c3 = wp1 * w * wm1 * (1.f / 6.f);
-            const double g0 = rc[i-1], g1 = rc[i], g2 = rc[i+1], g3 = rc[i+2];
-            float a0[2], a1[2], a2[2], a3[2];
-            __builtin_memcpy(a0, &g0, 8); __builtin_memcpy(a1, &g1, 8); __builtin_memcpy(a2, &g2, 8); __builtin_memcpy(a3, &g3, 8);
-            const float vre = c0*a0[0] + c1*a1[0] + c2*a2[0] + c3*a3[0];
-            const float vim = c0*a0[1] + c1*a1[1] + c2*a2[1] + c3*a3[1];
+            const float vre = c0*rr[i-1] + c1*rr[i] + c2*rr[i+1] + c3*rr[i+2];
+            const float vim = c0*ri[i-1] + c1*ri[i] + c2*ri[i+1] + c3*ri[i+2];
             const float s = std::sin(pp[q]), c = std::cos(pp[q]);
             are[q] += vre * c - vim * s;
             aim[q] += vre * s + vim * c;
@@ -250,7 +245,7 @@ def _cpu():
         f64 = np.ctypeslib.ndpointer(np.float64, flags='C_CONTIGUOUS')
         i32 = np.ctypeslib.ndpointer(np.int32, flags='C_CONTIGUOUS')
         ci, cd, cf = ctypes.c_int, ctypes.c_double, ctypes.c_float
-        L.bp_tiles.argtypes = [f32, f32, f32, ci, ci, i32, f64, f64, f64, ci, ci, ci, ci, ci, ci, cf, cf, f32, f32, cd, cd, ci, f32, f32]
+        L.bp_tiles.argtypes = [f32, f32, ci, ci, i32, f64, f64, f64, ci, ci, ci, ci, ci, ci, cf, cf, f32, f32, cd, cd, ci, f32, f32]
         _cpu_lib = L
     return _cpu_lib
 
@@ -383,8 +378,7 @@ class ExactFormer:
             prof = scipy.fft.ifft(pad, axis=1, workers=workers, overwrite_x=True)
             idx = (self.blo[p0:p1, None] + cols[None, :] - nfft // 2) % nfft
             win = np.take_along_axis(prof, idx, axis=1) * nfft
-            win = win.astype(np.complex64)
-            L.bp_tiles(np.ascontiguousarray(win.real), np.ascontiguousarray(win.imag), win.view(np.float32).reshape(-1), n, W,
+            L.bp_tiles(np.ascontiguousarray(win.real, np.float32), np.ascontiguousarray(win.imag, np.float32), n, W,
                        np.ascontiguousarray(self.lo[p0:p1]), np.ascontiguousarray(self.ant[p0:p1]),
                        np.ascontiguousarray(self.ref[p0:p1]), self.cen, self.ntx, self.nty, self.tx, self.ty, self.nx, self.ny,
                        self.spx, self.spy, e1, e2, self.inv_dr, self.kcyc, int(self.cubic), ore, oim)
