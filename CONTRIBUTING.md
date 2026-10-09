@@ -49,7 +49,7 @@ python tests/test_accuracy.py      # tile-size and oversampling errors against e
 `run_all.py` reports SKIP for a script that needs hardware this machine lacks (`test_ffbp_cuda.py` without a GPU);
 `--require cuda,tpu` makes that a failure. A script whose test package is missing fails; install them with
 `pip install -e ".[io,test]"`. It stops a script that runs past `-t` seconds (default 600) or holds more than
-`--max-rss-gb` of memory (default 6, or `FASTSAR_TEST_MAX_GB`), and exits non-zero if any script fails. `-v` prints
+`--max-rss-gb` of memory (default 6 GB, 12 GB on a TPU host, whose runtime holds about 5 GB; or `FASTSAR_TEST_MAX_GB`), and exits non-zero if any script fails. `-v` prints
 every script's output.
 
 `test_autofocus.py` is the only script that takes a backend argument. The others pick the backends this machine

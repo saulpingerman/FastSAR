@@ -229,12 +229,19 @@ def _sp_amp(p, f, s):
 # ------------------------------------------------------------------ JAX pieces
 
 def _x64(dtype):
+    """Context for the JAX steps at dtype: float64 enables x64 and, on a TPU (which has no complex128 FFT), runs
+    the steps on the host CPU."""
     if dtype == 'float64':
         import jax
+        stack = contextlib.ExitStack()
         if hasattr(jax, 'enable_x64'):
-            return jax.enable_x64(True)
-        from jax.experimental import enable_x64
-        return enable_x64()
+            stack.enter_context(jax.enable_x64(True))
+        else:
+            from jax.experimental import enable_x64
+            stack.enter_context(enable_x64())
+        if jax.default_backend() == 'tpu':
+            stack.enter_context(jax.default_device(jax.devices('cpu')[0]))
+        return stack
     if dtype != 'float32':
         raise ValueError("dtype: 'float32' or 'float64'")
     return contextlib.nullcontext()

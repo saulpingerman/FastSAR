@@ -97,8 +97,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('names', nargs='*', help='run only the scripts whose names contain one of these')
     ap.add_argument('-t', '--timeout', type=float, default=600.0, help='seconds per script (default 600)')
-    ap.add_argument('--max-rss-gb', type=float, default=float(os.environ.get('FASTSAR_TEST_MAX_GB', 6.0)),
-                    help='resident memory limit per script (default 6, or FASTSAR_TEST_MAX_GB)')
+    ap.add_argument('--max-rss-gb', type=float, default=float(os.environ.get('FASTSAR_TEST_MAX_GB', 12.0 if os.path.exists('/dev/accel0') or os.path.exists('/dev/vfio') else 6.0)),
+                    help='resident memory limit per script (default 6, 12 on a TPU host whose runtime holds about 5 GB; or FASTSAR_TEST_MAX_GB)')
     ap.add_argument('-v', '--verbose', action='store_true', help='print the full output of every script')
     ap.add_argument('--require', default='', help='hardware that must be present, e.g. cuda,tpu (absent: failure)')
     a = ap.parse_args()
