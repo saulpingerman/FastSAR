@@ -1,21 +1,21 @@
 [build-system]
-requires = ["setuptools>=64"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "fastsar"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Synthetic aperture radar image formation on x86 CPUs, Nvidia GPUs and Cloud TPUs"
 readme = "README.md"
-license = {text = "MIT"}
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{name = "Paul Singerman"}]
 requires-python = ">=3.10"
-dependencies = ["numpy", "scipy", "jax"]
+dependencies = ["numpy>=2.2.6", "scipy>=1.15.3", "jax>=0.6.2"]
 keywords = ["synthetic aperture radar", "SAR", "backprojection", "image formation", "CPHD", "SICD", "GPU", "TPU"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
@@ -34,10 +34,15 @@ Changelog = "https://github.com/saulpingerman/FastSAR/blob/main/CHANGELOG.md"
 [project.optional-dependencies]
 cuda = ["cupy-cuda12x"]
 io = ["sarpy"]
+tpu = ["jax[tpu]"]
+geo = ["rasterio"]
 test = ["sarpy", "sarkit", "rasterio", "finufft"]
 
 [tool.setuptools]
 packages = ["fastsar"]
+
+[tool.setuptools.dynamic]
+version = {attr = "fastsar.__version__"}
 
 [tool.setuptools.package-data]
 fastsar = ["ffbp_cpu.cpp"]

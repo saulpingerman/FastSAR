@@ -22,13 +22,17 @@ the float64 reference ([performance](https://github.com/saulpingerman/FastSAR/bl
 ## Install
 
 ```bash
-pip install "fastsar[io] @ git+https://github.com/saulpingerman/FastSAR"        # io: sarpy for CPHD and SICD
-pip install "fastsar[cuda,io] @ git+https://github.com/saulpingerman/FastSAR"   # cuda: CuPy
+pip install fastsar                  # CPU (and JAX on whatever device it has)
+pip install "fastsar[io]"            # io: sarpy for CPHD and SICD
+pip install "fastsar[cuda]"          # cuda: CuPy for Nvidia GPUs
+pip install "fastsar[tpu]"           # tpu: jax[tpu] for Cloud TPUs
+pip install "fastsar[geo]"           # geo: rasterio for GeoTIFFs and DEMs
+pip install "fastsar[cuda,io,geo]"   # extras combine
 ```
 
 From a clone: `pip install -e ".[cuda,io]"` or `uv sync`. The CPU kernels need `g++` with OpenMP and compile on
-first use; the float16 CUDA kernel needs `nvcc`; TPUs need `jax[tpu]`; GeoTIFFs and DEMs need `rasterio`. On the
-CPU set `OMP_NUM_THREADS=<physical cores> OMP_PLACES=cores OMP_PROC_BIND=close`.
+first use; the float16 CUDA kernel needs `nvcc`. On the CPU set
+`OMP_NUM_THREADS=<physical cores> OMP_PLACES=cores OMP_PROC_BIND=close`.
 
 ## Quickstart
 
