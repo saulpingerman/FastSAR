@@ -320,10 +320,16 @@ def backproject(S, ant, fmin, df, points, rcv=None, ref=None, backend='auto', up
     if ref.shape != (P,):
         raise ValueError(f'ref must hold one range per pulse, shape ({P},), got {ref.shape}')
     shape = points.shape[:-1]
-    if window:
-        wp, wk = _window(P, K)
-        S = S * wp[:, None] * wk[None, :]
-    S = S.astype(np.complex64)
+    # one complex64 copy, windowed in row blocks (whole-array products went through complex128 and took over 128 GB
+    # for a 320,360-pulse Capella spotlight)
+    Sw = np.empty((P, K), np.complex64)
+    wp, wk = _window(P, K) if window else (None, None)
+    for p0 in range(0, P, 4096):
+        sl = slice(p0, min(P, p0 + 4096))
+        Sw[sl] = S[sl]
+        if window:
+            Sw[sl] *= (wp[sl, None] * wk[None, :]).astype(np.float32)
+    S = Sw
     nfft = 1 << int(np.ceil(np.log2(upsample * K)))
     inv_dr = 2.0 * df * nfft / C
     kcyc = 2.0 * (fmin + (K // 2) * df) / C
