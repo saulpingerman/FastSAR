@@ -27,7 +27,7 @@ of the difference over the whole image.
   by 5 coherence with the reference exceeds 0.999 even at its 0.1 percentile. The L4 and CPU images are within
   0.1 dB of a float64 factorized image. The TPU kernels compute the last level's geometry in float32, the probable
   cause of their 2 dB larger error.
-- Single-pass TPU products add 12 dB. The amplitude is unchanged, but the phase deviates by up to 86 degrees beside
+- The single-pass TPU setting adds 12 dB. The amplitude is unchanged, but the phase deviates by up to 86 degrees beside
   bright returns (99th percentile 1.0 degree). Use three-pass for interferometry.
 - Polar format shows striped coherence below 0.99; its residual grows from -40 dB at the scene center to -30 dB in
   the outer quarter ([algorithms.md](algorithms.md#polar-format)).

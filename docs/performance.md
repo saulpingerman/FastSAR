@@ -26,7 +26,7 @@ Melbourne and Iowa.
 
 ![Cost per 1000 Panama images against error for every FastSAR configuration and the open-source implementations](images/teaser.png)
 
-Single-pass TPU products take 2.4 s (v6e) and 3.8 s (v5e) at -45.8 dB, $1.39 and $1.01 per 1000 images. Float16
+Single-pass on the TPUs takes 2.4 s (v6e) and 3.8 s (v5e) at -45.8 dB, $1.39 and $1.01 per 1000 images. Float16
 on the L4 and single-pass on the TPUs lower each device's cost by 18 to 38%. Polar format takes 2.4 s on the L4
 ($0.42 per 1000) and 11.3 s on the c4d-highmem-16, at -32.1 dB. On the TPUs its final resampling, a scattered
 gather, adds about 94 s (v5e) and 104 s (v6e), for 98 and 106 s per image. The L4 draws 0.07 kWh per 1000 float32
@@ -96,7 +96,7 @@ warnings.simplefilter('ignore', fastsar.MemoryWarning)   # silence the fallback 
 | Variable | Default | Effect |
 |---|---|---|
 | `CXX` | `g++` | CPU kernel compiler; builds are cached in `~/.cache/fastsar` |
-| `FFBP_CPU_FLAGS` | `-O3 -march=native -mprefer-vector-width=512 -funroll-loops` (exact backprojection: `-O3 -march=native`) | compiler flags |
+| `FFBP_CPU_FLAGS` | `-O3 -march=native -mprefer-vector-width=512 -funroll-loops` (`backproject`: `-O3 -march=native`; `ExactFormer`: `-O3 -march=native -ffast-math`) | compiler flags |
 | `FASTSAR_CPU_GROUP_GB` | a quarter of available memory | CPU first-level group budget (GB) |
 | `FASTSAR_CUDA_GROUP` | from free memory: 8 at full speed | CUDA first-level children per group |
 | `FASTSAR_TPU_GROUP` | from the device's memory: 4 at full speed | TPU first-level children per group |

@@ -38,16 +38,19 @@ python tests/test_bp.py            # exact backprojection: backends, bistatic, o
 python tests/test_io.py            # CPHD helpers: frequency resampling, re-referencing, geodetic conversions
 python tests/test_wide_angle.py    # 10 to 360 degree apertures against exact backprojection
 python tests/test_insar.py         # change detection and interferometric height (needs finufft)
-python tests/test_chain.py         # simulated CPHD to geolocation, map GeoTIFFs, SICD and autofocus (needs sarpy)
+python tests/test_chain.py         # simulated CPHD to geolocation, map GeoTIFFs, SICD and autofocus (needs sarpy, rasterio)
+python tests/test_exact.py         # ExactFormer, cubic and linear, at 20 and 600 km against upsample=64 backprojection
 python tests/test_units.py         # filters, program cache, aperture weights, mosaic pieces, input checks
 python tests/test_cphd.py          # read_cphd and form_cphd on simulated collections (stand-in CPHD reader)
 python tests/test_planning.py      # bucket planning, memory models, TPU out-of-memory retry, program cache
 python tests/test_accuracy.py      # tile-size and oversampling errors against exact backprojection
 ```
 
-`run_all.py` skips a script that needs hardware or a package this machine lacks (`test_ffbp_cuda.py`, `test_insar.py`)
-with a SKIP line, stops a script that runs past `-t` seconds (default 600) or holds more than `--max-rss-gb` of memory
-(default 6, or `FASTSAR_TEST_MAX_GB`), and exits non-zero if any script fails. `-v` prints every script's output.
+`run_all.py` reports SKIP for a script that needs hardware this machine lacks (`test_ffbp_cuda.py` without a GPU);
+`--require cuda,tpu` makes that a failure. A script whose test package is missing fails; install them with
+`pip install -e ".[io,test]"`. It stops a script that runs past `-t` seconds (default 600) or holds more than
+`--max-rss-gb` of memory (default 6, or `FASTSAR_TEST_MAX_GB`), and exits non-zero if any script fails. `-v` prints
+every script's output.
 
 `test_autofocus.py` is the only script that takes a backend argument. The others pick the backends this machine
 has (`fastsar.available_backends()`) or use the CPU. The tests use small simulated scenes and take seconds to a few

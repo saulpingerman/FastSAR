@@ -1,23 +1,23 @@
 # FastSAR
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](pyproject.toml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/saulpingerman/FastSAR/blob/v0.1.0/LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://github.com/saulpingerman/FastSAR/blob/v0.1.0/pyproject.toml)
 
 FastSAR forms synthetic aperture radar (SAR) images on x86 CPUs, Nvidia GPUs and Google Cloud TPUs from Python. It
 reads frequency-domain CPHD files, forms spotlight, stripmap and sliding spotlight images by factorized
-backprojection, and makes products: autofocus, interferometry, geolocation, map GeoTIFFs and SICD.
+backprojection, and provides autofocus, interferometry, geolocation, map GeoTIFFs and SICD output.
 
-![FastSAR image of the Panama Canal's Pacific entrance from an Umbra spotlight collection](docs/images/hero_panama.jpg)
+![FastSAR image of the Panama Canal's Pacific entrance from an Umbra spotlight collection](https://raw.githubusercontent.com/saulpingerman/FastSAR/v0.1.0/docs/images/hero_panama.jpg)
 
 *Panama Canal, Pacific entrance (Umbra open data, 2023-07-18): 12,207 by 8,808 pixels in 4.3 s on an Nvidia L4
 (warm former, transfers included; float32, -59.5 dB against float64 exact backprojection), downsampled. A
 c4d-highmem-16 CPU instance (16 vCPUs, 8 cores) takes 12.4 s. ISCE3, the fastest open-source code that forms this
 collection, would take an estimated 4.8 h on that CPU and 27 min on the L4.*
 
-![Cost per 1000 images against error for FastSAR and five open-source implementations](docs/images/teaser.png)
+![Cost per 1000 images against error for FastSAR and five open-source implementations](https://raw.githubusercontent.com/saulpingerman/FastSAR/v0.1.0/docs/images/teaser.png)
 
 *Cost per 1000 Panama images (October 2026 prices) against error over the lock, port and ship regions, relative to
-the float64 image ([performance](docs/performance.md), [comparison](docs/comparison.md)).*
+the float64 reference ([performance](https://github.com/saulpingerman/FastSAR/blob/v0.1.0/docs/performance.md), [comparison](https://github.com/saulpingerman/FastSAR/blob/v0.1.0/docs/comparison.md)).*
 
 ## Install
 
@@ -43,8 +43,8 @@ products.write_geotiff('amp.tif', **products.geocode_image(out))   # amplitude o
 products.write_sicd('scene.nitf', out)            # complex image with its geometry
 ```
 
-[`examples/chain.py`](examples/chain.py) runs this chain from the command line (`--simulate` needs no data);
-[`form_umbra.py`](examples/form_umbra.py) and [`form_capella_stripmap.py`](examples/form_capella_stripmap.py) form
+[`examples/chain.py`](https://github.com/saulpingerman/FastSAR/blob/v0.1.0/examples/chain.py) runs this chain from the command line (`--simulate` needs no data);
+[`form_umbra.py`](https://github.com/saulpingerman/FastSAR/blob/v0.1.0/examples/form_umbra.py) and [`form_capella_stripmap.py`](https://github.com/saulpingerman/FastSAR/blob/v0.1.0/examples/form_capella_stripmap.py) form
 vendor grids.
 
 ## Supported data, modes and devices
@@ -67,10 +67,10 @@ Polar format (`algorithm='pfa'`) runs as a JAX program on any device.
 
 ## Documentation
 
-[docs/README.md](docs/README.md) lists every page; start with the [processing chain](docs/processing-chain.md).
+[docs/README.md](https://github.com/saulpingerman/FastSAR/blob/v0.1.0/docs/README.md) lists every page; start with the [processing chain](https://github.com/saulpingerman/FastSAR/blob/v0.1.0/docs/processing-chain.md).
 Measurement records are in [sar-accel-study](https://github.com/saulpingerman/sar-accel-study). A citation file
 will come with the preprint.
 
 ## Contributing and license
 
-[CONTRIBUTING.md](CONTRIBUTING.md) explains how to run the tests. MIT license ([LICENSE](LICENSE)).
+[CONTRIBUTING.md](https://github.com/saulpingerman/FastSAR/blob/v0.1.0/CONTRIBUTING.md) explains how to run the tests. MIT license ([LICENSE](https://github.com/saulpingerman/FastSAR/blob/v0.1.0/LICENSE)).

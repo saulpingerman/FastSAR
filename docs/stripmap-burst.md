@@ -82,8 +82,8 @@ row from the burst that illuminates it most.
 Test results (`tests/test_burst.py`):
 
 - TOPS, 512 pulses steered over +/-2.70 degrees (2.68 PRFs): omega-k -60.1 to -63.1 dB, RDA with SRC -61.8 to
-  -64.4 dB; azimuth resolution 2.316 to 2.356 m (2.318 to 2.357 m expected); 3.7 s (omega-k) and 1.2 s (RDA) on
-  four threads for a 2940 by 448 image
+  -64.4 dB; azimuth resolution 2.316 to 2.356 m (2.318 to 2.357 m expected) for a 2940 by
+  448 image
 - ScanSAR, subswaths at 5.0 and 5.25 km, bursts of 128 pulses: omega-k -59.0 to -68.1 dB, RDA -59.4 to -72.4 dB;
   azimuth resolution 1.766 to 2.185 m, within 0.1% of each target's weighted Doppler support
 

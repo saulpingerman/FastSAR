@@ -69,7 +69,7 @@ rgb = products.pauli(hh, hv, vv)                          # quad polarization on
 lat, lon, h = products.geolocate(out, i, j)                 # pixel (i, j) on the image plane
 dem = products.read_dem('dem.tif', offset=geoid)            # DEM GeoTIFF -> dem(lat, lon); geoid height in m
 lat, lon, h = products.geolocate(out, i, j, height=dem)     # the terrain point imaged at (i, j)
-i, j = products.locate(out, lat, lon, h)                    # inverse
+ij = products.locate(out, lat, lon, h)                      # inverse: fractional (i, j) [..., 2]
 geo = products.geocode_image(out, products.multilook(out['image'], 2, 2), height=dem)   # north up, UTM
 ```
 

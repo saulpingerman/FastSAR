@@ -1,9 +1,10 @@
 # Changelog
 
-The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). FastSAR has no tagged release yet;
-`fastsar.__version__` is 0.1.0.
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## Unreleased
+## 0.1.0 (2026-10-09)
+
+First release.
 
 ### Added
 
@@ -92,13 +93,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Fas
 
 - Processing-chain page and API reference; README reduced to a landing page with a supported-data table.
 - Documentation matches the geolocation, map GeoTIFF, SICD and autofocus calls for `form_cphd` output; each fact
-  stated on one page, about 7,000 words in all.
+  stated on one page.
 - Shorter README with figures; the long-form material moved to `docs/`.
 - Contributing guide, issue and pull request templates, and package metadata for PyPI-style tools.
 
-## 0.1.0 (October 2026, untagged)
-
-First public version.
+### Initial functionality
 
 - Spotlight image formation by factorized backprojection with kernels for x86 CPUs (C++/OpenMP), Nvidia GPUs
   (CUDA through CuPy) and Cloud TPUs (Pallas), and the plain JAX program; `form_image` and `ImageFormer`.
