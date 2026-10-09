@@ -251,3 +251,45 @@ def test_moving_beam(chain):
     d2 = ground_m(g2[0], g2[1], truth2[0], truth2[1])
     print(f'moving beam ({st["mode"]}, {st["image"].shape}): geolocated peaks vs truth {d2.max() * 100:.2f} cm')
     assert st['mode'] == 'moving' and d2.max() < 0.03
+
+
+def test_steep_terrain(chain):
+    """A DEM with a cliff steeper than the radar's line of sight (layover) and a pit: every pixel geolocates to a finite
+    point that maps back to it, and the map extent of geocode_image is finite."""
+    out = chain.out
+
+    def cliff(lat, lon):
+        s = (io.geodetic_to_ecf(lat, lon, h0) - io.geodetic_to_ecf(lat0, lon0, h0)) @ sim.enu_axes(lat0, lon0).T @ M
+        return h0 + 30.0 * np.tanh(s[..., 0] / 2.0) - 40.0 * np.exp(-((s[..., 0] - 20) ** 2 + s[..., 1] ** 2) / 15.0 ** 2)
+    n0, n1 = out['image'].shape
+    I, J = np.meshgrid(np.linspace(-0.5, n0 - 0.5, 41), np.linspace(-0.5, n1 - 0.5, 41), indexing='ij')
+    g = products.geolocate(out, I, J, height=cliff)
+    back = products.locate(out, *g)
+    err = np.hypot(back[..., 0] - I, back[..., 1] - J)
+    print(f'steep terrain: {np.isfinite(g[0]).mean() * 100:.0f} % finite, round trip worst {np.nanmax(err):.2e} pixels')
+    assert np.all(np.isfinite(np.stack(g))) and np.nanmax(err) < 1e-2
+    geo = products.geocode_image(out, height=cliff)
+    assert geo['data'].shape[0] > 0 and np.isfinite(geo['data']).any()
+
+
+def test_troposphere(chain):
+    """A two-way troposphere delay of 10 ns in the data and in TDTropoSRP: form_cphd removes it by default, so the
+    targets stay where they are; with troposphere=False they appear c td / 2 farther in slant range."""
+    col, td = chain.col, 10e-9
+    f = col.fmin + col.df * np.arange(col.K)
+    S = (chain.S * np.exp(-2j * np.pi * f * td)[None, :]).astype(np.complex64)
+    path = os.path.join(chain.tmp, 'tropo.cphd')
+    sim.write_cphd(path, col, S, lat0, lon0, h0, heading=heading, tropo=td)
+    shift = []
+    for tro in (None, False):
+        out = fastsar.form_cphd(path, backend='cpu', spacing=0.4, height=h0, troposphere=tro)
+        ij = products.locate(out, *chain.truth)
+        pk = peaks(out['image'], ij, out['spx'], out['spy'])
+        g = products.geolocate(out, pk[:, 0], pk[:, 1], height=chain.truth[2])
+        shift.append(ground_m(g[0], g[1], chain.truth[0], chain.truth[1]))
+        if tro is None:
+            assert any('troposphere' in n for n in out['notes'])
+    expect = 0.5 * 299792458.0 * td / np.cos(np.radians(35.0))      # ground range at the 35 degree grazing angle
+    print(f'troposphere 10 ns: removed {shift[0].max() * 100:.2f} cm from the truth; kept {shift[1].min():.3f} to '
+          f'{shift[1].max():.3f} m (expected about {expect:.3f} m)')
+    assert shift[0].max() < 0.03 and np.all(np.abs(shift[1] / expect - 1) < 0.1)

@@ -146,12 +146,14 @@ def _reference_geometry(arp, varp, srp):
 
 
 def write_cphd(path, col, S, lat, lon, height=0.0, heading=0.0, speed=200.0, srp=None, scene=None, pol='VV',
-               start='2026-01-01T00:00:00.000000Z'):
+               start='2026-01-01T00:00:00.000000Z', tropo=0.0):
     """Write a simulated phase history S [Np, K] (this module's convention: compensated to the scene center, phase
     exp(-j 4 pi f dR / c)) as a monostatic frequency-domain CPHD 1.0.1 file, placed by to_ecf, with the pulses
     `speed` m/s apart in time along the track. srp: per-pulse scene reference points [Np, 3] in the simulator's
     frame for a moving beam (S compensated to them), default the scene center. scene: side (m) of the square image
-    area, default the extent the collection's frequency step leaves unambiguous. Needs sarpy."""
+    area, default the extent the collection's frequency step leaves unambiguous. tropo: the two-way troposphere
+    delay (s, one value or one per pulse) written as TDTropoSRP; S should already hold it (exp(-j 2 pi f tropo)).
+    Needs sarpy."""
     from sarpy.io.phase_history.cphd1_elements.CPHD import CPHDType
     from sarpy.io.phase_history.cphd import CPHDWriter1
     from .io import ecf_to_geodetic
@@ -210,6 +212,7 @@ def write_cphd(path, col, S, lat, lon, height=0.0, heading=0.0, speed=200.0, srp
     v['RcvTime'], v['RcvPos'], v['RcvVel'] = t + 2 * rng / C, tx, vel
     v['SRPPos'], v['FX1'], v['FX2'], v['SC0'], v['SCSS'] = sr, fmin, fmax, fmin, col.df
     v['TOA1'], v['TOA2'] = -0.45 / col.df, 0.45 / col.df
+    v['TDTropoSRP'] = tropo
     with CPHDWriter1(path, meta, check_existence=False) as w:
         w.write_file({pol: v}, {pol: np.asarray(S, np.complex64)})
 

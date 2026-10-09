@@ -16,8 +16,8 @@ the ellipsoid normal, with its origin at the (mid-aperture) scene reference poin
 - invalid positions (trimmed at the ends, interpolated inside), empty or flagged pulses (reported in `notes`)
 - a vendor SICD's grid: the image is the SICD array (transposed when range runs along rows); non-planar SICD grids
   need `io.sicd_points` and `backproject` ([processing-chain.md](processing-chain.md#2-form))
-- the troposphere delay at the scene reference point, with `troposphere=True` (off by default: without it Umbra
-  images land on the vendor's pixel grid)
+- the troposphere delay at the scene reference point, removed by default when the file gives a nonzero delay
+  (`troposphere=False` keeps it; Umbra's SICD images keep it, Capella's remove it)
 - a warning when the valid delay window (TOA1 to TOA2) exceeds the unambiguous range c/(2 df)
 
 Time-of-arrival (TOA) CPHD raises a `ValueError`.
@@ -26,7 +26,8 @@ Time-of-arrival (TOA) CPHD raises a `ValueError`.
 
 `form_cphd` was checked against the vendors' SICD images on 600 m grids around the scene center: correlation over
 256 by 256 vendor pixels projected to the grid's height. These values were measured before `read_cphd`'s z axis
-changed from the geocentric radial to the ellipsoid normal (up to 0.19 degrees apart; see the CHANGELOG).
+changed from the geocentric radial to the ellipsoid normal (up to 0.19 degrees apart; see the CHANGELOG). They
+are also without the troposphere correction, which `read_cphd` applies by default since 0.1.1.
 
 | Collection (SICD given) | Amplitude | Intensity, 5 by 5 average |
 |---|---|---|

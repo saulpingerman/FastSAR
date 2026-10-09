@@ -327,11 +327,15 @@ def geolocate(out, i, j, height=None, iterations=10, tol=1e-4):
 
     def f(t):
         la, lo, h = _llh(x(t), out['meta'])
-        return h - _height(height, la, lo)
+        return h - _height(height, la, lo), h
     t, dt = np.zeros(i.shape), 1e-6
     for _ in range(iterations):
-        f0 = f(t)
-        step = f0 * dt / (f(t + dt) - f0)
+        (f0, h0), (f1, h1) = f(t), f(t + dt)
+        # where the terrain's slope along the circle cancels the circle's own climb (steep walls facing the radar,
+        # layover), Newton's derivative vanishes: step with the climb alone there, at most 100 m along the circle
+        d, g = (f1 - f0) / dt, (h1 - h0) / dt
+        d = np.where(np.isfinite(d) & (np.abs(d) > 0.1 * np.abs(g)), d, g)
+        step = np.clip(f0 / d, -100.0 / rho[..., 0], 100.0 / rho[..., 0])
         t = t - step
         if np.max(np.abs(step) * rho[..., 0]) < tol:
             break
@@ -377,6 +381,8 @@ def geocode_image(out, data=None, spacing=None, crs=None, height=None, order=1):
     J = np.concatenate([np.full(33, -0.5), b, np.full(33, ny - 0.5), b])
     ll = [geolocate(out, I, J), geolocate(out, I, J, height=height)]
     xs, ys = (np.concatenate(v) for v in zip(*(fwd(g[1], g[0]) for g in ll)))
+    ok = np.isfinite(xs) & np.isfinite(ys)                         # edge pixels off the DEM (NaN) do not set the extent
+    xs, ys = xs[ok], ys[ok]
     if spacing is None:
         d = max(out['spx'] * l1, out['spy'] * l2)
         spacing = (d / (111320.0 * np.cos(np.radians(lat0))), d / 111132.0) if geo else d

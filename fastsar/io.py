@@ -23,10 +23,14 @@ phase_sign overrides the file's SGN (-1: the phase of a scatterer falls with fre
 form_image; +1: the data are conjugated on reading). By default the file's SGN is used, except for Capella
 collections, whose files declare +1 while their phase follows -1 (checked against the vendor's SICD).
 
-troposphere=True removes the per-pulse troposphere delay at the scene reference point (PVP TDTropoSRP). On the
-Umbra Panama collection (25.1 ns mean, 0.48 ns span) it sharpens 1024 x 1024 crops by 1 to 7 percent (fourth
-moment of the amplitude) and shifts the image 3.8 m in range; without it the image lands on the vendor's SICD
-pixel grid to a quarter pixel near the scene center, so it is off by default.
+troposphere (default None: when the file gives a nonzero delay) removes the per-pulse troposphere delay at the
+scene reference point (PVP TDTropoSRP); False keeps it, True notes its absence. The delay places scatterers too far
+in range: 3.8 m on the Umbra Panama collection (25.1 ns mean), 1.4 m at Silver Peak, Nevada (9.1 ns), where the
+correction moves FastSAR's geocoded image 2 m toward its position in Sentinel-2 and NAIP imagery. Removing it also
+sharpens 1024 x 1024 Panama crops by 1 to 7 percent (fourth moment of the amplitude). Capella's SICD images include
+the correction (a stripmap registers to within a pixel of Capella's SICD with it, 6 pixels or 3.7 m off without);
+Umbra's do not. The ICEYE file checked (X38, 2026) gives a zero delay, so its image keeps the delay: 2.6 m in range,
+which places it 5.9 m from ICEYE's SICD in ground range.
 """
 import numpy as np
 
@@ -84,7 +88,7 @@ def _opt(m, path, conv=None):
     return conv(m) if conv else m
 
 
-def read_cphd(cphd, sicd=None, channel=0, meta=False, regrid_tol=1e-3, drop_flagged=False, troposphere=False, phase_sign=None):
+def read_cphd(cphd, sicd=None, channel=0, meta=False, regrid_tol=1e-3, drop_flagged=False, troposphere=None, phase_sign=None):
     """-> dict(S, ant, fmin, df[, nx, ny, spx, spy, e1, e2]) ready for form_image(**d), and with meta=True also a
     dict of tx, rcv [P, 3] and ref [P] (local frame), R (local axes in ECF rows), srp (ECF origin), times (s from the
     collection start, `start`), the channel's polarization and identifier, the collector, core name and radar mode,
@@ -161,16 +165,16 @@ def read_cphd(cphd, sicd=None, channel=0, meta=False, regrid_tol=1e-3, drop_flag
         if drop_flagged:
             S[flagged] = 0
         notes.append(f'{int(flagged.sum())} pulses flagged SIGNAL=0 (not normal): ' + ('zeroed' if drop_flagged else 'kept'))
-    if troposphere:
-        td = pv('TDTropoSRP')
-        if td is None:
-            notes.append('no TDTropoSRP in the file: troposphere delay not applied')
-        else:
-            td = np.asarray(td, np.float64)[lo:hi]
-            # the data hold the SRP's echo at its tropospheric delay td beyond the geometric one: exp(+j 2 pi f td)
-            # moves it back, f from each pulse's own grid
-            _phase_rows(S, lambda sl: sc0[sl, None] + scss[sl, None] * np.arange(K)[None, :], td, +1)
-            notes.append(f'removed the troposphere delay at the SRP (mean {td.mean() * 1e9:.2f} ns, span {np.ptp(td) * 1e9:.3f} ns)')
+    td = pv('TDTropoSRP') if troposphere is not False else None
+    td = None if td is None else np.asarray(td, np.float64)[lo:hi]
+    if td is None or not np.any(td):
+        if troposphere:
+            notes.append('no troposphere delay in the file (TDTropoSRP absent or zero): not applied')
+    else:
+        # the data hold the SRP's echo at its tropospheric delay td beyond the geometric one: exp(+j 2 pi f td)
+        # moves it back, f from each pulse's own grid
+        _phase_rows(S, lambda sl: sc0[sl, None] + scss[sl, None] * np.arange(K)[None, :], td, +1)
+        notes.append(f'removed the troposphere delay at the SRP (mean {td.mean() * 1e9:.2f} ns, span {np.ptp(td) * 1e9:.3f} ns)')
     f0, df = float(np.median(sc0)), float(np.median(scss))
     t1, t2 = pv('TOA1'), pv('TOA2')
     if t1 is not None and t2 is not None:

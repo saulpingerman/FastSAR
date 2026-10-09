@@ -10,6 +10,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   cubic interpolation, as with linear interpolation (4 before). On three regions of the Umbra Panama collection,
   against a float64 backprojection with profiles oversampled 64 times, the error falls from -59.8 to -69.6 dB to
   -77.5 to -81.5 dB; the profile buffers double. Pass `upsample=4` for the previous behaviour.
+- `read_cphd` and `form_cphd` remove the troposphere delay at the scene reference point (PVP `TDTropoSRP`) by
+  default when the file gives a nonzero delay (`troposphere=None`; before, only with `troposphere=True`). The delay
+  places scatterers too far in range: 1.4 m on an Umbra collection at Silver Peak, Nevada, where the correction
+  moves the geocoded image 2 m toward its position in Sentinel-2 and NAIP imagery, and 3.7 m on a Capella stripmap,
+  which then registers to Capella's SICD within a pixel (6 pixels without). Umbra's SICD images keep the delay, so
+  `troposphere=False` reproduces their pixel grid.
 - The tests are pytest modules (`uv run pytest`) instead of scripts, with every check, limit and case kept;
   shared scenes are module fixtures and backend comparisons run once per backend. Tests marked `cuda` or `tpu`
   are skipped without the device, or fail with `--require cuda,tpu`; tests needing a package of the test group
@@ -24,6 +30,25 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `noxfile.py` (uv environments): `tests` on Python 3.10 to 3.13, `lowest` with numpy, scipy and jax at the lower
   bounds of `pyproject.toml`, and `cuda` and `tpu` for GPU and TPU machines.
 - GitHub Actions workflow running the `tests` and `lowest` sessions on the CPU for each push and pull request.
+- `form_cphd(..., troposphere=)`, passed to `read_cphd`; `sim.write_cphd(..., tropo=)` writes `TDTropoSRP`.
+
+### Fixed
+
+Found by forming collections not used in development (Capella, ICEYE and Umbra open data):
+
+- `ImageFormer` and `form_image` add factorization levels when three cannot split a long grid ("3 levels cannot
+  split ..."); an explicit `levels` is kept.
+- `form_cphd` without a SICD or `spacing` forms square resolution from the central pulses of a spotlight aperture
+  longer than that needs, instead of a grid tens of thousands of pixels long in azimuth, and says so in `notes`.
+- `form_cphd` checks host memory before forming and raises a `MemoryError` naming `extent` and `spacing`.
+- The CPHD image area comes from `ImageAreaCornerPoints`: Capella writes `ImageArea` in grid lines, which read as
+  metres made a 10 by 50 km stripmap footprint 50 by 249 km.
+- `read_cphd` reads in pulse blocks into one complex64 array and applies its corrections in place; a 16.5 GB ICEYE
+  file needed over 128 GB of memory.
+- `backproject` windows the history in row blocks of one complex64 copy; whole-array products took over 128 GB for a
+  320,360-pulse Capella spotlight.
+- `products.geolocate` on terrain steeper than the radar's line of sight (mine pits, cliffs) no longer divides by a
+  vanishing Newton derivative; `geocode_image` failed with an infinite map extent on such a DEM.
 
 ## 0.1.0 (2026-10-09)
 
