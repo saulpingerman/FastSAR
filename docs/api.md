@@ -28,8 +28,8 @@
 - `ExactFormer(ant, fmin, df, K, nx, ny, spx, spy, e1, e2, *, backend='auto', window=True, interp='cubic',
   upsample=None, ref=None, center=None, chunk=1024)`: exact backprojection onto the `form_image` grid (centered on
   `center`, default the origin), set up once; `former(S)` forms each image (`S` may be a CuPy array on the cuda
-  backend). Arguments after `e2` are keyword-only. `interp`: `'cubic'` (default, `upsample=4`) or `'linear'`
-  (`upsample=8`). Attributes `tile` (the pixel tile chosen from the range expansion's predicted error,
+  backend). Arguments after `e2` are keyword-only. `interp`: `'cubic'` (default) or `'linear'`, both at
+  `upsample=8` by default. Attributes `tile` (the pixel tile chosen from the range expansion's predicted error,
   [algorithms.md](algorithms.md#exact-backprojection)) and `predicted_error_db`; a `UserWarning` when even the
   smallest tile misses 3e-4 rad. `memory()`: as for `ImageFormer`, the bytes of the per-chunk buffers and the
   image. A grid wider in range than `c / (2 df)` raises `ValueError`. Monostatic; for bistatic geometry or arbitrary

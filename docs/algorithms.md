@@ -40,9 +40,9 @@ pixel-to-antenna distance, stays below 3e-4 rad of phase at the highest frequenc
 collections keep 32 by 32 tiles; at X band with 1 m pixels, ranges of 1 to 2 km take 8 by 8 tiles. On simulated
 128 by 128 pixel scenes (cubic, against a float64 backprojection at 64 times oversampling) the error is -68 dB from
 0.5 to 20 km and at 600 km. Range profiles are kept only over the reachable bins and read with cubic
-Lagrange interpolation at `upsample=4` (default) or linear interpolation at `upsample=8`. On the Umbra Panama
-collection cubic interpolation measures -70.0 dB against the float64 reference (about that reference's own
-accuracy), and linear -56.9 dB (`tests/test_exact.py` checks -65 and -52 dB on simulated scenes at 20 and 600 km).
+Lagrange interpolation at `upsample=8` (default) or linear interpolation at `upsample=8`. On the Umbra Panama
+collection cubic interpolation measures -67.4 dB against the float64 reference (that reference's own accuracy:
+against a 64 times float64 truth the regions are -77.5 to -81.7 dB), and linear -56.9 dB (`tests/test_exact.py` checks -65 and -52 dB on simulated scenes at 20 and 600 km).
 The CUDA and C++ kernels implement this; on TPU, `ExactFormer` runs `backproject`'s JAX program with linear interpolation, at
 `upsample=16` in place of cubic at 4 (linear keeps 8).
 
