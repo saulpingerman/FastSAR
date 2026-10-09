@@ -59,7 +59,11 @@ def geometry(col, nx, ny, spx, spy, taps=16, e1=(1.0, 0.0, 0.0), e2=(0.0, 1.0, 0
     rev = t[-1] < t[0]                              # pulses are taken in the order of increasing t
     if rev:
         t, ur = t[::-1], ur[::-1]
-    assert np.all(np.diff(t) > 0), 'look angle not monotonic in pulse'
+    if not np.all(np.diff(t) > 0):
+        raise ValueError("polar format needs the look angle in the image plane (from e2 toward e1) to change "
+                         "monotonically from pulse to pulse, and it does not: e1 must lie along the track (azimuth) "
+                         "and e2 across it (range), and the pulses must be in time order without repeated positions; "
+                         "with another grid use algorithm='ffbp' or 'bp'")
     # pulse grid uniform in t, inside the original aperture by m pulses
     t0, t1 = t[m], t[P - 1 - m]
     Pp = P
@@ -91,7 +95,10 @@ def geometry(col, nx, ny, spx, spy, taps=16, e1=(1.0, 0.0, 0.0), e2=(0.0, 1.0, 0
     extent_r = C / (2.0 * col.df)                            # period of a range profile (m)
     extent_a = 2.0 * math.pi / (kr * dt)                     # period of the azimuth profile of each kr row (m)
     edge = (ny * spy / 2.0, nx * spx / 2.0)
-    assert extent_r > 2 * (edge[0] + guard) and extent_a.min() > 2 * (edge[1] + guard), 'scene plus guard exceeds the unambiguous extent'
+    if not (extent_r > 2 * (edge[0] + guard) and extent_a.min() > 2 * (edge[1] + guard)):
+        raise ValueError(f'polar format: the scene ({nx * spx:.1f} by {ny * spy:.1f} m) plus pfa_guard={guard:g} m on each '
+                         f'side exceeds the unambiguous extent ({extent_a.min():.1f} m in azimuth, {extent_r:.1f} m in '
+                         'range); use a smaller pfa_guard or grid')
     return dict(pidx=pidx, taps=taps, kaiser=kaiser, Pp=Pp, K=K, extent_r=extent_r, extent_a=extent_a, edge=edge, guard=guard,
                 alpha=kr_min * scale - col.fmin / col.df,        # [Pp] frequency index at kr_min
                 beta=dkr * scale,                                # [Pp] frequency index step per kr sample
