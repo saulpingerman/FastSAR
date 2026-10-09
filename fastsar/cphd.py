@@ -54,10 +54,25 @@ def _image_area(cphd, meta):
     ref = None if iarp is None else io.ecf_to_local(np.array(iarp.ECF.get_array(), np.float64)[None], meta)[0]
     if ia is None or iarp is None or sc.ReferenceSurface is None or sc.ReferenceSurface.Planar is None:
         return None, ref
+    # the corner points (latitude, longitude) are unambiguous; ImageArea is in metres by the standard, but some
+    # producers write it in ImageGrid lines and samples (Capella: 49,837 lines of 0.2 m read as metres would make a
+    # 10 km footprint 50 km), so it is used only without corner points, and rescaled when it matches the grid's indices
+    iacp = getattr(sc, 'ImageAreaCornerPoints', None)
+    h = float(iarp.LLH.HAE) if getattr(iarp, 'LLH', None) is not None else 0.0
+    if iacp is not None and len(iacp) == 4:
+        ecf = np.array([np.ravel(io.geodetic_to_ecf(float(c.Lat), float(c.Lon), h)) for c in iacp], np.float64)
+        return io.ecf_to_local(ecf, meta), ref
     p0 = np.array(iarp.ECF.get_array(), np.float64)
     ux = np.array(sc.ReferenceSurface.Planar.uIAX.get_array(), np.float64)
     uy = np.array(sc.ReferenceSurface.Planar.uIAY.get_array(), np.float64)
     x1, y1, x2, y2 = ia.X1Y1.X, ia.X1Y1.Y, ia.X2Y2.X, ia.X2Y2.Y
+    g = getattr(sc, 'ImageGrid', None)
+    if g is not None and g.IAXExtent is not None and g.IAYExtent is not None:
+        fx, nx_ = g.IAXExtent.FirstLine, g.IAXExtent.NumLines
+        fy, ny_ = g.IAYExtent.FirstSample, g.IAYExtent.NumSamples
+        if abs(x1 - fx) <= 1 and abs(x2 - (fx + nx_ - 1)) <= 1 and abs(y1 - fy) <= 1 and abs(y2 - (fy + ny_ - 1)) <= 1:
+            sx, sy = float(g.IAXExtent.LineSpacing), float(g.IAYExtent.SampleSpacing)
+            x1, x2, y1, y2 = x1 * sx, x2 * sx, y1 * sy, y2 * sy
     ecf = np.array([p0 + x * ux + y * uy for x, y in ((x1, y1), (x1, y2), (x2, y1), (x2, y2))])
     return io.ecf_to_local(ecf, meta), ref
 

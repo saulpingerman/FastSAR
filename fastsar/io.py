@@ -33,19 +33,21 @@ import numpy as np
 C = 299792458.0
 
 
-def _sinc_regrid(S, u, taps=16, beta=8.0, nbins=4096):
+def _sinc_regrid(S, u, taps=16, beta=8.0, nbins=4096, out=None):
     """Resample each row of S [P, K] at fractional sample positions u [P, K] (Kaiser-windowed sinc from a table of
-    nbins fractional offsets; zero outside the row)."""
+    nbins fractional offsets; zero outside the row). u may be a function of a row slice returning its rows of u, so
+    that the full array is never built; out=S resamples in place (rows are independent)."""
     P, K = S.shape
     h = taps // 2
     fr = np.arange(nbins + 1) / nbins
     x = fr[:, None] - np.arange(-h + 1, h + 1)[None, :]
     W = (np.sinc(x) * np.i0(beta * np.sqrt(np.clip(1 - (x / h) ** 2, 0, None))) / np.i0(beta)).astype(np.float32)
-    out = np.zeros_like(S)
+    out = np.zeros_like(S) if out is None else out
     for p0 in range(0, P, 256):
         sl = slice(p0, min(P, p0 + 256))
-        i0 = np.floor(u[sl]).astype(np.int64)
-        b = np.rint((u[sl] - i0) * nbins).astype(np.int64)
+        us = u(sl) if callable(u) else u[sl]
+        i0 = np.floor(us).astype(np.int64)
+        b = np.rint((us - i0) * nbins).astype(np.int64)
         acc = np.zeros(i0.shape, S.dtype)
         for j, t in enumerate(range(-h + 1, h + 1)):
             i = i0 + t
@@ -53,6 +55,16 @@ def _sinc_regrid(S, u, taps=16, beta=8.0, nbins=4096):
             acc += np.where(ok, W[b, j] * np.take_along_axis(S[sl], np.clip(i, 0, K - 1), axis=1), 0)
         out[sl] = acc
     return out
+
+
+def _phase_rows(S, f, coef, sign):
+    """In place, in row blocks: S[p, k] *= exp(sign 2j pi f[p, k] coef[p]) with f a function of a row slice giving
+    its frequencies (Hz) [rows, K] (no full-size temporary)."""
+    P = S.shape[0]
+    for p0 in range(0, P, 1024):
+        sl = slice(p0, min(P, p0 + 1024))
+        S[sl] *= np.exp(sign * 2j * np.pi * f(sl) * np.asarray(coef, np.float64)[sl, None]).astype(np.complex64)
+    return S
 
 
 def rereference(S, fmin, df, dref):
@@ -100,7 +112,12 @@ def read_cphd(cphd, sicd=None, channel=0, meta=False, regrid_tol=1e-3, drop_flag
     pv = lambda n: r.read_pvp_variable(n, channel)
     tx, rcv, srp = pv('TxPos'), pv('RcvPos'), pv('SRPPos')
     sc0, scss = pv('SC0'), pv('SCSS')
-    S = r.read_chip((0, P), (0, K), index=channel).astype(np.complex64)
+    # read in pulse blocks into one complex64 array; every later step works in place on blocks of rows, so the
+    # reader needs about the history's complex64 size (a 16.5 GB ICEYE file needed over 128 GB with whole-array steps)
+    S = np.empty((P, K), np.complex64)
+    for p0 in range(0, P, 2048):
+        p1 = min(P, p0 + 2048)
+        S[p0:p1] = r.read_chip((p0, p1), (0, K), index=channel)
     notes = []
     sgn = phase_sign
     if sgn is None:
@@ -112,12 +129,15 @@ def read_cphd(cphd, sicd=None, channel=0, meta=False, regrid_tol=1e-3, drop_flag
             sgn = -1
             notes.append('Capella collection: SGN = +1 declared, phase taken as SGN = -1')
     if sgn > 0:
-        S = np.conj(S)
+        np.conjugate(S, out=S)
     # pulses without valid positions or samples at the ends of the aperture are trimmed; an invalid interior
     # position is interpolated from its neighbors, and non-finite interior samples are zeroed
     posbad = ~np.isfinite(tx).all(1) | ~np.isfinite(rcv).all(1) | ~np.isfinite(srp).all(1)
-    S[~np.isfinite(S)] = 0
-    empty = np.abs(S).sum(1) == 0
+    empty = np.zeros(P, bool)
+    for p0 in range(0, P, 2048):
+        blk = S[p0:p0 + 2048]
+        blk[~np.isfinite(blk)] = 0
+        empty[p0:p0 + 2048] = np.abs(blk).sum(1) == 0
     bad = posbad | empty
     sig = pv('SIGNAL')
     flagged = np.zeros(P, bool) if sig is None else np.asarray(sig).ravel() == 0
@@ -149,7 +169,7 @@ def read_cphd(cphd, sicd=None, channel=0, meta=False, regrid_tol=1e-3, drop_flag
             td = np.asarray(td, np.float64)[lo:hi]
             # the data hold the SRP's echo at its tropospheric delay td beyond the geometric one: exp(+j 2 pi f td)
             # moves it back, f from each pulse's own grid
-            S = (S * np.exp(2j * np.pi * (sc0[:, None] + scss[:, None] * np.arange(K)[None, :]) * td[:, None])).astype(np.complex64)
+            _phase_rows(S, lambda sl: sc0[sl, None] + scss[sl, None] * np.arange(K)[None, :], td, +1)
             notes.append(f'removed the troposphere delay at the SRP (mean {td.mean() * 1e9:.2f} ns, span {np.ptp(td) * 1e9:.3f} ns)')
     f0, df = float(np.median(sc0)), float(np.median(scss))
     t1, t2 = pv('TOA1'), pv('TOA2')
@@ -161,10 +181,11 @@ def read_cphd(cphd, sicd=None, channel=0, meta=False, regrid_tol=1e-3, drop_flag
                    f'{C / (2 * df):.0f} m: the samples are not a plain frequency-domain phase history and images will alias')
             warnings.warn(msg)
             notes.append(msg)
-    u = (f0 + np.arange(K)[None, :] * df - sc0[:, None]) / scss[:, None]
-    shift = float(np.abs(u - np.arange(K)[None, :]).max())
+    # u - k is linear in k for each pulse, so its largest magnitude is at the first or the last sample
+    a_, b_ = (f0 - sc0) / scss, df / scss - 1.0
+    shift = float(np.maximum(np.abs(a_), np.abs(a_ + (K - 1) * b_)).max())
     if shift > regrid_tol:
-        S = _sinc_regrid(S, u)
+        _sinc_regrid(S, lambda sl: (f0 + np.arange(K)[None, :] * df - sc0[sl, None]) / scss[sl, None], out=S)
         notes.append(f'resampled per-pulse frequency grids (largest offset {shift:.3g} samples)')
     # local frame at the mid-aperture scene reference point, z along the ellipsoid normal (not the geocentric radial,
     # which leans up to 0.19 degrees from it: 3 m of height across 1 km)
@@ -184,7 +205,7 @@ def read_cphd(cphd, sicd=None, channel=0, meta=False, regrid_tol=1e-3, drop_flag
     if moved > 1e-6:
         if moved < 0.25 * C / (2 * df):
             # exp(-j 4 pi f (|x - a| - ref)) -> exp(-j 4 pi f (|x - a| - ref0))
-            S = rereference(S, f0, df, ref - ref0)
+            _phase_rows(S, lambda sl: np.broadcast_to(f0 + df * np.arange(K), (len(range(*sl.indices(len(S)))), K)), 2 * (ref - ref0) / C, -1)
             notes.append(f're-referenced to the mid-aperture scene reference point (range change up to {moved:.1f} m)')
         else:
             fixed_ref = False
