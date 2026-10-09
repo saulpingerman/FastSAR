@@ -83,8 +83,8 @@ Two Capella Open Data collections were compared with the vendor's SICD:
 
 - Stripmap (2021-11-12, 39,899 pulses of 6,003 samples, scene reference point moving 27.5 km):
   [`examples/form_capella_stripmap.py`](../examples/form_capella_stripmap.py) forms a 512 by 512 crop of the
-  vendor's range / zero-Doppler grid by the patch mosaic (165 patches of about 10,300 pulses, 398 s on four CPU
-  threads). The amplitude images correlate at 0.96.
+  vendor's range / zero-Doppler grid by the patch mosaic (165 patches of about 10,300 pulses; 12 s on the
+  c4d-highmem-16 with release 0.1.0). The amplitude images correlate at 0.993.
 - Spotlight (2024-10-04, 74,203 pulses of 17,282 samples): exact backprojection onto the vendor's pixels correlates
   with the vendor's polar-format image at 0.78 at the scene center and 0.54 off center, where the vendor's image
   carries the polar-format distortion.

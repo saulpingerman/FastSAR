@@ -9,9 +9,9 @@ backprojection, and provides autofocus, interferometry, geolocation, map GeoTIFF
 
 ![FastSAR image of the Panama Canal's Pacific entrance from an Umbra spotlight collection](https://raw.githubusercontent.com/saulpingerman/FastSAR/v0.1.0/docs/images/hero_panama.jpg)
 
-*Panama Canal, Pacific entrance (Umbra open data, 2023-07-18): 12,207 by 8,808 pixels in 4.3 s on an Nvidia L4
-(warm former, transfers included; float32, -59.5 dB against float64 exact backprojection), downsampled. A
-c4d-highmem-16 CPU instance (16 vCPUs, 8 cores) takes 12.4 s. ISCE3, the fastest open-source code that forms this
+*Panama Canal, Pacific entrance (Umbra open data, 2023-07-18): 12,207 by 8,808 pixels in 3.8 s on an Nvidia L4
+(warm former, transfers included; float32, -59.9 dB against float64 exact backprojection), downsampled. A
+c4d-highmem-16 CPU instance (16 vCPUs, 8 cores) takes 11.3 s. ISCE3, the fastest open-source code that forms this
 collection, would take an estimated 4.8 h on that CPU and 27 min on the L4.*
 
 ![Cost per 1000 images against error for FastSAR and five open-source implementations](https://raw.githubusercontent.com/saulpingerman/FastSAR/v0.1.0/docs/images/teaser.png)

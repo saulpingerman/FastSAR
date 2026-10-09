@@ -15,26 +15,28 @@ of the difference over the whole image.
 
 | Configuration | Error (dB) |
 |---|---|
-| CPU, float32 | -59.6 |
-| Nvidia L4, float32 | -59.5 |
-| Nvidia L4, float16 | -58.6 |
-| TPU v5e, three-pass | -57.6 |
-| TPU v6e, three-pass | -57.5 |
-| TPU v5e and v6e, single-pass | -45.8 |
+| Exact backprojection, cubic (CPU and L4) | -70.0 |
+| Exact backprojection, linear, 8x (CPU and L4) | -56.9 |
+| CPU, float32 | -60.0 |
+| Nvidia L4, float32 | -59.9 |
+| Nvidia L4, float16 | -58.9 |
+| TPU v5e, three-pass | -57.9 |
+| TPU v6e, three-pass | -57.8 |
+| TPU v5e and v6e, single-pass | -46.2 |
 | Polar format with the displacement correction (all devices) | -32.1 |
 
 - Float32-class images (float32 on CPU and L4, three-pass on TPU) leave the amplitude visually unchanged; their 5
-  by 5 coherence with the reference exceeds 0.999 even at its 0.1 percentile. The L4 and CPU images are within
-  0.1 dB of a float64 factorized image. The TPU kernels compute the last level's geometry in float32, the probable
-  cause of their 2 dB larger error.
-- The single-pass TPU setting adds 12 dB. The amplitude is unchanged, but the phase deviates by up to 86 degrees beside
-  bright returns (99th percentile 1.0 degree). Use three-pass for interferometry.
+  by 5 coherence with the reference exceeds 0.999 even at its 0.1 percentile. The TPU kernels compute the last
+  level's geometry in float32, the probable cause of their error being up to 2.2 dB larger.
+- The single-pass TPU setting adds 12 dB. The amplitude is unchanged, but the phase deviates by up to 106 degrees beside
+  bright returns (99th percentile 1.1 degrees). Use three-pass for interferometry.
 - Polar format shows striped coherence below 0.99; its residual grows from -40 dB at the scene center to -30 dB in
   the outer quarter ([algorithms.md](algorithms.md#polar-format)).
-- Exact backprojection at the default eightfold oversampling is 0.8 to 4.9 dB farther from the reference than the
-  float32 factorized image on the three regions below; range interpolation sets its error.
+- Exact backprojection with its default cubic interpolation is 10.1 to 13.1 dB more accurate than the float32
+  factorized image on the three Umbra collections, at the limit to which the reference has converged; with linear
+  interpolation at 8 times oversampling, range interpolation sets its error.
 
-On Melbourne and Iowa the factorized configurations are within 1.4 dB of the Panama values.
+On Melbourne and Iowa the factorized configurations are within 1.1 dB of the Panama values.
 
 ![Four Panama regions formed by each configuration, with coherence maps against the reference](images/zoom_panama.png)
 

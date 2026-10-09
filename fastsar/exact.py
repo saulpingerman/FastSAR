@@ -24,9 +24,9 @@ oversampled, linear), cubic at upsample=4 measures -70 dB, at the reference's ow
 upsample=8 -57 dB. On simulated 128 x 128 pixel scenes from 0.5 to 20 km and at 600 km, cubic measures -67 to
 -68 dB against a float64 backprojection at 64 times oversampling.
 
-On an Nvidia L4 the CUDA kernel runs at about 83 billion pixel-pulse pairs per second, bound by the L1 cache's
+On an Nvidia L4 the CUDA kernel runs at about 87 billion pixel-pulse pairs per second, bound by the L1 cache's
 throughput for its data-dependent reads (86% of it, Nsight Compute), so it forms the 12,207 by 8,808 pixel, 15,186-pulse
-Panama image in about 20 s; factorized backprojection (ImageFormer) is faster beyond about 4096 by 4096 pixels and
+Panama image in about 19 s; factorized backprojection (ImageFormer) is faster beyond about 2048 by 2048 pixels and
 exact backprojection below.
 
 Backends: 'cuda' (CuPy kernel; pinned, overlapped upload), 'cpu' (C++ with OpenMP, vectorized over each tile's
