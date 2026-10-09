@@ -136,12 +136,14 @@ Run scripts and records: [sar-accel-study](https://github.com/saulpingerman/sar-
 `ExactFormer` on the Umbra Panama collection (12,207 by 8,808 pixels, 15,186 pulses), host memory to host memory,
 warm former, against the float64 reference:
 
-| Device | Cubic, `upsample=4` | Linear, `upsample=8` |
+| Device | Cubic, `upsample=8` (default) | Linear, `upsample=8` |
 |---|---|---|
-| L4 (g2-standard-4) | 18.7 s, -70.0 dB | 20.3 s, -56.9 dB |
-| c4d-highmem-16 | 403 s, -70.0 dB | 292 s, -56.9 dB |
+| L4 (g2-standard-4) | 24.2 s, -67.4 dB | 20.3 s, -56.9 dB |
+| c4d-highmem-16 | 433 s, -67.4 dB | 292 s, -56.9 dB |
 
-The cubic error is at the limit to which the reference itself has converged. The CUDA kernel runs at about 87
+The cubic error is the reference's own: against a float64 backprojection oversampled 64 times, the reference is
+-67.3 to -68.8 dB on the lock, port and ship regions and the cubic image -77.5 to -81.7 dB (the float32 factorized
+images -57 to -63 dB). Cubic at 4 times, the default before 0.1.1, reaches -59.8 to -69.6 dB against that truth. The CUDA kernel runs at about 87
 billion pixel-pulse pairs per second on the L4; in development it ran at 86% of the L1 cache's throughput for its
 data-dependent reads (Nsight Compute), and staging the profiles in shared memory or reading sample
 pairs as 16-byte words did not make it faster. The C++ kernel runs at about 4 billion per second on the
@@ -149,8 +151,8 @@ c4d-highmem-16, limited by its vector gathers.
 
 Exact backprojection costs pulses times pixels, factorized backprojection about pixels times the logarithm of the
 pulse count plus a fixed cost of reading the history. On square grids at the center of the Panama scene (all 15,186
-pulses, warm formers) on an L4 (g2-standard-4), exact backprojection with cubic interpolation took 0.48, 0.94, 2.99
-and 11.6 s at 1024, 2048, 4096 and 8192 pixels on a side, against 0.98, 0.94, 1.39 and 2.60 s for `ImageFormer`:
-the two meet near 2048 by 2048. On the c4d-highmem-16 factorized backprojection was faster at every size (5.4 against
-2.6 s at 1024 pixels, 250 against 7.2 s at 8192). On the full scenes exact backprojection is 10 to 13 dB more
-accurate. Records: `results/v3/crossover` in sar-accel-study.
+pulses, warm formers) on an L4 (g2-standard-4), exact backprojection with cubic interpolation at 8 times took 0.78, 1.29, 3.85
+and 14.9 s at 1024, 2048, 4096 and 8192 pixels on a side, against 1.00, 0.96, 1.42 and 2.63 s for `ImageFormer`:
+the two meet near 1024 by 1024. On the c4d-highmem-16 factorized backprojection was faster at every size (7.5 against
+2.6 s at 1024 pixels, 269 against 7.2 s at 8192). On the full scenes exact backprojection is 19 to 21 dB more
+accurate against the 64 times truth. Records: `results/v3/crossover` in sar-accel-study.
