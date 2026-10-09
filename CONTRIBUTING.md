@@ -39,7 +39,7 @@ python tests/test_io.py            # CPHD helpers: frequency resampling, re-refe
 python tests/test_wide_angle.py    # 10 to 360 degree apertures against exact backprojection
 python tests/test_insar.py         # change detection and interferometric height (needs finufft)
 python tests/test_chain.py         # simulated CPHD to geolocation, map GeoTIFFs, SICD and autofocus (needs sarpy, rasterio)
-python tests/test_exact.py         # ExactFormer, cubic and linear, at 20 and 600 km against upsample=64 backprojection
+python tests/test_exact.py         # ExactFormer: 1 to 600 km and a wide near-range grid against backprojection, validation
 python tests/test_units.py         # filters, program cache, aperture weights, mosaic pieces, input checks
 python tests/test_cphd.py          # read_cphd and form_cphd on simulated collections (stand-in CPHD reader)
 python tests/test_planning.py      # bucket planning, memory models, TPU out-of-memory retry, program cache

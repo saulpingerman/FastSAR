@@ -29,10 +29,17 @@ T=16 gives -47.0 dB (T=32: -35.7 dB); at 16 km, T=32 gives -47.7 dB. The predict
 ## Exact backprojection
 
 `ExactFormer` forms an exact backprojection on the `form_image` grid. Everything that depends only on the geometry
-is computed once: the window, 32 by 32 pixel tiles and their centers, and the range bins each pulse can reach. Each
-pixel's range is its tile center's, in float64 once per tile and pulse, plus a second-order expansion in its
-offset from the center, whose error is nanometers for tiles of tens of meters at orbital range; no division or
-square root is evaluated per pixel. Range profiles are kept only over the reachable bins and read with cubic
+is computed once: the window, the pixel tiles and their centers, and the range bins each pulse can reach (from the
+grid's nearest point to the antenna, by projection onto the plane, to its farthest corner). Each pixel's range is
+its tile center's, in float64 once per tile and pulse, plus a third-order expansion in its offset `d` from the
+center: with `u` the unit vector from the antenna to the center, `r` their distance, `du = d.u` and
+`D2 = |d|^2 - du^2`, `|w + d| - |w| = du + D2 / (2 r) - du D2 / (2 r^2)`; no division or square root is evaluated
+per pixel. The next term is at most `h^4 / (8 r^3)` for a tile of half-diagonal `h`. Each former takes the largest
+tile (32 by 32 down to 4 by 4 pixels on the CPU, 8 by 8 on CUDA) whose bound `h^4 / (2 r^3)`, with `r` the smallest
+pixel-to-antenna distance, stays below 3e-4 rad of phase at the highest frequency, and warns when none does. Orbital
+collections keep 32 by 32 tiles; at X band with 1 m pixels, ranges of 1 to 2 km take 8 by 8 tiles. On simulated
+128 by 128 pixel scenes (cubic, against a float64 backprojection at 64 times oversampling) the error is -68 dB from
+0.5 to 20 km and at 600 km. Range profiles are kept only over the reachable bins and read with cubic
 Lagrange interpolation at `upsample=4` (default) or linear interpolation at `upsample=8`. On the Umbra Panama
 collection cubic interpolation measures -70.0 dB against the float64 reference (about that reference's own
 accuracy), and linear -56.9 dB (`tests/test_exact.py` checks -65 and -52 dB on simulated scenes at 20 and 600 km).

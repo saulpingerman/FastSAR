@@ -89,9 +89,10 @@ def _backend(backend):
     return backend
 
 
-def _check_history(S, P=None, name='phase history'):
-    """S [P, K] complex (numpy or cupy) with at least 2 pulses and 2 samples, all finite; -> S unchanged. Real or
-    integer samples are refused (an I/Q pair interleaved along the last axis is S[..., 0] + 1j * S[..., 1])."""
+def _check_history(S, P=None, name='phase history', finite=True):
+    """S [P, K] complex (numpy or cupy) with at least 2 pulses and 2 samples, all finite (finite=False: the scan
+    for NaN and inf is left to the caller); -> S unchanged. Real or integer samples are refused (an I/Q pair
+    interleaved along the last axis is S[..., 0] + 1j * S[..., 1])."""
     if not hasattr(S, 'ndim'):
         S = np.asarray(S)
     if S.ndim != 2:
@@ -103,7 +104,7 @@ def _check_history(S, P=None, name='phase history'):
     if S.shape[0] < 2 or S.shape[1] < 2:
         raise ValueError(f'{name} needs at least 2 pulses and 2 samples, got shape {tuple(S.shape)}')
     # a sum per block of rows: one pass, no full-size temporary
-    for i in range(0, S.shape[0], 4096):
+    for i in range(0, S.shape[0] if finite else 0, 4096):
         if not np.isfinite(complex(S[i:i + 4096].sum())):
             first = i + int(np.argmax((~np.isfinite(S[i:i + 4096])).any(1)))
             raise ValueError(f'{name} has non-finite samples (NaN or inf), the first in pulse {first}; '
@@ -396,15 +397,24 @@ class ImageFormer:
 
 def form_image(S, ant, fmin, df, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 1.0, 0.0), algorithm='ffbp',
                backend='auto', precision='float32', window=True, T='auto', levels=3, pmax=0.4, pfa_guard=300.0, target_db=-40.0,
-               ref=None):
-    """Form the complex image [nx, ny] (complex64). See the module docstring for the arguments. For more than one
-    image of the same geometry, build an ImageFormer once and call it; this function sets one up on every call."""
+               ref=None, interp=None, upsample=None, center=None):
+    """Form the complex image [nx, ny] (complex64). See the module docstring for the arguments. precision, T, levels,
+    pmax and target_db apply to factorized backprojection, pfa_guard to polar format, and interp ('cubic' or
+    'linear'), upsample and center to exact backprojection (algorithm='bp'; see ExactFormer). For more than one
+    image of the same geometry, build an ImageFormer (or ExactFormer) once and call it; this function sets one up
+    on every call."""
     if algorithm not in ('ffbp', 'pfa', 'bp'):
         raise ValueError("algorithm must be 'ffbp', 'pfa' or 'bp'")
-    S = _check_history(np.asarray(S), len(_check_positions(ant)))
+    if algorithm != 'bp':
+        for n, v in (('interp', interp), ('upsample', upsample), ('center', center)):
+            if v is not None:
+                raise ValueError(f"{n} applies to exact backprojection (algorithm='bp'), not to algorithm={algorithm!r}")
+    # the formers scan S for NaN and inf themselves; polar format is checked here
+    S = _check_history(np.asarray(S), len(_check_positions(ant)), finite=algorithm == 'pfa')
     if algorithm == 'bp':
         from .exact import ExactFormer
-        return ExactFormer(ant, fmin, df, S.shape[1], nx, ny, spx, spy, e1, e2, backend, window, ref=ref)(S)
+        return ExactFormer(ant, fmin, df, S.shape[1], nx, ny, spx, spy, e1, e2, backend=backend, window=window,
+                           interp='cubic' if interp is None else interp, upsample=upsample, ref=ref, center=center)(S)
     if algorithm == 'pfa':
         nx, ny, e1, e2 = _check_grid(nx, ny, spx, spy, e1, e2)
         P, K = S.shape
@@ -418,8 +428,8 @@ def form_image(S, ant, fmin, df, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
             wp, wk = _window(P, K)
             S = (S * wp[:, None] * wk[None, :]).astype(np.complex64)
         return _pfa(S.astype(np.complex64), col, nx, ny, spx, spy, np.asarray(e1, np.float64), np.asarray(e2, np.float64), pfa_guard)
-    return ImageFormer(ant, fmin, df, S.shape[1], nx, ny, spx, spy, e1, e2, backend, precision, window, T, levels, pmax, target_db,
-                       ref=ref)(S)
+    return ImageFormer(ant, fmin, df, S.shape[1], nx, ny, spx, spy, e1, e2, backend=backend, precision=precision,
+                       window=window, T=T, levels=levels, pmax=pmax, target_db=target_db, ref=ref)(S)
 
 
 def _pfa(S, col, nx, ny, spx, spy, e1, e2, guard=300.0):

@@ -9,8 +9,9 @@ First release.
 ### Added
 
 - `fastsar.ExactFormer`: exact backprojection onto the `form_image` grid, set up once per geometry, with CUDA and
-  C++ kernels (float64 tile centers, a second-order expansion within each tile, cubic or linear interpolation of
-  cropped range profiles); `form_image(..., algorithm='bp')`.
+  C++ kernels (float64 tile centers, a third-order expansion within each tile, the tile size chosen from the
+  expansion's predicted error, cubic or linear interpolation of cropped range profiles);
+  `form_image(..., algorithm='bp')` with `interp`, `upsample` and `center`.
 - `fastsar.form_cphd`: one call from a CPHD file to an image; spotlight or moving beam chosen from the scene
   reference point, ground-plane grid at the scene reference height, SICD optional.
 - `products.geolocate` and `products.locate`: latitude, longitude and height of `form_cphd` pixels on the image
