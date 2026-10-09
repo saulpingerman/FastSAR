@@ -7,6 +7,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Fas
 
 ### Added
 
+- `fastsar.ExactFormer`: exact backprojection onto the `form_image` grid, set up once per geometry, with CUDA and
+  C++ kernels (float64 tile centers, a second-order expansion within each tile, cubic or linear interpolation of
+  cropped range profiles); `form_image(..., algorithm='bp')`.
 - `fastsar.form_cphd`: one call from a CPHD file to an image; spotlight or moving beam chosen from the scene
   reference point, ground-plane grid at the scene reference height, SICD optional.
 - `products.geolocate` and `products.locate`: latitude, longitude and height of `form_cphd` pixels on the image

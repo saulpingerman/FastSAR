@@ -127,3 +127,25 @@ by microbenchmarks on the same device.
 v6e (single-pass) and the L4 (float32 data, TF32 tensor-core matrix products), in the JAX program.*
 
 Run scripts and records: [sar-accel-study](https://github.com/saulpingerman/sar-accel-study).
+
+## Exact backprojection
+
+`ExactFormer` on the Umbra Panama collection (12,207 by 8,808 pixels, 15,186 pulses), host memory to host memory,
+warm former, against the float64 reference:
+
+| Device | Cubic, `upsample=4` | Linear, `upsample=8` |
+|---|---|---|
+| L4 (g2-standard-4) | 18.3 s, -70.0 dB | 18.7 s, -56.9 dB |
+| c4d-highmem-16 | 396 s, -70.0 dB | 286 s, -56.9 dB |
+
+The CUDA kernel runs at about 83 billion pixel-pulse pairs per second on the L4, at 86% of the L1 cache's
+throughput for its data-dependent reads (Nsight Compute); staging the profiles in shared memory or reading sample
+pairs as 16-byte words did not make it faster. The C++ kernel runs at about 4 billion per second on the
+c4d-highmem-16, limited by its vector gathers.
+
+Exact backprojection costs pulses times pixels, factorized backprojection about pixels times the logarithm of the
+pulse count plus a fixed cost of reading the history. On centered crops of the Panama image on an L4 (a g2-standard-8
+development instance), exact backprojection with cubic interpolation was faster up to 2048 by 2048 pixels (0.62 and
+1.12 s against 2.72 and 2.62 s for `ImageFormer`) and slower from 4096 by 4096 (3.92 against 3.16 s), and about 10 dB
+more accurate at every size. On the c4d-highmem-16 factorized backprojection was faster at every size from 1024 by
+1024 pixels.

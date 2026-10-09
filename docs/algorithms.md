@@ -28,6 +28,17 @@ T=16 gives -47.0 dB (T=32: -35.7 dB); at 16 km, T=32 gives -47.7 dB. The predict
 
 ## Exact backprojection
 
+`ExactFormer` forms an exact backprojection on the `form_image` grid. Everything that depends only on the geometry
+is computed once: the window, 32 by 32 pixel tiles and their centers, and the range bins each pulse can reach. Each
+pixel's range is its tile center's, in float64 once per tile and pulse, plus a second-order expansion in its
+offset from the center, whose error is nanometres for tiles of tens of metres at orbital range; no division or
+square root is evaluated per pixel. Range profiles are kept only over the reachable bins and read with cubic
+Lagrange interpolation at `upsample=4` (default) or linear interpolation at `upsample=8`. On the Umbra Panama
+collection cubic interpolation measures -70.0 dB against the float64 reference, which is that reference's own
+accuracy, and linear -56.9 dB (`tests/test_exact.py` checks -65 and -52 dB on simulated scenes at 20 and 600 km).
+The CUDA and C++ kernels implement this; on TPU, `ExactFormer` runs `backproject`'s JAX program, linear at four
+times the oversampling.
+
 `backproject` forms the image at any points, such as `plane_points(...)` on a DEM; `rcv` makes it bistatic (`ant` is
 then the transmitter) and `ref` handles a moving reference point. Its cost is pulses times points. Each pulse is
 range compressed by an FFT zero-padded `upsample` times (default 8) and read with linear interpolation. Ranges are

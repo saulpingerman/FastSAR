@@ -14,7 +14,7 @@
   frequency support along e1, e2), `window`, `phase_error` (or None), `meta` (from `read_cphd`), `notes`.
 - `form_image(S, ant, fmin, df, nx, ny, spx, spy, e1, e2, algorithm='ffbp', backend='auto', precision='float32',
   window=True, T='auto', ..., target_db=-40.0, ref=None)`: a spotlight image on a grid centered on the frame origin
-  ([algorithms.md](algorithms.md)). `algorithm`: `'ffbp'` or `'pfa'`. `ref` [P]: the one-way range each pulse's
+  ([algorithms.md](algorithms.md)). `algorithm`: `'ffbp'`, `'pfa'` or `'bp'` (exact backprojection, `ExactFormer`). `ref` [P]: the one-way range each pulse's
   samples are referenced to when it is not `|ant|` (a bistatic half path, a vendor's reference point).
 - `ImageFormer(ant, fmin, df, K, nx, ny, spx, spy, e1, e2, backend='auto', precision='float32', ...,
   aperture_weight=None, ref=None)`: plans and compiles once; `former(S)` forms each image. Attributes `T`,
@@ -22,6 +22,10 @@
   bytes full speed needs and the bytes free, as `dict(backend, needed, available, full_speed, parts)`.
   `stage(S)`: the checks, scaling and upload of `S` ahead of formation on the JAX and TPU backends;
   `former(former.stage(S))` equals `former(S)`.
+- `ExactFormer(ant, fmin, df, K, nx, ny, spx, spy, e1, e2, backend='auto', window=True, interp='cubic',
+  upsample=None, ref=None, center=None, chunk=1024)`: exact backprojection onto the `form_image` grid (centered on
+  `center`, default the origin), set up once; `former(S)` forms each image. `interp`: `'cubic'` (default,
+  `upsample=4`) or `'linear'` (`upsample=8`). Monostatic; for bistatic geometry or arbitrary points use `backproject`.
 - `MemoryWarning`: a `UserWarning` subclass issued when a former falls back to a slower path for lack of memory
   ([performance.md](performance.md#memory)). A TPU that cannot hold the history raises `MemoryError`.
 - `backproject(S, ant, fmin, df, points, rcv=None, ref=None, backend='auto', upsample=8, window=True, chunk=256)`:

@@ -61,7 +61,7 @@ vendor grids.
 |---|---|---|---|---|
 | Factorized backprojection | C++/OpenMP, AVX-512 or AVX2 | CUDA via CuPy | Pallas | reference program |
 | Precision | float32 | float32, float16 | three-pass (default), single-pass | float32, float16 |
-| Exact backprojection | float64 | float32, float64 block centers | falls back to `jax` | float32, float64 block centers |
+| Exact backprojection (`ExactFormer`) | C++/OpenMP, float32 with float64 tile centers | CUDA, the same | falls back to `jax` | float32, float64 block centers |
 
 Polar format (`algorithm='pfa'`) runs as a JAX program on any device.
 
