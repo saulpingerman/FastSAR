@@ -449,6 +449,7 @@ class ExactFormer:
 
     def _form_cuda(self, S):
         import cupy as cp
+        cp.get_default_memory_pool().free_all_blocks()      # blocks cached by earlier calls or other formers
         P, K, nfft, W, d = self.P, self.K, self.nfft, self.W, self._d
         ch = min(self.chunk, P)
         on_device = not isinstance(S, np.ndarray)          # a CuPy history is read in place
