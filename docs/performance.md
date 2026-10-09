@@ -96,7 +96,7 @@ warnings.simplefilter('ignore', fastsar.MemoryWarning)   # silence the fallback 
 | Variable | Default | Effect |
 |---|---|---|
 | `CXX` | `g++` | CPU kernel compiler; builds are cached in `~/.cache/fastsar` |
-| `FFBP_CPU_FLAGS` | `-O3 -march=native -mprefer-vector-width=512 -funroll-loops` (`backproject`: `-O3 -march=native`; `ExactFormer`: `-O3 -march=native -ffast-math`) | compiler flags |
+| `FFBP_CPU_FLAGS` | `-O3 -march=native -mprefer-vector-width=512 -funroll-loops` (`backproject` and `ExactFormer`: `-O3 -march=native`) | compiler flags; `ExactFormer` always adds `-ffast-math` (its sines and cosines vectorize only with it), at compile time only: the shared objects are linked without it, so loading them leaves the process's floating-point mode alone. Builds are cached per source, compiler, flags and CPU |
 | `FASTSAR_CPU_GROUP_GB` | a quarter of available memory | CPU first-level group budget (GB) |
 | `FASTSAR_CUDA_GROUP` | from free memory: 8 at full speed | CUDA first-level children per group |
 | `FASTSAR_TPU_GROUP` | from the device's memory: 4 at full speed | TPU first-level children per group |

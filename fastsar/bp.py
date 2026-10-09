@@ -17,7 +17,7 @@ is -39 dB at upsample=2, -51 at 4, -63 at 8 (the default), -75 at 16 and -88 at 
 Ranges are computed in float64 at the center of each block of nearby points and in float32 only for offsets
 within the block, so float32 kernels keep their accuracy at orbital range.
 """
-import ctypes, hashlib, os, subprocess
+import ctypes, os
 
 import numpy as np
 
@@ -143,17 +143,8 @@ _cpu_lib = None
 def _cpu():
     global _cpu_lib
     if _cpu_lib is None:
-        tag = hashlib.sha1(_CPU_SRC.encode()).hexdigest()[:12]
-        d = os.path.join(os.path.expanduser('~'), '.cache', 'fastsar')
-        os.makedirs(d, exist_ok=True)
-        so, src = os.path.join(d, f'libbp_cpu_{tag}.so'), os.path.join(d, f'bp_cpu_{tag}.cpp')
-        if not os.path.exists(so):
-            with open(src, 'w') as fh:
-                fh.write(_CPU_SRC)
-            flags = os.environ.get('FFBP_CPU_FLAGS', '-O3 -march=native')
-            subprocess.run([os.environ.get('CXX', 'g++')] + flags.split() + ['-fopenmp', '-shared', '-fPIC', src, '-o', so + '.tmp'],
-                           check=True)
-            os.replace(so + '.tmp', so)
+        from ._build import shared_object
+        so = shared_object('bp_cpu', _CPU_SRC, os.environ.get('FFBP_CPU_FLAGS', '-O3 -march=native').split())
         L = ctypes.CDLL(so)
         f32 = np.ctypeslib.ndpointer(np.float32, flags='C_CONTIGUOUS')
         f64 = np.ctypeslib.ndpointer(np.float64, flags='C_CONTIGUOUS')

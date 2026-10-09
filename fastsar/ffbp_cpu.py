@@ -5,7 +5,7 @@ same host-side orchestration as the CUDA pipeline (ffbp_cuda.py), with NumPy for
 
 The shared library is compiled on first use with g++ (-O3 -march=native -fopenmp) into ~/.cache/fastsar.
 """
-import ctypes, hashlib, os, subprocess, time
+import ctypes, os, time
 
 import numpy as np
 
@@ -29,16 +29,9 @@ def lib():
         return _lib
     with open(_SRC) as fh:
         src = fh.read()
-    tag = hashlib.sha1(src.encode()).hexdigest()[:12]
-    d = os.path.join(os.path.expanduser('~'), '.cache', 'fastsar')
-    os.makedirs(d, exist_ok=True)
-    so = os.path.join(d, f'libffbp_cpu_{tag}.so')
-    if not os.path.exists(so):
-        cxx = os.environ.get('CXX', 'g++')
-        flags = os.environ.get('FFBP_CPU_FLAGS', '-O3 -march=native -mprefer-vector-width=512 -funroll-loops')
-        cmd = [cxx] + flags.split() + ['-fopenmp', '-shared', '-fPIC', '-std=c++17', _SRC, '-o', so + '.tmp']
-        subprocess.run(cmd, check=True)
-        os.replace(so + '.tmp', so)
+    from ._build import shared_object
+    flags = os.environ.get('FFBP_CPU_FLAGS', '-O3 -march=native -mprefer-vector-width=512 -funroll-loops')
+    so = shared_object('ffbp_cpu', src, flags.split() + ['-std=c++17'])
     L = ctypes.CDLL(so)
     f32 = np.ctypeslib.ndpointer(np.float32, flags='C_CONTIGUOUS')
     f64 = np.ctypeslib.ndpointer(np.float64, flags='C_CONTIGUOUS')
