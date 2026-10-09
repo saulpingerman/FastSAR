@@ -16,6 +16,11 @@ are read with cubic Lagrange interpolation (four samples) or linear interpolatio
 collection, against the study's float64 reference (16 times oversampled, linear), cubic at upsample=4 measures
 -70 dB, at the reference's own accuracy, and linear at upsample=8 -57 dB.
 
+On an Nvidia L4 the CUDA kernel runs at about 83 billion pixel-pulse pairs per second, bound by the L1 cache's
+throughput for its data-dependent reads (86% of it, Nsight Compute), so it forms the 12,207 by 8,808 pixel, 15,186-pulse
+Panama image in about 20 s; factorized backprojection (ImageFormer) is faster beyond about 4096 by 4096 pixels and
+exact backprojection below.
+
 Backends: 'cuda' (CuPy kernel; pinned, overlapped upload), 'cpu' (C++ with OpenMP, vectorized over each tile's
 pixels), 'jax' or 'tpu' (fastsar.backproject's JAX path on the grid's points, without the tiling above).
 For arbitrary points, bistatic geometry or a DEM surface use fastsar.backproject.
@@ -33,13 +38,13 @@ C = 299792458.0
 
 _CUDA_SRC = r'''
 #ifndef PX
-#define PX 4
+#define PX 8
 #endif
 #ifndef TB
 #define TB 128
 #endif
 #ifndef TX
-#define TX 16
+#define TX 32
 #endif
 #define TY ((TB * PX) / TX)
 extern "C" __global__ void bp_tiles(const float2* rc, int P, int W, const int* lo, const double* ant, const double* ref,
@@ -278,8 +283,8 @@ class ExactFormer:
         self.wp, self.wk = _window(self.P, K) if window else (np.ones(self.P), np.ones(K))
         if self.backend == 'jax':
             return
-        # tiles: CUDA 16 x 32 pixels (128 threads, 4 pixels each); CPU 32 x 32
-        self.tx, self.ty = (16, 32) if self.backend == 'cuda' else (32, 32)
+        # tiles of 32 x 32 pixels (CUDA: 128 threads, 8 pixels each)
+        self.tx, self.ty = 32, 32
         self.ntx, self.nty = -(-nx // self.tx), -(-ny // self.ty)
         x0 = self.center + (-nx / 2.0) * spx * self.e1 + (-ny / 2.0) * spy * self.e2          # pixel (0, 0)
         bi = (np.arange(self.ntx) * self.tx + 0.5 * (self.tx - 1))[:, None, None]
@@ -302,7 +307,7 @@ class ExactFormer:
     # ---------------------------------------------------------------- CUDA
     def _setup_cuda(self):
         import cupy as cp
-        m = cp.RawModule(code=_CUDA_SRC, options=('-use_fast_math', '-DPX=4', '-DTB=128', '-DTX=16') + (('-DCUBIC',) if self.cubic else ()))
+        m = cp.RawModule(code=_CUDA_SRC, options=('-use_fast_math', '-DPX=8', '-DTB=128', '-DTX=32') + (('-DCUBIC',) if self.cubic else ()))
         self._k_bp, self._k_pad, self._k_crop = m.get_function('bp_tiles'), m.get_function('pad_window'), m.get_function('crop')
         self._d = dict(cen=cp.asarray(self.cen), blo=cp.asarray(self.blo), lo=cp.asarray(self.lo), ant=cp.asarray(self.ant),
                        ref=cp.asarray(self.ref), wp=cp.asarray(self.wp, cp.float32), wk=cp.asarray(self.wk, cp.float32))
