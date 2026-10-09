@@ -239,4 +239,12 @@ jx = pt.form_mosaic(fx, col.ant[keep], o, 128, 128, 0.5, 0.5, e1, e2, patch=(64,
 e = 10 * np.log10(np.sum(np.abs(jx - ex) ** 2) / np.sum(np.abs(ex) ** 2))
 print(f'jax mosaic against exact backprojection: {e:.1f} dB')
 assert e < -45, e
+
+# (f) one patch on the JAX backend: the first and only patch takes its gate and pulse count from the slack path
+# (padded_gate, padded_pulses: no planned lengths, nothing taken yet), its pulses padded to a multiple of 256
+info = []
+j1 = pt.form_mosaic(fx, col.ant[keep], o, 128, 128, 0.5, 0.5, e1, e2, patch=(128, 128), backend='jax', info=info)
+e = 10 * np.log10(np.sum(np.abs(j1 - ex) ** 2) / np.sum(np.abs(ex) ** 2))
+print(f'jax single patch against exact backprojection: {e:.1f} dB; {info}')
+assert len(info) == 1 and e < -45, (info, e)
 print('ok')
