@@ -4,8 +4,8 @@
 
 ## How it was tested
 
-<!-- Which tests/*.py scripts you ran, on which backends and devices, and the errors they printed
-     before and after if a kernel or algorithm changed. -->
+<!-- Which tests you ran (pytest, or the nox sessions tests, lowest, cuda, tpu), on which backends and devices,
+     and the errors they printed (pytest -s) before and after if a kernel or algorithm changed. -->
 
 - [ ] Tests run:
 - [ ] Documentation updated if the API or a documented result changed

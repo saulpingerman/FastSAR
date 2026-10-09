@@ -15,4 +15,4 @@ Methods and results:
 - [Performance](performance.md): time, cost, memory, environment variables
 - [Comparison with open-source implementations](comparison.md)
 
-Test results come from the scripts in `tests/` on small simulated scenes ([CONTRIBUTING.md](../CONTRIBUTING.md)).
+Test results come from the tests in `tests/` on small simulated scenes ([CONTRIBUTING.md](../CONTRIBUTING.md)).
