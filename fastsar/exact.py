@@ -37,6 +37,7 @@ import ctypes
 import os
 
 import numpy as np
+from . import memory as _mem
 
 C = 299792458.0
 
@@ -447,7 +448,7 @@ class ExactFormer:
         self._hbuf = [np.frombuffer(b, np.complex64, ch * self.K).reshape(ch, self.K) for b in self._pin]
         self._stream = cp.cuda.Stream(non_blocking=True)
 
-    def _form_cuda(self, S):
+    def _form_cuda(self, S, check=False):
         import cupy as cp
         cp.get_default_memory_pool().free_all_blocks()      # blocks cached by earlier calls or other formers
         P, K, nfft, W, d = self.P, self.K, self.nfft, self.W, self._d
@@ -459,6 +460,7 @@ class ExactFormer:
         win = cp.empty((ch, W), cp.complex64)
         chunks = [(p0, min(P, p0 + ch)) for p0 in range(0, P, ch)]
         used = [None, None]
+        bad = cp.zeros((), cp.bool_)            # a non-finite sample seen (read once, at the end)
 
         def stage(i):        # host copy into a pinned buffer, then an asynchronous upload on the copy stream
             if on_device:
@@ -481,6 +483,8 @@ class ExactFormer:
                 cp.cuda.get_current_stream().wait_event(up)
             src = S[p0:p1] if on_device else dev[b]
             self._k_pad((-(-n * K // 256),), (256,), (src, d['wp'][p0:p1], d['wk'], np.int32(n), np.int32(K), np.int32(nfft), pad))
+            if check:
+                bad |= ~cp.isfinite(src[:n].sum())
             used[b] = cp.cuda.Event()
             used[b].record()
             if i + 1 < len(chunks):
@@ -493,6 +497,9 @@ class ExactFormer:
                         np.int32(self.nty), np.int32(self.nx), np.int32(self.ny), f32(self.spx), f32(self.spy),
                         f32(self.e1[0]), f32(self.e1[1]), f32(self.e1[2]), f32(self.e2[0]), f32(self.e2[1]), f32(self.e2[2]),
                         np.float64(self.inv_dr), np.float64(self.kcyc), out))
+        if check and bool(bad):
+            from .api import _check_history
+            _check_history(S if isinstance(S, np.ndarray) else cp.asnumpy(S))       # raises, naming the first pulse
         return cp.asnumpy(out)
 
     # ---------------------------------------------------------------- CPU
@@ -557,10 +564,12 @@ class ExactFormer:
         from .api import _check_history
         if not (self.backend == 'cuda' and type(S).__module__.startswith('cupy')):
             S = np.asarray(S)
+        if self.backend == 'cuda' and isinstance(S, np.ndarray):     # the scan for NaN and inf runs on the GPU
+            return self._form(_check_history(S, self.P, finite=False), check=True)
         return self._form(_check_history(S, self.P))
 
-    def _form(self, S):
-        """S already checked (form_image checks it once)."""
+    def _form(self, S, check=False):
+        """S already checked (form_image checks it once); check: scan for non-finite samples on the GPU."""
         if S.shape[1] != self.K:
             raise ValueError(f'phase history must have {self.K} samples per pulse, got {S.shape[1]}')
         S = S.astype(np.complex64, copy=False)
@@ -568,7 +577,16 @@ class ExactFormer:
             if not isinstance(S, np.ndarray):
                 import cupy as cp
                 S = cp.ascontiguousarray(S)
-            return self._form_cuda(S)
+            import cupy as cp
+            while True:
+                try:
+                    return self._form_cuda(S, check)
+                except cp.cuda.memory.OutOfMemoryError:
+                    if self.chunk <= 64:
+                        raise
+                    self.chunk //= 2        # memory held elsewhere (another former, JAX): fewer pulses per chunk
+                    _mem._warn(f'cuda: out of GPU memory; ExactFormer continues with {self.chunk} pulses per chunk '
+                               f'({_mem._gb(_mem.cuda_free())} free)')
         if self.backend == 'cpu':
             return self._form_cpu(S)
         from .bp import backproject, plane_points
