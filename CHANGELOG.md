@@ -47,6 +47,8 @@ Found by forming collections not used in development (Capella, ICEYE and Umbra o
   file needed over 128 GB of memory.
 - `backproject` windows the history in row blocks of one complex64 copy; whole-array products took over 128 GB for a
   320,360-pulse Capella spotlight.
+- `ImageFormer` on the cpu, jax and tpu backends windows a host history the same way (one complex64 copy, row
+  blocks); the whole-array product held three copies of the 54 GB history of that spotlight.
 - `products.geolocate` on terrain steeper than the radar's line of sight (mine pits, cliffs) no longer divides by a
   vanishing Newton derivative; `geocode_image` failed with an infinite map extent on such a DEM.
 

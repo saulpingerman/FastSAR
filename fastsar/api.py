@@ -329,8 +329,15 @@ class ImageFormer:
             wp, wk = self.wp, self.wk
             if not isinstance(S, np.ndarray):
                 import cupy as cp
-                wp, wk = cp.asarray(wp), cp.asarray(wk)
-            S = (S * wp[:, None] * wk[None, :]).astype(np.complex64)
+                S = (S * cp.asarray(wp)[:, None] * cp.asarray(wk)[None, :]).astype(np.complex64)
+            else:
+                # one complex64 copy, windowed in row blocks: whole-array products would hold two more copies of a
+                # history that is tens of GB for a long spotlight (320,360 pulses by 20,996 samples: 54 GB)
+                out = np.empty(S.shape, np.complex64)
+                for p0 in range(0, self.P, 4096):
+                    sl = slice(p0, min(self.P, p0 + 4096))
+                    np.multiply(S[sl], (wp[sl, None] * wk[None, :]).astype(np.float32), out=out[sl])
+                S = out
         else:
             S = S.astype(np.complex64, copy=False)
         if not S.flags.c_contiguous:              # a transposed or strided view (the kernels read rows in place)
