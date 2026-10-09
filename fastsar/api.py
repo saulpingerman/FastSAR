@@ -442,28 +442,54 @@ def form_image(S, ant, fmin, df, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
             if np.shape(ref) != (P,):
                 raise ValueError(f'ref must hold one range per pulse ({P}), got shape {np.shape(ref)}')
             S = rereference(S, float(fmin), float(df), np.asarray(ref, np.float64) - np.linalg.norm(col.ant, axis=1))
-        if window:
-            wp, wk = _window(P, K)
-            S = (S * wp[:, None] * wk[None, :]).astype(np.complex64)
-        return _pfa(S.astype(np.complex64), col, nx, ny, spx, spy, np.asarray(e1, np.float64), np.asarray(e2, np.float64), pfa_guard)
+        return _pfa(S, col, nx, ny, spx, spy, np.asarray(e1, np.float64), np.asarray(e2, np.float64), pfa_guard, window)
     return ImageFormer(ant, fmin, df, S.shape[1], nx, ny, spx, spy, e1, e2, backend=backend, precision=precision,
                        window=window, T=T, levels=levels, pmax=pmax, target_db=target_db, ref=ref)(S)
 
 
-def _pfa(S, col, nx, ny, spx, spy, e1, e2, guard=300.0):
+_PFA_PROGRAMS = {}
+_PFA_LOCK = threading.Lock()
+
+
+def _pfa(S, col, nx, ny, spx, spy, e1, e2, guard=300.0, window=True):
     """Polar format with its final resampling (removes the planar-wavefront displacement), pulse resampling in
     gather form. The frequency samples are weighted by f_c / f_k so that polar format applies the same spectral
-    weighting as backprojection (the polar Jacobian)."""
+    weighting as backprojection (the polar Jacobian). The compiled program and its geometry arrays are kept per
+    collection geometry (the last four), so repeated images of one geometry compile once; the window, the weighting
+    and the scaling run on the device."""
+    import hashlib, sys
     from . import pfa2
     import jax
     import jax.numpy as jnp
-    K = S.shape[1]
-    f_k = col.fmin + np.arange(K) * col.df
-    S = (S * ((col.fmin + (K // 2) * col.df) / f_k)[None, :]).astype(np.complex64)
-    geo = pfa2.geometry(col, nx, ny, spx, spy, e1=e1, e2=e2, guard=guard)
-    dist = pfa2.distortion(col, nx, ny, spx, spy, e1, e2)
-    fn = pfa2.make_pfa(geo, nx, ny, spx, spy, 'taps', None, jax.lax.Precision.HIGHEST, dist=dist)
-    W, alpha, eps_r, shift, eps_a = pfa2.arrays(geo, S.shape[0], 'taps')
-    scale = float(np.abs(S).max()) or 1.0          # an all-zero history gives a zero image, not 0/0
-    out = fn(jnp.asarray((S.real / scale).astype(np.float32)), jnp.asarray((S.imag / scale).astype(np.float32)), W, alpha, eps_r, shift, eps_a)
-    return (np.asarray(out) * scale).astype(np.complex64)
+    P, K = S.shape
+    key = (P, K, float(col.fmin), float(col.df), nx, ny, float(spx), float(spy), tuple(e1), tuple(e2), float(guard), bool(window),
+           hashlib.sha1(np.ascontiguousarray(col.ant).tobytes()).hexdigest())
+    with _PFA_LOCK:
+        prog = _PFA_PROGRAMS.get(key)
+    if prog is None:
+        geo = pfa2.geometry(col, nx, ny, spx, spy, e1=e1, e2=e2, guard=guard)
+        dist = pfa2.distortion(col, nx, ny, spx, spy, e1, e2)
+        fn = pfa2.make_pfa(geo, nx, ny, spx, spy, 'taps', None, jax.lax.Precision.HIGHEST, dist=dist)
+        arrs = pfa2.arrays(geo, P, 'taps')
+        f_k = col.fmin + np.arange(K) * col.df
+        wp, wk = _window(P, K) if window else (np.ones(P), np.ones(K))
+        wkf = jnp.asarray((wk * (col.fmin + (K // 2) * col.df) / f_k).astype(np.float32))
+        wpd = jnp.asarray(np.asarray(wp, np.float32))
+
+        @jax.jit
+        def prep(Sd):
+            x = Sd * wpd[:, None] * wkf[None, :]
+            scale = jnp.max(jnp.abs(x))
+            scale = jnp.where(scale > 0, scale, 1.0)          # an all-zero history gives a zero image, not 0/0
+            return jnp.real(x) / scale, jnp.imag(x) / scale, scale
+        prog = (fn, arrs, prep)
+        with _PFA_LOCK:
+            if len(_PFA_PROGRAMS) >= 4:
+                _PFA_PROGRAMS.pop(next(iter(_PFA_PROGRAMS)))
+            _PFA_PROGRAMS[key] = prog
+    fn, (W, alpha, eps_r, shift, eps_a), prep = prog
+    if 'cupy' in sys.modules and jax.default_backend() == 'gpu':
+        sys.modules['cupy'].get_default_memory_pool().free_all_blocks()     # blocks CuPy cached are not JAX's to use
+    re, im, scale = prep(jax.device_put(np.asarray(S, np.complex64)))
+    out = fn(re, im, W, alpha, eps_r, shift, eps_a)
+    return (np.asarray(out) * float(scale)).astype(np.complex64)
