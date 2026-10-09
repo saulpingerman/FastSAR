@@ -638,7 +638,7 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
                     # recorded pulse for one inserted at a gap)
                     k = np.clip(np.searchsorted(idx, pul), 0, len(idx) - 1)
                     return wa(np.clip(beam(lo + k, np.asarray(q) + c) / umax, -1, 1))
-            former = ImageFormer(af, f0, df, S.shape[1], px * s1, py * s2, spx / s1, spy / s2, e1, e2, backend,
+            former = ImageFormer(af, f0, df, S.shape[1], px * s1, py * s2, spx / s1, spy / s2, e1, e2, backend=backend,
                                  window=False, T=Tp, levels=nlev, aperture_weight=aw)
 
             def form(S_, former=former, idx=idx, n=len(af), s1=s1, s2=s2):

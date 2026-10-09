@@ -343,6 +343,7 @@ if 'cuda' not in fastsar.available_backends():
 if 'tpu' not in fastsar.available_backends() and not os.environ.get('FFBP_FORCE_TPU_KERNELS'):
     expect('tpu on a machine without one', lambda: fi(S, backend='tpu'), ValueError)
 expect('former called on a wrong shape', lambda: former(S[:, :-1]), ValueError)
+expect('ImageFormer: backend passed by position', lambda: fastsar.ImageFormer(col.ant, col.fmin, col.df, K, *g, 'cpu'), TypeError)
 expect('former called with NaN', lambda: former(Sn), ValueError)
 small = fastsar.form_image(S, col.ant, col.fmin, col.df, 6, 4, 0.5, 0.5, grid['e1'], grid['e2'], backend='cpu')
 check('6 x 4 grid (smaller than a tile) against the 128 x 128 image', rel_db(small, ref_img[61:67, 62:66]), -80)

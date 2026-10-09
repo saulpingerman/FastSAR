@@ -213,14 +213,14 @@ class ImageFormer:
 
     Building plans the tiles and filters, computes the float64 geometry and compiles the kernels; each call then
     pays only the image formation. Reuse one former for repeated images of the same geometry (or for timing);
-    a different antenna path needs a new former. Arguments as for form_image, and
+    a different antenna path needs a new former. Arguments as for form_image (those after e2 by keyword only), and
     aperture_weight(points [m, 3], pulses [n]) -> W [n, m]: a per-pixel weight of pulses (int indices) (a stripmap aperture window), applied
     in the final stage as the mean weight of each final subaperture's pulses at each final tile's center, with its
     first-order variation across the tile (final_weights), and
     ref [P]: the range (one way) each pulse is referenced to, when it is not |ant| (the distance to the origin):
     a bistatic collection's half path |tx| / 2 + |rcv| / 2, or a reference point other than the origin."""
 
-    def __init__(self, ant, fmin, df, K, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 1.0, 0.0), backend='auto',
+    def __init__(self, ant, fmin, df, K, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 1.0, 0.0), *, backend='auto',
                  precision='float32', window=True, T='auto', levels=3, pmax=0.4, target_db=-40.0, aperture_weight=None,
                  ref=None):
         from . import ffbp2
