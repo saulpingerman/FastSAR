@@ -221,7 +221,7 @@ class ImageFormer:
     a bistatic collection's half path |tx| / 2 + |rcv| / 2, or a reference point other than the origin."""
 
     def __init__(self, ant, fmin, df, K, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 1.0, 0.0), *, backend='auto',
-                 precision='float32', window=True, T='auto', levels=3, pmax=0.4, target_db=-40.0, aperture_weight=None,
+                 precision='float32', window=True, T='auto', levels=None, pmax=0.4, target_db=-40.0, aperture_weight=None,
                  ref=None):
         from . import ffbp2
         import warnings
@@ -251,7 +251,17 @@ class ImageFormer:
                                   '(short range for this pixel size)')
             self.predicted_error_db = float(err)
         self.T = T
-        plan = ffbp2.make_plan(col, nx, ny, spx, spy, T=T, nlev=levels, pmax=pmax, e1=e1, e2=e2)
+        # levels=None: three, or more where three cannot split a long side into final tiles (factors up to 8)
+        nlev = 3 if levels is None else levels
+        while True:
+            try:
+                plan = ffbp2.make_plan(col, nx, ny, spx, spy, T=T, nlev=nlev, pmax=pmax, e1=e1, e2=e2)
+                break
+            except ValueError as e:
+                if levels is not None or 'cannot split' not in str(e) or nlev >= 8:
+                    raise
+                nlev += 1
+        self.levels = nlev
         self._plan = plan
         if ref is not None and np.shape(ref) != (self.P,):
             raise ValueError(f'ref must hold one range per pulse ({self.P}), got shape {np.shape(ref)}')
@@ -406,7 +416,7 @@ class ImageFormer:
 
 
 def form_image(S, ant, fmin, df, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 1.0, 0.0), algorithm='ffbp',
-               backend='auto', precision='float32', window=True, T='auto', levels=3, pmax=0.4, pfa_guard=300.0, target_db=-40.0,
+               backend='auto', precision='float32', window=True, T='auto', levels=None, pmax=0.4, pfa_guard=300.0, target_db=-40.0,
                ref=None, interp=None, upsample=None, center=None):
     """Form the complex image [nx, ny] (complex64). See the module docstring for the arguments. precision, T, levels,
     pmax and target_db apply to factorized backprojection, pfa_guard to polar format, and interp ('cubic' or

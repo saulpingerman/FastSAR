@@ -108,11 +108,6 @@ def form_cphd(cphd, sicd=None, mode='auto', backend='auto', window=True, spacing
     spot = mode == 'spotlight'
     if autofocus and not spot:
         raise ValueError('autofocus is implemented for spotlight collections only')
-    if window:
-        wk = _taylor(K)
-        wp = _taylor(P) if spot else np.ones(P, np.float32)
-        for p0 in range(0, P, 1024):            # in place, row blocks
-            S[p0:p0 + 1024] *= wp[p0:p0 + 1024, None] * wk[None, :]
     # ground-plane axes at the scene: e1 along track, e2 across, horizontal
     d = np.gradient(ant, axis=0)
     d /= np.linalg.norm(d, axis=1, keepdims=True)
@@ -142,6 +137,26 @@ def form_cphd(cphd, sicd=None, mode='auto', backend='auto', window=True, spacing
         hz = (refpt if refpt is not None else center)[2]
     center = np.array([center[0], center[1], hz])
     graze = np.arcsin(np.clip(-((center - ant[P // 2]) / np.linalg.norm(center - ant[P // 2])) @ up, 0.05, 1.0))
+    ref_r = np.asarray(meta['ref'], np.float64)
+    if spot and sm is None and spacing is None:
+        # without the vendor's product or a spacing: square resolution, the azimuth resolution matched to the ground
+        # range resolution by the central part of a longer aperture (the vendor's products do likewise); spacing=
+        # forms the whole aperture
+        u = (center[None] - ant) / np.linalg.norm(center[None] - ant, axis=1, keepdims=True)
+        ang = np.arccos(np.clip(u @ u[P // 2], -1, 1)) * np.sign(np.arange(P) - P // 2)
+        want = lam / (2 * rres / np.cos(graze))              # the angular span for azimuth resolution = ground range resolution
+        if np.ptp(ang) > 1.15 * want:
+            keep = np.nonzero(np.abs(ang) <= want / 2)[0]
+            lo_, hi_ = int(keep[0]), int(keep[-1]) + 1
+            S, ant, srp, ref_r = S[lo_:hi_], ant[lo_:hi_], srp[lo_:hi_], ref_r[lo_:hi_]
+            notes.append(f'aperture: the central {hi_ - lo_} of {P} pulses ({np.degrees(want):.2f} of {np.degrees(np.ptp(ang)):.2f} '
+                         'degrees) for square resolution; give spacing= or a sicd for the whole aperture')
+            P = hi_ - lo_
+    if window:
+        wk = _taylor(K)
+        wp = _taylor(P) if spot else np.ones(P, np.float32)
+        for p0 in range(0, P, 1024):            # in place, row blocks
+            S[p0:p0 + 1024] *= wp[p0:p0 + 1024, None] * wk[None, :]
     # azimuth band of a moving beam (spread of sin(look angle) about each pulse's SRP)
     if not spot:
         if sm is not None:
@@ -176,14 +191,22 @@ def form_cphd(cphd, sicd=None, mode='auto', backend='auto', window=True, spacing
     nx = int(np.ceil((a1.max() - a1.min()) / spx)) + 1
     ny = int(np.ceil((a2.max() - a2.min()) / spy)) + 1
     origin = a1.min() * e1 + a2.min() * e2 + h * up
-    fx = dict(S=S, fmin=f0, df=df, ref=np.asarray(meta['ref'], np.float64), band=(f0, f0 + K * df))
+    # host memory: the history, the image and the mosaic's accumulation; past what is available, a clear error
+    from . import memory as _mem
+    need = S.nbytes + 2 * 8 * nx * ny
+    avail = _mem.host_available()
+    if need > 0.9 * avail:
+        raise MemoryError(f'the {nx} x {ny} pixel grid ({spx:.2f} x {spy:.2f} m) and the {S.nbytes / 2**30:.1f} GiB phase '
+                          f'history need about {need / 2**30:.0f} GiB of host memory, {avail / 2**30:.0f} GiB is available: '
+                          'give a smaller extent= or a coarser spacing=')
+    fx = dict(S=S, fmin=f0, df=df, ref=ref_r, band=(f0, f0 + K * df))
     if spot:
         # phase reference to the grid center, a grid centered on it (as ImageFormer takes it)
         c = origin + (nx / 2.0) * spx * e1 + (ny / 2.0) * spy * e2
         # referenced to |ant - c|, the range the factorized former assumes (not the bistatic half path, which differs
         # from it by a near constant 0.19 mm on ICEYE and limited the image to -52 dB at 7 cm resolution)
         ref_new = np.linalg.norm(ant - c, axis=1)
-        dref = np.asarray(meta['ref'], np.float64) - ref_new
+        dref = ref_r - ref_new
         f = f0 + df * np.arange(K)
         for p0 in range(0, P, 1024):
             sl = slice(p0, min(P, p0 + 1024))

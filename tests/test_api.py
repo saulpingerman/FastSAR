@@ -46,3 +46,13 @@ ref_b = fastsar.form_image(S, col.ant, col.fmin, col.df, **grid, backend=b0, T=1
 print(f'ImageFormer ({b0}) vs form_image: {rel_db(img2, ref_b):.1f} dB; second call {t2:.3f} s')
 assert rel_db(img2, ref_b) < -100
 print('ok')
+
+# four levels (a grid that three cannot split falls back to more): every backend against the JAX program
+ref4 = fastsar.form_image(S, col.ant, col.fmin, col.df, **grid, backend='jax', T=16, levels=4)
+for b in fastsar.available_backends():
+    e = rel_db(fastsar.form_image(S, col.ant, col.fmin, col.df, **grid, backend=b, T=16, levels=4), ref4)
+    print(f'{b:5s} four levels vs jax: {e:.1f} dB')
+    assert e < -60, (b, e)
+assert fastsar.ImageFormer(col.ant, col.fmin, col.df, S.shape[1], 128, 128 * 600, 0.5, 0.5, grid['e1'], grid['e2'],
+                           backend='cpu', T=16).levels == 4
+print('ok')
