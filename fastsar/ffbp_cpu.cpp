@@ -1,6 +1,6 @@
 // Factorized backprojection on the CPU: the three stages of the CUDA pipeline (fastsar/ffbp_cuda.py) as C++ with
-// OpenMP and 16-wide float vectors (GCC vector extensions; AVX-512 on the instance of record, two AVX2 halves
-// elsewhere).
+// OpenMP and float vectors of VL lanes (GCC vector extensions): 16 on x86 (AVX-512 on the instance of record, two
+// AVX2 halves elsewhere), 4 on ARM (NEON).
 //
 //   rot_fir_k   rotate each parent row by the phase ramps of its children and decimate along frequency with the
 //               Kaiser filter. The vector lanes are children: a row sample is a scalar broadcast, the rotation is one
@@ -25,8 +25,12 @@
 
 namespace {
 
-typedef float v16 __attribute__((vector_size(64)));
-constexpr int VL = 16;
+#if defined(__aarch64__) || defined(__arm64__)
+constexpr int VL = 4;                            // NEON: one 128-bit register per vector
+#else
+constexpr int VL = 16;                           // AVX-512: one register; AVX2: two
+#endif
+typedef float v16 __attribute__((vector_size(VL * 4)));
 constexpr double TWO_PI = 6.283185307179586476925286766559;
 constexpr int RESEED = 2048;       // samples between exact re-evaluations of a rotation recurrence
 
@@ -42,13 +46,56 @@ inline void sincos_cyc(double cyc, float& s, float& c)
     s = (float)sd; c = (float)cd;
 }
 
-inline v16 bcast(float x) { return v16{x, x, x, x, x, x, x, x, x, x, x, x, x, x, x, x}; }
+inline v16 bcast(float x) { return v16{} + x; }
 
 struct Scratch {
     std::vector<v16> zr, zi;        // rotated samples of a window, one vector (16 children) per sample
     std::vector<v16> yr, yi;        // outputs [Ko] per plane
     std::vector<float> tmp;
 };
+
+// The product of a chunk: rows i of the A table (scalars, T per n) against the B table (NH vectors per n),
+// accumulated into accr, acci [T][NH]; R rows at a time with the accumulators and the B vectors in registers
+// (R = 4 for one or two vectors per row on x86; 2 and 1 for the four and eight vectors of NEON's lanes).
+#if defined(__clang__)
+#define FASTSAR_UNROLL _Pragma("clang loop unroll(full)")
+#else
+#define FASTSAR_UNROLL _Pragma("GCC unroll 8")
+#endif
+
+template <int NH, int R>
+static void tile_product(const float* Arf, const float* Aif, const v16* Br, const v16* Bi, int NC, int T, v16* accr, v16* acci)
+{
+    for (int i0 = 0; i0 < T; i0 += R) {
+        v16 pr[R][NH], pi[R][NH];
+        FASTSAR_UNROLL
+        for (int r = 0; r < R; ++r) {
+            FASTSAR_UNROLL
+            for (int h = 0; h < NH; ++h) { pr[r][h] = accr[(size_t)(i0 + r) * NH + h]; pi[r][h] = acci[(size_t)(i0 + r) * NH + h]; }
+        }
+        for (int n = 0; n < NC; ++n) {
+            v16 br[NH], bi[NH];
+            FASTSAR_UNROLL
+            for (int h = 0; h < NH; ++h) { br[h] = Br[(size_t)n * NH + h]; bi[h] = Bi[(size_t)n * NH + h]; }
+            const float* arow = Arf + (size_t)n * T + i0;
+            const float* airow = Aif + (size_t)n * T + i0;
+            FASTSAR_UNROLL
+            for (int r = 0; r < R; ++r) {
+                const v16 xr = bcast(arow[r]), xi = bcast(airow[r]);
+                FASTSAR_UNROLL
+                for (int h = 0; h < NH; ++h) {
+                    pr[r][h] += xr * br[h]; pr[r][h] -= xi * bi[h];
+                    pi[r][h] += xr * bi[h]; pi[r][h] += xi * br[h];
+                }
+            }
+        }
+        FASTSAR_UNROLL
+        for (int r = 0; r < R; ++r) {
+            FASTSAR_UNROLL
+            for (int h = 0; h < NH; ++h) { accr[(size_t)(i0 + r) * NH + h] = pr[r][h]; acci[(size_t)(i0 + r) * NH + h] = pi[r][h]; }
+        }
+    }
+}
 
 }  // namespace
 
@@ -217,7 +264,7 @@ void final_tiles(const float* dre, const float* dim, int B, int Pf, int Qf, int 
 {
     // w0, gx, gyr [B, Pf] (or null): an aperture weight per subaperture and pixel, w0 + gx dx + gy dy, applied as
     // (w0 + gx dx)(1 + gyr dy) with gyr = gy / w0, the x factor on the data table and the y factor on the other
-    if (T != VL && T != 2 * VL) { std::abort(); }             // the tables are one or two vectors wide
+    if (T % VL != 0 || T / VL > 8) { std::abort(); }          // the tables are one to eight vectors wide
     const int NH = T / VL;
     const int PC = std::max(1, 24576 / (Qf * T * 4 * 2));     // pulses per chunk: A and B chunks of about 24 KB each per plane
     const int NCmax = PC * Qf;
@@ -294,6 +341,7 @@ void final_tiles(const float* dre, const float* dim, int B, int Pf, int Qf, int 
                         }
                     }
                 }
+                if (NH <= 2) {
                 // the product over this chunk: four rows i at a time, j as NH vectors, accumulators carried in accr/acci
                 const float* Arf = reinterpret_cast<const float*>(Ar.data());
                 const float* Aif = reinterpret_cast<const float*>(Ai.data());
@@ -336,6 +384,13 @@ void final_tiles(const float* dre, const float* dim, int B, int Pf, int Qf, int 
                         ar_[0] = p00; ar_[1] = p10; ar_[2] = p20; ar_[3] = p30;
                         ai_[0] = s00; ai_[1] = s10; ai_[2] = s20; ai_[3] = s30;
                     }
+                }
+                } else {
+                    // four or eight vectors per row (NEON lanes): the generic product, fewer rows at a time
+                    const float* Arf = reinterpret_cast<const float*>(Ar.data());
+                    const float* Aif = reinterpret_cast<const float*>(Ai.data());
+                    if (NH == 4) tile_product<4, 2>(Arf, Aif, Br.data(), Bi.data(), NC, T, accr.data(), acci.data());
+                    else tile_product<8, 1>(Arf, Aif, Br.data(), Bi.data(), NC, T, accr.data(), acci.data());
                 }
             }
             // quadratic phase correction and store
