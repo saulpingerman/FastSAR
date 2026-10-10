@@ -125,6 +125,12 @@ forms the collection in moving mode over the swath (or an `extent`); `height` se
 transmit gaps are zeroed; the per-receiver calibration tables (caltone, attenuation, TRM phases) are not applied.
 A 2 s, 20 MHz granule (4,096 pulses by 25,970 samples) reads in 6 s and forms a 12 by 24 km patch in 9 s on 8 cores.
 
+NISAR dithers its pulse timing (`isDithered`; intervals varying by a few percent). The factorized former's pulse
+filters assume evenly spaced pulses, and on a dithered granule its image differed from exact backprojection by
+-38 dB where an undithered one gave -58 dB; the reader therefore resamples the referenced history onto uniform
+pulse times (cubic splines across pulses, the positions and reference delays with it) when the timing is dithered,
+which restored -60 dB. Exact backprojection needs none of this.
+
 The file's slant ranges count from the transmit event, and the echoes arrive late by the instrument's delay, which
 JPL's processors subtract as a calibration constant (`commonDelay` in the metadata of RSLC and GCOV products: 53.24 m
 for frequency A and 19.65 m for B in the provisional products of 2026). `read_nisar(range_delay=)` subtracts it,
@@ -140,7 +146,10 @@ directory, a zip, or an `IMG-` file beside its leader): the 8-bit I and Q sample
 of the leader removed, range compressed with a linear FM replica from the leader's chirp rate and pulse length,
 then the same frequency-domain history, zero-Doppler reference and orbit interpolation as the NISAR reader. Line
 times come from the 1PPS microsecond counter in each line's auxiliary data (the millisecond field alone is 7.5 m
-along track). Stripmap products (FBS, FBD); ScanSAR is not handled. `form_cphd(directory)` forms the scene.
+along track). PALSAR's chirp sweeps downward; the leader gives the rate's magnitude, and the image descriptor
+leaves the pixels-per-line field blank (the count comes from the data bytes per record): both learned from JAXA's
+files in the held-out round, where the look-alike had followed the format description. Stripmap products (FBS,
+FBD); ScanSAR is not handled. `form_cphd(directory)` forms the scene.
 
 ## Sentinel-1 Level-0
 

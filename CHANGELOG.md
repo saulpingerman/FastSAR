@@ -37,6 +37,9 @@ was published on PyPI.
   packets (`sentinel1.internal_delay`, about 0.43 us, within 4 ns of ESA's annotated value on a 2014 datatake).
   Images of a NISAR pass and of a Sentinel-1 stripmap datatake then fall within about 20 m of JPL's GCOV and
   ESA's GRD of the same passes, from 100 to 180 m before. The raw readers take `troposphere='model'`.
+- `read_nisar` resamples dithered pulse timing onto uniform pulse times for the factorized former (-60 dB against
+  exact backprojection on a dithered granule, from -38 dB); `read_palsar` uses the downward chirp and the sample
+  count from the record length, as JAXA's files need.
 - `fastsar/par.hpp`: the CPU kernels' parallel loops on OpenMP where the kernels are built with it and on
   `std::thread` otherwise; macOS builds with Apple's clang and `-fopenmp-simd`, with no OpenMP runtime (a second
   runtime next to the one finufft's wheel bundles deadlocked the test suite) and no Homebrew libomp.
