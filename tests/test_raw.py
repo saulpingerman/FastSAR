@@ -108,3 +108,55 @@ def test_form_nisar(nisar):
 def test_read_collection_dispatch(nisar):
     col, meta = io.read_collection(nisar['path'], channel=0, meta=True, troposphere='model')
     assert col['S'].shape[0] > 0 and any('not applicable' in n and 'troposphere' in n for n in meta['notes'])
+
+
+@pytest.fixture(scope='module')
+def palsar(tmp_path_factory):
+    """The same scene written as an ALOS PALSAR level 1.0 look-alike (CEOS leader and image files)."""
+    rng = np.random.default_rng(12)
+    col = sim.make_collect(res=0.5, scene=60.0, r0=20e3)
+    gx, gy = np.meshgrid([-16.0, -2.0, 14.0], [-15.0, 1.0, 17.0], indexing='ij')
+    tg = np.stack([gx.ravel()[:8], gy.ravel()[:8], np.zeros(8)], 1)
+    amp = np.ones(8) * np.exp(1j * rng.uniform(0, 2 * np.pi, 8))
+    d = str(tmp_path_factory.mktemp('palsar'))
+    info = sim.write_palsar(d, col, tg, amp, lat0, lon0, h0, heading=heading)
+    truth = io.ecf_to_geodetic(sim.to_ecf(tg, lat0, lon0, h0, heading))
+    return dict(dir=d, col=col, truth=truth, info=info)
+
+
+def test_read_palsar(palsar):
+    col, meta = io.read_palsar(palsar['dir'], meta=True)
+    S = col['S']
+    assert S.shape[0] == len(palsar['col'].ant) and np.isfinite(S).all()
+    assert S.shape[1] * col['df'] == pytest.approx(palsar['col'].K * palsar['col'].df, rel=0.02)
+    assert meta['polarization'] == 'HH' and meta['mode'] == 'STRIPMAP' and any('ALOS PALSAR' in n for n in meta['notes'])
+    assert np.abs(io.local_to_ecf(meta['tx'], meta) - palsar['info']['tx']).max() < 1e-2        # microsecond line times
+    with pytest.raises(ValueError, match='polarization'):
+        io.read_palsar(palsar['dir'], polarization='VV')
+    # the image file alone finds its leader beside it; a zip of the product reads too
+    import os, zipfile
+    img = [f for f in os.listdir(palsar['dir']) if f.startswith('IMG-')][0]
+    c2 = io.read_palsar(os.path.join(palsar['dir'], img))
+    assert np.array_equal(c2['S'], S)
+    zp = os.path.join(palsar['dir'], 'product.zip')
+    with zipfile.ZipFile(zp, 'w') as z:
+        for f in os.listdir(palsar['dir']):
+            if f.startswith(('IMG-', 'LED-')):
+                z.write(os.path.join(palsar['dir'], f), f'ALPSRP000000000-L1.0/{f}')
+    c3 = io.read_palsar(zp)
+    assert np.array_equal(c3['S'], S)
+
+
+def test_form_palsar(palsar):
+    out = fastsar.form_cphd(palsar['dir'], backend='cpu', spacing=0.4, height=h0, extent=(60.0, 60.0))
+    img = np.abs(out['image'])
+    ij = products.locate(out, *palsar['truth'])
+    err = []
+    for (i, j) in ij:
+        i0, j0 = int(round(i)), int(round(j))
+        w = img[max(0, i0 - 6):i0 + 7, max(0, j0 - 6):j0 + 7]
+        pi, pj = np.unravel_index(np.argmax(w), w.shape)
+        err.append(np.hypot((max(0, i0 - 6) + pi - i) * out['spx'], (max(0, j0 - 6) + pj - j) * out['spy']))
+    pk = img.max() / np.median(img)
+    print(f'PALSAR look-alike: {img.shape} image, peak to median {pk:.0f}, worst target offset {max(err):.2f} m')
+    assert max(err) < 0.35 and pk > 50

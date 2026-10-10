@@ -323,6 +323,99 @@ def write_nisar(path, col, pos, amp, lat, lon, height=0.0, heading=0.0, speed=75
     return dict(fs=fs, chirp=chirp, r_near=r_near, n=n, tx=ant, times=t)
 
 
+
+def write_palsar(directory, col, pos, amp, lat, lon, height=0.0, heading=0.0, speed=7500.0, bandwidth=None, fs=None,
+                 chirp_duration=27e-6, r_margin=200.0, pol='HH', scene_id='SIMULATED'):
+    """Write an ALOS PALSAR level 1.0 look-alike (CEOS: LED- leader and IMG- image files in the directory) of
+    scatterers pos [N, 3] (simulator frame): the raw echoes of a linear FM chirp (bandwidth default the
+    collection's; sampled at fs, default 1.2 times the bandwidth; negative chirp rate as PALSAR's), 8-bit I and Q
+    with a DC bias of 16; the per-line prefix fields (time, PRF, slant range to the first sample) and the leader's
+    data set summary and platform position records that io.read_palsar reads. The radar looks right (to_ecf)."""
+    import datetime
+    import os
+    ant_l = np.asarray(col.ant, np.float64)
+    ant = to_ecf(ant_l, lat, lon, height, heading)
+    pts = to_ecf(np.asarray(pos, np.float64), lat, lon, height, heading)
+    P = len(ant)
+    bw = float(col.K * col.df if bandwidth is None else bandwidth)
+    fs = float(1.2 * bw if fs is None else fs)
+    fc = col.fmin + (col.K // 2) * col.df
+    L = int(round(chirp_duration * fs))
+    u = (np.arange(L) - 0.5 * (L - 1)) / fs
+    k = -bw / chirp_duration
+    chirp = np.exp(1j * np.pi * k * u ** 2).astype(np.complex64)
+    r = np.linalg.norm(pts[None, :, :] - ant[:, None, :], axis=2)
+    r_near = r.min() - r_margin
+    n = int(np.ceil(2.0 * (r.max() + r_margin - r_near) / C * fs)) + L
+    t = 1.0 + np.cumsum(np.r_[0.0, np.linalg.norm(np.diff(ant_l, axis=0), axis=1)]) / speed
+    vel = np.gradient(ant, t, axis=0)
+    z = raw_echoes(col, pos, amp, fs, chirp, r_near, n, lat, lon, height, heading, vel=vel)
+    scale = 15.0 / max(np.abs(z.real).max(), np.abs(z.imag).max(), 1e-30)
+    iq = np.empty((P, n, 2), np.uint8)
+    iq[:, :, 0] = np.clip(np.round(z.real * scale) + 16, 0, 255)
+    iq[:, :, 1] = np.clip(np.round(z.imag * scale) + 16, 0, 255)
+    prf = 1.0 / np.median(np.diff(t))
+    day = datetime.date(2026, 1, 1)
+
+    def header(seq, codes, length):
+        return seq.to_bytes(4, 'big') + bytes(codes) + length.to_bytes(4, 'big')
+
+    def put(buf, a, s):
+        s = s.encode('ascii') if isinstance(s, str) else s
+        buf[a - 1:a - 1 + len(s)] = s
+
+    def num(v, w, prec=7):
+        return f'{v:{w}.{prec}f}'[:w].rjust(w)
+
+    def sci(v, w=22):
+        return f'{v:.15E}'.rjust(w)
+
+    # leader: file descriptor (720), data set summary (4096), platform position (4680)
+    fd = bytearray(720); fd[:12] = header(1, (11, 192, 18, 18), 720); put(fd, 17, 'CEOS-SAR-CCT')
+    ds = bytearray(4096); ds[:12] = header(2, (18, 10, 18, 20), 4096)
+    put(ds, 13, '   1'); put(ds, 21, scene_id.ljust(32)); put(ds, 117, num(lat, 16)); put(ds, 133, num(lon, 16))
+    put(ds, 149, num(heading, 16)); put(ds, 309, num(height / 1e3, 16)); put(ds, 397, 'ALOS'.ljust(16))
+    put(ds, 501, num(C / fc, 16)); put(ds, 519, 'LINEAR FM CHIRP '); put(ds, 535, f'{0.0:16.7E}'); put(ds, 551, f'{k:16.7E}')
+    put(ds, 711, num(fs / 1e6, 16)); put(ds, 727, num(2 * r_near / C * 1e6, 16)); put(ds, 743, num(chirp_duration * 1e6, 16))
+    put(ds, 759, 'YES '); put(ds, 763, 'NOT '); put(ds, 799, '       5'); put(ds, 819, num(16.0, 16)); put(ds, 835, num(16.0, 16))
+    put(ds, 935, num(prf * 1e3, 16)); put(ds, 1095, '1.0'.ljust(16))
+    pp = bytearray(4680); pp[:12] = header(3, (18, 30, 18, 20), 4680)
+    ts = np.linspace(t[0] - 4.0, t[-1] + 4.0, 9)
+    v0 = vel[P // 2]
+    sv_pos = ant[P // 2][None] + (ts - t[P // 2])[:, None] * v0[None]
+    put(pp, 141, f'{9:4d}'); put(pp, 145, f'{day.year:4d}'); put(pp, 149, f'{day.month:4d}'); put(pp, 153, f'{day.day:4d}')
+    put(pp, 157, f'{day.timetuple().tm_yday:4d}'); put(pp, 161, sci(ts[0])); put(pp, 183, sci(ts[1] - ts[0])); put(pp, 205, 'ECR'.ljust(64))
+    for j in range(9):
+        for c in range(3):
+            put(pp, 387 + 22 * (6 * j + c), sci(sv_pos[j, c]))
+            put(pp, 387 + 22 * (6 * j + 3 + c), sci(v0[c]))
+    os.makedirs(directory, exist_ok=True)
+    with open(os.path.join(directory, f'LED-{scene_id}'), 'wb') as fh:
+        fh.write(bytes(fd) + bytes(ds) + bytes(pp))
+    # image file: descriptor (720) then one record per line, 412 bytes of prefix and 2 n bytes of samples
+    rl = 412 + 2 * n
+    idf = bytearray(720); idf[:12] = header(1, (50, 192, 18, 18), 720); put(idf, 17, 'CEOS-SAR-CCT')
+    put(idf, 181, f'{P:6d}'); put(idf, 217, f'{8:4d}'); put(idf, 221, f'{2:4d}'); put(idf, 225, f'{2:4d}'); put(idf, 237, f'{P:8d}')
+    put(idf, 249, f'{n:8d}'); put(idf, 273, ' 1'); put(idf, 275, ' 1'); put(idf, 277, f'{412:4d}'); put(idf, 281, f'{2 * n:8d}')
+    put(idf, 289, f'{0:4d}')
+    recs = np.zeros((P, rl), np.uint8)
+    secs = t                                        # seconds of the day, the scale of the platform position record
+    for i in range(P):
+        pre = bytearray(412)
+        pre[:12] = header(i + 2, (50, 10, 18, 20), rl)
+        for a, v in ((13, i + 1), (17, 1), (25, n), (33, 1), (37, day.year), (41, day.timetuple().tm_yday),
+                     (45, int(round(secs[i] * 1e3))), (49, 1 << 16), (57, int(round(prf * 1e3))), (69, int(round(chirp_duration * 1e9))),
+                     (117, int(round(r_near))), (121, int(round(2 * r_near / C * 1e9)))):
+            pre[a - 1:a + 3] = int(v).to_bytes(4, 'big')
+        pre[49:51] = (1).to_bytes(2, 'big')          # SAR channel indicator
+        pre[296:300] = (int(round((secs[i] - np.floor(secs[i])) * 1e6)) << 8).to_bytes(4, 'big')      # 1Mpps counter (aux item 2)
+        recs[i, :412] = np.frombuffer(bytes(pre), np.uint8)
+        recs[i, 412:] = iq[i].reshape(-1)
+    with open(os.path.join(directory, f'IMG-{pol}-{scene_id}'), 'wb') as fh:
+        fh.write(bytes(idf)); fh.write(recs.tobytes())
+    return dict(fs=fs, chirp=chirp, r_near=r_near, n=n, tx=ant, times=t, sv_time=ts)
+
+
 # ---------------------------------------------------------------- scenes
 
 def change_mask(x, y, scene, part='all'):

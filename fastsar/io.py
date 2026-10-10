@@ -346,7 +346,14 @@ def read_collection(path, **kw):
     """read_cphd for a CPHD file, read_nisar for a NISAR L0B (HDF5, .h5) file, with the keyword arguments the
     reader called accepts; the others are dropped, with a note in meta when they were set."""
     import inspect
-    reader, kind = (read_nisar, 'a NISAR file') if str(path).lower().endswith(('.h5', '.hdf5')) else (read_cphd, 'a CPHD file')
+    import os
+    s = str(path).lower()
+    if s.endswith(('.h5', '.hdf5')):
+        reader, kind = read_nisar, 'a NISAR file'
+    elif s.endswith('.zip') or os.path.isdir(path) or os.path.basename(s).startswith(('img-', 'led-')):
+        reader, kind = read_palsar, 'an ALOS PALSAR product'
+    else:
+        reader, kind = read_cphd, 'a CPHD file'
     allowed = set(inspect.signature(reader).parameters)
     dropped = sorted(k for k in kw if k not in allowed and kw[k] not in (None, 0, False))
     out = reader(path, **{k: v for k, v in kw.items() if k in allowed})
@@ -464,6 +471,119 @@ def read_nisar(path, frequency=None, polarization=None, meta=False, height=None,
         return out
     finally:
         f.close()
+
+
+def read_palsar(path, polarization=None, meta=False, height=None, band_margin=1.0, block=512):
+    """An ALOS PALSAR level 1.0 product (raw signal data in CEOS format: a directory or zip holding the LED- leader
+    and IMG- image files, or one IMG- file beside its leader) as read_cphd returns a CPHD: the 8-bit I and Q samples
+    of one polarization (default the first image file), DC bias removed, range compressed with a linear FM replica
+    built from the leader's chirp rate and pulse length, taken to the frequency domain over the chirp's band
+    (fastsar.raw) and compensated to each pulse's zero-Doppler ground point at mid swath at the given height
+    (default the leader's terrain height); the antenna positions interpolated (Hermite) from the leader's
+    platform position record at each line's time. Stripmap (FBS, FBD) products; ScanSAR is not handled."""
+    import os
+    import zipfile
+    from . import raw
+    members = {}
+    if str(path).lower().endswith('.zip'):
+        zf = zipfile.ZipFile(path)
+        names = [n for n in zf.namelist() if os.path.basename(n).upper().startswith(('LED-', 'IMG-'))]
+        get = lambda n: zf.read(n)
+    else:
+        d = path if os.path.isdir(path) else os.path.dirname(os.path.abspath(path))
+        names = [os.path.join(d, n) for n in os.listdir(d) if n.upper().startswith(('LED-', 'IMG-'))]
+        get = lambda n: open(n, 'rb').read()
+    for n in names:
+        members[os.path.basename(n).upper()] = n
+    leds = [k for k in members if k.startswith('LED-')]
+    imgs = sorted(k for k in members if k.startswith('IMG-'))
+    if not leds or not imgs:
+        raise ValueError(f'no LED- leader and IMG- image file in {path}')
+    if polarization is not None:
+        want = [k for k in imgs if k.startswith(f'IMG-{polarization.upper()}-')]
+        if not want:
+            raise ValueError(f'polarization {polarization!r} not in the product ({[k.split("-")[1] for k in imgs]})')
+        imgs = want
+    pol = imgs[0].split('-')[1]
+    lead = raw.palsar_leader(get(members[leds[0]]))
+    data = get(members[imgs[0]])
+    hdr = raw.palsar_image_header(data)
+    P, n = hdr['records'], hdr['samples']
+    if hdr['bytes_per_group'] != 2 or hdr['bits_per_sample'] != 8:
+        raise ValueError(f"expected 8-bit I and Q samples (2 bytes per pixel), the file has {hdr['bits_per_sample']} bits and "
+                         f"{hdr['bytes_per_group']} bytes per pixel")
+    fs, fc = lead['sampling_rate'], C / lead['wavelength']
+    T = lead['pulse_length']
+    k = lead['chirp_rate']
+    bw = abs(k) * T
+    L = int(round(T * fs))
+    u = (np.arange(L) - 0.5 * (L - 1)) / fs
+    chirp = np.exp(1j * np.pi * k * u ** 2).astype(np.complex64)
+    dr = C / (2.0 * fs)
+    orbit = raw.hermite_orbit(lead['sv_time'], lead['sv_pos'], lead['sv_vel'])
+    # line times as seconds of the platform position record's day
+    import datetime
+    y, mo, d = lead['sv_day']
+    doy0 = datetime.date(y, mo, d).timetuple().tm_yday
+    # the geometry fields of every line first (small), the samples in blocks
+    fields_all = []
+    for p0 in range(0, P, 4096):
+        f, _ = raw.palsar_lines(data, hdr, p0, min(P, p0 + 4096))
+        fields_all.append(f)
+    fields = {k_: np.concatenate([f[k_] for f in fields_all]) for k_ in fields_all[0]}
+    day_shift = (fields['year'] - y) * 365 + (fields['doy'] - doy0)       # same day in practice
+    ut = fields['msec'] * 1e-3 + 86400.0 * day_shift
+    # the millisecond field is too coarse (a millisecond is 7.5 m along track): the microsecond counter since the
+    # 1PPS pulse refines it when present, else the line number and PRF
+    us = fields['pps_us'] * 1e-6
+    if np.any(us) and np.all(us < 1.0):
+        fine = np.floor(ut) + us
+        fine += np.where(fine - ut > 0.5, -1.0, np.where(ut - fine > 0.5, 1.0, 0.0))
+        ut = fine
+        notes_time = 'line times from the 1PPS microsecond counter'
+    else:
+        ut = ut[0] + (fields['line'] - fields['line'][0]) / fields['prf']
+        notes_time = 'line times from the first line and the PRF (no microsecond counter)'
+    sr0 = fields['slant_range']
+    height = float(lead['terrain_height'] if height is None else height)
+    notes = [f'ALOS PALSAR level 1.0 {lead["scene_id"]}, {pol}, {P} lines of {n} samples at {fs / 1e6:.0f} MHz, chirp '
+             f'{bw / 1e6:.0f} MHz over {T * 1e6:.0f} us, wavelength {lead["wavelength"]:.4f} m; orbit {len(lead["sv_time"])} '
+             f'state vectors ({lead["sv_frame"].split()[0] if lead["sv_frame"] else "?"})']
+    notes.append(notes_time)
+    if np.ptp(fields['prf']) > 1e-3:
+        notes.append(f'PRF changes within the scene ({fields["prf"].min():.1f} to {fields["prf"].max():.1f} Hz)')
+    tx_pos, tx_vel = orbit(ut)
+    n_far = max(1, n - L)
+    r_mid = sr0 + 0.5 * n_far * dr
+    srp = raw.zero_doppler_points(tx_pos, tx_vel, r_mid, 'right', height=height)
+    rcv_pos, _ = orbit(ut + 2.0 * np.linalg.norm(srp - tx_pos, axis=1) / C)
+    tau_ref = (np.linalg.norm(tx_pos - srp, axis=1) + np.linalg.norm(rcv_pos - srp, axis=1)) / C
+    bias = complex(lead['dc_bias_i'] or 0.0, lead['dc_bias_q'] or 0.0)
+    S = None
+    for p0 in range(0, P, block):
+        p1 = min(P, p0 + block)
+        _, z = raw.palsar_lines(data, hdr, p0, p1)
+        if bias == 0:
+            z -= z.mean()                               # no bias in the leader: the block's own mean
+        else:
+            z -= np.complex64(bias)
+        blk, fmin, df = raw.fx_history(raw.range_compress(z, chirp), fs, fc, 2.0 * sr0[p0:p1] / C, tau_ref[p0:p1], bw, band_margin)
+        if S is None:
+            S = np.empty((P, blk.shape[1]), np.complex64)
+        S[p0:p1] = blk
+    near_far = [raw.zero_doppler_points(tx_pos[[0, -1]], tx_vel[[0, -1]], r, 'right', height=height)
+                for r in (sr0[[0, -1]], sr0[[0, -1]] + n_far * dr)]
+    corners = np.stack([near_far[0][0], near_far[1][0], near_far[1][1], near_far[0][1]])
+    info = dict(tx_time=ut, rcv_time=ut + tau_ref, pulses=(0, P), polarization=pol, channel=pol, channel_index=0,
+                mode='STRIPMAP', start=f'{y:04d}-{mo:02d}-{d:02d}T00:00:00 + {ut[0]:.6f} s', collector=lead['mission'] or 'ALOS',
+                core_name=lead['scene_id'])
+    out = _assemble(S, tx_pos, rcv_pos, srp, fmin, df, notes, None, meta, info)
+    if meta:
+        col, info = out
+        info['image_area'] = (corners - info['origin']) @ info['R'].T
+        info['refpt'] = np.zeros(3)
+        return col, info
+    return out
 
 
 def orbit_type(orb):

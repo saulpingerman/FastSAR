@@ -103,3 +103,96 @@ def decode_bfpq(block, lut):
     lookup table lut [65536] -> complex64."""
     lut = np.asarray(lut, np.float32)
     return (lut[block['r']] + 1j * lut[block['i']]).astype(np.complex64)
+
+
+# ---------------------------------------------------------------------------------------------- CEOS (ALOS PALSAR 1.0)
+
+def ceos_records(data):
+    """The records of a CEOS file (bytes): (sequence number, subtype1, type, subtype2, subtype3, start, length) from
+    each 12-byte record header (big-endian sequence number and length, four code bytes)."""
+    out, pos, n = [], 0, len(data)
+    while pos + 12 <= n:
+        seq = int.from_bytes(data[pos:pos + 4], 'big')
+        codes = tuple(data[pos + 4:pos + 8])
+        length = int.from_bytes(data[pos + 8:pos + 12], 'big')
+        if length < 12:
+            break
+        out.append((seq, codes[0], codes[1], codes[2], codes[3], pos, length))
+        pos += length
+    return out
+
+
+def _ascii(rec, a, b):
+    """The ASCII field at 1-based byte positions a to b of a record."""
+    return rec[a - 1:b].decode('ascii', 'replace').strip()
+
+
+def _num(rec, a, b, default=None):
+    s = _ascii(rec, a, b).replace('D', 'E')
+    try:
+        return float(s)
+    except ValueError:
+        return default
+
+
+def palsar_leader(data):
+    """The fields of an ALOS PALSAR level 1.0 SAR leader file (bytes) that a reader needs: from the data set summary
+    record the scene center (latitude, longitude, terrain height), the wavelength, the chirp (constant and linear
+    terms, pulse length), the sampling rate, the range gate, the nominal PRF, the bits per sample; from the platform
+    position record the state vectors (times as seconds of the record's day, positions and velocities, ECR) and the
+    day. Positions follow JAXA's format description (Tables 3.3-5 and 3.3-6)."""
+    recs = ceos_records(data)
+    out = {}
+    for seq, s1, typ, s2, s3, start, length in recs:
+        rec = data[start:start + length]
+        if typ == 10 and s1 == 18:                       # data set summary
+            out.update(scene_lat=_num(rec, 117, 132), scene_lon=_num(rec, 133, 148), scene_heading=_num(rec, 149, 164),
+                       terrain_height=_num(rec, 309, 324, 0.0) * 1e3, wavelength=_num(rec, 501, 516),
+                       chirp_constant=_num(rec, 535, 550, 0.0), chirp_rate=_num(rec, 551, 566),
+                       sampling_rate=_num(rec, 711, 726) * 1e6, range_gate=_num(rec, 727, 742) * 1e-6,
+                       pulse_length=_num(rec, 743, 758) * 1e-6, bits_per_sample=_num(rec, 799, 806),
+                       dc_bias_i=_num(rec, 819, 834), dc_bias_q=_num(rec, 835, 850), prf=_num(rec, 935, 950) * 1e-3,
+                       scene_id=_ascii(rec, 21, 52), mission=_ascii(rec, 397, 412))
+        elif typ == 30:                                  # platform position
+            npts = int(_num(rec, 141, 144))
+            year, month, day = int(_num(rec, 145, 148)), int(_num(rec, 149, 152)), int(_num(rec, 153, 156))
+            t0, dt = _num(rec, 161, 182), _num(rec, 183, 204)
+            frame = _ascii(rec, 205, 268)
+            pv = np.array([_num(rec, 387 + 22 * k, 408 + 22 * k) for k in range(6 * npts)], np.float64).reshape(npts, 6)
+            out.update(sv_time=t0 + dt * np.arange(npts), sv_pos=pv[:, :3], sv_vel=pv[:, 3:],
+                       sv_day=(year, month, day), sv_frame=frame)
+    if 'sampling_rate' not in out or 'sv_pos' not in out:
+        raise ValueError('not an ALOS PALSAR level 1.0 leader file: data set summary or platform position record missing')
+    return out
+
+
+def palsar_image_header(data):
+    """The SAR data file descriptor of an ALOS PALSAR level 1.0 image file (bytes): records, bits per sample, bytes
+    per sample group, samples per line, prefix bytes, SAR data bytes per record, and the record length."""
+    rec = data[:720]
+    out = dict(records=int(_num(rec, 181, 186)), bits_per_sample=int(_num(rec, 217, 220)), bytes_per_group=int(_num(rec, 225, 228)),
+               lines=int(_num(rec, 237, 244)), samples=int(_num(rec, 249, 256)), prefix=int(_num(rec, 277, 280)),
+               data_bytes=int(_num(rec, 281, 288)))
+    out['record_length'] = out['prefix'] + out['data_bytes']
+    return out
+
+
+def palsar_lines(mm, header, lo, hi):
+    """Signal data records lo to hi of an ALOS PALSAR level 1.0 image file (a memory map or bytes): the per-line
+    fields (line number, year, day of year, milliseconds of day, PRF in Hz, chirp length in s, slant range to the
+    first sample in m, window position in s, microseconds since the 1PPS pulse) and the samples as complex64 [hi - lo, samples] (8-bit I and Q, the
+    DC bias not removed)."""
+    L = header['record_length']
+    n = header['samples']
+    recs = np.frombuffer(mm, np.uint8, count=(hi - lo) * L, offset=720 + lo * L).reshape(hi - lo, L)
+    b4 = lambda a: recs[:, a - 1:a + 3].copy().view('>u4').ravel().astype(np.int64)
+    fields = dict(line=b4(13), pixels=b4(25), year=b4(37), doy=b4(41), msec=b4(45), prf=b4(57) * 1e-3, chirp_length=b4(69) * 1e-9,
+                  slant_range=b4(117).astype(np.float64), window=b4(121) * 1e-9,
+                  # PALSAR auxiliary data (bytes 289 to 388): item 2, the microseconds since the 1PPS pulse, 20 bits of the
+                  # second word (Appendix A-2)
+                  pps_us=(b4(297) >> 8) & 0xFFFFF)
+    raw_iq = recs[:, header['prefix']:header['prefix'] + 2 * n].reshape(hi - lo, n, 2).astype(np.float32)
+    z = np.empty((hi - lo, n), np.complex64)
+    z.real = raw_iq[:, :, 0]
+    z.imag = raw_iq[:, :, 1]
+    return fields, z

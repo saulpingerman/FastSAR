@@ -12,6 +12,10 @@ was published on PyPI.
   (`fastsar.raw`), compensated to each pulse's zero-Doppler ground point at mid swath, the antenna from the file's
   orbit state vectors (Hermite). `form_cphd` accepts the `.h5` file (`io.read_collection` dispatches) and forms it
   in moving mode with the swath as footprint. `sim.write_nisar` writes a look-alike for tests. Extra `raw` (h5py).
+- `io.read_palsar`: ALOS PALSAR level 1.0 products (CEOS raw signal data, a directory, zip or `IMG-` file with its
+  leader): 8-bit I and Q lines range compressed with the leader's chirp, line times from the 1PPS microsecond
+  counter, the antenna from the platform position record; the same frequency-domain output as `read_cphd`, formed
+  by `form_cphd` in moving mode. `sim.write_palsar` writes a look-alike for tests.
 - `read_cphd(troposphere='model')` and `form_cphd(troposphere='model')`: the troposphere delay of a standard
   atmosphere (`io.troposphere_delay`, Saastamoinen hydrostatic zenith delay mapped by the elevation of each antenna)
   removed at the scene reference point, for files that give no delay. ICEYE's CPHD files write `TDTropoSRP` zero

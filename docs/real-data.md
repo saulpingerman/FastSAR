@@ -124,3 +124,12 @@ point at mid swath, with the antenna positions interpolated from the orbit state
 forms the collection in moving mode over the swath (or an `extent`); `height` sets the ground plane. Samples in the
 transmit gaps are zeroed; the per-receiver calibration tables (caltone, attenuation, TRM phases) are not applied.
 A 2 s, 20 MHz granule (4,096 pulses by 25,970 samples) reads in 6 s and forms a 12 by 24 km patch in 9 s on 8 cores.
+
+## ALOS PALSAR level 1.0
+
+`io.read_palsar` reads a PALSAR level 1.0 product (the CEOS leader and image files JAXA and ASF distribute, as a
+directory, a zip, or an `IMG-` file beside its leader): the 8-bit I and Q samples of one polarization, the DC bias
+of the leader removed, range compressed with a linear FM replica from the leader's chirp rate and pulse length,
+then the same frequency-domain history, zero-Doppler reference and orbit interpolation as the NISAR reader. Line
+times come from the 1PPS microsecond counter in each line's auxiliary data (the millisecond field alone is 7.5 m
+along track). Stripmap products (FBS, FBD); ScanSAR is not handled. `form_cphd(directory)` forms the scene.

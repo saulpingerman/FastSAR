@@ -55,6 +55,9 @@ Backends: `'cpu'`, `'cuda'`, `'tpu'`, `'jax'`, `'auto'`. Precision: `'float32'`,
   NISAR L0B RRSD granule as `read_cphd` returns a CPHD (range compressed, frequency domain, a moving scene
   reference point at mid swath); `meta` adds `image_area` (the swath's corners). `read_collection(path, **kw)`
   dispatches on the extension (`.h5`: NISAR). Needs h5py (`fastsar[raw]`).
+- `read_palsar(path, polarization=None, meta=False, height=None, band_margin=1.0, block=512)`: an ALOS PALSAR
+  level 1.0 product (CEOS directory, zip, or `IMG-` file beside its `LED-` leader) as `read_cphd` returns a CPHD;
+  `read_collection` dispatches directories, zips and `IMG-`/`LED-` files to it.
 - `troposphere_delay(tx, rcv, srp)`: two-way delay [P] (s) of a standard atmosphere at the scene reference point
   (Saastamoinen hydrostatic zenith delay, cosecant mapping); what `read_cphd(troposphere='model')` removes.
 - `sicd_points(sicd, rows, cols, meta, hae=None)`: local positions of SICD pixels on any grid type.
