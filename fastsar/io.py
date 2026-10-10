@@ -469,7 +469,7 @@ def read_nisar(path, frequency=None, polarization=None, meta=False, height=None,
         srp = raw.zero_doppler_points(tx_pos, tx_vel, r_mid, side, height=height)
         rcv_pos, _ = orbit(ut + 2.0 * np.linalg.norm(srp - tx_pos, axis=1) / C)
         tau_ref = (np.linalg.norm(tx_pos - srp, axis=1) + np.linalg.norm(rcv_pos - srp, axis=1)) / C
-        tau0 = 2.0 * sr[0] / C - _tropo(troposphere, tx_pos, rcv_pos, srp, notes)
+        tau0 = np.broadcast_to(2.0 * sr[0] / C - _tropo(troposphere, tx_pos, rcv_pos, srp, notes), (P,))
         S = None
         for p0 in range(0, P, block):
             p1 = min(P, p0 + block)
@@ -484,7 +484,7 @@ def read_nisar(path, frequency=None, polarization=None, meta=False, height=None,
                     ok = (a < n) & (b <= n) & (a < b)
                     keep |= ok & (cols >= a) & (cols < b)
                 z[~keep] = 0
-            blk, fmin, df = raw.fx_history(raw.range_compress(z, chirp), fs, fc, tau0, tau_ref[p0:p1], bw, band_margin)
+            blk, fmin, df = raw.fx_history(raw.range_compress(z, chirp), fs, fc, tau0[p0:p1], tau_ref[p0:p1], bw, band_margin)
             if S is None:
                 S = np.empty((P, blk.shape[1]), np.complex64)
             S[p0:p1] = blk

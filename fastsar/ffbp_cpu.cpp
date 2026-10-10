@@ -34,7 +34,11 @@ inline void sincos_cyc(double cyc, float& s, float& c)
 {
     cyc -= std::nearbyint(cyc);
     double sd, cd;
+#if defined(__APPLE__)
+    __sincos(TWO_PI * cyc, &sd, &cd);
+#else
     sincos(TWO_PI * cyc, &sd, &cd);
+#endif
     s = (float)sd; c = (float)cd;
 }
 

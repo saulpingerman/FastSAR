@@ -106,7 +106,7 @@ def test_form_nisar(nisar):
 
 
 def test_read_collection_dispatch(nisar):
-    col, meta = io.read_collection(nisar['path'], channel=0, meta=True, troposphere='model')
+    col, meta = io.read_collection(nisar['path'], channel=0, meta=True, troposphere='model', block=16)
     assert col['S'].shape[0] > 0 and any('troposphere delay removed' in n for n in meta['notes'])
 
 
