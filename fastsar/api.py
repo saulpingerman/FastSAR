@@ -238,8 +238,7 @@ class ImageFormer:
                  precision='float32', window=True, T='auto', levels=None, pmax=0.4, target_db=-40.0, aperture_weight=None,
                  ref=None):
         from . import ffbp2
-        import platform
-import warnings
+        import warnings
         self.ant = _check_positions(ant)
         self.P, self.K = self.ant.shape[0], int(K)
         if self.K < 2:
