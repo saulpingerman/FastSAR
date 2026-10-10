@@ -124,6 +124,17 @@ def palsar(tmp_path_factory):
     return dict(dir=d, col=col, truth=truth, info=info)
 
 
+def test_palsar_header_blank_samples():
+    """JAXA's level 1.0 image descriptors leave the pixels-per-line field blank: the sample count comes from the data
+    bytes per record."""
+    from fastsar import raw
+    rec = bytearray(b' ' * 720)
+    rec[180:186] = b' 35421'; rec[216:220] = b'   8'; rec[224:228] = b'   2'; rec[236:244] = b'   35421'
+    rec[276:280] = b' 412'; rec[280:288] = b'   20688'
+    h = raw.palsar_image_header(bytes(rec))
+    assert h['samples'] == 10344 and h['record_length'] == 21100
+
+
 def test_read_palsar(palsar):
     col, meta = io.read_palsar(palsar['dir'], meta=True)
     S = col['S']

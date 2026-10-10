@@ -171,8 +171,11 @@ def palsar_image_header(data):
     per sample group, samples per line, prefix bytes, SAR data bytes per record, and the record length."""
     rec = data[:720]
     out = dict(records=int(_num(rec, 181, 186)), bits_per_sample=int(_num(rec, 217, 220)), bytes_per_group=int(_num(rec, 225, 228)),
-               lines=int(_num(rec, 237, 244)), samples=int(_num(rec, 249, 256)), prefix=int(_num(rec, 277, 280)),
-               data_bytes=int(_num(rec, 281, 288)))
+               lines=int(_num(rec, 237, 244)), prefix=int(_num(rec, 277, 280)), data_bytes=int(_num(rec, 281, 288)))
+    # the pixels per line (bytes 249 to 256) are blank in JAXA's level 1.0 files (the look-alikes fill them): the
+    # data bytes per record over the bytes per sample group
+    samples = _num(rec, 249, 256)
+    out['samples'] = int(samples) if samples else out['data_bytes'] // out['bytes_per_group']
     out['record_length'] = out['prefix'] + out['data_bytes']
     return out
 
