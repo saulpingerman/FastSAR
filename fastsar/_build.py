@@ -31,14 +31,14 @@ def default_flags():
 
 
 def compiler():
-    """The C++ compiler and the OpenMP flags for compiling and linking: $CXX; on macOS a Homebrew GCC (g++-15 to
-    g++-12) if one is on the PATH, else clang++ with Homebrew's libomp. -> (cxx, compile flags, link flags)."""
+    """The C++ compiler and the OpenMP flags for compiling and linking: $CXX; on macOS the newest Homebrew GCC
+    (g++-20 down to g++-12) on the PATH, else clang++ with Homebrew's libomp. -> (cxx, compile flags, link flags)."""
     cxx = os.environ.get('CXX')
     if cxx:
         return cxx, ['-fopenmp'], ['-fopenmp']
     if sys.platform != 'darwin':
         return 'g++', ['-fopenmp'], ['-fopenmp']
-    for v in range(15, 11, -1):
+    for v in range(20, 11, -1):                     # the newest Homebrew GCC
         if shutil.which(f'g++-{v}'):
             return f'g++-{v}', ['-fopenmp'], ['-fopenmp']
     prefix = None
