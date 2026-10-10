@@ -17,7 +17,10 @@ the ellipsoid normal, with its origin at the (mid-aperture) scene reference poin
 - a vendor SICD's grid: the image is the SICD array (transposed when range runs along rows); non-planar SICD grids
   need `io.sicd_points` and `backproject` ([processing-chain.md](processing-chain.md#2-form))
 - the troposphere delay at the scene reference point, removed by default when the file gives a nonzero delay
-  (`troposphere=False` keeps it; Umbra's SICD images keep it, Capella's remove it)
+  (`troposphere=False` keeps it; Umbra's SICD images keep it, Capella's remove it). ICEYE's files give no delay
+  (`TDTropoSRP` is zero) while ICEYE's images include the correction, so an uncorrected image lies about 6 m in
+  ground range from theirs at 26 degrees of incidence; `troposphere='model'` removes the delay of a standard
+  atmosphere instead (`io.troposphere_delay`, hydrostatic, about 2.3 m at the zenith at sea level)
 - a warning when the valid delay window (TOA1 to TOA2) exceeds the unambiguous range c/(2 df)
 
 Time-of-arrival (TOA) CPHD raises a `ValueError`.

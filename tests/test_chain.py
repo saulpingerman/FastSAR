@@ -335,3 +335,44 @@ def test_troposphere(chain):
     print(f'troposphere 10 ns: removed {shift[0].max() * 100:.2f} cm from the truth; kept {shift[1].min():.3f} to '
           f'{shift[1].max():.3f} m (expected about {expect:.3f} m)')
     assert shift[0].max() < 0.03 and np.all(np.abs(shift[1] / expect - 1) < 0.1)
+
+
+def test_troposphere_model(chain):
+    """A file with the delay in the data but TDTropoSRP zero (ICEYE's files): troposphere='model' removes a
+    standard-atmosphere delay, which leaves the targets within a few centimeters of the truth for the hydrostatic
+    zenith delay of the scene's height; the default leaves them c td / 2 farther in slant range, and the note says what was applied."""
+    col = chain.col
+    graze = np.radians(35.0)
+    zenith = 2.213                                                   # m, one way: the hydrostatic delay at 351 m (972 hPa)
+    td = 2 * zenith / np.sin(graze) / 299792458.0                    # two-way, elevation = grazing angle on flat ground
+    f = col.fmin + col.df * np.arange(col.K)
+    S = (chain.S * np.exp(-2j * np.pi * f * td)[None, :]).astype(np.complex64)
+    path = os.path.join(chain.tmp, 'tropo0.cphd')
+    sim.write_cphd(path, col, S, lat0, lon0, h0, heading=heading, tropo=0.0)
+    shift = {}
+    for tro in ('model', None):
+        out = fastsar.form_cphd(path, backend='cpu', spacing=0.4, height=h0, troposphere=tro)
+        ij = products.locate(out, *chain.truth)
+        pk = peaks(out['image'], ij, out['spx'], out['spy'])
+        g = products.geolocate(out, pk[:, 0], pk[:, 1], height=chain.truth[2])
+        shift[tro] = ground_m(g[0], g[1], chain.truth[0], chain.truth[1])
+        if tro == 'model':
+            assert any('modeled troposphere' in n for n in out['notes']), out['notes']
+    expect = 0.5 * 299792458.0 * td / np.cos(graze)
+    print(f"troposphere model: {shift['model'].max() * 100:.1f} cm from the truth with the model; {shift[None].min():.2f} to "
+          f"{shift[None].max():.2f} m without (expected about {expect:.2f} m)")
+    assert shift['model'].max() < 0.05 and np.all(np.abs(shift[None] / expect - 1) < 0.1)
+    with pytest.raises(ValueError, match='troposphere'):
+        io.read_cphd(path, troposphere='yes')
+
+
+def test_troposphere_delay_values():
+    """Sea level, zenith: one way about 2.3 m; at 30 degrees of elevation twice that; height lowers it."""
+    srp = io.geodetic_to_ecf(np.array([45.0, 45.0, 45.0]), np.array([10.0, 10.0, 10.0]), np.array([0.0, 0.0, 3000.0]))
+    up = srp / np.linalg.norm(srp, axis=1, keepdims=True)
+    east = np.array([-np.sin(np.radians(10.0)), np.cos(np.radians(10.0)), 0.0])
+    pos = np.stack([srp[0] + 600e3 * up[0], srp[1] + 600e3 * (np.sin(np.radians(30.0)) * up[1] + np.cos(np.radians(30.0)) * east),
+                    srp[2] + 600e3 * up[2]])
+    td = io.troposphere_delay(pos, pos, srp) * 299792458.0 / 2          # one way, m
+    print('troposphere delay (one way, m): zenith at sea level %.3f, 30 degrees elevation %.3f, zenith at 3 km %.3f' % tuple(td))
+    assert abs(td[0] - 2.3) < 0.05 and abs(td[1] / td[0] - 2.0) < 0.03 and 1.5 < td[2] < 1.8

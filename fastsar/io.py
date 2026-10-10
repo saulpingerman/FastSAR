@@ -24,8 +24,12 @@ form_image; +1: the data are conjugated on reading). By default the file's SGN i
 collections, whose files declare +1 while their phase follows -1 (checked against the vendor's SICD).
 
 troposphere (default None: when the file gives a nonzero delay) removes the per-pulse troposphere delay at the
-scene reference point (PVP TDTropoSRP); False keeps it, True notes its absence. An uncorrected delay displaces scatterers in range, by 3.8 m on the Umbra Panama collection (25.1 ns mean), 1.4 m at Silver Peak, Nevada (9.1 ns), where the
-correction moves FastSAR's geocoded image 2 m toward its position in Sentinel-2 and NAIP imagery. Removing it also
+scene reference point (PVP TDTropoSRP); False keeps it, True notes its absence; 'model' removes the delay of a
+standard atmosphere (troposphere_delay) for files that give none, such as ICEYE's, whose own images include the
+correction and lie about 6 m in ground range from an uncorrected image at 26 degrees of incidence. An uncorrected
+delay displaces scatterers in range, by 3.8 m on the Umbra Panama collection (25.1 ns mean), 1.4 m at Silver Peak,
+Nevada (9.1 ns), where the correction moves FastSAR's geocoded image 2 m toward its position in Sentinel-2 and NAIP
+imagery. Removing it also
 sharpens 1024 x 1024 Panama crops by 1 to 7 percent (fourth moment of the amplitude). Capella's SICD images include
 the correction (a stripmap registers to within a pixel of Capella's SICD with it, 6 pixels or 3.7 m off without);
 Umbra's do not. The ICEYE file checked (X38, 2026) gives a zero delay, so its image keeps the delay: 2.6 m in range,
@@ -59,6 +63,27 @@ def _sinc_regrid(S, u, taps=16, beta=8.0, nbins=4096, out=None):
             acc += np.where(ok, W[b, j] * np.take_along_axis(S[sl], np.clip(i, 0, K - 1), axis=1), 0)
         out[sl] = acc
     return out
+
+
+def troposphere_delay(tx, rcv, srp):
+    """Two-way troposphere delay (s) [P] at the scene reference point from a standard atmosphere, for the transmitter
+    and receiver positions tx, rcv [P, 3] and the point srp [P, 3] (ECF, m): the Saastamoinen hydrostatic zenith
+    delay at the point's latitude and height (about 2.3 m at sea level, from the 1976 standard atmosphere's pressure),
+    mapped by the cosecant of the elevation of each antenna above the point's horizon. The wet delay (0.05 to 0.3 m
+    at the zenith, from the water vapor of the day) is not modeled. For a file whose TDTropoSRP is zero
+    (ICEYE's), read_cphd(troposphere='model') removes this delay."""
+    tx, rcv, srp = (np.asarray(a, np.float64) for a in (tx, rcv, srp))
+    lat, lon, h = ecf_to_geodetic(srp)
+    lat, lon = np.radians(lat), np.radians(lon)
+    up = np.stack([np.cos(lat) * np.cos(lon), np.cos(lat) * np.sin(lon), np.sin(lat)], -1)
+    hpa = 1013.25 * np.clip(1.0 - 2.25577e-5 * h, 0.0, None) ** 5.25588
+    zenith = 0.0022768 * hpa / (1.0 - 0.00266 * np.cos(2.0 * lat) - 0.00028 * h / 1e3)      # m, one way
+    out = np.zeros(len(srp))
+    for pos in (tx, rcv):
+        d = pos - srp
+        sin_el = np.clip(np.einsum('ij,ij->i', d, up) / np.linalg.norm(d, axis=1), np.sin(np.radians(5.0)), 1.0)
+        out += zenith / sin_el
+    return out / C
 
 
 def _phase_rows(S, f, coef, sign):
@@ -177,8 +202,18 @@ def read_cphd(cphd, sicd=None, channel=0, meta=False, regrid_tol=1e-3, drop_flag
         if drop_flagged:
             S[flagged] = 0
         notes.append(f'{int(flagged.sum())} pulses flagged SIGNAL=0 (not normal): ' + ('zeroed' if drop_flagged else 'kept'))
+    if troposphere not in (None, True, False, 'model'):
+        raise ValueError(f"troposphere must be None, True, False or 'model', not {troposphere!r}")
     td = pv('TDTropoSRP') if troposphere is not False else None
     td = None if td is None else np.asarray(td, np.float64)[lo:hi]
+    if troposphere == 'model':
+        if td is not None and np.any(td):
+            notes.append(f'the file gives a troposphere delay (mean {td.mean() * 1e9:.2f} ns); the modeled delay is applied '
+                         'instead')
+        td = troposphere_delay(tx, rcv, srp)
+        what = 'a modeled troposphere delay (standard atmosphere, hydrostatic)'
+    else:
+        what = 'the troposphere delay'
     if td is None or not np.any(td):
         if troposphere:
             notes.append('no troposphere delay in the file (TDTropoSRP absent or zero): not applied')
@@ -186,7 +221,7 @@ def read_cphd(cphd, sicd=None, channel=0, meta=False, regrid_tol=1e-3, drop_flag
         # the data hold the SRP's echo at its tropospheric delay td beyond the geometric one: exp(+j 2 pi f td)
         # moves it back, f from each pulse's own grid
         _phase_rows(S, lambda sl: sc0[sl, None] + scss[sl, None] * np.arange(K)[None, :], td, +1)
-        notes.append(f'removed the troposphere delay at the SRP (mean {td.mean() * 1e9:.2f} ns, span {np.ptp(td) * 1e9:.3f} ns)')
+        notes.append(f'removed {what} at the SRP (mean {td.mean() * 1e9:.2f} ns, span {np.ptp(td) * 1e9:.3f} ns)')
     f0, df = float(np.median(sc0)), float(np.median(scss))
     t1, t2 = pv('TOA1'), pv('TOA2')
     if t1 is not None and t2 is not None:

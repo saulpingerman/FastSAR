@@ -7,6 +7,11 @@ was published on PyPI.
 
 ### Added
 
+- `read_cphd(troposphere='model')` and `form_cphd(troposphere='model')`: the troposphere delay of a standard
+  atmosphere (`io.troposphere_delay`, Saastamoinen hydrostatic zenith delay mapped by the elevation of each antenna)
+  removed at the scene reference point, for files that give no delay. ICEYE's CPHD files write `TDTropoSRP` zero
+  while ICEYE's images include the correction; an uncorrected image lay 6 m in ground range from ICEYE's on a
+  26 degree incidence dwell.
 - `CITATION.cff` with the software citation and the paper as the preferred citation.
 
 ## [0.1.1] - 2026-10-10
