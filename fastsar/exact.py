@@ -309,7 +309,8 @@ def _threads():
 
 # candidate tiles (TX, TY), largest first; on CUDA each has a compile-time thread block of TB threads with PX pixels
 # per thread (TY = TB * PX / TX)
-TILES = {'cpu': ((32, 32), (16, 16), (8, 8), (4, 4)), 'cuda': ((32, 32), (16, 16), (8, 16), (8, 8))}
+TILES = {'cpu': ((32, 32), (16, 16), (8, 8), (4, 4)), 'cuda': ((32, 32), (16, 16), (8, 16), (8, 8)),
+         'metal': ((32, 32), (16, 16), (8, 16), (8, 8))}
 CUDA_BLOCKS = {(32, 32): (128, 8), (16, 16): (128, 2), (8, 16): (128, 1), (8, 8): (64, 1)}     # (TB, PX)
 PHASE_LIMIT = 3e-4          # rad: the largest predicted phase error of the range expansion a tile may have
 
@@ -562,6 +563,44 @@ class ExactFormer:
                 raise MemoryError('ExactFormer cpu: a thread could not allocate its tile buffers')
         return (ore + 1j * oim).astype(np.complex64).reshape(self.nx, self.ny)
 
+    # ---------------------------------------------------------------- Metal (Apple GPUs)
+    def _form_metal(self, S):
+        import ctypes
+        import scipy.fft
+        from . import metal
+        ctx, tb = metal.pipeline(self.tx, self.ty, self.cubic)
+        L = metal._bridge()
+        P, K, nfft, W = self.P, self.K, self.nfft, self.W
+        ntiles = self.ntx * self.nty
+        ch = max(32, min(self.chunk, int(2.5e8 // (ntiles * 36))))       # the per-tile terms of a chunk within 250 MB
+        h = K // 2
+        workers = _threads()
+        e1, e2 = self.e1.astype(np.float32), self.e2.astype(np.float32)
+        cols = np.arange(W)
+        image = L.fsm_image_begin(ctx, self.nx * self.ny)
+        if not image:
+            raise MemoryError('ExactFormer metal: the image buffer could not be allocated')
+        err = ctypes.create_string_buffer(1024)
+        for p0 in range(0, P, ch):
+            p1 = min(P, p0 + ch)
+            n = p1 - p0
+            s = S[p0:p1] * (self.wp[p0:p1, None] * self.wk[None, :]).astype(np.float32)
+            pad = np.zeros((n, nfft), np.complex64)
+            pad[:, :K - h] = s[:, h:]
+            pad[:, nfft - h:] = s[:, :h]
+            prof = scipy.fft.ifft(pad, axis=1, workers=workers, overwrite_x=True)
+            idx = (self.blo[p0:p1, None] + cols[None, :] - nfft // 2) % nfft
+            win = np.ascontiguousarray((np.take_along_axis(prof, idx, axis=1) * nfft).astype(np.complex64))
+            terms, ti = metal.tile_terms(self.cen, self.ant[p0:p1], self.ref[p0:p1], self.lo[p0:p1], self.inv_dr, self.kcyc)
+            rc = win.view(np.float32)
+            if L.fsm_bp_tiles(ctx, image, rc, n, W, np.ascontiguousarray(terms), np.ascontiguousarray(ti), ntiles, self.nty,
+                              self.tx, self.ty, self.nx, self.ny, self.spx, self.spy, e1, e2, self.inv_dr, self.kcyc,
+                              int(self.cubic), err, 1024):
+                raise RuntimeError(f'ExactFormer metal: {err.value.decode()}')
+        out = np.zeros(self.nx * self.ny * 2, np.float32)
+        L.fsm_image_end(image, out)
+        return out.view(np.complex64).reshape(self.nx, self.ny)
+
     # ---------------------------------------------------------------- memory
     def memory(self):
         """What a call needs on this former's device and what is free: dict(backend, needed, available, full_speed,
@@ -621,6 +660,8 @@ class ExactFormer:
                                f'({_mem._gb(_mem.cuda_free())} free)')
         if self.backend == 'cpu':
             return self._form_cpu(S)
+        if self.backend == 'metal':
+            return self._form_metal(S)
         from .bp import backproject, plane_points
         pts = plane_points(self.nx, self.ny, self.spx, self.spy, self.e1, self.e2) + self.center
         # linear interpolation only: 4 times the oversampling stands in for cubic interpolation's accuracy

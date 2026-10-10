@@ -82,7 +82,7 @@ def available_backends():
 _JAX_PROGRAMS = {}         # compiled JAX/TPU programs by plan signature (ImageFormer)
 _JAX_LOCK = threading.Lock()   # mosaic workers build formers concurrently: one build per signature, no torn eviction
 
-BACKENDS = ('auto', 'tpu', 'cuda', 'cpu', 'jax')     # the values form_image, ImageFormer, ExactFormer and form_cphd accept
+BACKENDS = ('auto', 'tpu', 'cuda', 'cpu', 'jax', 'metal')     # the values form_image, ImageFormer, ExactFormer and form_cphd accept
 
 
 def _backend(backend):
@@ -97,6 +97,11 @@ def _backend(backend):
     if backend == 'cuda' and 'cuda' not in have:
         raise ValueError("backend 'cuda' needs CuPy and an Nvidia GPU; this machine has " + ', '.join(have + ['jax'])
                          + (f" (the CuPy probe failed: {_PROBE_ERRORS['cuda']})" if 'cuda' in _PROBE_ERRORS else ''))
+    if backend == 'metal':
+        from . import metal
+        if not metal.available():
+            raise ValueError("backend 'metal' needs macOS on Apple silicon (ExactFormer only); this machine has " + ', '.join(have + ['jax']))
+        return backend
     if backend == 'tpu' and 'tpu' not in have and not os.environ.get('FFBP_FORCE_TPU_KERNELS'):
         raise ValueError("backend 'tpu' needs JAX on a Cloud TPU; this machine has " + ', '.join(have + ['jax'])
                          + (f" (the JAX probe failed: {_PROBE_ERRORS['tpu']})" if 'tpu' in _PROBE_ERRORS else ''))

@@ -49,6 +49,41 @@ def compiler():
                        "(xcode-select --install), or set CXX")
 
 
+def shared_object_mm(name, src):
+    """Path of the shared library built from the Objective-C++ source text src with Apple's clang against the Metal
+    and Foundation frameworks (macOS only), cached as shared_object caches."""
+    if sys.platform != 'darwin':
+        raise RuntimeError('Metal is available on macOS only')
+    cxx = 'clang++'
+    flags = ['-O2', '-std=c++17', '-ObjC++', '-fobjc-arc']
+    key = '\0'.join([src, cxx, ' '.join(flags), _host_tag()])
+    tag = hashlib.sha1(key.encode()).hexdigest()[:12]
+    d = cache_dir()
+    so = os.path.join(d, f'lib{name}_{tag}.dylib')
+    if os.path.exists(so):
+        return so
+    stem = os.path.join(d, f'{name}_{tag}.{os.getpid()}')
+    mm, tmp = stem + '.mm', stem + '.dylib.tmp'
+    with open(mm, 'w') as fh:
+        fh.write(src)
+    try:
+        cmd = [cxx] + flags + ['-shared', '-fPIC', '-framework', 'Metal', '-framework', 'Foundation', mm, '-o', tmp]
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+        except FileNotFoundError:
+            raise RuntimeError("the Metal bridge needs Apple's clang (xcode-select --install)") from None
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(f'compiling the Metal bridge failed ({" ".join(cmd)}):\n{e.stderr.strip()}') from None
+        os.replace(tmp, so)
+    finally:
+        for f in (mm, tmp):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+    return so
+
+
 def _check_gcc(cxx):
     """On ARM the vector extensions need GCC 12 or later (earlier releases mis-lower the 64-byte vector type)."""
     try:
