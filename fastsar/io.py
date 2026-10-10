@@ -488,6 +488,16 @@ def read_nisar(path, frequency=None, polarization=None, meta=False, height=None,
             if S is None:
                 S = np.empty((P, blk.shape[1]), np.complex64)
             S[p0:p1] = blk
+        # dithered pulse timing (NISAR varies the PRI by a few percent): the factorized former's pulse filters assume
+        # pulses evenly spaced, so the referenced history is resampled onto uniform pulse times (cubic splines across
+        # pulses, the positions and reference delays with it); exact backprojection needs none of this
+        dt = np.diff(ut)
+        if dt.size > 1 and np.ptp(dt) > 1e-3 * dt.mean():
+            uu = np.linspace(ut[0], ut[-1], P)
+            S, (tx_pos, rcv_pos, srp, tau_ref) = raw.resample_pulses(S, ut, uu, (tx_pos, rcv_pos, srp, tau_ref))
+            notes.append(f'pulse timing dithered ({dt.min() * 1e6:.0f} to {dt.max() * 1e6:.0f} us): history resampled to uniform pulse times')
+            ut = uu
+            tx_vel = orbit(ut)[1]
         # the swath's corners: near and far range at zero Doppler on the first and last pulses
         near_far = [raw.zero_doppler_points(tx_pos[[0, -1]], tx_vel[[0, -1]], r, side, height=height) for r in (sr[0], r_far)]
         corners = np.stack([near_far[0][0], near_far[1][0], near_far[1][1], near_far[0][1]])

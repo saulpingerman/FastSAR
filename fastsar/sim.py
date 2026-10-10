@@ -254,14 +254,17 @@ def raw_echoes(col, pos, amp, fs, chirp, r_near, n, lat, lon, height=0.0, headin
 
 
 def write_nisar(path, col, pos, amp, lat, lon, height=0.0, heading=0.0, speed=7500.0, bandwidth=None, fs=None,
-                chirp_duration=10e-6, r_margin=200.0, pol='HH', frequency='A', epoch='2026-01-01T00:00:00', range_delay=None):
+                chirp_duration=10e-6, r_margin=200.0, pol='HH', frequency='A', epoch='2026-01-01T00:00:00', range_delay=None,
+                dither=0.0):
     """Write a NISAR L0B RRSD look-alike (HDF5) of scatterers pos [N, 3] (simulator frame) with amplitudes amp:
     the raw echoes of a linear-FM chirp (bandwidth default the collection's, sampled at fs, default 1.2 times the
     bandwidth) in a receive window from r_margin m before the nearest scatterer to r_margin m past the farthest,
     block-floating-point encoded; the pulse times speed m/s apart along the track; the orbit as nine state vectors
     along the (straight) track; the datasets and attributes io.read_nisar reads. The radar looks right (to_ecf).
     range_delay: the instrument's range delay (m, default io.NISAR_RANGE_DELAY for the frequency): the echoes
-    arrive late by it, so each sample's slant range labels a target that far nearer. Needs h5py."""
+    arrive late by it, so each sample's slant range labels a target that far nearer. dither: the pulse timing varied
+    at random by up to this fraction of the interval (NISAR dithers its PRI), the antenna positions following the
+    times along the track. Needs h5py."""
     _deps.require('h5py')
     import h5py
     ant_l = np.asarray(col.ant, np.float64)
@@ -281,6 +284,16 @@ def write_nisar(path, col, pos, amp, lat, lon, height=0.0, heading=0.0, speed=75
     r_near = r.min() - r_margin + delay              # the labeled slant range of sample 0 (the echoes arrive late)
     n = int(np.ceil(2.0 * (r.max() + r_margin - (r_near - delay)) / C * fs)) + L     # the physical window
     t = 1.0 + np.cumsum(np.r_[0.0, np.linalg.norm(np.diff(ant_l, axis=0), axis=1)]) / speed
+    if dither:
+        rng = np.random.default_rng(7)
+        dt = float(np.median(np.diff(t)))
+        tj = t + rng.uniform(-dither, dither, len(t)) * dt           # the pulses fire at jittered times
+        tj[0], tj[-1] = t[0], t[-1]
+        from scipy.interpolate import CubicSpline
+        ant = CubicSpline(t, ant, axis=0)(tj)                         # on the same straight track, where the platform is then
+        ant_l = CubicSpline(t, ant_l, axis=0)(tj)
+        t = tj
+        col = Collect(col.fmin, col.df, col.K, ant_l, col.res)
     vel = np.gradient(ant, t, axis=0)
     z = raw_echoes(col, pos, amp, fs, chirp, r_near - delay, n, lat, lon, height, heading, vel=vel)
     # nine state vectors on the straight track, one second apart around the aperture

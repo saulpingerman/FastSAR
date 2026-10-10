@@ -98,6 +98,21 @@ def zero_doppler_points(pos, vel, r, side, height=0.0, iterations=60):
     return pos + r[:, None] * (np.cos(mid)[:, None] * down + sign * np.sin(mid)[:, None] * right)
 
 
+def resample_pulses(S, t, tu, arrays=(), block=2048):
+    """The phase history S [P, K] (complex64, referenced so that it varies slowly from pulse to pulse) at the pulse
+    times t [P] resampled onto the times tu [P'] by cubic splines across pulses, in blocks of frequency samples;
+    the arrays [P, ...] (positions, delays) interpolated the same way. -> S' [P', K], tuple of interpolated arrays."""
+    from scipy.interpolate import CubicSpline
+    t, tu = np.asarray(t, np.float64), np.asarray(tu, np.float64)
+    P, K = S.shape
+    out = np.empty((len(tu), K), np.complex64)
+    for k0 in range(0, K, block):
+        k1 = min(K, k0 + block)
+        blk = S[:, k0:k1]
+        out[:, k0:k1] = CubicSpline(t, blk.real, axis=0)(tu) + 1j * CubicSpline(t, blk.imag, axis=0)(tu)
+    return out, tuple(CubicSpline(t, np.asarray(a, np.float64), axis=0)(tu) for a in arrays)
+
+
 def decode_bfpq(block, lut):
     """NISAR's block floating point quantization: a compound array with uint16 fields 'r' and 'i' indexing the
     lookup table lut [65536] -> complex64."""

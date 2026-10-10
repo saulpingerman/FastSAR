@@ -105,6 +105,32 @@ def test_form_nisar(nisar):
     assert max(err) < 0.35 and pk > 50
 
 
+def test_form_nisar_dithered(tmp_path):
+    """Dithered pulse timing (NISAR's PRI dithering): the reader resamples the history to uniform pulse times and
+    the targets still focus where they are, within half a meter."""
+    rng = np.random.default_rng(21)
+    col = sim.make_collect(res=0.5, scene=60.0, r0=20e3)
+    gx, gy = np.meshgrid([-16.0, -2.0, 14.0], [-15.0, 1.0, 17.0], indexing='ij')
+    tg = np.stack([gx.ravel()[:6], gy.ravel()[:6], np.zeros(6)], 1)
+    amp = np.ones(6) * np.exp(1j * rng.uniform(0, 2 * np.pi, 6))
+    path = os.path.join(tmp_path, 'dithered.h5')
+    sim.write_nisar(path, col, tg, amp, lat0, lon0, h0, heading=heading, dither=0.08)
+    col_, meta = io.read_nisar(path, meta=True)
+    assert any('dithered' in n for n in meta['notes'])
+    out = fastsar.form_cphd(path, backend='cpu', spacing=0.4, height=h0, extent=(60.0, 60.0))
+    img = np.abs(out['image'])
+    truth = io.ecf_to_geodetic(sim.to_ecf(tg, lat0, lon0, h0, heading))
+    err = []
+    for (i, j) in products.locate(out, *truth):
+        i0, j0 = int(round(i)), int(round(j))
+        w = img[max(0, i0 - 6):i0 + 7, max(0, j0 - 6):j0 + 7]
+        pi, pj = np.unravel_index(np.argmax(w), w.shape)
+        err.append(np.hypot((max(0, i0 - 6) + pi - i) * out['spx'], (max(0, j0 - 6) + pj - j) * out['spy']))
+    pk = img.max() / np.median(img)
+    print(f'dithered NISAR look-alike: worst target offset {max(err):.2f} m, peak to median {pk:.0f}')
+    assert max(err) < 0.5 and pk > 50
+
+
 def test_read_collection_dispatch(nisar):
     col, meta = io.read_collection(nisar['path'], channel=0, meta=True, troposphere='model', block=16)
     assert col['S'].shape[0] > 0 and any('troposphere delay removed' in n for n in meta['notes'])
