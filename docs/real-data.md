@@ -114,3 +114,13 @@ ICEYE dwell files declare the non-standard radar mode EXPERIMENTAL (`meta['mode'
 ICEYE's SICD metadata `.xml` (`sicd='scene_SICD.xml'`). A 91,426-pulse dwell (28 GB) is read in place or streamed
 ([performance.md](performance.md#large-collections)); the plan of a 71,790 by 10,000 pixel image takes 0.1 s and
 2.7 GB. No comparison with ICEYE's image is published.
+
+## NISAR Level 0B
+
+`io.read_nisar` reads a NISAR L0B RRSD granule (HDF5) as `read_cphd` reads a CPHD: one frequency (`A` or `B`) and
+polarization at a time, the block-floating-point echoes decoded, range compressed with the chirp replica the file
+carries, taken to the frequency domain over the chirp's band and compensated to each pulse's zero-Doppler ground
+point at mid swath, with the antenna positions interpolated from the orbit state vectors. `form_cphd(path.h5)` then
+forms the collection in moving mode over the swath (or an `extent`); `height` sets the ground plane. Samples in the
+transmit gaps are zeroed; the per-receiver calibration tables (caltone, attenuation, TRM phases) are not applied.
+A 2 s, 20 MHz granule (4,096 pulses by 25,970 samples) reads in 6 s and forms a 12 by 24 km patch in 9 s on 8 cores.

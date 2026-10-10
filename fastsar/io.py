@@ -140,6 +140,82 @@ def _opt(m, path, conv=None):
     return conv(m) if conv else m
 
 
+def _assemble(S, tx, rcv, srp, f0, df, notes, sicd, meta, info):
+    """The tail shared by the readers: the local frame at the mid-aperture scene reference point, the reference
+    range of each pulse (re-referenced to one point when the scene reference point barely moves), the SICD grid
+    when one is given, and the (col, meta) outputs. S [P, K] is the frequency-domain phase history on the grid
+    f0 + k df compensated to each pulse's srp [P, 3] (ECF), tx and rcv [P, 3] the antenna positions (ECF), info
+    the source-specific metadata fields."""
+    P, K = S.shape
+    # local frame at the mid-aperture scene reference point, z along the ellipsoid normal (not the geocentric radial,
+    # which leans up to 0.19 degrees from it: 3 m of height across 1 km)
+    s0 = srp[P // 2]
+    phi, lam, _ = (np.radians(float(v)) for v in ecf_to_geodetic(s0))
+    up = np.array([np.cos(phi) * np.cos(lam), np.cos(phi) * np.sin(lam), np.sin(phi)])
+    apc = 0.5 * (tx + rcv)
+    mid = apc[P // 2] - s0
+    los_h = mid - (mid @ up) * up
+    yhat = -los_h / np.linalg.norm(los_h)
+    xhat = np.cross(yhat, up)
+    R = np.stack([xhat, yhat, up])
+    ref = 0.5 * (np.linalg.norm(tx - srp, axis=1) + np.linalg.norm(rcv - srp, axis=1))
+    ref0 = 0.5 * (np.linalg.norm(tx - s0, axis=1) + np.linalg.norm(rcv - s0, axis=1))
+    moved = float(np.abs(ref - ref0).max())
+    fixed_ref = True
+    if moved > 1e-6:
+        if moved < 0.25 * C / (2 * df):
+            # exp(-j 4 pi f (|x - a| - ref)) -> exp(-j 4 pi f (|x - a| - ref0))
+            _phase_rows(S, lambda sl: np.broadcast_to(f0 + df * np.arange(K), (len(range(*sl.indices(len(S)))), K)), 2 * (ref - ref0) / C, -1)
+            notes.append(f're-referenced to the mid-aperture scene reference point (range change up to {moved:.1f} m)')
+        else:
+            fixed_ref = False
+            notes.append(f'scene reference point moves (range change up to {moved:.0f} m): image with backproject and ref')
+    moving_note = notes[-1] if not fixed_ref else None
+    cur_ref = ref if not fixed_ref else ref0           # the range each pulse is compensated to from here on
+    origin = s0
+    if sicd is not None:
+        _deps.require('sarpy')
+        from sarpy.io.complex.converter import open_complex
+        sm = open_complex(sicd).sicd_meta
+        if sm.Grid.Type not in ('RGAZIM', 'PLANE', 'XRGYCR', 'XCTYAT'):
+            raise ValueError(f'the SICD grid is {sm.Grid.Type}, not a plane: read without sicd and form its pixels with '
+                             'fastsar.backproject(S, ..., io.sicd_points(sicd, rows, cols, meta))')
+        rows, cols = int(sm.ImageData.NumRows), int(sm.ImageData.NumCols)
+        row_ss, col_ss = float(sm.Grid.Row.SS), float(sm.Grid.Col.SS)
+        row_u = np.array(sm.Grid.Row.UVectECF.get_array()) @ R.T
+        col_u = np.array(sm.Grid.Col.UVectECF.get_array()) @ R.T
+        range_is_row = abs(row_u[1]) > abs(row_u[0])
+        e2, e1 = (row_u, col_u) if range_is_row else (col_u, row_u)
+        grid = dict(nx=cols if range_is_row else rows, ny=rows if range_is_row else cols,
+                    spx=col_ss if range_is_row else row_ss, spy=row_ss if range_is_row else col_ss,
+                    e1=e1 / np.linalg.norm(e1), e2=e2 / np.linalg.norm(e2))
+        # the grid's center pixel (nx / 2, ny / 2) on the SICD's pixel grid: SICD pixel (r, c) lies at
+        # SCP + (r - SCPRow) row_ss row_u + (c - SCPCol) col_ss col_u (first row and column of the full image)
+        scp = np.array(sm.GeoData.SCP.ECF.get_array())
+        r0 = float(sm.ImageData.SCPPixel.Row - sm.ImageData.FirstRow)
+        c0 = float(sm.ImageData.SCPPixel.Col - sm.ImageData.FirstCol)
+        origin = (scp + (rows / 2.0 - r0) * row_ss * np.array(sm.Grid.Row.UVectECF.get_array())
+                  + (cols / 2.0 - c0) * col_ss * np.array(sm.Grid.Col.UVectECF.get_array()))
+        grid['transpose'] = range_is_row
+    shift = (origin - s0) @ R.T
+    if np.abs(shift).max() > 0:
+        ref1 = 0.5 * (np.linalg.norm(tx - origin, axis=1) + np.linalg.norm(rcv - origin, axis=1))
+        S = rereference(S, f0, df, cur_ref - ref1)
+        cur_ref = ref1
+        notes.append(f'grid origin moved {np.linalg.norm(shift):.2f} m from the scene reference point onto the SICD pixel grid')
+    out = dict(S=S, ant=(apc - origin) @ R.T, fmin=f0, df=df)
+    if sicd is not None:
+        out.update({k: v for k, v in grid.items() if k != 'transpose'})
+    if not meta:
+        if not fixed_ref:
+            raise ValueError(moving_note + '; call read_cphd(..., meta=True)')
+        return out
+    info = dict(info, tx=(tx - origin) @ R.T, rcv=(rcv - origin) @ R.T, ref=cur_ref, fixed_ref=fixed_ref,
+                R=R, origin=origin, srp=s0, srp_pulses=(srp - origin) @ R.T,
+                sicd_transpose=None if sicd is None else grid['transpose'], notes=notes)
+    return out, info
+
+
 def read_cphd(cphd, sicd=None, channel=0, meta=False, regrid_tol=1e-3, drop_flagged=False, troposphere=None, phase_sign=None):
     """-> dict(S, ant, fmin, df[, nx, ny, spx, spy, e1, e2]) ready for form_image(**d), and with meta=True also a
     dict: tx, rcv [P, 3] (local frame, m), ref [P] (the one-way range each pulse is compensated to after this
@@ -258,78 +334,141 @@ def read_cphd(cphd, sicd=None, channel=0, meta=False, regrid_tol=1e-3, drop_flag
     if shift > regrid_tol:
         _sinc_regrid(S, lambda sl: (f0 + np.arange(K)[None, :] * df - sc0[sl, None]) / scss[sl, None], out=S)
         notes.append(f'resampled per-pulse frequency grids (largest offset {shift:.3g} samples)')
-    # local frame at the mid-aperture scene reference point, z along the ellipsoid normal (not the geocentric radial,
-    # which leans up to 0.19 degrees from it: 3 m of height across 1 km)
-    s0 = srp[P // 2]
-    phi, lam, _ = (np.radians(float(v)) for v in ecf_to_geodetic(s0))
-    up = np.array([np.cos(phi) * np.cos(lam), np.cos(phi) * np.sin(lam), np.sin(phi)])
-    apc = 0.5 * (tx + rcv)
-    mid = apc[P // 2] - s0
-    los_h = mid - (mid @ up) * up
-    yhat = -los_h / np.linalg.norm(los_h)
-    xhat = np.cross(yhat, up)
-    R = np.stack([xhat, yhat, up])
-    ref = 0.5 * (np.linalg.norm(tx - srp, axis=1) + np.linalg.norm(rcv - srp, axis=1))
-    ref0 = 0.5 * (np.linalg.norm(tx - s0, axis=1) + np.linalg.norm(rcv - s0, axis=1))
-    moved = float(np.abs(ref - ref0).max())
-    fixed_ref = True
-    if moved > 1e-6:
-        if moved < 0.25 * C / (2 * df):
-            # exp(-j 4 pi f (|x - a| - ref)) -> exp(-j 4 pi f (|x - a| - ref0))
-            _phase_rows(S, lambda sl: np.broadcast_to(f0 + df * np.arange(K), (len(range(*sl.indices(len(S)))), K)), 2 * (ref - ref0) / C, -1)
-            notes.append(f're-referenced to the mid-aperture scene reference point (range change up to {moved:.1f} m)')
-        else:
-            fixed_ref = False
-            notes.append(f'scene reference point moves (range change up to {moved:.0f} m): image with backproject and ref')
-    moving_note = notes[-1] if not fixed_ref else None
-    cur_ref = ref if not fixed_ref else ref0           # the range each pulse is compensated to from here on
-    origin = s0
-    if sicd is not None:
-        _deps.require('sarpy')
-        from sarpy.io.complex.converter import open_complex
-        sm = open_complex(sicd).sicd_meta
-        if sm.Grid.Type not in ('RGAZIM', 'PLANE', 'XRGYCR', 'XCTYAT'):
-            raise ValueError(f'the SICD grid is {sm.Grid.Type}, not a plane: read without sicd and form its pixels with '
-                             'fastsar.backproject(S, ..., io.sicd_points(sicd, rows, cols, meta))')
-        rows, cols = int(sm.ImageData.NumRows), int(sm.ImageData.NumCols)
-        row_ss, col_ss = float(sm.Grid.Row.SS), float(sm.Grid.Col.SS)
-        row_u = np.array(sm.Grid.Row.UVectECF.get_array()) @ R.T
-        col_u = np.array(sm.Grid.Col.UVectECF.get_array()) @ R.T
-        range_is_row = abs(row_u[1]) > abs(row_u[0])
-        e2, e1 = (row_u, col_u) if range_is_row else (col_u, row_u)
-        grid = dict(nx=cols if range_is_row else rows, ny=rows if range_is_row else cols,
-                    spx=col_ss if range_is_row else row_ss, spy=row_ss if range_is_row else col_ss,
-                    e1=e1 / np.linalg.norm(e1), e2=e2 / np.linalg.norm(e2))
-        # the grid's center pixel (nx / 2, ny / 2) on the SICD's pixel grid: SICD pixel (r, c) lies at
-        # SCP + (r - SCPRow) row_ss row_u + (c - SCPCol) col_ss col_u (first row and column of the full image)
-        scp = np.array(sm.GeoData.SCP.ECF.get_array())
-        r0 = float(sm.ImageData.SCPPixel.Row - sm.ImageData.FirstRow)
-        c0 = float(sm.ImageData.SCPPixel.Col - sm.ImageData.FirstCol)
-        origin = (scp + (rows / 2.0 - r0) * row_ss * np.array(sm.Grid.Row.UVectECF.get_array())
-                  + (cols / 2.0 - c0) * col_ss * np.array(sm.Grid.Col.UVectECF.get_array()))
-        grid['transpose'] = range_is_row
-    shift = (origin - s0) @ R.T
-    if np.abs(shift).max() > 0:
-        ref1 = 0.5 * (np.linalg.norm(tx - origin, axis=1) + np.linalg.norm(rcv - origin, axis=1))
-        S = rereference(S, f0, df, cur_ref - ref1)
-        cur_ref = ref1
-        notes.append(f'grid origin moved {np.linalg.norm(shift):.2f} m from the scene reference point onto the SICD pixel grid')
-    out = dict(S=S, ant=(apc - origin) @ R.T, fmin=f0, df=df)
-    if sicd is not None:
-        out.update({k: v for k, v in grid.items() if k != 'transpose'})
-    if not meta:
-        if not fixed_ref:
-            raise ValueError(moving_note + '; call read_cphd(..., meta=True)')
-        return out
     pol = getattr(par, 'Polarization', None)
-    info = dict(tx=(tx - origin) @ R.T, rcv=(rcv - origin) @ R.T, ref=cur_ref, fixed_ref=fixed_ref,
-                R=R, origin=origin, srp=s0, srp_pulses=(srp - origin) @ R.T,
-                sicd_transpose=None if sicd is None else grid['transpose'], tx_time=pv('TxTime')[lo:hi], rcv_time=pv('RcvTime')[lo:hi], pulses=(lo, hi),
+    info = dict(tx_time=pv('TxTime')[lo:hi], rcv_time=pv('RcvTime')[lo:hi], pulses=(lo, hi),
                 polarization=None if pol is None else f'{pol.TxPol}{pol.RcvPol}', channel=ch.Identifier, channel_index=channel,
-                mode=_mode_type(r, m, notes),
-                notes=notes, start=_opt(m, 'Global.Timeline.CollectionStart', str),
+                mode=_mode_type(r, m, notes), start=_opt(m, 'Global.Timeline.CollectionStart', str),
                 collector=_opt(m, 'CollectionID.CollectorName'), core_name=_opt(m, 'CollectionID.CoreName'))
-    return out, info
+    return _assemble(S, tx, rcv, srp, f0, df, notes, sicd, meta, info)
+
+
+def read_collection(path, **kw):
+    """read_cphd for a CPHD file, read_nisar for a NISAR L0B (HDF5, .h5) file, with the keyword arguments the
+    reader called accepts; the others are dropped, with a note in meta when they were set."""
+    import inspect
+    reader, kind = (read_nisar, 'a NISAR file') if str(path).lower().endswith(('.h5', '.hdf5')) else (read_cphd, 'a CPHD file')
+    allowed = set(inspect.signature(reader).parameters)
+    dropped = sorted(k for k in kw if k not in allowed and kw[k] not in (None, 0, False))
+    out = reader(path, **{k: v for k, v in kw.items() if k in allowed})
+    if dropped and kw.get('meta'):
+        out[1]['notes'].append(f'not applicable to {kind}: {", ".join(dropped)}')
+    return out
+
+
+def read_nisar(path, frequency=None, polarization=None, meta=False, height=None, band_margin=1.0, block=1024):
+    """A NISAR L0B RRSD granule (HDF5) as read_cphd returns a CPHD: dict(S, ant, fmin, df) with the raw echoes of one
+    frequency ('A' or 'B', default the file's first) and polarization ('HH', 'HV', 'VH', 'VV', default the first)
+    range compressed with the file's chirp replica and taken to the frequency domain (fastsar.raw), compensated to
+    each pulse's zero-Doppler ground point at mid swath at the given height above the ellipsoid (default 0; a moving scene
+    reference point, so the collection forms with form_cphd's moving mode), the antenna positions interpolated
+    from the file's orbit state vectors at the transmit times (Hermite). band_margin: the fraction of the range
+    bandwidth kept around the carrier (1.0: the chirp's band). With meta=True also the dict read_cphd gives, plus
+    image_area (the swath's corners, local frame) and refpt. Transmit gaps (the file's valid-sample intervals) are
+    zeroed; the per-receiver calibration (caltone, attenuation, TRM phases) is not applied. Needs h5py
+    (pip install "fastsar[raw]")."""
+    from . import _deps, raw
+    h5py = _deps.require('h5py')
+    f = h5py.File(path, 'r')
+    try:
+        ident = f['science/LSAR/identification']
+        freqs = [x.decode() if isinstance(x, bytes) else str(x) for x in ident['listOfFrequencies'][()]]
+        if frequency is None:
+            frequency = freqs[0]
+        if frequency not in freqs:
+            raise ValueError(f'frequency {frequency!r} not in the file ({freqs})')
+        sw = f[f'science/LSAR/RRSD/swaths/frequency{frequency}']
+        txs = [k for k in sw if k.startswith('tx')]
+        pols = []
+        for tx in txs:
+            for rx in [k for k in sw[tx] if k.startswith('rx')]:
+                pols.append((tx[2:] + rx[2:], tx, rx))
+        if polarization is None:
+            polarization = pols[0][0]
+        match = [p for p in pols if p[0] == polarization.upper()]
+        if not match:
+            raise ValueError(f'polarization {polarization!r} not in the file ({[p[0] for p in pols]})')
+        pol, tx, rx = match[0]
+        g, h = sw[tx], sw[tx][rx]
+        ds = h[pol]
+        P, n = ds.shape
+        lut = h['BFPQLUT'][()]
+        chirp = g['chirpWaveform'][()]
+        sr = g['slantRange'][()].astype(np.float64)
+        dr = float(g['slantRangeSpacing'][()])
+        fs = C / (2.0 * dr)
+        fc = float(g['centerFrequency'][()])
+        bw = float(g['rangeBandwidth'][()])
+        ut = g['UTCtime'][()].astype(np.float64)
+        epoch = g['UTCtime'].attrs.get('units', b'')
+        epoch = (epoch.decode() if isinstance(epoch, bytes) else str(epoch)).replace('seconds since ', '')
+        bpc = h['basebandPhaseCorrection'][()].astype(np.complex64) if 'basebandPhaseCorrection' in h else None
+        nsub = int(g['numberOfSubSwaths'][()]) if 'numberOfSubSwaths' in g else 1
+        valid = [g[f'validSamplesSubSwath{k}'][()] for k in range(1, nsub + 1) if f'validSamplesSubSwath{k}' in g]
+        orb = f['science/LSAR/RRSD/lowRateTelemetry/orbit']
+        ot = orb['time'][()].astype(np.float64)
+        oepoch = orb['time'].attrs.get('units', b'')
+        oepoch = (oepoch.decode() if isinstance(oepoch, bytes) else str(oepoch)).replace('seconds since ', '')
+        if oepoch.strip() != epoch.strip():
+            raise ValueError(f'orbit epoch {oepoch!r} differs from the pulse time epoch {epoch!r}')
+        orbit = raw.hermite_orbit(ot, orb['position'][()], orb['velocity'][()])
+        side = ident['lookDirection'][()]
+        side = (side.decode() if isinstance(side, bytes) else str(side)).lower()
+        core = ident['granuleId'][()] if 'granuleId' in ident else b''
+        core = core.decode() if isinstance(core, bytes) else str(core)
+        notes = [f'NISAR L0B frequency {frequency}, {pol}, {P} pulses of {n} samples at {fs / 1e6:.1f} MHz, band '
+                 f'{bw / 1e6:.0f} MHz at {fc / 1e9:.4f} GHz, {side}-looking; orbit {orbit_type(orb)} with {len(ot)} state vectors']
+        if nsub > 1:
+            notes.append(f'{nsub} sub-swaths: samples in the transmit gaps zeroed')
+        # geometry: transmitter at the pulse time, the zero-Doppler point at mid swath, the receiver at the echo time
+        tx_pos, tx_vel = orbit(ut)
+        # the last chirp length of the window holds partial correlations: the far edge of the imaged swath is before it
+        n_far = max(1, n - len(chirp))
+        r_far = sr[n_far - 1]
+        r_mid = 0.5 * (sr[0] + r_far)
+        height = 0.0 if height is None else float(height)
+        srp = raw.zero_doppler_points(tx_pos, tx_vel, r_mid, side, height=height)
+        rcv_pos, _ = orbit(ut + 2.0 * np.linalg.norm(srp - tx_pos, axis=1) / C)
+        tau_ref = (np.linalg.norm(tx_pos - srp, axis=1) + np.linalg.norm(rcv_pos - srp, axis=1)) / C
+        tau0 = 2.0 * sr[0] / C
+        S = None
+        for p0 in range(0, P, block):
+            p1 = min(P, p0 + block)
+            z = raw.decode_bfpq(ds[p0:p1], lut)
+            if bpc is not None:
+                z *= bpc[p0:p1, None]
+            if valid:
+                keep = np.zeros((p1 - p0, n), bool)
+                cols = np.arange(n)[None, :]
+                for v in valid:
+                    a, b = v[p0:p1, 0][:, None], v[p0:p1, 1][:, None]
+                    ok = (a < n) & (b <= n) & (a < b)
+                    keep |= ok & (cols >= a) & (cols < b)
+                z[~keep] = 0
+            blk, fmin, df = raw.fx_history(raw.range_compress(z, chirp), fs, fc, tau0, tau_ref[p0:p1], bw, band_margin)
+            if S is None:
+                S = np.empty((P, blk.shape[1]), np.complex64)
+            S[p0:p1] = blk
+        # the swath's corners: near and far range at zero Doppler on the first and last pulses
+        near_far = [raw.zero_doppler_points(tx_pos[[0, -1]], tx_vel[[0, -1]], r, side, height=height) for r in (sr[0], r_far)]
+        corners = np.stack([near_far[0][0], near_far[1][0], near_far[1][1], near_far[0][1]])
+        start = f'{epoch.strip()}T00:00:00' if 'T' not in epoch else epoch.strip()
+        info = dict(tx_time=ut, rcv_time=ut + tau_ref, pulses=(0, P), polarization=pol, channel=f'{frequency}{pol}',
+                    channel_index=[p[0] for p in pols].index(pol), mode='STRIPMAP', start=f'{start} + {ut[0]:.6f} s',
+                    collector='NISAR', core_name=core)
+        out = _assemble(S, tx_pos, rcv_pos, srp, fmin, df, notes, None, meta, info)
+        if meta:
+            col, info = out
+            info['image_area'] = (corners - info['origin']) @ info['R'].T
+            info['refpt'] = np.zeros(3)
+            return col, info
+        return out
+    finally:
+        f.close()
+
+
+def orbit_type(orb):
+    v = orb['orbitType'][()] if 'orbitType' in orb else b'?'
+    return v.decode() if isinstance(v, bytes) else str(v)
 
 
 def sicd_points(sicd, rows, cols, meta, hae=None):

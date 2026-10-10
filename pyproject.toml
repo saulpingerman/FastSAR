@@ -41,11 +41,12 @@ cuda = ["cupy-cuda12x"]
 io = ["sarpy>=1.3.64"]
 tpu = ["jax[tpu]>=0.6.2"]
 geo = ["rasterio>=1.4.4"]
+raw = ["h5py>=3.10"]
 # the same packages as the test dependency group, for installers without PEP 735 groups
-test = ["pytest>=8", "pytest-timeout", "pytest-xdist", "sarpy>=1.3.64", "sarkit; python_version >= '3.11'", "rasterio>=1.4.4", "finufft"]
+test = ["pytest>=8", "pytest-timeout", "pytest-xdist", "sarpy>=1.3.64", "sarkit; python_version >= '3.11'", "rasterio>=1.4.4", "finufft", "h5py>=3.10"]
 
 [dependency-groups]
-test = ["pytest>=8", "pytest-timeout", "pytest-xdist", "sarpy>=1.3.64", "sarkit; python_version >= '3.11'", "rasterio>=1.4.4", "finufft"]
+test = ["pytest>=8", "pytest-timeout", "pytest-xdist", "sarpy>=1.3.64", "sarkit; python_version >= '3.11'", "rasterio>=1.4.4", "finufft", "h5py>=3.10"]
 dev = [{include-group = "test"}, "nox>=2025.2.9"]
 
 [tool.setuptools]

@@ -1,7 +1,7 @@
 """Optional dependencies: an ImportError that names the extra installing the missing package."""
 import importlib
 
-EXTRA = {'sarpy': 'io', 'rasterio': 'geo', 'cupy': 'cuda'}
+EXTRA = {'sarpy': 'io', 'rasterio': 'geo', 'cupy': 'cuda', 'h5py': 'raw'}
 
 
 def require(module):

@@ -51,6 +51,8 @@ def _sicd_meta(sicd):
 def _image_area(cphd, meta):
     """Corners [4, 3] of the CPHD's image area rectangle and its reference point [3] (local frame), or (None, IARP or
     None)."""
+    if 'image_area' in meta:                       # a reader that supplies the footprint itself (read_nisar)
+        return meta['image_area'], meta.get('refpt')
     _deps.require('sarpy')
     from sarpy.io.phase_history.converter import open_phase_history
     sc = open_phase_history(cphd).cphd_meta.SceneCoordinates
@@ -111,7 +113,7 @@ def form_cphd(cphd, sicd=None, *, mode='auto', backend='auto', window=True, spac
             raise ValueError(f'{n} must be one or two positive lengths in meters, got {v!r}')
     if extent is not None and np.size(extent) != 2:
         raise ValueError(f'extent must be (along track, across track) in meters, got {extent!r}')
-    col, meta = io.read_cphd(cphd, channel=channel, meta=True, troposphere=troposphere)
+    col, meta = io.read_collection(cphd, channel=channel, meta=True, troposphere=troposphere, height=height)
     S = col['S']
     P, K = S.shape
     f0, df = float(col['fmin']), float(col['df'])

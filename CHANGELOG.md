@@ -7,6 +7,11 @@ was published on PyPI.
 
 ### Added
 
+- `io.read_nisar`: NISAR L0B RRSD granules (HDF5) read as a CPHD is, one frequency and polarization at a time: the
+  echoes decoded (BFPQ), range compressed with the file's chirp replica and taken to the frequency domain
+  (`fastsar.raw`), compensated to each pulse's zero-Doppler ground point at mid swath, the antenna from the file's
+  orbit state vectors (Hermite). `form_cphd` accepts the `.h5` file (`io.read_collection` dispatches) and forms it
+  in moving mode with the swath as footprint. `sim.write_nisar` writes a look-alike for tests. Extra `raw` (h5py).
 - `read_cphd(troposphere='model')` and `form_cphd(troposphere='model')`: the troposphere delay of a standard
   atmosphere (`io.troposphere_delay`, Saastamoinen hydrostatic zenith delay mapped by the elevation of each antenna)
   removed at the scene reference point, for files that give no delay. ICEYE's CPHD files write `TDTropoSRP` zero

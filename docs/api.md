@@ -51,6 +51,10 @@ Backends: `'cpu'`, `'cuda'`, `'tpu'`, `'jax'`, `'auto'`. Precision: `'float32'`,
   phase_sign=None)`: one channel as `dict(S, ant, fmin, df)`, plus `nx, ny, spx, spy, e1, e2` with a SICD.
   `channel`: index, identifier or polarization. `meta=True` also returns `tx`, `rcv`, `ref`, `R`, `origin`, `srp`,
   `tx_time`, `rcv_time`, `pulses`, `polarization`, `channel`, `mode`, `start`, `collector`, `core_name`, `notes`.
+- `read_nisar(path, frequency=None, polarization=None, meta=False, height=None, band_margin=1.0, block=1024)`: a
+  NISAR L0B RRSD granule as `read_cphd` returns a CPHD (range compressed, frequency domain, a moving scene
+  reference point at mid swath); `meta` adds `image_area` (the swath's corners). `read_collection(path, **kw)`
+  dispatches on the extension (`.h5`: NISAR). Needs h5py (`fastsar[raw]`).
 - `troposphere_delay(tx, rcv, srp)`: two-way delay [P] (s) of a standard atmosphere at the scene reference point
   (Saastamoinen hydrostatic zenith delay, cosecant mapping); what `read_cphd(troposphere='model')` removes.
 - `sicd_points(sicd, rows, cols, meta, hae=None)`: local positions of SICD pixels on any grid type.

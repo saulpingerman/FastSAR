@@ -219,6 +219,110 @@ def write_cphd(path, col, S, lat, lon, height=0.0, heading=0.0, speed=200.0, srp
         w.write_file({pol: v}, {pol: np.asarray(S, np.complex64)})
 
 
+
+def raw_echoes(col, pos, amp, fs, chirp, r_near, n, lat, lon, height=0.0, heading=0.0, vel=None):
+    """Baseband raw echo lines [Np, n] (complex64) of scatterers pos [N, 3] (simulator frame) with amplitudes amp
+    [N], for a collection placed by to_ecf: the receive window starts at the slant range r_near (m) and holds n
+    samples at the rate fs (Hz); each echo is the chirp [L] (baseband replica at fs) delayed by the two-way time
+    and carrying the carrier phase exp(-j 2 pi fc tau) with fc the collection's center frequency. With vel [Np, 3]
+    (ECF, m/s) the receiver has moved on by the echo's travel time, as a satellite does. The sum is exact (direct
+    O(Np N L))."""
+    ant = to_ecf(np.asarray(col.ant, np.float64), lat, lon, height, heading)
+    pts = to_ecf(np.asarray(pos, np.float64), lat, lon, height, heading)
+    fc = col.fmin + (col.K // 2) * col.df
+    chirp = np.asarray(chirp, np.complex64)
+    L = len(chirp)
+    out = np.zeros((len(ant), n), np.complex64)
+    tau0 = 2.0 * r_near / C
+    spec = np.fft.fft(chirp, 4 * L)                        # the replica, shifted by fractions of a sample through its spectrum
+    fq = np.fft.fftfreq(4 * L)
+    for i, a in enumerate(ant):
+        tau = 2.0 * np.linalg.norm(pts - a, axis=1) / C
+        if vel is not None:                     # the receiver at the echo's arrival: one refinement of the delay
+            tau = (np.linalg.norm(pts - a, axis=1) + np.linalg.norm(pts - (a[None] + vel[i][None] * tau[:, None]), axis=1)) / C
+        line = np.zeros(n, np.complex128)
+        for d, A in zip(tau, np.asarray(amp)):
+            m = (d - tau0) * fs                            # fractional start sample of this echo
+            m0 = int(np.floor(m))
+            frac = m - m0
+            shifted = np.fft.ifft(spec * np.exp(-2j * np.pi * fq * frac))[:L]
+            lo, hi = max(0, m0), min(n, m0 + L)
+            if hi > lo:
+                line[lo:hi] += A * np.exp(-2j * np.pi * fc * d) * shifted[lo - m0:hi - m0]
+        out[i] = line
+    return out
+
+
+def write_nisar(path, col, pos, amp, lat, lon, height=0.0, heading=0.0, speed=7500.0, bandwidth=None, fs=None,
+                chirp_duration=10e-6, r_margin=200.0, pol='HH', frequency='A', epoch='2026-01-01T00:00:00'):
+    """Write a NISAR L0B RRSD look-alike (HDF5) of scatterers pos [N, 3] (simulator frame) with amplitudes amp:
+    the raw echoes of a linear-FM chirp (bandwidth default the collection's, sampled at fs, default 1.2 times the
+    bandwidth) in a receive window from r_margin m before the nearest scatterer to r_margin m past the farthest,
+    block-floating-point encoded; the pulse times speed m/s apart along the track; the orbit as nine state vectors
+    along the (straight) track; the datasets and attributes io.read_nisar reads. The radar looks right (to_ecf).
+    Needs h5py."""
+    _deps.require('h5py')
+    import h5py
+    ant_l = np.asarray(col.ant, np.float64)
+    ant = to_ecf(ant_l, lat, lon, height, heading)
+    pts = to_ecf(np.asarray(pos, np.float64), lat, lon, height, heading)
+    P = len(ant)
+    bw = float(col.K * col.df if bandwidth is None else bandwidth)
+    fs = float(1.2 * bw if fs is None else fs)
+    fc = col.fmin + (col.K // 2) * col.df
+    L = int(round(chirp_duration * fs))
+    u = (np.arange(L) - 0.5 * (L - 1)) / fs
+    slope = bw / chirp_duration
+    chirp = np.exp(1j * np.pi * slope * u ** 2).astype(np.complex64)
+    r = np.linalg.norm(pts[None, :, :] - ant[:, None, :], axis=2)
+    r_near = r.min() - r_margin
+    n = int(np.ceil(2.0 * (r.max() + r_margin - r_near) / C * fs)) + L
+    t = 1.0 + np.cumsum(np.r_[0.0, np.linalg.norm(np.diff(ant_l, axis=0), axis=1)]) / speed
+    vel = np.gradient(ant, t, axis=0)
+    z = raw_echoes(col, pos, amp, fs, chirp, r_near, n, lat, lon, height, heading, vel=vel)
+    # nine state vectors on the straight track, one second apart around the aperture
+    ts = np.linspace(t[0] - 4.0, t[-1] + 4.0, 9)
+    v0 = vel[P // 2]
+    sv_pos = ant[P // 2][None] + (ts - t[P // 2])[:, None] * v0[None]
+    sv_vel = np.repeat(v0[None], 9, 0)
+    scale = 32000.0 / max(np.abs(z.real).max(), np.abs(z.imag).max(), 1e-30)
+    lut = ((np.arange(65536) - 32768) / scale).astype(np.float32)
+    enc = np.empty(z.shape, dtype=[('r', '<u2'), ('i', '<u2')])
+    enc['r'] = np.clip(np.round(z.real * scale) + 32768, 0, 65535).astype(np.uint16)
+    enc['i'] = np.clip(np.round(z.imag * scale) + 32768, 0, 65535).astype(np.uint16)
+    with h5py.File(path, 'w') as f:
+        ident = f.create_group('science/LSAR/identification')
+        ident['listOfFrequencies'] = np.array([frequency.encode()], dtype='S1')
+        ident['lookDirection'] = np.bytes_(b'Right')
+        ident['granuleId'] = np.bytes_(b'SIMULATED')
+        ident['isDithered'] = np.bytes_(b'False')
+        g = f.create_group(f'science/LSAR/RRSD/swaths/frequency{frequency}/tx{pol[0]}')
+        g['listOfRxPolarizations'] = np.array([pol[1].encode()], dtype='S1')
+        g['chirpWaveform'] = chirp
+        g['chirpDuration'] = chirp_duration
+        g['chirpSlope'] = slope
+        g['centerFrequency'] = fc
+        g['rangeBandwidth'] = bw
+        g['slantRangeSpacing'] = C / (2.0 * fs)
+        g['slantRange'] = r_near + np.arange(n) * C / (2.0 * fs)
+        d = g.create_dataset('UTCtime', data=t)
+        d.attrs['units'] = f'seconds since {epoch}'
+        g['numberOfSubSwaths'] = np.uint8(1)
+        g['validSamplesSubSwath1'] = np.tile(np.array([[0, n]], np.uint32), (P, 1))
+        h = g.create_group(f'rx{pol[1]}')
+        h['BFPQLUT'] = lut
+        h.create_dataset(pol, data=enc)
+        h['basebandPhaseCorrection'] = np.ones(P, np.complex64)
+        orb = f.create_group('science/LSAR/RRSD/lowRateTelemetry/orbit')
+        d = orb.create_dataset('time', data=ts)
+        d.attrs['units'] = f'seconds since {epoch}'
+        orb['position'] = sv_pos
+        orb['velocity'] = sv_vel
+        orb['orbitType'] = np.bytes_(b'POE')
+        orb['interpMethod'] = np.bytes_(b'Hermite')
+    return dict(fs=fs, chirp=chirp, r_near=r_near, n=n, tx=ant, times=t)
+
+
 # ---------------------------------------------------------------- scenes
 
 def change_mask(x, y, scene, part='all'):
