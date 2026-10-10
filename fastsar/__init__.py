@@ -1,7 +1,7 @@
 """SAR image formation on x86 CPUs, Nvidia GPUs and Cloud TPUs: factorized backprojection with a kernel for each
 (C++/OpenMP, CUDA, Pallas) for spotlight, stripmap, sliding spotlight and burst collections, exact backprojection,
 polar format, and the chain from a CPHD file to geolocated products. Start with form_cphd or form_image."""
-__version__ = '0.1.1'
+__version__ = '0.1.2'
 
 import os as _os
 
