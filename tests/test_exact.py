@@ -182,7 +182,7 @@ def test_wide_grid_rows(wide, b):
 
 
 def test_close_range_warning():
-    """The warning when even the smallest tile misses the phase limit, and the error at a few metres from the
+    """The warning when even the smallest tile misses the phase limit, and the error at a few meters from the
     antenna."""
     y = np.linspace(-5, 5, 64)
     ant = np.stack([np.full_like(y, -20.0), y, np.full_like(y, 20.0)], 1)
@@ -209,7 +209,10 @@ def _bad_inputs(col):
             ("backend 'tpu' without a TPU", dict(backend='tpu'))]
 
 
-@pytest.mark.parametrize('case', range(18), ids=[n for n, _ in _bad_inputs(SimpleNamespace(ant=np.zeros((1, 3))))])
+_BAD_IDS = [n for n, _ in _bad_inputs(SimpleNamespace(ant=np.zeros((1, 3))))]
+
+
+@pytest.mark.parametrize('case', range(len(_BAD_IDS)), ids=_BAD_IDS)
 def test_input_validation(col20, case):
     """Each raises ValueError."""
     col = col20

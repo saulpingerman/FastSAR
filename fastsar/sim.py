@@ -1,7 +1,7 @@
 """Synthetic spotlight SAR collects in float64: geometry, scenes, phase history.
 
 The phase history follows the CPHD convention of motion compensation to the
-scene centre:  S[p, k] = sum_n sigma_n exp(-j 4 pi f_k dR_pn / c)  with
+scene center:  S[p, k] = sum_n sigma_n exp(-j 4 pi f_k dR_pn / c)  with
 dR_pn = |x_n - a_p| - |a_p|.  It is synthesised with a type-1 NUFFT per pulse
 (finufft), which is exact to the requested tolerance and makes million-scatterer
 clutter scenes cheap.
@@ -9,6 +9,7 @@ clutter scenes cheap.
 from dataclasses import dataclass
 
 import numpy as np
+from . import _deps
 
 C = 299792458.0
 
@@ -18,8 +19,8 @@ class Collect:
     fmin: float          # Hz, frequency of sample k=0
     df: float            # Hz, frequency step
     K: int               # frequency samples per pulse
-    ant: np.ndarray      # [Np, 3] antenna phase centre, scene-centred metres
-    res: float           # nominal slant-plane resolution, metres
+    ant: np.ndarray      # [Np, 3] antenna phase center, scene-centered meters
+    res: float           # nominal slant-plane resolution, meters
 
     @property
     def Np(self):
@@ -154,6 +155,7 @@ def write_cphd(path, col, S, lat, lon, height=0.0, heading=0.0, speed=200.0, srp
     area, default the extent the collection's frequency step leaves unambiguous. tropo: the two-way troposphere
     delay (s, one value or one per pulse) written as TDTropoSRP; S should already hold it (exp(-j 2 pi f tropo)).
     Needs sarpy."""
+    _deps.require('sarpy')
     from sarpy.io.phase_history.cphd1_elements.CPHD import CPHDType
     from sarpy.io.phase_history.cphd import CPHDWriter1
     from .io import ecf_to_geodetic
@@ -263,7 +265,7 @@ def clutter_pair(scene, res, rng, per_cell=4, gamma_t=0.98, n_bright=3,
 
 
 def point_scene(scene):
-    """Isolated unit point targets at off-grid positions (centre, mid, corner)."""
+    """Isolated unit point targets at off-grid positions (center, mid, corner)."""
     s = scene
     xy = np.array([[0.013, -0.021], [0.21 * s + 0.07, 0.19 * s - 0.04],
                    [-0.36 * s + 0.03, -0.37 * s + 0.11], [0.35 * s, -0.1 * s + 0.05],

@@ -5,8 +5,8 @@ backprojection, as ImageFormer is for factorized backprojection.
     img = former(S)
 
 The grid is that of form_image (x_i = (i - nx/2) spx along e1, y_j = (j - ny/2) spy along e2, about the scene
-reference point, or about `center`). Everything that depends only on the geometry is computed once: the window, the
-tiles and their centers, and the range bins each pulse can reach (from the grid's nearest point to the antenna, the
+reference point, or about `center`). The window, the tiles with their centers, and the range bins each pulse can reach depend only on the geometry and
+are computed once (from the grid's nearest point to the antenna, the
 antenna projected onto the plane and clamped into the grid with a tile of margin, to its farthest corner). A call
 range-compresses each block of pulses (one zero-padded inverse FFT, upsample times the sample count) and keeps only
 those bins, then backprojects them. A grid that spans more range than c / (2 df) raises ValueError.
@@ -20,15 +20,15 @@ distance, gives a phase 4 pi f_max / c times that below PHASE_LIMIT (3e-4 rad); 
 the predicted error. Orbital geometries keep 32 x 32 tiles; X band with 1 m pixels takes 8 x 8 at 1 to 2 km and
 32 x 32 from 10 km. The range profiles are read with cubic Lagrange interpolation (four samples) or linear
 interpolation (two). On three 512 by 512 pixel regions of the 2023 Umbra Panama collection, against a float64
-backprojection with profiles oversampled 64 times, cubic at upsample=8 (the default) measures -77.5 to -81.5 dB,
+backprojection with profiles oversampled 64 times, cubic at upsample=8 (the default) measures -77.5 to -81.7 dB,
 cubic at upsample=4 -59.8 to -69.6 dB and linear at upsample=8 -53.7 to -56.4 dB. On simulated 128 x 128 pixel
 scenes from 0.5 to 20 km and at 600 km, cubic at upsample=4 measures -67 to -68 dB against a float64
 backprojection at 64 times oversampling.
 
-On an Nvidia L4 the CUDA kernel runs at about 87 billion pixel-pulse pairs per second, bound by the L1 cache's
-throughput for its data-dependent reads (86% of it, Nsight Compute), so it forms the 12,207 by 8,808 pixel, 15,186-pulse
-Panama image in about 19 s; factorized backprojection (ImageFormer) is faster beyond about 2048 by 2048 pixels and
-exact backprojection below.
+On an Nvidia L4 the CUDA kernel runs at about 68 billion pixel-pulse pairs per second with cubic interpolation,
+bound by the L1 cache's throughput for its data-dependent reads (86% of it, Nsight Compute), and forms the 12,207 by
+8,808 pixel, 15,186-pulse Panama image in 24 s; factorized backprojection (ImageFormer) is faster above about 1024 to
+2048 pixels on a side and exact backprojection below.
 
 Backends: 'cuda' (CuPy kernel; pinned, overlapped upload), 'cpu' (C++ with OpenMP, vectorized over each tile's
 pixels), 'jax' or 'tpu' (fastsar.backproject's JAX path on the grid's points, without the tiling above).
@@ -343,16 +343,16 @@ class ExactFormer:
             try:
                 self.center = np.asarray(center, np.float64)
             except (TypeError, ValueError):
-                raise ValueError(f'center must be a point (a finite 3-vector) in metres, got {center!r}') from None
+                raise ValueError(f'center must be a point (a finite 3-vector) in meters, got {center!r}') from None
             if self.center.shape != (3,) or not np.isfinite(self.center).all():
-                raise ValueError(f'center must be a point (a finite 3-vector) in metres, got {center!r}')
+                raise ValueError(f'center must be a point (a finite 3-vector) in meters, got {center!r}')
         if ref is None:
             self.ref = np.linalg.norm(self.ant, axis=1)
         else:
             try:
                 self.ref = np.asarray(ref, np.float64)
             except (TypeError, ValueError):
-                raise ValueError('ref must be a range per pulse in metres') from None
+                raise ValueError('ref must be a range per pulse in meters') from None
             if self.ref.shape != (self.P,):
                 raise ValueError(f'ref must hold one range per pulse, shape ({self.P},), got {self.ref.shape}')
             if not np.isfinite(self.ref).all():

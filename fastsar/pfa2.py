@@ -170,7 +170,7 @@ def make_pfa(geo, nx, ny, spx, spy, resample='dense', mm_dtype=None, precision=N
     mm_dtype / precision apply to the pulse-resampling product (bfloat16 operands, or the device default
     precision for float32 operands); the chirp-z transforms and FFTs run in complex64.
     orient = (sy, sx): sign of the exponent along each image axis, exp(j sy kr y) and exp(j sx ka x); with the
-    phase history referenced to the scene centre as prepared here, the two signs are opposite. Pixel i of an
+    phase history referenced to the scene center as prepared here, the two signs are opposite. Pixel i of an
     axis of n pixels sits at (i - n / 2) times the spacing, as in the backprojection grids.
     dist: a distortion model from `distortion`; the image is then formed on a grid oversampled by `oversample`,
     without its carriers, and resampled at the apparent position of every pixel by a 4-tap cubic kernel along
@@ -205,8 +205,8 @@ def make_pfa(geo, nx, ny, spx, spy, resample='dense', mm_dtype=None, precision=N
         return cis(sign * (base[None, :] + extra))
 
     def taper(n, extent, edge):
-        """Window over a profile of n samples whose period is `extent` metres (per row, [R]): one inside
-        `edge` metres of the centre, a raised cosine to zero over the next `guard` metres."""
+        """Window over a profile of n samples whose period is `extent` meters (per row, [R]): one inside
+        `edge` meters of the center, a raised cosine to zero over the next `guard` meters."""
         d = jnp.abs(jnp.arange(n, dtype=jnp.int32) - n // 2).astype(f)[None, :] * (extent[:, None] / n)
         gd = geo['guard']
         return jnp.where(d <= edge, 1.0, jnp.where(d >= edge + gd, 0.0, 0.5 + 0.5 * jnp.cos((d - edge) * (math.pi / gd)))).astype(f)
@@ -305,7 +305,7 @@ def make_pfa(geo, nx, ny, spx, spy, resample='dense', mm_dtype=None, precision=N
     i0, j0, h, w = crop if crop else (0, 0, nx, ny)
     half = taps // 2
     offs = list(range(-half + 1, half + 1))                    # tap offsets from floor(t)
-    kr_c = geo['kr_min'] + (nkr // 2) * geo['dkr']           # the spectrum is centred in the oversampled raster
+    kr_c = geo['kr_min'] + (nkr // 2) * geo['dkr']           # the spectrum is centered in the oversampled raster
     ka_c = geo['ka_lo'] + (nka // 2) * geo['dka']
     xs = (np.arange(i0, i0 + h) - nx / 2.0) * spx + offset[0]                                  # true positions of the output pixels
     bw = 512 if w > 512 else w                                  # output range columns per block
@@ -375,10 +375,10 @@ def make_pfa(geo, nx, ny, spx, spy, resample='dense', mm_dtype=None, precision=N
 
     return pfa_corrected
 
-    return pfa
-
 
 def arrays(geo, P, resample='dense'):
+    """The device arrays of the pulse resampling for the geometry geo and P pulses: the dense [P, P] matrix
+    (resample='dense'), or the (indices, weights) of its taps (float32)."""
     f = np.float32
     W = pulse_matrix(geo, P).astype(f) if resample == 'dense' else tuple(np.asarray(v) for v in pulse_taps(geo, P))
     return (jnp.asarray(W) if resample == 'dense' else (jnp.asarray(W[0].astype(np.int32)), jnp.asarray(W[1].astype(f))),

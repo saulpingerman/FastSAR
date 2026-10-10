@@ -7,7 +7,8 @@
     nox -s tpu              # on a Cloud TPU VM: the TPU tests must run (--require tpu)
 
 Arguments after `--` go to pytest, e.g. `nox -s tests-3.12 -- -k exact -s`. Every session installs the `test`
-dependency group and passes `--require io`, so a missing test package fails instead of skipping.
+dependency group and passes `--require io`, so a missing test package fails instead of skipping; the 600 s limit per
+test is pyproject.toml's.
 """
 import os
 
@@ -20,7 +21,7 @@ nox.options.sessions = ['tests', 'lowest']
 PYTHONS = ['3.10', '3.11', '3.12', '3.13']
 PYPROJECT = nox.project.load_toml('pyproject.toml')
 TEST = nox.project.dependency_groups(PYPROJECT, 'test')
-PYTEST = ['pytest', '--timeout', '600']
+PYTEST = ['pytest']
 
 
 def _pytest(session, require):

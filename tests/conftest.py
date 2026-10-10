@@ -21,7 +21,6 @@ fixture below, which also sets the default device, so the dense references stay 
 whatever ran before. `pytest -n 4 --dist loadfile` (pytest-xdist) runs modules in parallel worker processes.
 """
 import importlib
-import importlib.util
 import os
 import resource
 import signal

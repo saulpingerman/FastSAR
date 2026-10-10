@@ -6,7 +6,7 @@ multiplier handle that badly, so this module reaches the same image a
 different way:
 
   1. Split the image into s x s child tiles. For each child, rotate the phase
-     history so it is motion-compensated to the child's centre (exact ranges).
+     history so it is motion-compensated to the child's center (exact ranges).
   2. The child's signal is now band-limited in both frequency and pulse index,
      so low-pass filter and decimate both axes. The filter is a fixed dense
      matrix: a matrix product.
@@ -70,8 +70,8 @@ def decimator(n_in, D, pass_frac, atten=70.0):
     half = math.ceil((atten - 8.0) / (2.285 * dw)) / 2.0 + 1.0
     m = int(math.ceil(half / D))
     n_out = -(-n_in // D) + 2 * m
-    centres = D * (np.arange(n_out) - m) + (D - 1) / 2.0
-    d = np.arange(n_in)[:, None] - centres[None, :]
+    centers = D * (np.arange(n_out) - m) + (D - 1) / 2.0
+    d = np.arange(n_in)[:, None] - centers[None, :]
     beta = 0.1102 * (atten - 8.7)
     w = np.where(np.abs(d) <= half, np.i0(beta * np.sqrt(np.clip(1.0 - (d / half) ** 2, 0.0, 1.0))) / np.i0(beta), 0.0)
     F = np.sinc(d / D) * w
@@ -339,7 +339,7 @@ def make_ffbp(policy, plan, budget=1 << 26, jit=True, left=False, groups=0):
 
         def per_chunk(a):
             tre, tim, cen = a
-            # unit vector from each tile centre to each pulse, and the tile's mean range
+            # unit vector from each tile center to each pulse, and the tile's mean range
             u, r0 = fa['u'], fa['r0']
             wx = r0[None, :] * u[None, :, 0] - cen[:, 0:1]
             wy = r0[None, :] * u[None, :, 1] - cen[:, 1:2]

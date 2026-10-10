@@ -1,7 +1,6 @@
 """Exact backprojection onto points: each backend against a float64 NumPy reference that range compresses at 64x
 and interpolates linearly, monostatic and bistatic, at airborne and orbital range; and agreement with factorized
 backprojection on its own grid."""
-import time
 from types import SimpleNamespace
 
 import numpy as np

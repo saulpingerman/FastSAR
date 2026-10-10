@@ -32,10 +32,10 @@ of the difference over the whole image.
   bright returns (99th percentile 1.1 degrees). Use three-pass for interferometry.
 - Polar format shows striped coherence below 0.99; its residual grows from -40 dB at the scene center to -30 dB in
   the outer quarter ([algorithms.md](algorithms.md#polar-format)).
-- Exact backprojection with its default cubic interpolation at 8 times is more accurate than the reference itself:
+- The reference limits the measured error of exact backprojection with its default cubic interpolation at 8 times:
   against a float64 backprojection oversampled 64 times on the lock, port and ship regions, the reference is -67.3
-  to -68.8 dB, the cubic image -77.5 to -81.7 dB and the float32 factorized images -57.1 to -62.6 dB, so exact
-  backprojection is 19 to 21 dB more accurate than them. With linear interpolation at 8 times, range interpolation
+  to -68.8 dB, the cubic image -77.5 to -81.7 dB and the float32 factorized images -57.1 to -62.6 dB, a margin of 19 to 21 dB for
+  exact backprojection. With linear interpolation at 8 times, range interpolation
   sets the error (-53.7 to -56.4 dB against the truth).
 
 On Melbourne and Iowa the factorized configurations are within 1.1 dB of the Panama values.

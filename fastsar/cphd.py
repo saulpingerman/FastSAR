@@ -22,6 +22,7 @@ Azimuth band of a moving beam: the SICD's processed bandwidth (Grid.Col.ImpRespB
 `azimuth_fraction` (default 0.8) of the Doppler band the PRF samples, 2 v sin(theta) / lambda in [-PRF/2, PRF/2].
 """
 import numpy as np
+from . import _deps
 
 from . import io
 
@@ -38,9 +39,11 @@ def _sicd_meta(sicd):
         return None
     if not isinstance(sicd, str):
         return sicd
+    _deps.require('sarpy')
     if sicd.endswith('.xml'):                 # the SICD's metadata alone (ICEYE publishes it beside the image)
         from sarpy.io.complex.sicd_elements.SICD import SICDType
-        return SICDType.from_xml_string(open(sicd).read())
+        with open(sicd) as fh:
+            return SICDType.from_xml_string(fh.read())
     from sarpy.io.complex.converter import open_complex
     return open_complex(sicd).sicd_meta
 
@@ -48,14 +51,15 @@ def _sicd_meta(sicd):
 def _image_area(cphd, meta):
     """Corners [4, 3] of the CPHD's image area rectangle and its reference point [3] (local frame), or (None, IARP or
     None)."""
+    _deps.require('sarpy')
     from sarpy.io.phase_history.converter import open_phase_history
     sc = open_phase_history(cphd).cphd_meta.SceneCoordinates
     ia, iarp = sc.ImageArea, sc.IARP
     ref = None if iarp is None else io.ecf_to_local(np.array(iarp.ECF.get_array(), np.float64)[None], meta)[0]
     if ia is None or iarp is None or sc.ReferenceSurface is None or sc.ReferenceSurface.Planar is None:
         return None, ref
-    # the corner points (latitude, longitude) are unambiguous; ImageArea is in metres by the standard, but some
-    # producers write it in ImageGrid lines and samples (Capella: 49,837 lines of 0.2 m read as metres would make a
+    # the corner points (latitude, longitude) are unambiguous; ImageArea is in meters by the standard, but some
+    # producers write it in ImageGrid lines and samples (Capella: 49,837 lines of 0.2 m read as meters would make a
     # 10 km footprint 50 km), so it is used only without corner points, and rescaled when it matches the grid's indices
     iacp = getattr(sc, 'ImageAreaCornerPoints', None)
     h = float(iarp.LLH.HAE) if getattr(iarp, 'LLH', None) is not None else 0.0
@@ -84,8 +88,8 @@ def form_cphd(cphd, sicd=None, mode='auto', backend='auto', window=True, spacing
 
     cphd: path. sicd: the vendor's SICD (path, .xml metadata, or sarpy SICDType) for the footprint, spacing and
     processed azimuth band, or None. mode: 'auto', 'spotlight' or 'moving' (stripmap, sliding spotlight, dynamic
-    stripmap). backend: 'auto', 'cpu', 'cuda', 'tpu' or 'jax'. spacing: (along track, across track) in metres, or
-    None. extent: (along track, across track) in metres around the scene center, overriding the footprint. height:
+    stripmap). backend: 'auto', 'cpu', 'cuda', 'tpu' or 'jax'. spacing: (along track, across track) in meters, or
+    None. extent: (along track, across track) in meters around the scene center, overriding the footprint. height:
     the grid plane's height above the ellipsoid at the scene center (default: the SICD's scene center point, else the
     CPHD's image area reference point; a scatterer at another height appears displaced in range). patch:
     mosaic patch size in pixels. info: a list that receives one dict per mosaic patch. autofocus: phase gradient
@@ -103,9 +107,9 @@ def form_cphd(cphd, sicd=None, mode='auto', backend='auto', window=True, spacing
     backend = _backend(backend)                       # before the file is read
     for n, v in (('spacing', spacing), ('extent', extent)):
         if v is not None and (np.size(v) not in (1, 2) or not np.all(np.isfinite(v)) or np.min(v) <= 0):
-            raise ValueError(f'{n} must be one or two positive lengths in metres, got {v!r}')
+            raise ValueError(f'{n} must be one or two positive lengths in meters, got {v!r}')
     if extent is not None and np.size(extent) != 2:
-        raise ValueError(f'extent must be (along track, across track) in metres, got {extent!r}')
+        raise ValueError(f'extent must be (along track, across track) in meters, got {extent!r}')
     col, meta = io.read_cphd(cphd, channel=channel, meta=True, troposphere=troposphere)
     S = col['S']
     P, K = S.shape
@@ -114,10 +118,10 @@ def form_cphd(cphd, sicd=None, mode='auto', backend='auto', window=True, spacing
     ant = np.asarray(col['ant'], np.float64)
     sm = _sicd_meta(sicd)
     notes = list(meta.get('notes', []))
-    # the SRP of every pulse (local frame), for the mode and a moving beam's center
-    from sarpy.io.phase_history.converter import open_phase_history
-    lo, hi = meta.get('pulses', (0, P))
-    srp = io.ecf_to_local(open_phase_history(cphd).read_pvp_variable('SRPPos', channel)[lo:hi], meta)
+    # the SRP of every pulse (local frame, positions interpolated where the file lacks them), for the mode and a
+    # moving beam's center
+    channel = meta.get('channel_index', channel)
+    srp = np.asarray(meta['srp_pulses'], np.float64)
     rres = C / (2 * K * df)
     if mode == 'auto':
         mode = 'moving' if np.linalg.norm(srp.max(0) - srp.min(0)) > rres else 'spotlight'
@@ -145,7 +149,7 @@ def form_cphd(cphd, sicd=None, mode='auto', backend='auto', window=True, spacing
         raise ValueError('the CPHD has no planar image area: give a sicd or an extent')
     center = (srp[len(srp) // 2] if refpt is None else refpt) if corners is None else corners.mean(0)
     # the grid plane through the reference point (not the corners' mean: over a footprint of tens of km the corners
-    # lie metres below the tangent plane), or at the height asked for
+    # lie meters below the tangent plane), or at the height asked for
     if height is not None:
         lat, lon, _ = (float(np.ravel(v)[0]) for v in io.ecf_to_geodetic(io.local_to_ecf(center[None], meta)[0]))
         hz = float(io.ecf_to_local(io.geodetic_to_ecf(lat, lon, float(height))[None], meta)[0, 2])
@@ -191,10 +195,13 @@ def form_cphd(cphd, sicd=None, mode='auto', backend='auto', window=True, spacing
         ares = lam / (2 * dsin)
     # spacing
     if spacing is not None:
-        spx, spy = (float(spacing), float(spacing)) if np.isscalar(spacing) else map(float, spacing)
+        sp_ = np.ravel(np.asarray(spacing, np.float64))
+        spx, spy = (float(sp_[0]), float(sp_[0])) if sp_.size == 1 else (float(sp_[0]), float(sp_[1]))
     elif sm is not None:
         spx = max(float(sm.Grid.Col.SS), 0.8 * float(sm.Grid.Col.ImpRespWid))
-        spy = max(float(sm.Grid.Row.SS), 0.8 * float(sm.Grid.Row.ImpRespWid)) / np.cos(np.radians(float(sm.SCPCOA.GrazeAng)))
+        spy = max(float(sm.Grid.Row.SS), 0.8 * float(sm.Grid.Row.ImpRespWid))
+        if getattr(sm.Grid, 'ImagePlane', 'SLANT') != 'GROUND':      # slant-plane rows: project onto the ground
+            spy /= np.cos(np.radians(float(sm.SCPCOA.GrazeAng)))
     else:
         spx, spy = 0.8 * 1.2 * ares, 0.8 * 1.2 * rres / np.cos(graze)          # 1.2: the Taylor window's broadening
     # grid
@@ -243,7 +250,7 @@ def form_cphd(cphd, sicd=None, mode='auto', backend='auto', window=True, spacing
             w = np.asarray(pts)[None] - ant[idx][:, None]
             return ((w * d[idx][:, None]).sum(-1) / np.linalg.norm(w, axis=-1) - sp[idx][:, None]) / (dsin / 2)
 
-        img = patches.form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1, e2, patch=(patch, patch), beam=beam,
+        img = patches.form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1, e2, patch=(patch, patch), beam=beam, precision=precision,
                                   awin='hann' if window else None, backend=backend, target_db=target_db, info=info)
     return dict(image=img, origin=origin, e1=e1, e2=e2, spx=float(spx), spy=float(spy), mode=mode,
                 band=(f0, f0 + (K - 1) * df), bandwidth=(1.0 / ares, 2 * K * df * np.cos(graze) / C),

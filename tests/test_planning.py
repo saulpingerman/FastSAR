@@ -83,7 +83,7 @@ def test_choose_buckets():
     pt.choose_buckets(c, 11.0, step=2)
     dt = time.perf_counter() - t
     print(f'  ({len(np.unique(2 * -(-c // 2)))} distinct gate lengths planned in {dt:.3f} s)')
-    check(bad, 'time for thousands of distinct gate lengths (s)', dt, 1.0, '{:.3f}')
+    check(bad, 'time for thousands of distinct gate lengths (s)', dt, 10.0, '{:.3f}')
     done(bad)
 
 

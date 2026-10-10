@@ -24,8 +24,7 @@ form_image; +1: the data are conjugated on reading). By default the file's SGN i
 collections, whose files declare +1 while their phase follows -1 (checked against the vendor's SICD).
 
 troposphere (default None: when the file gives a nonzero delay) removes the per-pulse troposphere delay at the
-scene reference point (PVP TDTropoSRP); False keeps it, True notes its absence. The delay places scatterers too far
-in range: 3.8 m on the Umbra Panama collection (25.1 ns mean), 1.4 m at Silver Peak, Nevada (9.1 ns), where the
+scene reference point (PVP TDTropoSRP); False keeps it, True notes its absence. An uncorrected delay displaces scatterers in range, by 3.8 m on the Umbra Panama collection (25.1 ns mean), 1.4 m at Silver Peak, Nevada (9.1 ns), where the
 correction moves FastSAR's geocoded image 2 m toward its position in Sentinel-2 and NAIP imagery. Removing it also
 sharpens 1024 x 1024 Panama crops by 1 to 7 percent (fourth moment of the amplitude). Capella's SICD images include
 the correction (a stripmap registers to within a pixel of Capella's SICD with it, 6 pixels or 3.7 m off without);
@@ -33,6 +32,7 @@ Umbra's do not. The ICEYE file checked (X38, 2026) gives a zero delay, so its im
 which places it 5.9 m from ICEYE's SICD in ground range.
 """
 import numpy as np
+from . import _deps
 
 C = 299792458.0
 
@@ -73,10 +73,17 @@ def _phase_rows(S, f, coef, sign):
 
 def rereference(S, fmin, df, dref):
     """Move the motion-compensation point of each pulse: S [P, K] compensated to ranges ref_old becomes compensated
-    to ref_new, given dref = ref_old - ref_new [P] (one way, or the mean of the two legs)."""
-    K = S.shape[1]
+    to ref_new, given dref = ref_old - ref_new [P] (one way, or the mean of the two legs). Returns a new complex64
+    array (S is not modified), built in row blocks without a full-size temporary."""
+    S = np.asarray(S)
+    P, K = S.shape
     f = fmin + df * np.arange(K)
-    return (S * np.exp(-4j * np.pi * f[None, :] / C * np.asarray(dref, np.float64)[:, None])).astype(S.dtype)
+    dref = np.asarray(dref, np.float64)
+    out = np.empty((P, K), np.complex64)
+    for p0 in range(0, P, 1024):
+        sl = slice(p0, min(P, p0 + 1024))
+        np.multiply(S[sl], np.exp(-4j * np.pi * f[None, :] / C * dref[sl, None]).astype(np.complex64), out=out[sl])
+    return out
 
 
 def _opt(m, path, conv=None):
@@ -90,9 +97,14 @@ def _opt(m, path, conv=None):
 
 def read_cphd(cphd, sicd=None, channel=0, meta=False, regrid_tol=1e-3, drop_flagged=False, troposphere=None, phase_sign=None):
     """-> dict(S, ant, fmin, df[, nx, ny, spx, spy, e1, e2]) ready for form_image(**d), and with meta=True also a
-    dict of tx, rcv [P, 3] and ref [P] (local frame), R (local axes in ECF rows), srp (ECF origin), times (s from the
-    collection start, `start`), the channel's polarization and identifier, the collector, core name and radar mode,
-    and what was done to the data."""
+    dict: tx, rcv [P, 3] (local frame, m), ref [P] (the one-way range each pulse is compensated to after this
+    function's corrections, m), fixed_ref (False when the scene reference point moves and the image needs
+    backproject with ref), R (local axes as ECF rows), origin and srp (ECF, m), srp_pulses [P, 3] (each pulse's
+    scene reference point, local frame, positions interpolated where the file lacks them), tx_time and rcv_time
+    [P] (s), pulses (the (first, last + 1) kept of the file's), channel_index, sicd_transpose (with a SICD: whether
+    its rows run along range), the channel's polarization and identifier, the collector, core name and radar mode,
+    and notes on what was done to the data."""
+    _deps.require('sarpy')
     from sarpy.io.phase_history.converter import open_phase_history
     r = open_phase_history(cphd)
     m = r.cphd_meta
@@ -214,8 +226,11 @@ def read_cphd(cphd, sicd=None, channel=0, meta=False, regrid_tol=1e-3, drop_flag
         else:
             fixed_ref = False
             notes.append(f'scene reference point moves (range change up to {moved:.0f} m): image with backproject and ref')
+    moving_note = notes[-1] if not fixed_ref else None
+    cur_ref = ref if not fixed_ref else ref0           # the range each pulse is compensated to from here on
     origin = s0
     if sicd is not None:
+        _deps.require('sarpy')
         from sarpy.io.complex.converter import open_complex
         sm = open_complex(sicd).sicd_meta
         if sm.Grid.Type not in ('RGAZIM', 'PLANE', 'XRGYCR', 'XCTYAT'):
@@ -241,21 +256,21 @@ def read_cphd(cphd, sicd=None, channel=0, meta=False, regrid_tol=1e-3, drop_flag
     shift = (origin - s0) @ R.T
     if np.abs(shift).max() > 0:
         ref1 = 0.5 * (np.linalg.norm(tx - origin, axis=1) + np.linalg.norm(rcv - origin, axis=1))
-        S = rereference(S, f0, df, (ref if not fixed_ref else ref0) - ref1)
-        if fixed_ref:
-            ref0 = ref1
+        S = rereference(S, f0, df, cur_ref - ref1)
+        cur_ref = ref1
         notes.append(f'grid origin moved {np.linalg.norm(shift):.2f} m from the scene reference point onto the SICD pixel grid')
     out = dict(S=S, ant=(apc - origin) @ R.T, fmin=f0, df=df)
     if sicd is not None:
         out.update({k: v for k, v in grid.items() if k != 'transpose'})
     if not meta:
         if not fixed_ref:
-            raise ValueError(notes[-1] + '; call read_cphd(..., meta=True)')
+            raise ValueError(moving_note + '; call read_cphd(..., meta=True)')
         return out
     pol = getattr(par, 'Polarization', None)
-    info = dict(tx=(tx - origin) @ R.T, rcv=(rcv - origin) @ R.T, ref=ref if not fixed_ref else ref0, fixed_ref=fixed_ref,
-                R=R, origin=origin, srp=s0, sicd_transpose=None if sicd is None else grid['transpose'], tx_time=pv('TxTime')[lo:hi], rcv_time=pv('RcvTime')[lo:hi], pulses=(lo, hi),
-                polarization=None if pol is None else f'{pol.TxPol}{pol.RcvPol}', channel=ch.Identifier,
+    info = dict(tx=(tx - origin) @ R.T, rcv=(rcv - origin) @ R.T, ref=cur_ref, fixed_ref=fixed_ref,
+                R=R, origin=origin, srp=s0, srp_pulses=(srp - origin) @ R.T,
+                sicd_transpose=None if sicd is None else grid['transpose'], tx_time=pv('TxTime')[lo:hi], rcv_time=pv('RcvTime')[lo:hi], pulses=(lo, hi),
+                polarization=None if pol is None else f'{pol.TxPol}{pol.RcvPol}', channel=ch.Identifier, channel_index=channel,
                 mode=getattr(m.CollectionID.RadarMode, 'ModeType', None),   # None for modes outside the CPHD enumeration (ICEYE: EXPERIMENTAL)
                 notes=notes, start=_opt(m, 'Global.Timeline.CollectionStart', str),
                 collector=_opt(m, 'CollectionID.CollectorName'), core_name=_opt(m, 'CollectionID.CoreName'))
@@ -267,6 +282,7 @@ def sicd_points(sicd, rows, cols, meta, hae=None):
     by the SICD's own model onto the surface at height hae above the ellipsoid (default: the SCP's). Any grid type,
     including range / zero-Doppler grids, which are not planes; backproject onto these points forms the image on the
     vendor's pixels."""
+    _deps.require('sarpy')
     from sarpy.io.complex.converter import open_complex
     sm = sicd if not isinstance(sicd, str) else open_complex(sicd).sicd_meta
     rows, cols = np.broadcast_arrays(np.asarray(rows, np.float64), np.asarray(cols, np.float64))

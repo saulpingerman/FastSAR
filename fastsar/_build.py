@@ -1,5 +1,5 @@
 """Compiling the C++ kernels on first use: one shared object per source, compiler, flags and host, cached in
-~/.cache/fastsar. The source is compiled with the given flags and linked in a separate step without them, so that
+$FASTSAR_CACHE_DIR, else $XDG_CACHE_HOME/fastsar, else ~/.cache/fastsar. The source is compiled with the given flags and linked in a separate step without them, so that
 -ffast-math, when a kernel is compiled with it, does not link crtfastmath.o (which would switch the whole process to
 flush-to-zero on load). Concurrent first builds each write their own temporary files and the last os.replace wins,
 with identical contents."""
@@ -7,6 +7,7 @@ import hashlib
 import os
 import platform
 import subprocess
+import sys
 
 
 def _host_tag():
@@ -23,14 +24,30 @@ def _host_tag():
     return tag + platform.processor()
 
 
+def cache_dir():
+    """The directory of the compiled kernels: $FASTSAR_CACHE_DIR, else $XDG_CACHE_HOME/fastsar, else
+    ~/.cache/fastsar, created if needed."""
+    d = os.environ.get('FASTSAR_CACHE_DIR') or os.path.join(
+        os.environ.get('XDG_CACHE_HOME') or os.path.join(os.path.expanduser('~'), '.cache'), 'fastsar')
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError as e:
+        raise RuntimeError(f'fastsar cannot create its kernel cache directory {d!r} ({e.strerror}); set '
+                           'FASTSAR_CACHE_DIR to a writable directory') from None
+    return d
+
+
 def shared_object(name, src, flags):
     """Path of the shared object built from the C++ source text src with the compiler flags (a list), building it
     if it is not cached. The compiler is $CXX (default g++); OpenMP and -fPIC are added."""
+    if not sys.platform.startswith('linux') or platform.machine() not in ('x86_64', 'AMD64'):
+        raise RuntimeError(f"fastsar's cpu backend compiles C++ kernels for x86-64 Linux; this is "
+                           f'{platform.machine()} {sys.platform}. Use backend="jax" (any device JAX supports) '
+                           'or run on an x86-64 Linux machine')
     cxx = os.environ.get('CXX', 'g++')
     key = '\0'.join([src, cxx, ' '.join(flags), _host_tag()])
     tag = hashlib.sha1(key.encode()).hexdigest()[:12]
-    d = os.path.join(os.path.expanduser('~'), '.cache', 'fastsar')
-    os.makedirs(d, exist_ok=True)
+    d = cache_dir()
     so = os.path.join(d, f'lib{name}_{tag}.so')
     if os.path.exists(so):
         return so

@@ -28,6 +28,7 @@ the window over pulses times the window over frequency (both ones for window=Fal
 calibration, so the pixels are in the phase history's units; beta0 or sigma0 need the vendor's calibration constant.
 """
 import numpy as np
+from . import _deps
 
 
 def multilook(img, la=1, lr=1):
@@ -138,6 +139,7 @@ def write_geotiff(path, data, transform, crs='EPSG:4326', nodata=np.nan):
     """GeoTIFF of data [rows, cols] or [bands, rows, cols], float32 or, for complex data, complex64 (GDAL CFloat32),
     with an affine transform (rasterio.Affine or its 6 coefficients a, b, c, d, e, f: x = a col + b row + c,
     y = d col + e row + f) in crs. write_geotiff(path, **geocode_image(...)) writes a geocoded image. Needs rasterio."""
+    _deps.require('rasterio')
     import rasterio
     from rasterio.transform import Affine
     tr = transform if isinstance(transform, Affine) else Affine(*transform)
@@ -156,7 +158,8 @@ def write_sicd(path, img, template=None, transpose=None):
     write_sicd(path, img, template): img formed on the grid of the template SICD (path or sarpy SICDType;
     read_cphd(..., sicd=template)), with the template's metadata; transpose as meta['sicd_transpose'] (default:
     when the template's rows run along range). ImageFormAlgo becomes OTHER and Grid.Type PLANE: the pixels are
-    backprojection's on the template's image plane, which keep each scatterer's phase, not polar format's."""
+    backprojection's on the template's image plane, which carry each scatterer's phase."""
+    _deps.require('sarpy')
     from sarpy.io.complex.converter import open_complex
     from sarpy.io.complex.sicd import SICDWriter
     if template is None:
@@ -167,7 +170,17 @@ def write_sicd(path, img, template=None, transpose=None):
         rows, cols = int(sm.ImageData.NumRows), int(sm.ImageData.NumCols)
         a = np.asarray(img)
         if transpose is None:
-            transpose = a.shape == (cols, rows) and rows != cols
+            # the image's rows run along track (form_cphd, read_cphd with a sicd): transpose when the template's
+            # rows run along range, judged from the row vector's component along the line of sight (as read_cphd)
+            try:
+                los = np.array(sm.GeoData.SCP.ECF.get_array()) - np.array(sm.SCPCOA.ARPPos.get_array())
+                row_r = abs(np.array(sm.Grid.Row.UVectECF.get_array()) @ los)
+                col_r = abs(np.array(sm.Grid.Col.UVectECF.get_array()) @ los)
+                transpose = row_r > col_r
+            except AttributeError:
+                transpose = a.shape == (cols, rows) and rows != cols
+            if a.shape != ((cols, rows) if transpose else (rows, cols)) and a.shape == ((rows, cols) if transpose else (cols, rows)):
+                transpose = not transpose            # a square or pre-transposed array: trust its shape
         a = a.T if transpose else a
         if a.shape != (rows, cols):
             raise ValueError(f'image {a.shape} does not match the template grid {(rows, cols)}')
@@ -192,6 +205,7 @@ def sicd_meta(out):
     backprojection's phase: the band of each axis is centered at its spatial frequency, KCtr, modulo the sampling
     rate. There is no radiometric calibration (see the module docstring)."""
     from datetime import datetime, timezone
+    _deps.require('sarpy')
     from sarpy.io.complex.sicd_elements.SICD import SICDType
     from sarpy.io.complex.sicd_elements.CollectionInfo import CollectionInfoType, RadarModeType
     from sarpy.io.complex.sicd_elements.ImageCreation import ImageCreationType
@@ -372,6 +386,7 @@ def geocode_image(out, data=None, spacing=None, crs=None, height=None, order=1):
     if geo:
         fwd = inv = lambda xs, ys: (np.asarray(xs, np.float64), np.asarray(ys, np.float64))
     else:
+        _deps.require('rasterio')
         from rasterio.warp import transform as warp
         fwd = lambda lon, lat: tuple(np.asarray(v) for v in warp('EPSG:4326', crs, np.ravel(lon), np.ravel(lat)))
         inv = lambda xs, ys: tuple(np.asarray(v) for v in warp(crs, 'EPSG:4326', np.ravel(xs), np.ravel(ys)))
@@ -410,6 +425,7 @@ def read_dem(path, offset=0.0):
     bilinear between posts, NaN outside, plus offset. DEMs often give heights above the geoid (Copernicus DEM:
     EGM2008); offset, the geoid's height above the ellipsoid at the scene, makes them ellipsoid heights. The whole
     raster is read into memory. Needs rasterio."""
+    _deps.require('rasterio')
     import rasterio
     from rasterio.warp import transform as warp
     with rasterio.open(path) as src:

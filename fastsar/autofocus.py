@@ -130,7 +130,15 @@ def autofocus(S, ant, fmin, df, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 1
     m = np.arange(nx) - nx // 2
     ramp = np.exp(-1j * deramp_phase(ant, fmin, df, K, nx, ny, spx, spy, e1, e2))
     phi = np.zeros(P)
+
+    def corrected(phi):          # S exp(-j phi) as one complex64 array, in row blocks (no complex128 temporary)
+        out = np.empty(S.shape, np.complex64)
+        for p0 in range(0, P, 1024):
+            sl = slice(p0, min(P, p0 + 1024))
+            np.multiply(S[sl], np.exp(-1j * phi[sl])[:, None].astype(np.complex64), out=out[sl])
+        return out
+
     for _ in range(rounds):
-        _, pb, _ = pga(former(S * np.exp(-1j * phi)[:, None]) * ramp, **(pga_kwargs or {}))
+        _, pb, _ = pga(former(corrected(phi)) * ramp, **(pga_kwargs or {}))
         phi = _detrend(phi + np.interp(b, m, pb), b)
-    return former(S * np.exp(-1j * phi)[:, None]), phi
+    return former(corrected(phi)), phi

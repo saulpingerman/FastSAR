@@ -7,8 +7,9 @@
 
 - `form_cphd(cphd, sicd=None, mode='auto', backend='auto', window=True, spacing=None, channel=0, patch=1024,
   azimuth_fraction=0.8, extent=None, height=None, precision='float32', target_db=-40.0, info=None,
-  autofocus=False)`: the image of a CPHD file ([processing-chain.md](processing-chain.md#2-form)). `mode`:
-  `'auto'`, `'spotlight'`, `'moving'`. `sicd`: path, `.xml` or sarpy SICDType. `spacing`, `extent`: (along, across
+  autofocus=False, troposphere=None)`: the image of a CPHD file ([processing-chain.md](processing-chain.md#2-form)).
+  `mode`: `'auto'`, `'spotlight'`, `'moving'`. `troposphere`: passed to `read_cphd` (default: the delay the file
+  gives is removed). `sicd`: path, `.xml` or sarpy SICDType. `spacing`, `extent`: (along, across
   track) in m. `height`: grid height above the ellipsoid. Returns a dict: `image` [nx, ny] complex64, `origin`
   (pixel (0, 0)), `e1`, `e2`, `spx`, `spy`, `mode`, `band` (first and last frequency), `bandwidth` (spatial
   frequency support along e1, e2), `window`, `phase_error` (or None), `meta` (from `read_cphd`), `notes`.

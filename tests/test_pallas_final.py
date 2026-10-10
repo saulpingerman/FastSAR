@@ -8,7 +8,7 @@ pytestmark = pytest.mark.usefixtures('jax_cpu')
 
 B, Pf, Qf, T = 3, 16, 79, 32
 Qpad = 128
-a0, a1 = 2 * 9.6e9 / 3e8, 2 * 1.2e6 / 3e8                      # cycles per metre and per metre per sample
+a0, a1 = 2 * 9.6e9 / 3e8, 2 * 1.2e6 / 3e8                      # cycles per meter and per meter per sample
 
 
 @pytest.fixture(scope='module')

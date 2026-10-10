@@ -1,6 +1,6 @@
 """End-to-end check of the TPU kernels (level kernel and fused final stage) in interpret mode on the CPU: the pallas2
 image against the dense image on the simulated scene. FFBP_FORCE_TPU_KERNELS and the interpret-mode wrappers are
-set for this module only; NLEV (default 2) sets the number of levels."""
+set for this module only; FASTSAR_TEST_NLEV (default 2) sets the number of levels."""
 import os
 
 import numpy as np
@@ -29,7 +29,7 @@ def scene():
     amp = rng.standard_normal(40) + 1j * rng.standard_normal(40)
     S = sim.simulate_brute(col, pos, amp).astype(np.complex64)
     n = 128
-    nlev = int(os.environ.get('NLEV', '2'))
+    nlev = int(os.environ.get('FASTSAR_TEST_NLEV', '2'))
     plan = ffbp2.make_plan(col, n, n, 0.5, 0.5, T=16, nlev=nlev, pmax=0.4)
     print('levels', nlev)
     return S, plan, ffbp2.collection_arrays(plan, col.ant)

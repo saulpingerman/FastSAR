@@ -326,11 +326,15 @@ def _children(kern, pre, pim, c0, sl, lv):
         yre = cp.empty((Np * Cn, P, Ko), kern['dtype'])
         yim = cp.empty((Np * Cn, P, Ko), kern['dtype'])
         W = 16 * Dk + L
-        for pb in _PB_CHOICES:                            # pulses per block: the largest whose window fits in 96 KB
+        smem_max = int(cp.cuda.Device().attributes.get('MaxSharedMemoryPerBlockOptin', 48 * 1024))
+        for pb in _PB_CHOICES:                            # pulses per block: the largest whose window fits the device
             smem = (2 * pb * (W | 1) + L + 2 * pb * 16) * 4
-            if smem <= 96 * 1024:
+            if smem <= smem_max:
                 break
-        assert smem <= 96 * 1024, (Dk, L)
+        if smem > smem_max:
+            raise ValueError(f"the cuda backend's first-level window ({smem // 1024} KB: range decimation {Dk} with a "
+                             f"{L}-tap filter, a small image from a wide-band collection) exceeds the GPU's shared memory "
+                             f"({smem_max // 1024} KB): use backend='cpu' or 'jax', or a larger image")
         kl = kern['rot_fir_k'] if pb == 32 else _kernels(kern['store'], pb)['rot_fir_k']
         kl(((Ko + 15) // 16, (P + pb - 1) // pb, Np), (pb * 8,),
                           (pre, pim, c0, sl, taps, yre, yim, np.int32(Cn), np.int32(P), np.int32(K), np.int32(Ko), np.int32(Dk),
@@ -371,7 +375,7 @@ def _children(kern, pre, pim, c0, sl, lv):
 
 
 def _device_phases(la, refs, lv):
-    """Band-centre phase and slope of every child of every parent (float64 on the device): refs [Np, 3] ->
+    """Band-center phase and slope of every child of every parent (float64 on the device): refs [Np, 3] ->
     c0, slope [Np, C, P] float32. Same formula as ffbp2.device_phases."""
     k0c = 2.0 * (lv['f0'] + (lv['K'] - 1) / 2.0 * lv['df']) / C
     k1 = 2.0 * lv['df'] / C
@@ -445,7 +449,10 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
     smem_max = int(cp.cuda.Device().attributes.get('MaxSharedMemoryPerBlockOptin', 48 * 1024))
     pps = 2 if 4 * T * (2 * Qf) * 4 <= 48 * 1024 else 1                   # pulses per table
     smem_final = 4 * T * (pps * Qf) * 4
-    assert T % 4 == 0 and T * T // 8 <= 1024 and (T * T // 8) % (2 * T) == 0 and smem_final <= smem_max, (T, Qf, smem_max)
+    assert T % 4 == 0 and T * T // 8 <= 1024 and (T * T // 8) % (2 * T) == 0, T
+    if smem_final > smem_max:
+        raise ValueError(f"the cuda final stage's tables ({smem_final // 1024} KB for {Qf} frequency samples per final "
+                         f"tile) exceed the GPU's shared memory ({smem_max // 1024} KB): use backend='cpu' or 'jax'")
 
     def final(are, aim, cen, wts=None):
         """are, aim [B, Pf, Qf]; cen [B, 3] float64; wts None or (w0, gx, gyr) [B, Pf] float32 -> (re, im) [B, T, T]."""
@@ -537,9 +544,10 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
 
     ox, oy, nx, ny = plan['ox'], plan['oy'], plan['nx'], plan['ny']
 
-    def level0_streamed(S, scale, c0, sl, lv):
+    def level0_streamed(S, scale, c0, sl, lv, win=None):
         """The first level from a host phase history S [P, K] too large for the device: pulse blocks (with the
-        pulse filter's halo) are uploaded, rotated and range-filtered, and pulse-filtered into their output rows.
+        pulse filter's halo) are uploaded, windowed on the device (win: the pulse [P, 1] and sample [1, K] windows,
+        device float32, or None), rotated and range-filtered, and pulse-filtered into their output rows.
         c0, sl [1, ng, P] (device) -> [ng, Po, Ko] planes."""
         P_, K_ = S.shape
         ngc, Po, Ko = c0.shape[1], lv['Po'], lv['Ko']
@@ -556,6 +564,8 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
             blk = cp.zeros((p1 - p0, K_), cp.complex64)
             if b > a:
                 blk[a - p0:b - p0] = cp.asarray(S[a:b])
+                if win is not None:
+                    blk[a - p0:b - p0] *= win[0][a:b] * win[1]
             pre = cp.ascontiguousarray((blk.real / scale).astype(kern['dtype']))[None]
             pim = cp.ascontiguousarray((blk.imag / scale).astype(kern['dtype']))[None]
             del blk
@@ -585,12 +595,9 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
         free = memory.cuda_free()
         stream = isinstance(S, np.ndarray) and (memory.cuda_streams(planes, free)
                                                 or os.environ.get('FASTSAR_CUDA_STREAM') == '1')
-        if stream and (window is not None or check):        # the streamed blocks are read as they are: prepare on the host
-            if check:
-                _finite(S, np)
-            if window is not None:
-                S = (S * window[0][:, None] * window[1][None, :]).astype(np.complex64)
-            window, check = None, False
+        if stream and check:                                # the streamed blocks are checked once here, on the host
+            _finite(S, np)
+            check = False
         if window is not None:
             wpd, wkd = cp.asarray(window[0], cp.float32)[:, None], cp.asarray(window[1], cp.float32)[None, :]
 
@@ -637,7 +644,7 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
             sl = cp.ascontiguousarray(la0['slope'][0, g0:g0 + len(gs)][None])
             try:
                 if stream:
-                    A, Bm = level0_streamed(S, scale, c0, sl, lv0)
+                    A, Bm = level0_streamed(S, scale, c0, sl, lv0, None if window is None else (wpd, wkd))
                 else:
                     A, Bm = _children(kern, pre, pim, c0, sl, lv0)                   # [ng, Po, Ko]
             except cp.cuda.memory.OutOfMemoryError:

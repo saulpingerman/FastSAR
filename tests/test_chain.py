@@ -200,6 +200,47 @@ def test_sicd(chain, sicd_path):
     assert np.array_equal(open_complex(f2)[:, :], data)
 
 
+def test_sicd_input(chain, sicd_path):
+    """read_cphd and form_cphd with the SICD: the grid is the SICD's (the spacings of the image that wrote it, its
+    pixel count), the targets' peaks land where locate puts them on it, sicd_points agrees with the grid, and a
+    SICD whose grid is not a plane is refused."""
+    from sarpy.io.complex.converter import open_complex
+    out0, truth = chain.out, chain.truth
+    c, meta = io.read_cphd(chain.path, sicd=sicd_path, meta=True)
+    assert sorted(set(c) & {'nx', 'ny', 'spx', 'spy', 'e1', 'e2'}) == ['e1', 'e2', 'nx', 'ny', 'spx', 'spy']
+    assert c['nx'] * c['ny'] == out0['image'].size
+    assert abs(c['spx'] - out0['spx']) < 1e-9 and abs(c['spy'] - out0['spy']) < 1e-9
+    assert abs(abs(c['e1'] @ c['e2'])) < 1e-9 and meta['sicd_transpose'] in (True, False)
+    out = fastsar.form_cphd(chain.path, sicd=sicd_path, backend='cpu')     # the SICD's footprint at form_cphd's spacing
+    for k, n in ((0, 'nx'), (1, 'ny')):
+        ext_out = (out['image'].shape[k] - 1) * out['spx' if k == 0 else 'spy']
+        ext_sicd = (c[n] - 1) * c['spx' if k == 0 else 'spy']
+        assert abs(ext_out - ext_sicd) < 0.05 * ext_sicd + 2 * out['spx'], (k, ext_out, ext_sicd)
+    ij = products.locate(out, *truth)
+    pk = peaks(out['image'], ij, out['spx'], out['spy'])
+    d = np.hypot(pk[:, 0] - ij[:, 0], pk[:, 1] - ij[:, 1]).max()
+    print(f'SICD grid: {c["nx"]} x {c["ny"]} at {c["spx"]:.3f} x {c["spy"]:.3f} m, transposed {meta["sicd_transpose"]}; '
+          f'form_cphd on its footprint {out["image"].shape} at {out["spx"]:.3f} x {out["spy"]:.3f} m; peaks vs locate {d:.3f} pixels')
+    assert d < 0.1
+    # sicd_points: the SICD's own projection of its pixels against the grid read_cphd built from it
+    sm = open_complex(sicd_path).sicd_meta
+    rows, cols = np.array([0, sm.ImageData.NumRows - 1]), np.array([0, sm.ImageData.NumCols - 1])
+    pts = io.sicd_points(sm, rows, cols, meta)
+    assert pts.shape == (2, 3) and np.isfinite(pts).all()
+    span = np.linalg.norm(pts[1] - pts[0])
+    expect = np.hypot((c['nx'] - 1) * c['spx'], (c['ny'] - 1) * c['spy'])
+    assert abs(span - expect) < 0.05 * expect, (span, expect)
+    # a grid that is not a plane (write_sicd always writes PLANE, so the file is written with sarpy directly)
+    from sarpy.io.complex.sicd import SICDWriter
+    sm.Grid.Type = 'RGZERO'
+    f3 = os.path.join(chain.tmp, 'rgzero.nitf')
+    with SICDWriter(f3, sm, check_existence=False) as w:
+        w.write_chip(open_complex(sicd_path)[:, :])
+    assert open_complex(f3).sicd_meta.Grid.Type == 'RGZERO'
+    with pytest.raises(ValueError, match='not a plane'):
+        io.read_cphd(chain.path, sicd=f3)
+
+
 def test_sarkit_consistency(chain, sicd_path, need):
     if sys.version_info < (3, 11):
         pytest.skip('sarkit needs Python 3.11 or later')
@@ -253,6 +294,7 @@ def test_moving_beam(chain):
     assert st['mode'] == 'moving' and d2.max() < 0.03
 
 
+@pytest.mark.needs('rasterio')
 def test_steep_terrain(chain):
     """A DEM with a cliff steeper than the radar's line of sight (layover) and a pit: every pixel geolocates to a finite
     point that maps back to it, and the map extent of geocode_image is finite."""

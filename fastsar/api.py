@@ -17,7 +17,7 @@ Backends for factorized backprojection (the same plan, filters and float64 geome
     'cuda'  CUDA kernels through CuPy (Nvidia GPU)
     'cpu'   C++ kernels with OpenMP (x86-64; compiled with g++ on first use)
     'jax'   the plain JAX program, on whatever device JAX has
-    'auto'  tpu if JAX sees a TPU, else cuda if CuPy sees a GPU, else cpu
+    'auto' tpu if JAX reports a TPU, else cuda if CuPy reports a GPU, else cpu
 
 ref [P]: the range (one way) each pulse's samples are referenced to, when it is not |ant| (a bistatic collection's
 half path, a vendor's reference point); both algorithms honor it (polar format re-references the samples to |ant|).
@@ -48,21 +48,29 @@ def _window(P, K, sll=35.0, nbar=4):
     return taylor(P, nbar=nbar, sll=sll, norm=False).astype(np.float32), taylor(K, nbar=nbar, sll=sll, norm=False).astype(np.float32)
 
 
+_PROBE_ERRORS = {}          # why a device backend is absent (available_backends), for _backend's message
+
+
 def available_backends():
-    """The backends this machine can run, in the order 'auto' tries them."""
+    """The backends this machine can run, in the order 'auto' tries them. When CuPy or JAX is installed but its
+    device probe fails, the error is kept and reported by a request for that backend."""
     out = []
     try:
         import jax
         if any(d.platform == 'tpu' for d in jax.devices()):
             out.append('tpu')
-    except Exception:
+    except ImportError:
         pass
+    except Exception as e:
+        _PROBE_ERRORS['tpu'] = f'{type(e).__name__}: {e}'
     try:
         import cupy
         if cupy.cuda.runtime.getDeviceCount() > 0:
             out.append('cuda')
-    except Exception:
+    except ImportError:
         pass
+    except Exception as e:
+        _PROBE_ERRORS['cuda'] = f'{type(e).__name__}: {e}'
     out.append('cpu')
     return out
 
@@ -70,7 +78,7 @@ def available_backends():
 _JAX_PROGRAMS = {}         # compiled JAX/TPU programs by plan signature (ImageFormer)
 _JAX_LOCK = threading.Lock()   # mosaic workers build formers concurrently: one build per signature, no torn eviction
 
-BACKENDS = ('auto', 'tpu', 'cuda', 'cpu', 'jax')
+BACKENDS = ('auto', 'tpu', 'cuda', 'cpu', 'jax')     # the values form_image, ImageFormer, ExactFormer and form_cphd accept
 
 
 def _backend(backend):
@@ -83,9 +91,11 @@ def _backend(backend):
     if backend == 'auto':
         return have[0]
     if backend == 'cuda' and 'cuda' not in have:
-        raise ValueError("backend 'cuda' needs CuPy and an Nvidia GPU; this machine has " + ', '.join(have + ['jax']))
+        raise ValueError("backend 'cuda' needs CuPy and an Nvidia GPU; this machine has " + ', '.join(have + ['jax'])
+                         + (f" (the CuPy probe failed: {_PROBE_ERRORS['cuda']})" if 'cuda' in _PROBE_ERRORS else ''))
     if backend == 'tpu' and 'tpu' not in have and not os.environ.get('FFBP_FORCE_TPU_KERNELS'):
-        raise ValueError("backend 'tpu' needs JAX on a Cloud TPU; this machine has " + ', '.join(have + ['jax']))
+        raise ValueError("backend 'tpu' needs JAX on a Cloud TPU; this machine has " + ', '.join(have + ['jax'])
+                         + (f" (the JAX probe failed: {_PROBE_ERRORS['tpu']})" if 'tpu' in _PROBE_ERRORS else ''))
     return backend
 
 
@@ -130,11 +140,11 @@ def _check_grid(nx, ny, spx, spy, e1, e2):
     """Pixel counts (positive integers), spacings (positive) and the axes (orthonormal 3-vectors) -> nx, ny (int),
     e1, e2 (float64)."""
     for n, v in (('nx', nx), ('ny', ny)):
-        if not np.isscalar(v) or not np.isfinite(v) or v < 1 or int(v) != v:
+        if np.ndim(v) != 0 or not np.isfinite(v) or v < 1 or int(v) != v:
             raise ValueError(f'{n} must be a positive integer, got {v!r}')
     for n, v in (('spx', spx), ('spy', spy)):
         if not np.isfinite(v) or v <= 0:
-            raise ValueError(f'{n} must be a positive spacing in metres, got {v!r}')
+            raise ValueError(f'{n} must be a positive spacing in meters, got {v!r}')
     e1, e2 = np.asarray(e1, np.float64), np.asarray(e2, np.float64)
     if e1.shape != (3,) or e2.shape != (3,):
         raise ValueError(f'e1 and e2 must be 3-vectors, got shapes {e1.shape} and {e2.shape}')
@@ -183,7 +193,7 @@ def final_weights(plan, weight, P, grad=False, points=None):
     nodes = np.clip(np.rint(0.5 * (a + b)[:, None] + 0.5 * (b - a)[:, None] * t[None, :]), 0, P - 1).astype(np.int64)
     U, inv = np.unique(nodes.ravel(), return_inverse=True)
     W = np.asarray(weight(q, U), np.float64)[inv].reshape(len(idx), 3, -1)    # [Pf, 3, ntiles]
-    # a subaperture centred beyond the collection holds the filter tails of the edge pulses (the decimators run m
+    # a subaperture centered beyond the collection holds the filter tails of the edge pulses (the decimators run m
     # outputs past each end): it takes the weight of the nearest pulse (its nodes clip to it), not zero
     m = np.tensordot(gw, W, axes=(0, 1))                                          # [Pf, ntiles]
     return np.ascontiguousarray(m.T, np.float32)
@@ -212,7 +222,7 @@ class ImageFormer:
     histories:  former = ImageFormer(ant, fmin, df, K, nx, ny, spx, spy, e1, e2); img = former(S).
 
     Building plans the tiles and filters, computes the float64 geometry and compiles the kernels; each call then
-    pays only the image formation. Reuse one former for repeated images of the same geometry (or for timing);
+    performs only the image formation. Reuse one former for repeated images of the same geometry (or for timing);
     a different antenna path needs a new former. Arguments as for form_image (those after e2 by keyword only), and
     aperture_weight(points [m, 3], pulses [n]) -> W [n, m]: a per-pixel weight of pulses (int indices) (a stripmap aperture window), applied
     in the final stage as the mean weight of each final subaperture's pulses at each final tile's center, with its
@@ -265,6 +275,8 @@ class ImageFormer:
         self._plan = plan
         if ref is not None and np.shape(ref) != (self.P,):
             raise ValueError(f'ref must hold one range per pulse ({self.P}), got shape {np.shape(ref)}')
+        if ref is not None and not np.all(np.isfinite(ref)):
+            raise ValueError('ref has non-finite values')
         coll = ffbp2.collection_arrays(plan, self.ant, ref)
         wf = None if aperture_weight is None else final_weights(plan, aperture_weight, self.P, grad=os.environ.get('FASTSAR_WEIGHT_GRAD', '1') == '1')
         if window:

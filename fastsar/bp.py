@@ -157,6 +157,8 @@ def _cpu():
 def _run_cpu(S, tx, rcv, ref, pts, nfft, inv_dr, kcyc, chunk):
     L = _cpu()
     N = len(pts)
+    if N > 2**31 - 1:
+        raise ValueError(f'{N} points: the cpu kernel addresses at most 2^31 - 1 points per call; backproject in pieces')
     ore, oim = np.zeros(N), np.zeros(N)
     pts = np.ascontiguousarray(pts, np.float64)
     for p0 in range(0, len(S), chunk):
@@ -333,14 +335,12 @@ def backproject(S, ant, fmin, df, points, rcv=None, ref=None, backend='auto', up
     nfft = 1 << int(np.ceil(np.log2(upsample * K)))
     inv_dr = 2.0 * df * nfft / C
     kcyc = 2.0 * (fmin + (K // 2) * df) / C
-    if backend == 'tpu':
-        backend = 'jax'
     if backend == 'cpu':
         return _run_cpu(S, tx, rcv, ref, points.reshape(-1, 3), nfft, inv_dr, kcyc, chunk).reshape(shape)
     order, cen, d = _order(points)
     if backend == 'cuda':
         flat = _run_cuda(S, tx, rcv, ref, cen, d, nfft, inv_dr, kcyc, chunk)
-    elif backend in ('jax', 'tpu'):
+    elif backend == 'jax':
         flat = _run_jax(S, tx, rcv, ref, cen, d, nfft, inv_dr, kcyc, chunk)
     else:
         raise ValueError(f'unknown backend {backend!r}')

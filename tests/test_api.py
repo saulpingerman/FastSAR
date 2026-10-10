@@ -76,6 +76,19 @@ def test_former_reuse(scene):
     assert rel_db(img2, ref_b) < -100
 
 
+def test_stage(scene):
+    """former(former.stage(S)) equals former(S): on the JAX backend the staged history is the scaled device planes,
+    on the cpu backend stage returns S itself."""
+    c, S = scene.col, scene.S
+    for b in ('jax', 'cpu'):
+        former = fastsar.ImageFormer(c.ant, c.fmin, c.df, S.shape[1], **GRID, backend=b, T=16, levels=2)
+        staged = former.stage(S)
+        assert (staged is S) == (b == 'cpu')
+        img, img_staged = former(S), former(staged)
+        assert np.array_equal(img, img_staged), b
+        print(f'ImageFormer.stage ({b}): identical images')
+
+
 @pytest.fixture(scope='module')
 def ref4(scene):
     c = scene.col

@@ -1,4 +1,4 @@
-// Factorized backprojection on the CPU: the three stages of the CUDA pipeline (sarbench/ffbp_cuda.py) as C++ with
+// Factorized backprojection on the CPU: the three stages of the CUDA pipeline (fastsar/ffbp_cuda.py) as C++ with
 // OpenMP and 16-wide float vectors (GCC vector extensions; AVX-512 on the instance of record, two AVX2 halves
 // elsewhere).
 //

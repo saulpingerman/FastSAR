@@ -36,8 +36,8 @@ failure.
 
 Each test's peak resident memory is checked against `--max-rss-gb` (default 12, or `FASTSAR_TEST_MAX_GB`): a test
 above it fails, and a process that reaches 1.5 times the limit is stopped so that a runaway test cannot exhaust the
-machine. The summary lists the peak of each module. `--timeout` (pytest-timeout) limits the time of each test.
-For the CPU kernels, set `OMP_NUM_THREADS` to the number of physical cores.
+machine. The summary lists the peak of each module. Each test has 600 s (`pytest-timeout`, set in `pyproject.toml`;
+`--timeout` overrides it). For the CPU kernels, set `OMP_NUM_THREADS` to the number of physical cores.
 
 [nox](https://nox.thea.codes) runs the suite in fresh environments made by uv (`uv tool install nox`, or
 `uv sync --group dev`):
@@ -50,10 +50,13 @@ nox -s tpu           # on a Cloud TPU VM: installs the tpu extra, runs with --re
 nox -s tests-3.12 -- -k exact -s     # arguments after -- go to pytest
 ```
 
-The nox sessions pass `--require io` and a timeout of 600 s per test. GitHub Actions runs `tests` on each Python
-and `lowest` on every push and pull request (CPU only). `python tests/run_all.py` remains for scripts written for
+The nox sessions pass `--require io`. GitHub Actions runs `tests` on each Python, `lowest`, and a packaging job
+(sdist and wheel built and checked, the wheel installed with the `io` and `geo` extras, its CPU kernel compiled
+from site-packages and `examples/chain.py --simulate` run) on every push and pull request, and weekly (CPU only). `python tests/run_all.py` remains for scripts written for
 the former runner: it runs pytest with the same options (`-t` seconds per test, `--max-rss-gb`, `--require`,
 module names to select, `-v` for every test's output) and, as before, fails when a test package is missing.
+`pyproject.toml` sets the 600 s limit per test (`pytest-timeout`); `run_all.py -t` and `pytest --timeout` override
+it.
 
 | Module | Checks |
 |---|---|
@@ -62,7 +65,7 @@ module names to select, `-v` for every test's output) and, as before, fails when
 | `test_ffbp_cuda.py` | CUDA kernels against the dense JAX image (needs a GPU) |
 | `test_pallas_fused.py` | TPU level kernel in interpret mode (runs on a CPU) |
 | `test_pallas_final.py` | TPU final-stage kernel in interpret mode (runs on a CPU) |
-| `test_pallas_e2e_tpu.py` | TPU kernels end to end in interpret mode (runs on a CPU) |
+| `test_pallas_e2e.py` | TPU kernels end to end in interpret mode (runs on a CPU) |
 | `test_autofocus.py` | phase gradient autofocus on the JAX and CPU backends, and CUDA and TPU where present |
 | `test_stripmap.py` | stripmap omega-k and RDA against float64 backprojection |
 | `test_patches.py` | patch mosaics for stripmap and non-linear tracks |
@@ -83,6 +86,13 @@ module names to select, `-v` for every test's output) and, as before, fails when
 set about 5 dB above the value measured when the limit was set. A test that checks several cases reports every
 case that failed.
 
+## Code conventions
+
+The package has no type annotations and no `py.typed` marker; keep it that way rather than adding partial hints.
+Lines run to 120 characters. Public functions carry a docstring that gives units (meters, seconds, Hz, dB) and
+array shapes; optional packages are imported inside the functions that need them, after `_deps.require(...)`, so
+that a missing one raises an `ImportError` naming the extra to install.
+
 ## Pull requests
 
 - Keep a pull request to one change, and state in the description which tests ran and on which devices.
@@ -92,8 +102,21 @@ case that failed.
   data are labeled as test results.
 - Do not commit data files (CPHD, SICD, NITF, `.npy`) or build artifacts.
 
+## Releasing
+
+1. Run the full suite on a CPU machine, on a machine with an Nvidia GPU (`nox -s cuda`) and on a Cloud TPU VM
+   (`nox -s tpu`), and form a few collections that were not used in development.
+2. Set `__version__` in `fastsar/__init__.py`, date the version in `CHANGELOG.md`, and point the pinned links in
+   `README.md` at the new tag (`sed -i 's#/v0.1.0/#/v0.1.1/#g' README.md`); the README is the PyPI page and
+   cannot be changed after upload.
+3. `rm -rf build dist *.egg-info && uv build && uvx twine check dist/*`, then install the wheel in a fresh
+   environment with `g++` and run `python examples/chain.py --simulate out` (the `package` job does the same).
+4. Commit, tag annotated (`git tag -a v0.1.1 -m "FastSAR 0.1.1"`), push the tag, upload with `uvx twine upload
+   dist/*`, and publish the GitHub release with the changelog section as its notes.
+
 ## Reporting a bug
 
-Use the bug report template. Include the FastSAR commit, the backend, the device, the Python, JAX and CuPy
+Use the bug report template. Include the FastSAR version (`fastsar.__version__`, and the commit for a source
+checkout), the backend, the device, the Python, JAX and CuPy
 versions, and if possible a script that reproduces the problem on a simulated scene (`fastsar.sim`), since radar
 data files are often large or not shareable.

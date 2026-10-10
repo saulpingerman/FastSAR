@@ -10,7 +10,7 @@ history is read from HBM once per child and the decimated result written once.
     y = fused_rotate_dec_k(S_re, S_im, c0, slope, band, geom)   ->  (y_re, y_im), each [P, Ko]
 
 band: dict from `band_blocks` (the decimation matrix cut into [nb, win, kob] blocks on the padded column index).
-geom: dict(K, kc, pl_pad) giving the unpadded sample count, the ramp centre and the left padding in columns.
+geom: dict(K, kc, pl_pad) giving the unpadded sample count, the ramp center and the left padding in columns.
 """
 import math
 
@@ -71,7 +71,7 @@ def _split_bf16(x):
 
 def fused_rotate_dec_k(S_re, S_im, c0, slope, band, kc, pb=128, chunk=512, passes=1, interpret=False, vmem_limit=100 << 20):
     """S_re, S_im [P, Kpad] float32 (padded with pad_columns); c0, slope [P] float32 cycles and cycles per sample;
-    band from band_blocks; kc the ramp centre in unpadded sample index. Returns (y_re, y_im) [P, Ko_pad] float32."""
+    band from band_blocks; kc the ramp center in unpadded sample index. Returns (y_re, y_im) [P, Ko_pad] float32."""
     P, Kpad = S_re.shape
     assert Kpad == band['Kpad'] and Kpad % chunk == 0 and P % pb == 0, (P, Kpad, band['Kpad'], chunk, pb)
     nb, win, kob, stride, pl_pad = band['nb'], band['win'], band['kob'], band['stride'], band['pl_pad']
@@ -96,7 +96,7 @@ def fused_rotate_dec_k(S_re, S_im, c0, slope, band, kc, pb=128, chunk=512, passe
         fcos, fsin = jnp.cos(fang), jnp.sin(fang)
 
         def rot_chunk(c, carry):
-            k0 = c * chunk - pl_pad - kc                                # unpadded sample offset of the chunk's first lane, minus the centre
+            k0 = c * chunk - pl_pad - kc                                # unpadded sample offset of the chunk's first lane, minus the center
             ccyc = c0b + slb * k0.astype(jnp.float32)                   # [pb, 1]
             cang = (ccyc - jnp.floor(ccyc + 0.5)) * TWO_PI
             ccos, csin = jnp.cos(cang), jnp.sin(cang)
@@ -209,7 +209,7 @@ def band_blocks2(Fk, D, kob=None, lane=LANE, chunk=128, kob_max=512):
 
 def fused_rotate_dec_k2(S_re, S_im, c0, slope, band, kc, pb=256, passes=1, interpret=False, vmem_limit=100 << 20):
     """S_re, S_im [N, P, Kpad] float32 (pad_columns with the band); c0, slope [N, nc, P] float32 (cycles, cycles per
-    sample); kc the ramp centre in unpadded sample index. Returns (y_re, y_im) [N, nc, P, Ko_pad] float32."""
+    sample); kc the ramp center in unpadded sample index. Returns (y_re, y_im) [N, nc, P, Ko_pad] float32."""
     N, P, Kpad = S_re.shape
     nc = c0.shape[1]
     nb, win, kob, stride, pl_pad, chunk = band['nb'], band['win'], band['kob'], band['stride'], band['pl_pad'], band['chunk']
@@ -375,7 +375,7 @@ def fused_final2(dT_re, dT_im, gx, gy, a0, a1, Qf, passes=1, q0=0, interpret=Fal
     one complex multiplication per q. The data are held transposed, q on sublanes and p on lanes.
 
     dT_re, dT_im [B, Qpad, Pl] float32 (q rows, p columns, zero padded); gx, gy [B, T, Pl] float32 (dl[t] u[p]);
-    a0, a1 floats (cycles per metre at the first frequency sample, per sample step); Qf the number of valid rows;
+    a0, a1 floats (cycles per meter at the first frequency sample, per sample step); Qf the number of valid rows;
     q0 the frequency index of the first row when the rows are a chunk of a longer set (the ramps then start at
     exp(-j 2 pi g a0) exp(-j 2 pi g a1 q0), so the large phase g a0 is rounded as it is for the whole set).
     Returns (cre, cim) [B, T, T] float32."""
@@ -446,7 +446,7 @@ def fused_final2(dT_re, dT_im, gx, gy, a0, a1, Qf, passes=1, q0=0, interpret=Fal
 # ----------------------------------------------------------------------------------------------------------------------
 
 def fused_rotate_dec_k3(S_re, S_im, c0, slope, band, kc, pb=256, passes=1, FpT=None, interpret=False, vmem_limit=100 << 20):
-    """S_re, S_im [N, P, Kpad] float32; c0, slope [N, nc, P] float32; band from band_blocks2; kc the ramp centre.
+    """S_re, S_im [N, P, Kpad] float32; c0, slope [N, nc, P] float32; band from band_blocks2; kc the ramp center.
     FpT: None, or the transposed pulse decimation matrix [Po, P] (float32); when given the kernel returns the pulse-
     decimated children (y_re, y_im) [N, nc, Po_pad, Ko_pad], otherwise [N, nc, P, Ko_pad] as fused_rotate_dec_k2."""
     N, P, Kpad = S_re.shape

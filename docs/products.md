@@ -19,7 +19,7 @@ at 5 km):
 ## Geolocation and terrain correction
 
 A point off the image plane appears where the plane has its range and Doppler cone angle at the aperture center.
-`project` solves this in closed form, so terrain correction is exact under that model. It also holds for moving-beam
+`project` solves the two conditions in closed form; under this model the terrain correction has no approximation error. It also holds for moving-beam
 mosaics on a straight track, and on an orbit while the track over the image is close to a line. `geolocate` inverts
 it by Newton iteration. `geocode_image` projects every map pixel center into the image and samples there, NaN
 outside. DEM heights are often above the geoid (Copernicus DEM: EGM2008); `read_dem`'s `offset` converts them to

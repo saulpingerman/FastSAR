@@ -1,27 +1,9 @@
 # Changelog
 
-The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The date of a version is the day it
+was published on PyPI.
 
-## 0.1.1 (2026-10-09)
-
-### Changed
-
-- `ExactFormer` (and `form_image(..., algorithm='bp')`) oversamples the range profiles 8 times by default with
-  cubic interpolation, as with linear interpolation (4 before). On three regions of the Umbra Panama collection,
-  against a float64 backprojection with profiles oversampled 64 times, the error falls from -59.8 to -69.6 dB to
-  -77.5 to -81.5 dB; the profile buffers double. Pass `upsample=4` for the previous behaviour.
-- `read_cphd` and `form_cphd` remove the troposphere delay at the scene reference point (PVP `TDTropoSRP`) by
-  default when the file gives a nonzero delay (`troposphere=None`; before, only with `troposphere=True`). The delay
-  places scatterers too far in range: 1.4 m on an Umbra collection at Silver Peak, Nevada, where the correction
-  moves the geocoded image 2 m toward its position in Sentinel-2 and NAIP imagery, and 3.7 m on a Capella stripmap,
-  which then registers to Capella's SICD within a pixel (6 pixels without). Umbra's SICD images keep the delay, so
-  `troposphere=False` reproduces their pixel grid.
-- The tests are pytest modules (`uv run pytest`) instead of scripts, with every check, limit and case kept;
-  shared scenes are module fixtures and backend comparisons run once per backend. Tests marked `cuda` or `tpu`
-  are skipped without the device, or fail with `--require cuda,tpu`; tests needing a package of the test group
-  are skipped without it, or fail with `--require io`. Each test's peak resident memory is checked against
-  `--max-rss-gb` (default 12 GB, or `FASTSAR_TEST_MAX_GB`). `tests/run_all.py` runs pytest with its former
-  options.
+## [0.1.1] - unreleased
 
 ### Added
 
@@ -31,6 +13,38 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   bounds of `pyproject.toml`, and `cuda` and `tpu` for GPU and TPU machines.
 - GitHub Actions workflow running the `tests` and `lowest` sessions on the CPU for each push and pull request.
 - `form_cphd(..., troposphere=)`, passed to `read_cphd`; `sim.write_cphd(..., tropo=)` writes `TDTropoSRP`.
+- `FASTSAR_CACHE_DIR` (else `$XDG_CACHE_HOME/fastsar`, else `~/.cache/fastsar`) for the compiled CPU kernels, with a
+  clear error when the directory cannot be created.
+- A packaging job in the workflow: sdist and wheel built and checked, the wheel installed with the `io` and `geo`
+  extras and its C++ kernel compiled from site-packages, `examples/chain.py --simulate` run.
+- Python version classifiers and lower bounds for the `io`, `geo` and `tpu` extras; the `test` extra now matches
+  the `test` dependency group.
+
+### Changed
+
+- `ExactFormer` (and `form_image(..., algorithm='bp')`) oversamples the range profiles 8 times by default with
+  cubic interpolation, as with linear interpolation (4 before). On three regions of the Umbra Panama collection,
+  against a float64 backprojection with profiles oversampled 64 times, the error falls from -59.8 to -69.6 dB to
+  -77.5 to -81.7 dB; the profile buffers double. Pass `upsample=4` for the previous behavior.
+- `read_cphd` and `form_cphd` remove the troposphere delay at the scene reference point (PVP `TDTropoSRP`) by
+  default when the file gives a nonzero delay (`troposphere=None`; before, only with `troposphere=True`). An uncorrected delay displaces scatterers in range, by 1.4 m on an Umbra collection at Silver Peak, Nevada, and
+  by 3.7 m on a Capella stripmap. With the correction the Silver Peak image lies 2 to 3 m closer to its position in
+  Sentinel-2 and NAIP imagery, and the Capella image registers to Capella's SICD within a pixel (6 pixels without). Umbra's SICD images keep the delay, so
+  `troposphere=False` reproduces their pixel grid.
+- A missing optional package raises `ImportError` naming the extra that installs it (`pip install "fastsar[io]"`
+  for sarpy in `read_cphd`, `form_cphd`, `write_sicd`, `sim.write_cphd`; `"fastsar[geo]"` for rasterio in
+  `write_geotiff`, `read_dem` and map projections) instead of a bare `ModuleNotFoundError`; the CPU backend says
+  so when it is not on x86-64 Linux instead of failing in the compiler.
+- Documentation remeasured for the release: the exact-backprojection rows at the 8x default, the crossover with
+  factorized backprojection, and the accuracy margins against the 64x float64 computation (`docs/performance.md`,
+  `docs/comparison.md`, `docs/precision.md`).
+- The `sarkit` test dependency is required on Python 3.11 and later only.
+- The tests are pytest modules (`uv run pytest`) instead of scripts, with the same checks and limits;
+  shared scenes are module fixtures and backend comparisons run once per backend. Tests marked `cuda` or `tpu`
+  are skipped without the device, or fail with `--require cuda,tpu`; tests needing a package of the test group
+  are skipped without it, or fail with `--require io`. Each test's peak resident memory is checked against
+  `--max-rss-gb` (default 12 GB, or `FASTSAR_TEST_MAX_GB`). `tests/run_all.py` runs pytest with its former
+  options.
 
 ### Fixed
 
@@ -42,7 +56,7 @@ Found by forming collections not used in development (Capella, ICEYE and Umbra o
   longer than that needs, instead of a grid tens of thousands of pixels long in azimuth, and says so in `notes`.
 - `form_cphd` checks host memory before forming and raises a `MemoryError` naming `extent` and `spacing`.
 - The CPHD image area comes from `ImageAreaCornerPoints`: Capella writes `ImageArea` in grid lines, which read as
-  metres made a 10 by 50 km stripmap footprint 50 by 249 km.
+  meters made a 10 by 50 km stripmap footprint 50 by 249 km.
 - `read_cphd` reads in pulse blocks into one complex64 array and applies its corrections in place; a 16.5 GB ICEYE
   file needed over 128 GB of memory.
 - `backproject` windows the history in row blocks of one complex64 copy; whole-array products took over 128 GB for a
@@ -52,7 +66,7 @@ Found by forming collections not used in development (Capella, ICEYE and Umbra o
 - `products.geolocate` on terrain steeper than the radar's line of sight (mine pits, cliffs) no longer divides by a
   vanishing Newton derivative; `geocode_image` failed with an infinite map extent on such a DEM.
 
-## 0.1.0 (2026-10-09)
+## [0.1.0] - 2026-10-09
 
 First release.
 
@@ -91,8 +105,7 @@ First release.
 - JAX and TPU formers cache compiled programs and the plan's device arrays by plan signature (up to 32).
 - Polar format keeps its compiled program and geometry arrays per collection geometry (the last four), and applies
   the window, the spectral weighting and the scaling on the device.
-- `ExactFormer` on CUDA halves its pulses per chunk on an out-of-memory error instead of failing (with a
-  `MemoryWarning`).
+- `ExactFormer` on CUDA halves its pulses per chunk on an out-of-memory error and issues a `MemoryWarning`.
 - Environment variables `FASTSAR_SHARED_PROFILES`, `FASTSAR_WEIGHT_TERMS`, `FASTSAR_WEIGHT_GRAD`,
   `FASTSAR_MOSAIC_PREFETCH`, `FASTSAR_COMPILE_PATCHES`, `FASTSAR_PULSE_SLACK`, `FASTSAR_CPU_GROUP_GB`,
   `FASTSAR_CUDA_GROUP`, `FASTSAR_TPU_GROUP`, `FASTSAR_CUDA_STREAM` and `FASTSAR_TIMING`
@@ -171,3 +184,6 @@ First release.
   tracks, ScanSAR and TOPS burst modes.
 - Products: multilook, interferogram, coherence, Pauli decomposition, range-Doppler projection and geocoding,
   GeoTIFF and SICD output.
+
+[0.1.1]: https://github.com/saulpingerman/FastSAR/compare/v0.1.0...v0.1.1
+[0.1.0]: https://github.com/saulpingerman/FastSAR/releases/tag/v0.1.0

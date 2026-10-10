@@ -12,6 +12,10 @@ dist/
 venv/
 .pytest_cache/
 .nox/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
 .ipynb_checkpoints/
 
 # radar data and arrays

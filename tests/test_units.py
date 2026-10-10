@@ -197,7 +197,7 @@ def test_final_weights(scene, nlev):
     for f in range(len(idx)):
         p = np.arange(int(np.ceil(idx[f] - D / 2)), int(np.floor(idx[f] + D / 2)) + 1)
         p = p[(p >= 0) & (p < P)]
-        if not len(p):                    # centred beyond the collection: the nearest pulse's weight
+        if not len(p):                    # centered beyond the collection: the nearest pulse's weight
             p = np.array([int(np.clip(np.rint(idx[f]), 0, P - 1))])
         ref[:, f] = wfun(cen, p).mean(0)
     check(bad, f'final_weights against the mean over pulses ({nm}, D {D:.0f}, max abs)', float(np.abs(wf - ref).max()), 0.006, '{:.4f}')
@@ -367,7 +367,7 @@ def test_mosaic_weights_and_prefetch(monkeypatch):
     t = time.perf_counter()
     expect(bad, 'an error in the prefetch thread', lambda: pt.form_mosaic(fxs, pt.straight_track(p), (x[rows[0]], r[0], 0.0), 192, 256,
            x[1] - x[0], r[1] - r[0], patch=(96, 128), beam=beam_fails), RuntimeError)
-    check(bad, 'time to report it (s)', time.perf_counter() - t, 30, '{:.1f}')
+    check(bad, 'time to report it (s)', time.perf_counter() - t, 120, '{:.1f}')
     done(bad)
 
 

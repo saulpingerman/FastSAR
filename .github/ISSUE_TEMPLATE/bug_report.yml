@@ -20,8 +20,8 @@ body:
   - type: input
     id: version
     attributes:
-      label: FastSAR commit
-      placeholder: output of git rev-parse --short HEAD
+      label: FastSAR version
+      placeholder: python -c "import fastsar; print(fastsar.__version__)" (and git rev-parse --short HEAD for a source checkout)
     validations:
       required: true
   - type: dropdown

@@ -2,11 +2,19 @@ name: tests
 
 on:
   push:
+    branches: ['**']
+    tags: ['v*']
   pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 6 * * 1'      # Mondays: catches a jax, numpy or scipy release that breaks the suite
+
+permissions:
+  contents: read
 
 concurrency:
   group: tests-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   tests:
@@ -18,21 +26,55 @@ jobs:
       matrix:
         python: ['3.10', '3.11', '3.12', '3.13']
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
-      # the cpu backend compiles its C++ kernels on first use with g++ and OpenMP, both on the runner image
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4.4.0
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e   # v6
+        with:
+          enable-cache: true
+      # the cpu backend compiles its C++ kernels on first use with g++ and OpenMP, both on the runner image; the
+      # compiled objects are keyed on the runner's CPU flags, so they are not cached between jobs
       - run: g++ --version
       - run: uv python install ${{ matrix.python }}
       - run: uv tool install nox
-      - run: nox -s tests-${{ matrix.python }}
+      - run: nox -s tests-${{ matrix.python }} -- --durations=15
 
   lowest:
     name: CPU, lowest dependency versions
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4.4.0
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e   # v6
+        with:
+          enable-cache: true
       - run: uv python install 3.10
       - run: uv tool install nox
       - run: nox -s lowest
+
+  package:
+    name: sdist and wheel
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4.4.0
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e   # v6
+      - run: uv python install 3.12
+      - run: uv build
+      - run: uvx twine check dist/*
+      - run: uvx check-wheel-contents dist/*.whl
+      # the wheel as a user installs it, with the io and geo extras, imported from site-packages (the repository
+      # directory is not on sys.path): the C++ source must ship and compile, and the example chain must run
+      - run: uv venv wheel-env
+      - run: uv pip install --python wheel-env/bin/python "$(ls dist/*.whl)[io,geo]"
+      - run: |
+          cd /tmp
+          $GITHUB_WORKSPACE/wheel-env/bin/python -c "
+          import importlib.resources as r, numpy as np, fastsar
+          from fastsar import sim
+          assert r.files('fastsar').joinpath('ffbp_cpu.cpp').is_file(), 'ffbp_cpu.cpp missing from the wheel'
+          col = sim.make_collect(res=0.5, scene=30.0, r0=5e3)
+          S = sim.simulate_brute(col, np.array([[0.0, 0.0, 0.0]]), np.ones(1)).astype(np.complex64)
+          img = fastsar.form_image(S, col.ant, col.fmin, col.df, 64, 64, 0.5, 0.5, (0.0, 1.0, 0.0), (1.0, 0.0, 0.0), backend='cpu', T=16, levels=2)
+          assert np.isfinite(img).all() and np.abs(img).max() > 0
+          print('cpu kernels compiled from the installed wheel; fastsar', fastsar.__version__)
+          "
+      - run: $GITHUB_WORKSPACE/wheel-env/bin/python examples/chain.py --simulate /tmp/chain-out

@@ -478,7 +478,7 @@ def choose_buckets(counts, compile_cost, step=256):
 
 def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 1.0, 0.0), patch=(128, 128), crop=0,
                 beam=None, umax=1.0, awin=None, pulses=None, margin=None, guard=None, backend='cpu', T='auto',
-                levels='auto', target_db=-40.0, sub='auto', wtol_db=None, exact=False, info=None):
+                levels='auto', target_db=-40.0, sub='auto', wtol_db=None, exact=False, info=None, precision='float32'):
     """Complex image [nx, ny] (complex64) on the grid origin + i spx e1 + j spy e2 from the FX phase history fx
     (see echoes_to_fx and the module docstring) and the antenna positions ant [P, 3] of any track, formed patch by
     patch with ImageFormer on backend ('cpu', 'jax', 'cuda', 'tpu').
@@ -620,7 +620,7 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
         else:
             af, idx = fill_gaps(a)
             if backend in ('jax', 'tpu'):         # pulses padded (padded_pulses) so that patches share compiled
-                # programs: zero pulses continuing the track, half before and half after (the final stage centres
+                # programs: zero pulses continuing the track, half before and half after (the final stage centers
                 # its plane-wave model on the mean over the aperture)
                 extra = padded_pulses(len(af)) - len(af)
                 if extra:
@@ -638,7 +638,7 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
                     # recorded pulse for one inserted at a gap)
                     k = np.clip(np.searchsorted(idx, pul), 0, len(idx) - 1)
                     return wa(np.clip(beam(lo + k, np.asarray(q) + c) / umax, -1, 1))
-            former = ImageFormer(af, f0, df, S.shape[1], px * s1, py * s2, spx / s1, spy / s2, e1, e2, backend=backend,
+            former = ImageFormer(af, f0, df, S.shape[1], px * s1, py * s2, spx / s1, spy / s2, e1, e2, backend=backend, precision=precision,
                                  window=False, T=Tp, levels=nlev, aperture_weight=aw)
 
             def form(S_, former=former, idx=idx, n=len(af), s1=s1, s2=s2):

@@ -90,7 +90,7 @@ def ecf(local):
     return srp0 + local[..., :1] * N + local[..., 1:2] * E + local[..., 2:3] * U
 
 
-def cphd(path, S, ant, srp, f0, df, prf, sgn=-1, image_area=None, mode='SPOTLIGHT'):
+def cphd(path, S, ant, srp, f0, df, prf, sgn=-1, image_area=None, mode='SPOTLIGHT', domain='FX'):
     """Register a collection: S [P, K] in the CPHD convention for SGN = -1 (conjugated for +1), antenna and SRP
     positions [P, 3] (ECF)."""
     P, K = S.shape
@@ -103,7 +103,7 @@ def cphd(path, S, ant, srp, f0, df, prf, sgn=-1, image_area=None, mode='SPOTLIGH
         sc.ReferenceSurface = NS(Planar=NS(uIAX=XYZ(N), uIAY=XYZ(E)))
     meta = NS(Data=NS(Channels=[NS(NumVectors=P, NumSamples=K, Identifier='VV')]),
               Channel=NS(Parameters=[NS(Polarization=NS(TxPol='V', RcvPol='V'))]),
-              Global=NS(DomainType='FX', SGN=sgn), CollectionID=NS(CollectorName='SIMULATED', RadarMode=NS(ModeType=mode)),
+              Global=NS(DomainType=domain, SGN=sgn), CollectionID=NS(CollectorName='SIMULATED', RadarMode=NS(ModeType=mode)),
               SceneCoordinates=sc)
     FILES[path] = dict(meta=meta, pvp=pvp, S=np.conj(S) if sgn > 0 else S.copy())
 
@@ -180,7 +180,7 @@ def test_form_cphd_spotlight(spot):
     assert not bad, 'FAILED: ' + '; '.join(bad)
 
 
-@pytest.mark.parametrize('b', ['jax'])
+@pytest.mark.parametrize('b', ['jax', 'cpu'])
 def test_form_cphd_spacing_extent(spot, b):
     bad = []
     col, S, P, K, ant = spot.col, spot.S, spot.P, spot.K, spot.ant
@@ -192,6 +192,37 @@ def test_form_cphd_spacing_extent(spot, b):
                               ref=np.linalg.norm(ant - srp0, axis=1), backend='cpu', window=False, upsample=16)
     check(bad, f'form_cphd ({b}, spacing 0.4 m, extent 30 x 20 m) against exact backprojection', rel_db(o2['image'], ref), -43)
     assert not bad, 'FAILED: ' + '; '.join(bad)
+
+
+def test_errors(spot, monkeypatch):
+    """The errors a user meets first, each a ValueError or MemoryError naming what to change: a time-of-arrival CPHD,
+    a channel that is not in the file, a CPHD without a planar image area and no extent, a one-element extent,
+    autofocus on a moving collection, and a grid too large for the host's memory."""
+    col, S, P, ant, prf = spot.col, spot.S, spot.P, spot.ant, spot.prf
+    srp = np.repeat(srp0[None], P, 0)
+    cphd('spot_toa.cphd', S, ant, srp, col.fmin, col.df, prf, domain='TOA')
+    with pytest.raises(ValueError, match='TOA'):
+        io.read_cphd('spot_toa.cphd')
+    with pytest.raises(ValueError, match='HH'):
+        io.read_cphd('spot.cphd', channel='HH')
+    with pytest.raises(ValueError, match='channel 3 out of range'):
+        io.read_cphd('spot.cphd', channel=3)
+    cphd('spot_noarea.cphd', S, ant, srp, col.fmin, col.df, prf)
+    with pytest.raises(ValueError, match='no planar image area'):
+        fastsar.form_cphd('spot_noarea.cphd', backend='cpu')
+    with pytest.raises(ValueError, match='extent must be'):
+        fastsar.form_cphd('spot.cphd', backend='cpu', extent=(40.0,))
+    with pytest.raises(ValueError, match='positive'):
+        fastsar.form_cphd('spot.cphd', backend='cpu', spacing=-0.5)
+    with pytest.raises(ValueError, match='spotlight collections only'):
+        fastsar.form_cphd('spot.cphd', backend='cpu', mode='moving', autofocus=True)
+    from fastsar import memory as _mem
+    monkeypatch.setattr(_mem, 'host_available', lambda: 1e3)
+    with pytest.raises(MemoryError, match='extent'):
+        fastsar.form_cphd('spot.cphd', backend='cpu')
+    # troposphere=True on a file without a delay: read, with a note
+    _, meta = io.read_cphd('spot.cphd', meta=True, troposphere=True)
+    assert any('troposphere' in n for n in meta['notes']), meta['notes']
 
 
 # ---------------------------------------------------------------------------------------------- (b) moving SRP

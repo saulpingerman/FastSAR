@@ -10,7 +10,7 @@ The image is divided recursively into tiles (three levels by default). At each l
 tile is re-referenced to each child tile's center by a phase ramp, then low-pass filtered and decimated in frequency
 and pulse index by a Kaiser-windowed sinc (70 dB design attenuation). At the last level the range to each pixel is
 linearized about the tile center, so each final T by T tile is a product of two matrices and a per-pixel quadratic
-phase correction. Images may have any shape and size.
+phase correction. 
 
 The TPU kernels fuse rotation and decimation and run the final stage on the matrix units; the CUDA kernels use
 shared-memory filters and, for float16, tensor cores. CUDA and C++ use float64 geometry at every level and agree to
@@ -19,8 +19,7 @@ about -87 dB in float32; the JAX program and the TPU kernels compute the last le
 ### Tile size and range
 
 The final stage models each tile with a plane wave plus an aperture-mean curvature term. The residual grows as the
-square of the tile size and falls with range. With `T='auto'` FastSAR predicts the error from the geometry, takes
-the largest tile (32 or 16) that meets `target_db` (default -40 dB), and warns when neither does
+square of the tile size and falls with range. With `T='auto'` the error of each tile size is predicted from the geometry; the larger of 32 and 16 that meets `target_db` (default -40 dB) is used, with a warning when neither does
 (`ImageFormer.predicted_error_db`). Spaceborne collections keep T=32; CUDA float16 always uses it. Test results
 (`tests/test_accuracy.py`, 128 by 128 pixels of 0.5 m): at 1 km, T=16 gives -34.8 dB (T=32: -22.5 dB); at 4 km,
 T=16 gives -47.0 dB (T=32: -35.7 dB); at 16 km, T=32 gives -47.7 dB. The prediction is within 1.3 dB of these. At
@@ -28,8 +27,7 @@ T=16 gives -47.0 dB (T=32: -35.7 dB); at 16 km, T=32 gives -47.7 dB. The predict
 
 ## Exact backprojection
 
-`ExactFormer` forms an exact backprojection on the `form_image` grid. Everything that depends only on the geometry
-is computed once: the window, the pixel tiles and their centers, and the range bins each pulse can reach (from the
+`ExactFormer` forms an exact backprojection on the `form_image` grid. The window, the pixel tiles with their centers, and the range bins each pulse can reach depend only on the geometry and are computed when the former is built (from the
 grid's nearest point to the antenna, by projection onto the plane, to its farthest corner). Each pixel's range is
 its tile center's, in float64 once per tile and pulse, plus a third-order expansion in its offset `d` from the
 center: with `u` the unit vector from the antenna to the center, `r` their distance, `du = d.u` and
@@ -37,14 +35,12 @@ center: with `u` the unit vector from the antenna to the center, `r` their dista
 per pixel. The next term is at most `h^4 / (8 r^3)` for a tile of half-diagonal `h`. Each former takes the largest
 tile (32 by 32 down to 4 by 4 pixels on the CPU, 8 by 8 on CUDA) whose bound `h^4 / (2 r^3)`, with `r` the smallest
 pixel-to-antenna distance, stays below 3e-4 rad of phase at the highest frequency, and warns when none does. Orbital
-collections keep 32 by 32 tiles; at X band with 1 m pixels, ranges of 1 to 2 km take 8 by 8 tiles. On simulated
-128 by 128 pixel scenes (cubic, against a float64 backprojection at 64 times oversampling) the error is -68 dB from
-0.5 to 20 km and at 600 km. Range profiles are kept only over the reachable bins and read with cubic
+collections keep 32 by 32 tiles; at X band with 1 m pixels, ranges of 1 to 2 km take 8 by 8 tiles. On simulated 128 by 128 pixel scenes (cubic at 4 times, against a float64 backprojection at 64 times oversampling) the error was -67 to -68 dB from 0.5 to 20 km and at 600 km. Range profiles are kept only over the reachable bins and read with cubic
 Lagrange interpolation at `upsample=8` (default) or linear interpolation at `upsample=8`. On the Umbra Panama
 collection cubic interpolation measures -67.4 dB against the float64 reference (that reference's own accuracy:
 against a 64 times float64 truth the regions are -77.5 to -81.7 dB), and linear -56.9 dB (`tests/test_exact.py` checks -65 and -52 dB on simulated scenes at 20 and 600 km).
 The CUDA and C++ kernels implement this; on TPU, `ExactFormer` runs `backproject`'s JAX program with linear interpolation, at
-`upsample=16` in place of cubic at 4 (linear keeps 8).
+four times the cubic oversampling (`upsample=32` for the default 8; linear keeps its own).
 
 `backproject` forms the image at any points, such as `plane_points(...)` on a DEM; `rcv` makes it bistatic (`ant` is
 then the transmitter) and `ref` handles a moving reference point. Its cost is pulses times points. Each pulse is
@@ -63,7 +59,7 @@ reference at 4 km (`tests/test_accuracy.py`) the error falls by 12 dB per doubli
 `pfa_guard` (default 300 m, for orbital scenes) is the margin kept free of wrap-around; small simulated scenes need
 less. The planar-wavefront assumption displaces scatterers away from the center: on Panama by up to 18 pixels in
 azimuth and 12 in range at the corners. FastSAR removes the displacement predicted from the geometry by a final
-resampling. The error is then -32.1 dB on Panama (Melbourne -33.4 dB, Iowa -35.3 dB). It grows by about 10 dB from
+resampling. The error is then -32.1 dB on Panama (Melbourne -33.5 dB, Iowa -35.4 dB). It grows by about 10 dB from
 the inner to the outer ring around the scene center; the factorized image's error stays level:
 
 ![Error of polar format and factorized backprojection in four rings around the scene center](images/rings.png)
@@ -73,7 +69,7 @@ factorized image on the L4.*
 
 ## Wide-angle and circular apertures
 
-Factorized backprojection makes no small-angle assumption, so it forms wide-angle and circular collections. Test
+Factorized backprojection makes no small-angle assumption and forms wide-angle and circular collections. Test
 results (`tests/test_wide_angle.py`): 256 by 256 images at the resolution of 10, 45, 120 and 360 degree apertures (X
 band, 1.5 GHz, pixels of 72 to 6 mm) agree with exact backprojection to -53.1, -62.2, -63.8 and -65.2 dB.
 

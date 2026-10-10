@@ -19,6 +19,11 @@ classifiers = [
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Environment :: GPU :: NVIDIA CUDA :: 12",
     "Programming Language :: C++",
     "Topic :: Scientific/Engineering",
     "Topic :: Scientific/Engineering :: Image Processing",
@@ -33,13 +38,14 @@ Changelog = "https://github.com/saulpingerman/FastSAR/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 cuda = ["cupy-cuda12x"]
-io = ["sarpy"]
-tpu = ["jax[tpu]"]
-geo = ["rasterio"]
-test = ["sarpy", "sarkit; python_version >= '3.11'", "rasterio", "finufft", "pytest>=8", "pytest-timeout"]
+io = ["sarpy>=1.3.64"]
+tpu = ["jax[tpu]>=0.6.2"]
+geo = ["rasterio>=1.4.4"]
+# the same packages as the test dependency group, for installers without PEP 735 groups
+test = ["pytest>=8", "pytest-timeout", "pytest-xdist", "sarpy>=1.3.64", "sarkit; python_version >= '3.11'", "rasterio>=1.4.4", "finufft"]
 
 [dependency-groups]
-test = ["pytest>=8", "pytest-timeout", "pytest-xdist", "sarpy", "sarkit; python_version >= '3.11'", "rasterio", "finufft"]
+test = ["pytest>=8", "pytest-timeout", "pytest-xdist", "sarpy>=1.3.64", "sarkit; python_version >= '3.11'", "rasterio>=1.4.4", "finufft"]
 dev = [{include-group = "test"}, "nox>=2025.2.9"]
 
 [tool.setuptools]
@@ -55,6 +61,7 @@ fastsar = ["ffbp_cpu.cpp"]
 testpaths = ["tests"]
 pythonpath = ["."]
 addopts = ["-ra", "--strict-markers"]
+timeout = 600
 markers = [
     "cuda: needs CuPy and an Nvidia GPU (skipped without one; a failure with --require cuda)",
     "tpu: needs a Cloud TPU (skipped without one; a failure with --require tpu)",

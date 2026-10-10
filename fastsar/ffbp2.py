@@ -12,7 +12,7 @@ a separable matrix product). This version differs in four ways.
     taps (both suited to devices where a gather or a convolution is cheap).
   * The rotation phases of the first two levels are computed in float64 on the
     host. The offsets between a first-level tile and its children are hundreds
-    of metres, and their range differences cannot be held to a small fraction
+    of meters, and their range differences cannot be held to a small fraction
     of a wavelength in float32 at orbital range.
   * The device program takes one first-level tile at a time, so that only the
     intermediate data of that tile exist on the device.
@@ -182,7 +182,7 @@ def fir(F, D, m):
 
 def make_plan(col, nx, ny, spx, spy, T=32, nlev=3, pmax=0.4, atten=70.0, splits=None, e1=(1.0, 0.0, 0.0), e2=(0.0, 1.0, 0.0)):
     """Tile grid, decimation factors and filters for an nx x ny image with pixel spacings spx, spy in the
-    plane spanned by the orthonormal vectors e1, e2 (the ground plane by default), centred on the origin of
+    plane spanned by the orthonormal vectors e1, e2 (the ground plane by default), centered on the origin of
     the collection's coordinates. Depends on the imaging mode only."""
     e1, e2 = np.asarray(e1, np.float64), np.asarray(e2, np.float64)
     sxs = choose_splits(nx, T, nlev) if splits is None else tuple(s[0] for s in splits)
@@ -291,7 +291,7 @@ HOST_LEVELS = 2          # levels whose rotation phases are computed in float64 
 
 def collection_arrays(plan, ant, ref=None):
     """Per-collection host work in float64: the antenna path on each level's pulse grid, and for the first
-    HOST_LEVELS levels the rotation phase of every child at band centre (wrapped to a cycle) and its slope
+    HOST_LEVELS levels the rotation phase of every child at band center (wrapped to a cycle) and its slope
     in cycles per frequency sample. ref [P]: the range each pulse's samples are referenced to (one way), when it
     is not the antenna's distance to the origin (a bistatic collection's half path, a vendor's reference point);
     the first level's rotation then starts from it, at no extra cost."""
@@ -490,16 +490,16 @@ def make_ffbp(policy, plan, filt='dense', budget=1 << 26, trig='split', pallas_p
             z = zt if z is None else z + zt
         return z.reshape(Np * nc, b['nbo'] * b['G'], Kq)[:, :b['n_out'], :Ko].reshape(Np, nc, b['n_out'], Ko)
 
-    def ramp(c0, sl, n, centre):
-        """cos and sin of 2 pi (c0 + (k - centre) sl) for k = 0 .. n - 1; c0 and sl of one shape, result [..., n]."""
+    def ramp(c0, sl, n, center):
+        """cos and sin of 2 pi (c0 + (k - center) sl) for k = 0 .. n - 1; c0 and sl of one shape, result [..., n]."""
         if trig == 'direct':
-            kk = jnp.arange(n, dtype=jnp.int32).astype(f) - float(centre)
+            kk = jnp.arange(n, dtype=jnp.int32).astype(f) - float(center)
             cyc = c0[..., None] + kk * sl[..., None]
             ang = (cyc - jnp.round(cyc)) * two_pi
             return jnp.cos(ang).astype(ew), jnp.sin(ang).astype(ew)
         Bq = int(math.ceil(math.sqrt(n)))
         nh = -(-n // Bq)
-        kh = jnp.arange(nh, dtype=jnp.int32).astype(f) * float(Bq) - float(centre)
+        kh = jnp.arange(nh, dtype=jnp.int32).astype(f) * float(Bq) - float(center)
         ch = c0[..., None] + kh * sl[..., None]
         ah = (ch - jnp.round(ch)) * two_pi
         cl = jnp.arange(Bq, dtype=jnp.int32).astype(f) * sl[..., None]
@@ -516,7 +516,7 @@ def make_ffbp(policy, plan, filt='dense', budget=1 << 26, trig='split', pallas_p
         return jnp.concatenate([pre[None] * cs - pim[None] * sn, pre[None] * sn + pim[None] * cs], axis=0)
 
     def device_phases(la, refb, lv):
-        """Band-centre phase and slope of every child of the parent at refb, in the working type."""
+        """Band-center phase and slope of every child of the parent at refb, in the working type."""
         k0c = float(2.0 * (lv['f0'] + (lv['K'] - 1) / 2.0 * lv['df']) / C)
         k1 = float(2.0 * lv['df'] / C)
         u, r0, d = la['u'], la['r0'], la['d']

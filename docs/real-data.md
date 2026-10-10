@@ -38,8 +38,7 @@ are also without the troposphere correction, which `read_cphd` applies by defaul
 | Capella spotlight, mountains (yes) | 0.605 | 0.904 |
 | Capella dynamic stripmap, 2022 (yes) | 0.224 | 0.752 |
 
-Speckle limits amplitude correlation wherever the processors' windows or azimuth bands differ; averaged intensity
-shows whether the same structure appears in the same place. The 2022 dynamic stripmap (Capella's name for sliding
+Amplitude correlation is limited by speckle where the two processors' windows or azimuth bands differ; the averaged intensity is the better indicator of common structure. The 2022 dynamic stripmap (Capella's name for sliding
 spotlight) is the collection [below](#capella-dynamic-stripmap-scene-center-only).
 
 ## Umbra spotlight
@@ -57,8 +56,7 @@ Three Umbra open-data spotlight collections were formed on the vendor's grid:
 *Float64 exact backprojection, downsampled (45 dB, azimuth horizontal, 1 km bar). Boxes: the regions of
 [precision.md](precision.md).*
 
-Near the scene center FastSAR's pixels match the vendor's to a quarter pixel. The vendor's polar format lacks the
-planar-wavefront correction, so its Panama image is displaced by up to 13.2 pixels in
+Near the scene center FastSAR's pixels match the vendor's to a quarter pixel. The vendor's polar format does not correct the planar-wavefront displacement; its Panama image is displaced by up to 13.2 pixels in
 azimuth and 9.0 in range, against 13.2 and 9.1 predicted from the geometry. After resampling the vendor image
 through that model, the residual is at most 0.25 pixel rms on all three collections.
 
@@ -82,7 +80,7 @@ the GEC with no offset. These figures also predate the z-axis change noted above
 
 Two Capella Open Data collections were compared with the vendor's SICD:
 
-- Stripmap (2021-11-12, 39,899 pulses of 6,003 samples, scene reference point moving 27.5 km):
+- Stripmap (2021-11-12, 39,898 pulses of 6,003 samples, scene reference point moving 27.5 km):
   [`examples/form_capella_stripmap.py`](../examples/form_capella_stripmap.py) forms a 512 by 512 crop of the
   vendor's range / zero-Doppler grid by the patch mosaic (165 patches of about 10,300 pulses; 12 s on the
   c4d-highmem-16 with release 0.1.0). The amplitude images correlate at 0.993.

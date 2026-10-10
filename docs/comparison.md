@@ -2,13 +2,13 @@
 
 Five open-source backprojection codes were run on the Umbra Panama collection, on the c4d-highmem-16 or the L4
 ([performance.md](performance.md#timing-protocol-and-devices)), from the same Taylor-windowed phase history and
-antenna positions. Two produced no usable image.
+antenna positions. 
 
 Errors are against the float64 reference (linear interpolation, 16 times oversampled) over the lock, port and ship
 regions of [precision.md](precision.md), worst to best; FastSAR's exact rows (truth) are against a float64
 backprojection at 64 times, since the reference's own error, -67.3 to -68.8 dB, is above theirs; ISCE3 was scored on three 256 by 256 patches of its own grid after removal of a common linear phase
 ramp. Times are for the full image, host to host; FastSAR's factorized rows use a warm former. Estimates (est.) scale
-one region's time by the pixel count and overstate it: the same estimate for FastSAR's exact backprojection gives 28
+one region's time by the pixel count and overstate the full-image time; applied to FastSAR's exact backprojection, the same estimate for FastSAR's exact backprojection gives 28
 min against 433 s measured.
 
 | CPU (c4d-highmem-16) | Error (dB) | Time |
@@ -26,7 +26,7 @@ min against 433 s measured.
 | ISCE3 `backproject`, CUDA | -31.5 to -52.2 | 27 min (est.) |
 | torchbp, exact | no image | 16.0 s |
 | torchbp, factorized | out of memory | |
-| FastSAR, exact backprojection, cubic, 8x | -77.5 to -81.7 (truth) | 24.2 s |
+| FastSAR, exact backprojection, cubic, 8x | -77.5 to -81.7 (truth) | 24.1 s |
 | FastSAR, factorized, float32 | -56.7 to -61.1 | 3.8 s |
 | FastSAR, factorized, float16 | -55.3 to -60.4 | 3.5 s |
 
@@ -40,13 +40,13 @@ min against 433 s measured.
 - GRDL's factorized backprojection, documented as a stripmap algorithm, formed no focused image with default
   parameters.
 
-With the algorithm held fixed, FastSAR's exact backprojection is 43 times faster than ISCE3's estimated time on the
-CPU and 86 times faster on the L4, with lower errors in every region. The factorized algorithm cuts the CPU time by a
-further factor of 36.
+With the algorithm held fixed, FastSAR's exact backprojection is 40 times faster than ISCE3's estimated time on the
+CPU and 67 times faster on the L4, with lower errors in every region. The factorized algorithm cuts the CPU time by a
+further factor of 38.
 
 On the same CPU, NGA's `pfa_mem` (Octave) forms a polar-format image in 44 s and GRDL's polar format in 24.5 s.
 Neither corrects the planar-wavefront displacement. Their log-amplitude correlations with the reference are 0.80 to
-0.89 and 0.78 to 0.93, against 0.996 to 0.999 for FastSAR's corrected polar format (11.3 s).
+0.89 and 0.78 to 0.93, against 0.996 to 0.999 for FastSAR's corrected polar format (11.4 s).
 
 Scripts and records: [sar-accel-study](https://github.com/saulpingerman/sar-accel-study), directories `oss` and
 `results/oss`.
