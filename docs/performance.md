@@ -140,9 +140,15 @@ vector sine library. On the synthetic collection of `oss/bench_cpu_synth.py` in 
 |---|---|---|---|
 | Threadripper PRO 7965WX (Zen 4, AVX-512) | 8 | 2.7 s (T=32) | 2.7 s |
 | MacBook Air M2 (4 performance and 4 efficiency cores) | 8 | 3.7 s (T=16), 4.4 s (T=32) | 3.5 s |
+| MacBook Air M2, GPU through Metal (`ExactFormer` only) | | | 1.4 s |
 
 The automatic tile choice takes 16 pixels on ARM. macOS builds the kernels with Apple's clang, `-fopenmp-simd` and
 `-mcpu=native`, with the parallel loops on `std::thread` (no OpenMP runtime, see `fastsar/par.hpp`).
+
+On the Panama collection of the paper (15,186 pulses by 14,399 samples, 12,207 by 8,808 pixels) a c4a-highmem-16
+(Google Axion, Neoverse V2, 16 cores) forms the factorized float32 image in 20.3 s with these kernels, from 43.7 s
+with the 16-lane vectors of 0.1.1 (the c4d-highmem-16 of record: 11.4 s). Record: `results/fastsar/logs/arm2` in
+sar-accel-study.
 
 ## Exact backprojection
 

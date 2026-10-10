@@ -162,9 +162,9 @@ _CPU_SRC = r'''
 // one task per tile of TX x TY pixels (par.hpp: OpenMP, or std::thread without the runtime); per pulse the tile
 // center's terms in float64, then the tile's pixels in float32 in one vectorizable loop (the sines from the vector
 // math library)
-#if defined(__APPLE__)
-#define FASTSAR_POLY_SINCOS 1       // no vector sine library: polynomials in cycles (3.7e-9 max error) that vectorize
-#endif
+// the sines by polynomials in cycles (3.7e-9 max error) that vectorize on every target: faster than glibc's vector
+// library on x86 and the only vector option on macOS and ARM
+#define FASTSAR_POLY_SINCOS 1
 #ifdef FASTSAR_POLY_SINCOS
 static inline void sincos_cyc_f(float c, float& s, float& co) {
   const float a = std::fabs(c);                      // c in [-0.5, 0.5] cycles

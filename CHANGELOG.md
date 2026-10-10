@@ -48,9 +48,10 @@ was published on PyPI.
   kernel to 2e-7 of the peak; `backend='auto'` picks it for `ExactFormer` on a Mac. The factorized former has no
   Metal kernels and runs on the CPU cores.
 - ARM and Apple silicon: the factorized CPU kernel's vectors are four lanes on ARM (NEON) with the final tile
-  stage templated on the vectors per table row (the x86 code is unchanged), the exact kernel's sines are
-  vectorizable polynomials on macOS (no vector sine library there), macOS builds with `-mcpu=native`, and the
-  automatic tile choice takes 16 pixels on ARM. On an M2 MacBook Air the synthetic 4096 by 4096 image of
+  stage templated on the vectors per table row (the x86 code is unchanged), the exact CPU kernel's sines are
+  vectorizable polynomials (3.7e-9 maximum error) on every target (15% faster than glibc's vector library on x86,
+  the only vector option on macOS and ARM), macOS builds with `-mcpu=native`, and the automatic tile choice takes
+  16 pixels on ARM. On a c4a-highmem-16 (Axion) the factorized Panama image takes 20.3 s, from 43.7 s. On an M2 MacBook Air the synthetic 4096 by 4096 image of
   `oss/bench_cpu_synth.py` (5,794 pulses) forms in 3.7 s factorized and 3.5 s exact at 1024 by 1024, from 6.3 and
   8.0 s before; eight Zen 4 threads with AVX-512 take 2.7 s for each.
 
