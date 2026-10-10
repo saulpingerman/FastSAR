@@ -663,6 +663,7 @@ test = [
     { name = "finufft" },
     { name = "pytest" },
     { name = "pytest-timeout" },
+    { name = "pytest-xdist" },
     { name = "rasterio", version = "1.4.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "rasterio", version = "1.5.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "sarkit", version = "1.8.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
@@ -708,15 +709,16 @@ requires-dist = [
     { name = "cupy-cuda12x", marker = "extra == 'cuda'" },
     { name = "finufft", marker = "extra == 'test'" },
     { name = "jax", specifier = ">=0.6.2" },
-    { name = "jax", extras = ["tpu"], marker = "extra == 'tpu'" },
+    { name = "jax", extras = ["tpu"], marker = "extra == 'tpu'", specifier = ">=0.6.2" },
     { name = "numpy", specifier = ">=2.2.6" },
     { name = "pytest", marker = "extra == 'test'", specifier = ">=8" },
     { name = "pytest-timeout", marker = "extra == 'test'" },
-    { name = "rasterio", marker = "extra == 'geo'" },
-    { name = "rasterio", marker = "extra == 'test'" },
+    { name = "pytest-xdist", marker = "extra == 'test'" },
+    { name = "rasterio", marker = "extra == 'geo'", specifier = ">=1.4.4" },
+    { name = "rasterio", marker = "extra == 'test'", specifier = ">=1.4.4" },
     { name = "sarkit", marker = "python_full_version >= '3.11' and extra == 'test'" },
-    { name = "sarpy", marker = "extra == 'io'" },
-    { name = "sarpy", marker = "extra == 'test'" },
+    { name = "sarpy", marker = "extra == 'io'", specifier = ">=1.3.64" },
+    { name = "sarpy", marker = "extra == 'test'", specifier = ">=1.3.64" },
     { name = "scipy", specifier = ">=1.15.3" },
 ]
 provides-extras = ["cuda", "io", "tpu", "geo", "test"]
@@ -728,18 +730,18 @@ dev = [
     { name = "pytest", specifier = ">=8" },
     { name = "pytest-timeout" },
     { name = "pytest-xdist" },
-    { name = "rasterio" },
+    { name = "rasterio", specifier = ">=1.4.4" },
     { name = "sarkit", marker = "python_full_version >= '3.11'" },
-    { name = "sarpy" },
+    { name = "sarpy", specifier = ">=1.3.64" },
 ]
 test = [
     { name = "finufft" },
     { name = "pytest", specifier = ">=8" },
     { name = "pytest-timeout" },
     { name = "pytest-xdist" },
-    { name = "rasterio" },
+    { name = "rasterio", specifier = ">=1.4.4" },
     { name = "sarkit", marker = "python_full_version >= '3.11'" },
-    { name = "sarpy" },
+    { name = "sarpy", specifier = ">=1.3.64" },
 ]
 
 [[package]]
