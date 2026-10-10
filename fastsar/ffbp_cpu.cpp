@@ -97,6 +97,44 @@ static void tile_product(const float* Arf, const float* Aif, const v16* Br, cons
     }
 }
 
+// The same product in blocks of HB vectors of the row (NH = 8 on NEON: two blocks of four, two rows at a time,
+// so the accumulators and the B vectors of a block fit the 32 registers).
+template <int NH, int HB, int R>
+static void tile_product_blocked(const float* Arf, const float* Aif, const v16* Br, const v16* Bi, int NC, int T, v16* accr, v16* acci)
+{
+    for (int hb = 0; hb < NH; hb += HB) {
+        for (int i0 = 0; i0 < T; i0 += R) {
+            v16 pr[R][HB], pi[R][HB];
+            FASTSAR_UNROLL
+            for (int r = 0; r < R; ++r) {
+                FASTSAR_UNROLL
+                for (int h = 0; h < HB; ++h) { pr[r][h] = accr[(size_t)(i0 + r) * NH + hb + h]; pi[r][h] = acci[(size_t)(i0 + r) * NH + hb + h]; }
+            }
+            for (int n = 0; n < NC; ++n) {
+                v16 br[HB], bi[HB];
+                FASTSAR_UNROLL
+                for (int h = 0; h < HB; ++h) { br[h] = Br[(size_t)n * NH + hb + h]; bi[h] = Bi[(size_t)n * NH + hb + h]; }
+                const float* arow = Arf + (size_t)n * T + i0;
+                const float* airow = Aif + (size_t)n * T + i0;
+                FASTSAR_UNROLL
+                for (int r = 0; r < R; ++r) {
+                    const v16 xr = bcast(arow[r]), xi = bcast(airow[r]);
+                    FASTSAR_UNROLL
+                    for (int h = 0; h < HB; ++h) {
+                        pr[r][h] += xr * br[h]; pr[r][h] -= xi * bi[h];
+                        pi[r][h] += xr * bi[h]; pi[r][h] += xi * br[h];
+                    }
+                }
+            }
+            FASTSAR_UNROLL
+            for (int r = 0; r < R; ++r) {
+                FASTSAR_UNROLL
+                for (int h = 0; h < HB; ++h) { accr[(size_t)(i0 + r) * NH + hb + h] = pr[r][h]; acci[(size_t)(i0 + r) * NH + hb + h] = pi[r][h]; }
+            }
+        }
+    }
+}
+
 }  // namespace
 
 extern "C" {
@@ -389,7 +427,7 @@ static void final_tiles_impl(const float* dre, const float* dim, int B, int Pf, 
                     const float* Arf = reinterpret_cast<const float*>(Ar.data());
                     const float* Aif = reinterpret_cast<const float*>(Ai.data());
                     if (NH == 4) tile_product<4, 2>(Arf, Aif, Br.data(), Bi.data(), NC, T, accr.data(), acci.data());
-                    else tile_product<8, 1>(Arf, Aif, Br.data(), Bi.data(), NC, T, accr.data(), acci.data());
+                    else tile_product_blocked<8, 4, 2>(Arf, Aif, Br.data(), Bi.data(), NC, T, accr.data(), acci.data());
                 }
             }
             // quadratic phase correction and store

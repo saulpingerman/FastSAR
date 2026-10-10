@@ -161,6 +161,20 @@ _CPU_SRC = r'''
 // one task per tile of TX x TY pixels (par.hpp: OpenMP, or std::thread without the runtime); per pulse the tile
 // center's terms in float64, then the tile's pixels in float32 in one vectorizable loop (the sines from the vector
 // math library)
+#if defined(__APPLE__)
+#define FASTSAR_POLY_SINCOS 1       // no vector sine library: polynomials in cycles (3.7e-9 max error) that vectorize
+#endif
+#ifdef FASTSAR_POLY_SINCOS
+static inline void sincos_cyc_f(float c, float& s, float& co) {
+  const float a = std::fabs(c);                      // c in [-0.5, 0.5] cycles
+  const float x = a > 0.25f ? 0.5f - a : a;          // folded to [0, 0.25]
+  const float x2 = x * x;
+  const float sp = x * (6.283185189e+00f + x2 * (-4.134166012e+01f + x2 * (8.160126724e+01f + x2 * (-7.655501843e+01f + x2 * 3.957215334e+01f))));
+  const float cp = 9.999999999e-01f + x2 * (-1.973920861e+01f + x2 * (6.493935261e+01f + x2 * (-8.545381044e+01f + x2 * (6.014806081e+01f + x2 * -2.500674980e+01f))));
+  s = c < 0.f ? -sp : sp;
+  co = a > 0.25f ? -cp : cp;
+}
+#endif
 struct TileScratch {
   float* p = nullptr; size_t n = 0;
   ~TileScratch() { free(p); }
@@ -210,7 +224,11 @@ extern "C" int bp_tiles(const float* wre, const float* wim, int P, int W, const 
           const float del = du + (dd[q] - du*du) * (hir - du * hi2);
           tt[q] = tfk + del * fdr;
           float ph = phk + fk * del;
+#ifdef FASTSAR_POLY_SINCOS
+          pp[q] = ph - std::nearbyint(ph);
+#else
           pp[q] = 6.283185307179586f * (ph - std::nearbyint(ph));
+#endif
         }
         if (cubic) {
           #pragma omp simd
@@ -222,7 +240,11 @@ extern "C" int bp_tiles(const float* wre, const float* wim, int P, int W, const 
             const float c2 = -wp1 * w * wm2 * 0.5f, c3 = wp1 * w * wm1 * (1.f / 6.f);
             const float vre = c0*rr[i-1] + c1*rr[i] + c2*rr[i+1] + c3*rr[i+2];
             const float vim = c0*ri[i-1] + c1*ri[i] + c2*ri[i+1] + c3*ri[i+2];
+#ifdef FASTSAR_POLY_SINCOS
+            float s, c; sincos_cyc_f(pp[q], s, c);
+#else
             const float s = std::sin(pp[q]), c = std::cos(pp[q]);
+#endif
             are[q] += vre * c - vim * s;
             aim[q] += vre * s + vim * c;
           }
@@ -232,7 +254,11 @@ extern "C" int bp_tiles(const float* wre, const float* wim, int P, int W, const 
             const float fl = std::floor(tt[q]), w = tt[q] - fl;
             const int i = (int)fl;
             const float vre = rr[i] + w * (rr[i+1] - rr[i]), vim = ri[i] + w * (ri[i+1] - ri[i]);
+#ifdef FASTSAR_POLY_SINCOS
+            float s, c; sincos_cyc_f(pp[q], s, c);
+#else
             const float s = std::sin(pp[q]), c = std::cos(pp[q]);
+#endif
             are[q] += vre * c - vim * s;
             aim[q] += vre * s + vim * c;
           }
