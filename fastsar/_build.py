@@ -31,25 +31,30 @@ def default_flags():
 
 
 def compiler():
-    """The C++ compiler and the OpenMP flags for compiling and linking: $CXX; on macOS the newest Homebrew GCC
-    (g++-20 down to g++-12) on the PATH, else clang++ with Homebrew's libomp. -> (cxx, compile flags, link flags)."""
+    """The C++ compiler and the OpenMP flags for compiling and linking: $CXX; on macOS clang++ with Homebrew's
+    libomp, else the newest Homebrew GCC (g++-20 down to g++-12) on the PATH. -> (cxx, compile flags, link flags)."""
     cxx = os.environ.get('CXX')
     if cxx:
         return cxx, ['-fopenmp'], ['-fopenmp']
     if sys.platform != 'darwin':
         return 'g++', ['-fopenmp'], ['-fopenmp']
-    for v in range(20, 11, -1):                     # the newest Homebrew GCC
+    # macOS: Apple's clang with Homebrew's libomp, the OpenMP runtime jaxlib and numpy's wheels already load (a
+    # second runtime in the process, GCC's libgomp, aborts on initialization); a Homebrew GCC only as a fallback
+    prefix = None
+    for brew in ('brew', '/opt/homebrew/bin/brew', '/usr/local/bin/brew'):
+        try:
+            prefix = subprocess.run([brew, '--prefix', 'libomp'], capture_output=True, text=True, timeout=60).stdout.strip()
+            if prefix:
+                break
+        except (OSError, subprocess.SubprocessError):
+            continue
+    if prefix and os.path.isdir(prefix) and shutil.which('clang++'):
+        return 'clang++', ['-Xpreprocessor', '-fopenmp', f'-I{prefix}/include'], [f'-L{prefix}/lib', '-lomp', f'-Wl,-rpath,{prefix}/lib']
+    for v in range(20, 11, -1):
         if shutil.which(f'g++-{v}'):
             return f'g++-{v}', ['-fopenmp'], ['-fopenmp']
-    prefix = None
-    try:
-        prefix = subprocess.run(['brew', '--prefix', 'libomp'], capture_output=True, text=True, timeout=60).stdout.strip()
-    except (OSError, subprocess.SubprocessError):
-        pass
-    if prefix and os.path.isdir(prefix) and shutil.which('clang++'):
-        return 'clang++', ['-Xpreprocessor', '-fopenmp', f'-I{prefix}/include'], [f'-L{prefix}/lib', '-lomp']
-    raise RuntimeError("fastsar's cpu backend needs a C++ compiler with OpenMP: on macOS install GCC (brew install gcc) "
-                       "or libomp for Apple's clang (brew install libomp), or set CXX")
+    raise RuntimeError("fastsar's cpu backend needs a C++ compiler with OpenMP: on macOS install libomp for Apple's clang "
+                       "(brew install libomp), or set CXX")
 
 
 def _check_gcc(cxx):
