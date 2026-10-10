@@ -85,7 +85,7 @@ def _image_area(cphd, meta):
 
 def form_cphd(cphd, sicd=None, *, mode='auto', backend='auto', window=True, spacing=None, channel=0, patch=1024,
               azimuth_fraction=0.8, extent=None, height=None, precision='float32', target_db=-40.0, info=None,
-              autofocus=False, troposphere=None):
+              autofocus=False, troposphere=None, reader_options=None):
     """Form the image of a CPHD collection (see the module docstring).
 
     cphd: path. sicd: the vendor's SICD (path, .xml metadata, or sarpy SICDType) for the footprint, spacing and
@@ -98,6 +98,8 @@ def form_cphd(cphd, sicd=None, *, mode='auto', backend='auto', window=True, spac
     autofocus (fastsar.autofocus.autofocus, two rounds; spotlight only), which forms the image three times.
     troposphere: remove the per-pulse troposphere delay the file gives (io.read_cphd; default: when nonzero);
         'model' removes a standard-atmosphere delay instead, for files that give none (ICEYE).
+    reader_options: a dict of further keyword arguments for the reader of this file type (io.read_collection), such as
+        pulses=(first, last) or polarization for the raw-data readers.
     -> dict(image [nx, ny] complex64, origin [3] (local, pixel (0, 0)), e1, e2 (unit axes, local), spx, spy, mode,
     band (first and last frequency, Hz), bandwidth (spatial frequency support along e1 and e2, cycles/m), window,
     phase_error (autofocus: per pulse, rad, else None), meta (read_cphd's), notes). Pixel (i, j) lies at
@@ -113,7 +115,7 @@ def form_cphd(cphd, sicd=None, *, mode='auto', backend='auto', window=True, spac
             raise ValueError(f'{n} must be one or two positive lengths in meters, got {v!r}')
     if extent is not None and np.size(extent) != 2:
         raise ValueError(f'extent must be (along track, across track) in meters, got {extent!r}')
-    col, meta = io.read_collection(cphd, channel=channel, meta=True, troposphere=troposphere, height=height)
+    col, meta = io.read_collection(cphd, channel=channel, meta=True, troposphere=troposphere, height=height, **(reader_options or {}))
     S = col['S']
     P, K = S.shape
     f0, df = float(col['fmin']), float(col['df'])

@@ -133,3 +133,16 @@ of the leader removed, range compressed with a linear FM replica from the leader
 then the same frequency-domain history, zero-Doppler reference and orbit interpolation as the NISAR reader. Line
 times come from the 1PPS microsecond counter in each line's auxiliary data (the millisecond field alone is 7.5 m
 along track). Stripmap products (FBS, FBD); ScanSAR is not handled. `form_cphd(directory)` forms the scene.
+
+## Sentinel-1 Level-0
+
+`io.read_sentinel1` reads a Level-0 product's measurement file: the space packets are parsed (`fastsar.sentinel1`:
+datation, radar configuration, the SES and SAS messages, the sample count), the echo packets' user data decoded
+(FDBAQ with the five Huffman trees and the reconstruction tables of the packet protocol, BAQ, or bypass) by a C++
+decoder that was checked bit for bit against a public decoder on a real S1 stripmap file, and each echo range
+compressed with the replica the headers describe (start frequency, ramp rate, length). The antenna positions come from
+the position and velocity records sub-commutated in the packets, interpolated at the transmit time of each echo (the
+packet time less RANK pulse intervals); sample 0 of the window lies RANK times the PRI plus SWST plus the decimation
+filter's suppressed transient after that pulse. A 15 s stripmap file (28,065 echo packets of 25,670 samples) decodes
+at about 35 million samples per second on one core; 1,500 pulses read in 4 s and form a 6 by 20 km patch in 8 s on
+8 cores. Stripmap (S1 to S6) and wave products; IW and EW bursts are not split yet.

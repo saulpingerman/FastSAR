@@ -160,3 +160,46 @@ def test_form_palsar(palsar):
     pk = img.max() / np.median(img)
     print(f'PALSAR look-alike: {img.shape} image, peak to median {pk:.0f}, worst target offset {max(err):.2f} m')
     assert max(err) < 0.35 and pk > 50
+
+
+@pytest.fixture(scope='module')
+def sentinel1(tmp_path_factory):
+    """The same scene at 2 m resolution written as a Sentinel-1 Level-0 measurement file look-alike."""
+    rng = np.random.default_rng(13)
+    col = sim.make_collect(res=2.0, scene=120.0, r0=20e3, fc=5.405e9)           # Sentinel-1's carrier, which the reader assumes
+    gx, gy = np.meshgrid([-40.0, -5.0, 35.0], [-38.0, 2.0, 42.0], indexing='ij')
+    tg = np.stack([gx.ravel()[:8], gy.ravel()[:8], np.zeros(8)], 1)
+    amp = np.ones(8) * np.exp(1j * rng.uniform(0, 2 * np.pi, 8))
+    path = os.path.join(tmp_path_factory.mktemp('s1'), 's1z-s1-raw-s-hh-sim.dat')
+    info = sim.write_sentinel1(path, col, tg, amp, lat0, lon0, h0, heading=heading)
+    truth = io.ecf_to_geodetic(sim.to_ecf(tg, lat0, lon0, h0, heading))
+    return dict(path=path, col=col, truth=truth, info=info)
+
+
+def test_read_sentinel1(sentinel1):
+    col, meta = io.read_sentinel1(sentinel1['path'], meta=True, height=h0)
+    S = col['S']
+    assert S.shape[0] == len(sentinel1['col'].ant) and np.isfinite(S).all()
+    assert S.shape[1] * col['df'] == pytest.approx(sentinel1['col'].K * sentinel1['col'].df, rel=0.03)
+    assert meta['polarization'] == 'HH' and meta['mode'] == 'STRIPMAP' and any('Sentinel-1' in n for n in meta['notes'])
+    assert not any('ended before' in n for n in meta['notes'])
+    assert np.abs(io.local_to_ecf(meta['tx'], meta) - sentinel1['info']['tx']).max() < 0.2       # 16-bit fine time: 15 us, 0.1 m
+    with pytest.raises(ValueError, match='polarization'):
+        io.read_sentinel1(os.path.dirname(sentinel1['path']), polarization='VV')
+    c2, _ = io.read_collection(sentinel1['path'], meta=True, pulses=(0, 50), height=h0)
+    assert c2['S'].shape[0] == 50
+
+
+def test_form_sentinel1(sentinel1):
+    out = fastsar.form_cphd(sentinel1['path'], backend='cpu', spacing=1.0, height=h0, extent=(120.0, 120.0))
+    img = np.abs(out['image'])
+    ij = products.locate(out, *sentinel1['truth'])
+    err = []
+    for (i, j) in ij:
+        i0, j0 = int(round(i)), int(round(j))
+        w = img[max(0, i0 - 5):i0 + 6, max(0, j0 - 5):j0 + 6]
+        pi, pj = np.unravel_index(np.argmax(w), w.shape)
+        err.append(np.hypot((max(0, i0 - 5) + pi - i) * out['spx'], (max(0, j0 - 5) + pj - j) * out['spy']))
+    pk = img.max() / np.median(img)
+    print(f'Sentinel-1 look-alike: {img.shape} image, peak to median {pk:.0f}, worst target offset {max(err):.2f} m')
+    assert max(err) < 1.0 and pk > 50

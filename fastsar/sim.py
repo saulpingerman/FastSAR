@@ -416,6 +416,95 @@ def write_palsar(directory, col, pos, amp, lat, lon, height=0.0, heading=0.0, sp
     return dict(fs=fs, chirp=chirp, r_near=r_near, n=n, tx=ant, times=t, sv_time=ts)
 
 
+
+def write_sentinel1(path, col, pos, amp, lat, lon, height=0.0, heading=0.0, speed=7500.0, bandwidth=None, range_decimation=0,
+                    chirp_duration=20e-6, r_margin=200.0, rank=None, pol='HH', swath=1, gps_start=1.4e9):
+    """Write a Sentinel-1 Level-0 measurement file look-alike of scatterers pos [N, 3] (simulator frame): one
+    space packet per pulse with the primary and secondary headers io.read_sentinel1 reads (datation, radar
+    configuration with the chirp encoded as start frequency, ramp rate and length, rank, PRI, SWST, SWL, SES
+    message with the echo signal type, number of quads) and the echoes as 10-bit decimation-only user data (BAQ mode
+    0); the position and velocity records sub-commutated over the first 22 packets of every 64. The sampling rate
+    follows the range decimation code (default 0: 112.6 MHz) and the chirp bandwidth is the collection's unless
+    given; the data of each packet are the echo of the pulse sent `rank` intervals earlier (default: as many as the
+    near range spans). The radar looks right."""
+    from . import sentinel1 as s1
+    ant_l = np.asarray(col.ant, np.float64)
+    ant = to_ecf(ant_l, lat, lon, height, heading)
+    pts = to_ecf(np.asarray(pos, np.float64), lat, lon, height, heading)
+    P = len(ant)
+    fs = s1.sampling_frequency(range_decimation)
+    bw = float(col.K * col.df if bandwidth is None else bandwidth)
+    if bw > 0.9 * fs:
+        raise ValueError(f'bandwidth {bw / 1e6:.1f} MHz exceeds the sampling rate of decimation code {range_decimation} ({fs / 1e6:.1f} MHz)')
+    # the chirp as the headers encode it: ramp rate and start frequency quantized like the instrument's fields
+    prr_code = int(round(bw / chirp_duration * 2 ** 21 / s1.F_REF ** 2))
+    txprr = prr_code * s1.F_REF ** 2 / 2 ** 21
+    psf_code = int(round((bw / 2 - txprr / (4 * s1.F_REF)) * 2 ** 14 / s1.F_REF))
+    txpsf = txprr / (4 * s1.F_REF) - psf_code * s1.F_REF / 2 ** 14
+    pl_code = int(round(chirp_duration * s1.F_REF))
+    txpl = pl_code / s1.F_REF
+    chirp = s1.chirp(txpsf, txprr, txpl, fs)
+    L = len(chirp)
+    t = gps_start + np.cumsum(np.r_[0.0, np.linalg.norm(np.diff(ant_l, axis=0), axis=1)]) / speed
+    pri = float(np.median(np.diff(t)))
+    pri_code = int(round(pri * s1.F_REF)); pri = pri_code / s1.F_REF
+    t = gps_start + np.arange(P) * pri                          # the instrument's own uniform timing
+    vel = np.gradient(ant, t, axis=0)
+    r = np.linalg.norm(pts[None, :, :] - ant[:, None, :], axis=2)
+    r_near = r.min() - r_margin
+    # the window starts SWST + the suppressed transient after the pulse sent `rank` intervals before the packet's own
+    tau_first = 2.0 * r_near / C
+    if rank is None:                        # the pulse intervals the echo spans (default: as many as fit)
+        rank = max(0, int((tau_first - s1.T_SUPPRESSED) // pri))
+    swst_code = int(round((tau_first - rank * pri - s1.T_SUPPRESSED) * s1.F_REF))
+    if swst_code < 0:
+        raise ValueError('the near range is too short for this rank and PRI')
+    tau0 = rank * pri + swst_code / s1.F_REF + s1.T_SUPPRESSED
+    n = int(np.ceil(2.0 * (r.max() + r_margin) / C * fs - tau0 * fs)) + L
+    n += n % 2
+    nq = n // 2
+    z = raw_echoes(col, pos, amp, fs, chirp, C * tau0 / 2.0, n, lat, lon, height, heading, vel=vel)
+    scale = 400.0 / max(np.abs(z.real).max(), np.abs(z.imag).max(), 1e-30)
+    zi = np.clip(np.round(z.real * scale), -511, 511).astype(int); zq = np.clip(np.round(z.imag * scale), -511, 511).astype(int)
+    swl_code = int(round(n / fs * s1.F_REF))
+    # sub-commutated position and velocity records: the state vector at the start of each 64-packet cycle
+    words = {}
+    for c0 in range(0, P, 64):
+        tc = t[c0] - rank * pri
+        pos_c, vel_c = ant[c0], vel[c0]
+        raw = pos_c.astype('>f8').tobytes() + vel_c.astype('>f4').tobytes() + bytes([0]) + int(np.floor(tc)).to_bytes(4, 'big') + int(round((tc - np.floor(tc)) * 2 ** 24)).to_bytes(3, 'big')
+        for i in range(22):
+            words[c0 + i] = int.from_bytes(raw[2 * i:2 * i + 2], 'big')
+
+    def codes(vals):
+        return ''.join(('1' if v < 0 else '0') + format(abs(int(v)), '09b') for v in vals)
+
+    def align(b):
+        return b + '0' * (-len(b) % 16)
+
+    out = bytearray()
+    for i in range(P):
+        user_bits = align(codes(zi[i, 0::2])) + align(codes(zi[i, 1::2])) + align(codes(zq[i, 0::2])) + align(codes(zq[i, 1::2]))
+        user_bits += '0' * (-len(user_bits) % 32)
+        user = bytes(int(user_bits[k:k + 8], 2) for k in range(0, len(user_bits), 8))
+        h = bytearray(68)
+        pdl = 62 + len(user) - 1
+        h[0:2] = (0x0800 | 1052).to_bytes(2, 'big'); h[2:4] = (0xC000 | (i & 0x3FFF)).to_bytes(2, 'big'); h[4:6] = pdl.to_bytes(2, 'big')
+        coarse = int(np.floor(t[i])); fine = int(round((t[i] - coarse) * 65536)) & 0xFFFF
+        h[6:10] = coarse.to_bytes(4, 'big'); h[10:12] = fine.to_bytes(2, 'big'); h[12:16] = (0x352EF853).to_bytes(4, 'big')
+        h[16:20] = (1).to_bytes(4, 'big'); h[20] = 11; h[21] = 1 if pol[1] == 'H' else 0
+        h[26] = (i % 64) + 1; h[27:29] = words.get(i, 0).to_bytes(2, 'big')
+        h[29:33] = i.to_bytes(4, 'big'); h[33:37] = i.to_bytes(4, 'big')
+        h[37] = 0; h[38] = 31; h[40] = range_decimation; h[41] = 0
+        h[42:44] = (0x8000 | prr_code).to_bytes(2, 'big'); h[44:46] = (psf_code & 0x7FFF).to_bytes(2, 'big'); h[46:49] = pl_code.to_bytes(3, 'big')
+        h[49] = rank; h[50:53] = pri_code.to_bytes(3, 'big'); h[53:56] = swst_code.to_bytes(3, 'big'); h[56:59] = swl_code.to_bytes(3, 'big')
+        h[59] = ({'HH': 1, 'HV': 2, 'VH': 5, 'VV': 6}[pol.upper()] << 4); h[62] = 0; h[63] = 0; h[64] = swath; h[65:67] = nq.to_bytes(2, 'big')
+        out += bytes(h) + user
+    with open(path, 'wb') as fh:
+        fh.write(bytes(out))
+    return dict(fs=fs, chirp=chirp, n=n, tx=ant, times=t - rank * pri, tau0=tau0)
+
+
 # ---------------------------------------------------------------- scenes
 
 def change_mask(x, y, scene, part='all'):

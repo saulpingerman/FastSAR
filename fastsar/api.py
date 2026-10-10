@@ -22,6 +22,9 @@ Backends for factorized backprojection (the same plan, filters and float64 geome
 ref [P]: the range (one way) each pulse's samples are referenced to, when it is not |ant| (a bistatic collection's
 half path, a vendor's reference point); both algorithms honor it (polar format re-references the samples to |ant|).
 
+pfa_support: 'union' (default) keeps every pulse's band on the polar-format raster, the trapezoidal support of
+backprojection; 'inscribed' keeps the rectangle common to all pulses, a clean window at the cost of the bandwidth
+outside it (half the range bandwidth in the ground plane of a squinted orbital spotlight, little in the slant plane).
 pfa_guard: margin (m) around the scene that polar format keeps free of wrap-around; 300 m suits orbital scenes of a
 few kilometers and must be smaller for small simulated scenes.
 
@@ -435,7 +438,7 @@ class ImageFormer:
 
 
 def form_image(S, ant, fmin, df, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 1.0, 0.0), *, algorithm='ffbp',
-               backend='auto', precision='float32', window=True, T='auto', levels=None, pmax=0.4, pfa_guard=300.0, target_db=-40.0,
+               backend='auto', precision='float32', window=True, T='auto', levels=None, pmax=0.4, pfa_guard=300.0, pfa_support='union', target_db=-40.0,
                ref=None, interp=None, upsample=None, center=None):
     """Form the complex image [nx, ny] (complex64). See the module docstring for the arguments. precision, T, levels,
     pmax and target_db apply to factorized backprojection, pfa_guard to polar format, and interp ('cubic' or
@@ -463,7 +466,7 @@ def form_image(S, ant, fmin, df, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
             if np.shape(ref) != (P,):
                 raise ValueError(f'ref must hold one range per pulse ({P}), got shape {np.shape(ref)}')
             S = rereference(S, float(fmin), float(df), np.asarray(ref, np.float64) - np.linalg.norm(col.ant, axis=1))
-        return _pfa(S, col, nx, ny, spx, spy, np.asarray(e1, np.float64), np.asarray(e2, np.float64), pfa_guard, window)
+        return _pfa(S, col, nx, ny, spx, spy, np.asarray(e1, np.float64), np.asarray(e2, np.float64), pfa_guard, window, pfa_support)
     return ImageFormer(ant, fmin, df, S.shape[1], nx, ny, spx, spy, e1, e2, backend=backend, precision=precision,
                        window=window, T=T, levels=levels, pmax=pmax, target_db=target_db, ref=ref)(S)
 
@@ -472,7 +475,7 @@ _PFA_PROGRAMS = {}
 _PFA_LOCK = threading.Lock()
 
 
-def _pfa(S, col, nx, ny, spx, spy, e1, e2, guard=300.0, window=True):
+def _pfa(S, col, nx, ny, spx, spy, e1, e2, guard=300.0, window=True, support='union'):
     """Polar format with its final resampling (removes the planar-wavefront displacement), pulse resampling in
     gather form. The frequency samples are weighted by f_c / f_k so that polar format applies the same spectral
     weighting as backprojection (the polar Jacobian). The compiled program and its geometry arrays are kept per
@@ -483,12 +486,12 @@ def _pfa(S, col, nx, ny, spx, spy, e1, e2, guard=300.0, window=True):
     import jax
     import jax.numpy as jnp
     P, K = S.shape
-    key = (P, K, float(col.fmin), float(col.df), nx, ny, float(spx), float(spy), tuple(e1), tuple(e2), float(guard), bool(window),
+    key = (P, K, float(col.fmin), float(col.df), nx, ny, float(spx), float(spy), tuple(e1), tuple(e2), float(guard), bool(window), support,
            hashlib.sha1(np.ascontiguousarray(col.ant).tobytes()).hexdigest())
     with _PFA_LOCK:
         prog = _PFA_PROGRAMS.get(key)
     if prog is None:
-        geo = pfa2.geometry(col, nx, ny, spx, spy, e1=e1, e2=e2, guard=guard)
+        geo = pfa2.geometry(col, nx, ny, spx, spy, e1=e1, e2=e2, guard=guard, support=support)
         dist = pfa2.distortion(col, nx, ny, spx, spy, e1, e2)
         fn = pfa2.make_pfa(geo, nx, ny, spx, spy, 'taps', None, jax.lax.Precision.HIGHEST, dist=dist)
         arrs = pfa2.arrays(geo, P, 'taps')

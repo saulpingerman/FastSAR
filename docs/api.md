@@ -7,7 +7,7 @@
 
 - `form_cphd(cphd, sicd=None, *, mode='auto', backend='auto', window=True, spacing=None, channel=0, patch=1024,
   azimuth_fraction=0.8, extent=None, height=None, precision='float32', target_db=-40.0, info=None,
-  autofocus=False, troposphere=None)`: the image of a CPHD file ([processing-chain.md](processing-chain.md#2-form)).
+  autofocus=False, troposphere=None, reader_options=None)`: the image of a CPHD file ([processing-chain.md](processing-chain.md#2-form)).
   `mode`: `'auto'`, `'spotlight'`, `'moving'`. `troposphere`: passed to `read_cphd` (default: the delay the file
   gives is removed; `'model'` removes a standard-atmosphere delay for files that give none). `sicd`: path, `.xml` or sarpy SICDType. `spacing`, `extent`: (along, across
   track) in m. `height`: grid height above the ellipsoid. Returns a dict: `image` [nx, ny] complex64, `origin`
@@ -58,6 +58,10 @@ Backends: `'cpu'`, `'cuda'`, `'tpu'`, `'jax'`, `'auto'`. Precision: `'float32'`,
 - `read_palsar(path, polarization=None, meta=False, height=None, band_margin=1.0, block=512)`: an ALOS PALSAR
   level 1.0 product (CEOS directory, zip, or `IMG-` file beside its `LED-` leader) as `read_cphd` returns a CPHD;
   `read_collection` dispatches directories, zips and `IMG-`/`LED-` files to it.
+- `read_sentinel1(path, polarization=None, meta=False, height=None, band_margin=1.0, block=512, pulses=None, swath=None)`:
+  a Sentinel-1 Level-0 product (.SAFE directory, zip, or one measurement .dat file) as `read_cphd` returns a CPHD;
+  `pulses=(first, last)` reads a part. `fastsar.sentinel1` holds the packet parser, the user-data decoder and the
+  orbit assembly.
 - `troposphere_delay(tx, rcv, srp)`: two-way delay [P] (s) of a standard atmosphere at the scene reference point
   (Saastamoinen hydrostatic zenith delay, cosecant mapping); what `read_cphd(troposphere='model')` removes.
 - `sicd_points(sicd, rows, cols, meta, hae=None)`: local positions of SICD pixels on any grid type.

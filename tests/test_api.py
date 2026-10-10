@@ -108,3 +108,23 @@ def test_four_levels_chosen(scene):
     c = scene.col
     assert fastsar.ImageFormer(c.ant, c.fmin, c.df, scene.S.shape[1], 128, 128 * 600, 0.5, 0.5, GRID['e1'], GRID['e2'],
                                backend='cpu', T=16).levels == 4
+
+
+def test_pfa_support(scene):
+    """Polar format on the inscribed rectangle: a narrower raster than the union of the pulses' bands, and an
+    image that still matches backprojection to the reference's level."""
+    import fastsar.pfa2 as pfa2
+    from fastsar.sim import Collect
+    c = scene.col
+    col = Collect(fmin=c.fmin, df=c.df, K=c.K, ant=c.ant, res=c.res)
+    gu = pfa2.geometry(col, GRID['nx'], GRID['ny'], GRID['spx'], GRID['spy'], e1=GRID['e1'], e2=GRID['e2'], guard=10.0)
+    gi = pfa2.geometry(col, GRID['nx'], GRID['ny'], GRID['spx'], GRID['spy'], e1=GRID['e1'], e2=GRID['e2'], guard=10.0, support='inscribed')
+    assert gi['nkr'] <= gu['nkr'] and gi['nka'] <= gu['nka'] and (gi['nkr'] < gu['nkr'] or gi['nka'] < gu['nka'])
+    img = fastsar.form_image(scene.S, c.ant, c.fmin, c.df, **GRID, algorithm='pfa', pfa_guard=10.0, pfa_support='inscribed')
+    ref = fastsar.form_image(scene.S, c.ant, c.fmin, c.df, **GRID, algorithm='pfa', pfa_guard=10.0)
+    assert img.shape == ref.shape and np.isfinite(img).all()
+    e = rel_db(img, ref)
+    print(f'pfa inscribed against union: raster {gi["nkr"]} x {gi["nka"]} vs {gu["nkr"]} x {gu["nka"]}, difference {e:.1f} dB')
+    assert e < -15
+    with pytest.raises(ValueError, match='support'):
+        fastsar.form_image(scene.S, c.ant, c.fmin, c.df, **GRID, algorithm='pfa', pfa_guard=10.0, pfa_support='circumscribed')

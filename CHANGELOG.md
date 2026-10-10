@@ -16,6 +16,15 @@ was published on PyPI.
   leader): 8-bit I and Q lines range compressed with the leader's chirp, line times from the 1PPS microsecond
   counter, the antenna from the platform position record; the same frequency-domain output as `read_cphd`, formed
   by `form_cphd` in moving mode. `sim.write_palsar` writes a look-alike for tests.
+- `io.read_sentinel1`: Sentinel-1 Level-0 products (a .SAFE directory, its zip, or one measurement file): the
+  instrument source packets parsed (`fastsar.sentinel1`), the echoes decoded from FDBAQ, BAQ or bypass user data by a
+  C++ decoder checked bit for bit against a public decoder on real data, range compressed with the replica the
+  headers describe, the antenna from the sub-commutated position and velocity records; the same frequency-domain
+  output as `read_cphd`, formed by `form_cphd` in moving mode. Stripmap and wave modes; the bursts of IW and EW are
+  not split yet. `sim.write_sentinel1` writes a look-alike for tests. `form_cphd(reader_options=...)` passes
+  `pulses=(first, last)`, `polarization` and the like to the raw-data readers.
+- `form_image(pfa_support='inscribed')`: polar format on the rectangle common to all pulses instead of the union
+  of their bands (the default), a clean window at the cost of the bandwidth outside the rectangle.
 - `read_cphd(troposphere='model')` and `form_cphd(troposphere='model')`: the troposphere delay of a standard
   atmosphere (`io.troposphere_delay`, Saastamoinen hydrostatic zenith delay mapped by the elevation of each antenna)
   removed at the scene reference point, for files that give no delay. ICEYE's CPHD files write `TDTropoSRP` zero

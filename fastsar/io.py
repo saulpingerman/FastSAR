@@ -348,9 +348,12 @@ def read_collection(path, **kw):
     import inspect
     import os
     s = str(path).lower()
+    base = os.path.basename(s.rstrip('/'))
     if s.endswith(('.h5', '.hdf5')):
         reader, kind = read_nisar, 'a NISAR file'
-    elif s.endswith('.zip') or os.path.isdir(path) or os.path.basename(s).startswith(('img-', 'led-')):
+    elif base.startswith('s1') and ('raw' in base or base.endswith('.safe')):
+        reader, kind = read_sentinel1, 'a Sentinel-1 Level-0 product'
+    elif s.endswith('.zip') or os.path.isdir(path) or base.startswith(('img-', 'led-')):
         reader, kind = read_palsar, 'an ALOS PALSAR product'
     else:
         reader, kind = read_cphd, 'a CPHD file'
@@ -584,6 +587,124 @@ def read_palsar(path, polarization=None, meta=False, height=None, band_margin=1.
         info['refpt'] = np.zeros(3)
         return col, info
     return out
+
+
+def read_sentinel1(path, polarization=None, meta=False, height=None, band_margin=1.0, block=512, pulses=None, swath=None):
+    """A Sentinel-1 Level-0 product (a .SAFE directory or its zip, or one measurement .dat file) as read_cphd returns
+    a CPHD: the echo packets of one polarization (default the first measurement file; 'HH', 'HV', 'VV' or 'VH'
+    picks the file), decoded (fastsar.sentinel1: FDBAQ, BAQ or bypass), range compressed with the replica of the
+    transmitted pulse built from the packet headers (start frequency, ramp rate, length), taken to the frequency
+    domain over the chirp's band and compensated to each pulse's zero-Doppler ground point at mid swath at the
+    given height, the antenna positions interpolated (Hermite) from the position and velocity records
+    sub-commutated in the packets, at the transmit time of each echo (the packet time less RANK pulse intervals).
+    pulses: (first, last) packet indices among the echo packets to read a part of the collection. swath: the swath
+    number to keep when the file holds several (default the most frequent). Stripmap (S1 to S6) and wave products;
+    the bursts of IW and EW products need fastsar.burst."""
+    import os
+    import zipfile
+    from . import raw, sentinel1 as s1
+    s = str(path)
+    if s.lower().endswith('.zip'):
+        zf = zipfile.ZipFile(s)
+        names = [n for n in zf.namelist() if n.lower().endswith('.dat') and '-annot' not in n and '-index' not in n]
+        pick = _pick_measurement(names, polarization)
+        data = np.frombuffer(zf.read(pick), np.uint8)
+    elif os.path.isdir(s):
+        names = [os.path.join(s, n) for n in os.listdir(s) if n.lower().endswith('.dat') and '-annot' not in n and '-index' not in n]
+        pick = _pick_measurement(names, polarization)
+        data = np.memmap(pick, np.uint8, 'r')
+    else:
+        pick = s
+        data = np.memmap(s, np.uint8, 'r')
+    base = os.path.basename(pick)
+    pol = base.split('-')[4].upper() if base.count('-') >= 5 else '?'       # s1a-s3-raw-s-hh-...
+    hdr = s1.parse_packets(data)
+    echo = np.nonzero((hdr['signal_type'] == 0) & (hdr['error_flag'] == 0) & (hdr['quads'] > 0))[0]
+    if echo.size == 0:
+        raise ValueError(f'{base}: no echo packets')
+    sw = hdr['swath'][echo]
+    if swath is None:
+        vals, counts = np.unique(sw, return_counts=True)
+        swath = int(vals[np.argmax(counts)])
+    echo = echo[sw == swath]
+    if pulses is not None:
+        lo, hi = int(pulses[0]), int(pulses[1])
+        echo = echo[lo:hi]
+    P = len(echo)
+    if P < 2:
+        raise ValueError(f'{base}: {P} echo packets of swath {swath} selected')
+    # constant radar configuration within a swath: the first echo packet's values
+    k = int(echo[0])
+    fs = s1.sampling_frequency(hdr['range_decimation'][k])
+    txprr, txpsf, txpl = float(hdr['tx_ramp_rate'][k]), float(hdr['tx_start_frequency'][k]), float(hdr['tx_pulse_length'][k])
+    bw = abs(txprr) * txpl
+    chirp = s1.chirp(txpsf, txprr, txpl, fs)
+    rank, pri = hdr['rank'][echo], hdr['pri'][echo]
+    swst = hdr['swst'][echo]
+    nq = hdr['quads'][echo]
+    n = int(2 * nq.max())
+    t_packet = hdr['time'][echo]
+    tx_time = t_packet - rank * pri                     # the echo is of the pulse sent RANK intervals before
+    tau0 = rank * pri + swst + s1.T_SUPPRESSED           # two-way delay of sample 0 after that pulse
+    ot, op, ov = s1.orbit_from_packets(hdr)
+    orbit = raw.hermite_orbit(ot, op, ov)
+    notes = [f'Sentinel-1 Level-0 {base.split("-")[0].upper()} {pol}, swath {swath}, {P} echo packets of {n} samples at {fs / 1e6:.2f} MHz, '
+             f'chirp {bw / 1e6:.1f} MHz over {txpl * 1e6:.1f} us, PRI {pri[0] * 1e6:.1f} us, rank {int(rank[0])}; '
+             f'{len(ot)} position records at {np.diff(ot).mean():.1f} s']
+    if np.ptp(nq) > 0:
+        notes.append(f'number of samples varies ({2 * nq.min()} to {2 * nq.max()}); shorter packets zero padded')
+    if np.ptp(swst) > 1e-9:
+        notes.append(f'sampling window start varies by {np.ptp(swst) * 1e6:.2f} us')
+    height = 0.0 if height is None else float(height)
+    tx_pos, tx_vel = orbit(tx_time)
+    dr = C / (2.0 * fs)
+    n_far = max(1, n - len(chirp))
+    r0 = C * tau0 / 2.0
+    r_mid = r0 + 0.5 * n_far * dr
+    srp = raw.zero_doppler_points(tx_pos, tx_vel, r_mid, 'right', height=height)
+    rcv_pos, _ = orbit(tx_time + 2.0 * np.linalg.norm(srp - tx_pos, axis=1) / C)
+    tau_ref = (np.linalg.norm(tx_pos - srp, axis=1) + np.linalg.norm(rcv_pos - srp, axis=1)) / C
+    S = None
+    bad = 0
+    for p0 in range(0, P, block):
+        p1 = min(P, p0 + block)
+        z, b = s1.decode_user_data(data, hdr, echo[p0:p1])
+        bad += b
+        if z.shape[1] < n:
+            z = np.pad(z, ((0, 0), (0, n - z.shape[1])))
+        blk, fmin, df = raw.fx_history(raw.range_compress(z, chirp), fs, s1.F_CARRIER, tau0[p0:p1], tau_ref[p0:p1], bw, band_margin)
+        if S is None:
+            S = np.empty((P, blk.shape[1]), np.complex64)
+        S[p0:p1] = blk
+    if bad:
+        notes.append(f'{bad} packets whose user data ended before their last code (samples partial)')
+    near_far = [raw.zero_doppler_points(tx_pos[[0, -1]], tx_vel[[0, -1]], r, 'right', height=height) for r in (r0[[0, -1]], r0[[0, -1]] + n_far * dr)]
+    corners = np.stack([near_far[0][0], near_far[1][0], near_far[1][1], near_far[0][1]])
+    info = dict(tx_time=tx_time, rcv_time=tx_time + tau_ref, pulses=(int(echo[0]), int(echo[-1]) + 1), polarization=pol, channel=pol,
+                channel_index=0, mode='STRIPMAP', start=f'GPS {tx_time[0]:.6f} s', collector=base.split('-')[0].upper(),
+                core_name=base.rsplit('.', 1)[0])
+    out = _assemble(S, tx_pos, rcv_pos, srp, fmin, df, notes, None, meta, info)
+    if meta:
+        col, info = out
+        info['image_area'] = (corners - info['origin']) @ info['R'].T
+        info['refpt'] = np.zeros(3)
+        return col, info
+    return out
+
+
+def _pick_measurement(names, polarization):
+    import os
+    """The measurement file of a polarization among a Level-0 product's .dat files (names like
+    s1a-s3-raw-s-hh-...dat), default the first in name order."""
+    names = sorted(names)
+    if not names:
+        raise ValueError('no measurement .dat file in the product')
+    if polarization is None:
+        return names[0]
+    want = [n for n in names if f'-{polarization.lower()}-' in n.lower()]
+    if not want:
+        raise ValueError(f'polarization {polarization!r} not in the product ({[os.path.basename(n).split("-")[4] for n in names]})')
+    return want[0]
 
 
 def orbit_type(orb):

@@ -46,8 +46,10 @@ def _fft_size(n):
     return best
 
 
-def geometry(col, nx, ny, spx, spy, taps=16, e1=(1.0, 0.0, 0.0), e2=(0.0, 1.0, 0.0), guard=300.0, kaiser=8.0):
-    """Host-side float64 setup. The image axes are x along track (cross range) and y ground range, as in the
+def geometry(col, nx, ny, spx, spy, taps=16, e1=(1.0, 0.0, 0.0), e2=(0.0, 1.0, 0.0), guard=300.0, kaiser=8.0, support='union'):
+    """Host-side float64 setup. support: 'union' keeps every pulse's band (the trapezoidal support of backprojection, zeros
+    where a pulse has no sample); 'inscribed' keeps the rectangle common to all pulses, a clean window at the cost of
+    the bandwidth outside it (about half the range bandwidth in the ground plane of a squinted orbital spotlight). The image axes are x along track (cross range) and y ground range, as in the
     prepared collections; polar format's range axis is y and its azimuth axis is x."""
     u = col.ant / np.linalg.norm(col.ant, axis=1)[:, None]
     e1, e2 = np.asarray(e1, np.float64), np.asarray(e2, np.float64)
@@ -84,12 +86,21 @@ def geometry(col, nx, ny, spx, spy, taps=16, e1=(1.0, 0.0, 0.0), e2=(0.0, 1.0, 0
     # the bands; samples a pulse does not have are zero, which keeps the full spectral support of
     # backprojection (a trapezoid) instead of the common rectangle, which here would be half the bandwidth.
     fa, fb = col.fmin, col.fmin + (K - 1) * col.df
-    kr_min = 4.0 * math.pi * fa / C * ur_r.min()
-    kr_max = 4.0 * math.pi * fb / C * ur_r.max()
+    if support == 'inscribed':
+        kr_min = 4.0 * math.pi * fa / C * ur_r.max()
+        kr_max = 4.0 * math.pi * fb / C * ur_r.min()
+        if kr_max <= kr_min:
+            raise ValueError('polar format: no range band is common to all pulses (support=\'inscribed\'); use support=\'union\'')
+    elif support == 'union':
+        kr_min = 4.0 * math.pi * fa / C * ur_r.min()
+        kr_max = 4.0 * math.pi * fb / C * ur_r.max()
+    else:
+        raise ValueError(f"support must be 'union' or 'inscribed', not {support!r}")
     nkr = int((kr_max - kr_min) / dkr) + 1
     kr = kr_min + dkr * np.arange(nkr)
     ta, tb = t0 + m * dt, t1 - m * dt
-    ka_lo, ka_hi = kr_max * ta, kr_max * tb
+    kref = kr_min if support == 'inscribed' else kr_max      # the azimuth band common to the rows, or the widest row's
+    ka_lo, ka_hi = kref * ta, kref * tb
     nka = int((ka_hi - ka_lo) / dka) + 1
     scale = C / (4.0 * math.pi * ur_r * col.df)
     extent_r = C / (2.0 * col.df)                            # period of a range profile (m)

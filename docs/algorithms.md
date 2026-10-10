@@ -56,6 +56,10 @@ reference at 4 km (`tests/test_accuracy.py`) the error falls by 12 dB per doubli
 ## Polar format
 
 `algorithm='pfa'` resamples the data onto a rectangular wavenumber grid by chirp-z transforms and applies a 2-D FFT.
+`pfa_support` chooses the raster's spectral support: `'union'` (default) keeps every pulse's band, the trapezoid
+backprojection sees, with zeros where a pulse has no sample; `'inscribed'` keeps the rectangle common to all pulses,
+a clean window at the cost of the bandwidth outside it (about half the range bandwidth in the ground plane of a
+squinted orbital spotlight, little in the slant plane).
 `pfa_guard` (default 300 m, for orbital scenes) is the margin kept free of wrap-around; small simulated scenes need
 less. The planar-wavefront assumption displaces scatterers away from the center: on Panama by up to 18 pixels in
 azimuth and 12 in range at the corners. FastSAR removes the displacement predicted from the geometry by a final
