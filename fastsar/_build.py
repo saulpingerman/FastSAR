@@ -17,13 +17,13 @@ MACHINES = ('x86_64', 'AMD64', 'aarch64', 'arm64')
 def default_flags():
     """The optimization flags of the C++ kernels for this machine: -O3 -march=native on Linux, and on x86-64 a
     preference for 512-bit vectors (the kernels' 16-float vector type maps to one AVX-512 register; on ARM the
-    compiler splits it over NEON or SVE registers); -O3 alone on macOS, where Apple's clang has no -march=native
-    and NEON is the baseline of Apple silicon. FFBP_CPU_FLAGS replaces them."""
+    compiler splits it over NEON or SVE registers); -O3 -mcpu=native on macOS (Apple's clang has no -march=native).
+    FFBP_CPU_FLAGS replaces them."""
     env = os.environ.get('FFBP_CPU_FLAGS')
     if env:
         return env.split()
     if sys.platform == 'darwin':
-        return ['-O3']
+        return ['-O3', '-mcpu=native']
     flags = ['-O3', '-march=native']
     if platform.machine() in ('x86_64', 'AMD64'):
         flags.append('-mprefer-vector-width=512')
