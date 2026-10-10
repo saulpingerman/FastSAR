@@ -253,7 +253,8 @@ class ImageFormer:
         self.window = window
         col = Collect(fmin=float(fmin), df=float(df), K=self.K, ant=self.ant, res=0.5)
         nx, ny, e1, e2 = _check_grid(nx, ny, spx, spy, e1, e2)
-        self.backend = _backend(backend)
+        b = _backend(backend)
+        self.backend = 'cpu' if b == 'metal' else b          # no Metal kernels for the factorized former
         self.precision = precision
         self.predicted_error_db = None
         if T == 'auto':

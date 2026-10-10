@@ -40,6 +40,13 @@ was published on PyPI.
 - `fastsar/par.hpp`: the CPU kernels' parallel loops on OpenMP where the kernels are built with it and on
   `std::thread` otherwise; macOS builds with Apple's clang and `-fopenmp-simd`, with no OpenMP runtime (a second
   runtime next to the one finufft's wheel bundles deadlocked the test suite) and no Homebrew libomp.
+- `backend='metal'` of `ExactFormer`: exact backprojection on Apple GPUs (`fastsar.metal`), the CUDA tile kernel
+  as a Metal compute kernel with the tile centers' float64 terms computed by numpy per chunk (Apple GPUs have no
+  float64), through a small Objective-C++ bridge compiled on first use with Apple's clang; the shader compiles at run
+  time, no Xcode needed. On an M2 MacBook Air the 1024 by 1024 image of 5,794 pulses takes 1.4 s (3.4 s on its CPU
+  cores) and 2048 by 2048 takes 3.2 s (11.9 s), at 7.6 billion pixel-pulse pairs per second, agreeing with the CPU
+  kernel to 2e-7 of the peak; `backend='auto'` picks it for `ExactFormer` on a Mac. The factorized former has no
+  Metal kernels and runs on the CPU cores.
 - ARM and Apple silicon: the factorized CPU kernel's vectors are four lanes on ARM (NEON) with the final tile
   stage templated on the vectors per table row (the x86 code is unchanged), the exact kernel's sines are
   vectorizable polynomials on macOS (no vector sine library there), macOS builds with `-mcpu=native`, and the

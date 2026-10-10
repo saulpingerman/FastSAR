@@ -36,6 +36,7 @@ For arbitrary points, bistatic geometry or a DEM surface use fastsar.backproject
 """
 import ctypes
 import os
+import sys
 
 import numpy as np
 from . import memory as _mem
@@ -393,6 +394,10 @@ class ExactFormer:
         self.upsample = 8 if upsample is None else _integer(upsample, 'upsample', 1)
         self.chunk = _integer(chunk, 'chunk', 1)
         b = _backend(backend)
+        if backend == 'auto' and b == 'cpu' and sys.platform == 'darwin':
+            from . import metal
+            if metal.available():
+                b = 'metal'                                  # Apple GPUs: the exact kernel through Metal
         self.backend = 'jax' if b == 'tpu' else b
         self.fmin, self.df, self.window = fmin, df, window
         self.nfft = 1 << int(np.ceil(np.log2(self.upsample * self.K)))

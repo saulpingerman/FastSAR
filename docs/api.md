@@ -34,7 +34,9 @@
   [algorithms.md](algorithms.md#exact-backprojection)) and `predicted_error_db`; a `UserWarning` when even the
   smallest tile misses 3e-4 rad. `memory()`: as for `ImageFormer`, the bytes of the per-chunk buffers and the
   image. A grid wider in range than `c / (2 df)` raises `ValueError`. Monostatic; for bistatic geometry or arbitrary
-  points use `backproject`. One former is not safe to call from two threads at once.
+  points use `backproject`. One former is not safe to call from two threads at once. `backend='metal'` runs the
+  kernel on an Apple GPU (`fastsar.metal`; `'auto'` picks it on a Mac), the tile centers' float64 terms computed
+  by numpy per chunk since Apple GPUs have no float64.
 - `MemoryWarning`: a `UserWarning` subclass issued when a former falls back to a slower path for lack of memory
   ([performance.md](performance.md#memory)). A TPU that cannot hold the history raises `MemoryError`.
 - `backproject(S, ant, fmin, df, points, *, rcv=None, ref=None, backend='auto', upsample=8, window=True, chunk=256)`:
