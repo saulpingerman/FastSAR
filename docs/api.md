@@ -5,7 +5,7 @@
 
 ## `fastsar`
 
-- `form_cphd(cphd, sicd=None, mode='auto', backend='auto', window=True, spacing=None, channel=0, patch=1024,
+- `form_cphd(cphd, sicd=None, *, mode='auto', backend='auto', window=True, spacing=None, channel=0, patch=1024,
   azimuth_fraction=0.8, extent=None, height=None, precision='float32', target_db=-40.0, info=None,
   autofocus=False, troposphere=None)`: the image of a CPHD file ([processing-chain.md](processing-chain.md#2-form)).
   `mode`: `'auto'`, `'spotlight'`, `'moving'`. `troposphere`: passed to `read_cphd` (default: the delay the file
@@ -13,7 +13,7 @@
   track) in m. `height`: grid height above the ellipsoid. Returns a dict: `image` [nx, ny] complex64, `origin`
   (pixel (0, 0)), `e1`, `e2`, `spx`, `spy`, `mode`, `band` (first and last frequency), `bandwidth` (spatial
   frequency support along e1, e2), `window`, `phase_error` (or None), `meta` (from `read_cphd`), `notes`.
-- `form_image(S, ant, fmin, df, nx, ny, spx, spy, e1, e2, algorithm='ffbp', backend='auto', precision='float32',
+- `form_image(S, ant, fmin, df, nx, ny, spx, spy, e1, e2, *, algorithm='ffbp', backend='auto', precision='float32',
   window=True, T='auto', ..., target_db=-40.0, ref=None, interp=None, upsample=None, center=None)`: a spotlight
   image on a grid centered on the frame origin ([algorithms.md](algorithms.md)). `algorithm`: `'ffbp'`, `'pfa'` or
   `'bp'` (exact backprojection, `ExactFormer`). `ref` [P]: the one-way range each pulse's samples are referenced to
@@ -37,7 +37,7 @@
   points use `backproject`. One former is not safe to call from two threads at once.
 - `MemoryWarning`: a `UserWarning` subclass issued when a former falls back to a slower path for lack of memory
   ([performance.md](performance.md#memory)). A TPU that cannot hold the history raises `MemoryError`.
-- `backproject(S, ant, fmin, df, points, rcv=None, ref=None, backend='auto', upsample=8, window=True, chunk=256)`:
+- `backproject(S, ant, fmin, df, points, *, rcv=None, ref=None, backend='auto', upsample=8, window=True, chunk=256)`:
   exact backprojection at points [..., 3]; `rcv` for bistatic, `ref` for per-pulse reference ranges.
 - `plane_points(nx, ny, spx, spy, e1, e2, height=None)`: the `form_image` grid as points [nx, ny, 3].
   `available_backends()`: backends this machine runs, in `'auto'` order.

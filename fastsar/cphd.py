@@ -81,7 +81,7 @@ def _image_area(cphd, meta):
     return io.ecf_to_local(ecf, meta), ref
 
 
-def form_cphd(cphd, sicd=None, mode='auto', backend='auto', window=True, spacing=None, channel=0, patch=1024,
+def form_cphd(cphd, sicd=None, *, mode='auto', backend='auto', window=True, spacing=None, channel=0, patch=1024,
               azimuth_fraction=0.8, extent=None, height=None, precision='float32', target_db=-40.0, info=None,
               autofocus=False, troposphere=None):
     """Form the image of a CPHD collection (see the module docstring).

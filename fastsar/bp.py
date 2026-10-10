@@ -301,7 +301,7 @@ def _rc_jax(S, nfft):
 
 # ---------------------------------------------------------------------------------------------------- entry point
 
-def backproject(S, ant, fmin, df, points, rcv=None, ref=None, backend='auto', upsample=8, window=True, chunk=256):
+def backproject(S, ant, fmin, df, points, *, rcv=None, ref=None, backend='auto', upsample=8, window=True, chunk=256):
     """Complex image at points [..., 3] (shape [...], complex64). ant [P, 3] is the antenna phase center
     (monostatic) or the transmitter position when rcv [P, 3] is given. ref [P] is the range (one way, or the mean
     of the two legs) to which each pulse was motion compensated; by default the distance to the origin, the fixed

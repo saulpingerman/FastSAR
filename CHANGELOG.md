@@ -14,6 +14,12 @@ was published on PyPI.
   26 degree incidence dwell.
 - `CITATION.cff` with the software citation and the paper as the preferred citation.
 
+### Changed
+
+- The options of `form_image` (after `e2`), `form_cphd` (after `sicd`) and `backproject` (after `points`) are
+  keyword-only, as those of `ImageFormer` and `ExactFormer` already were. A call that passed `algorithm`, `mode` or
+  `rcv` by position raises a TypeError; name the argument.
+
 ## [0.1.1] - 2026-10-10
 
 ### Added

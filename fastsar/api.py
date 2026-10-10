@@ -434,7 +434,7 @@ class ImageFormer:
         return hit
 
 
-def form_image(S, ant, fmin, df, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 1.0, 0.0), algorithm='ffbp',
+def form_image(S, ant, fmin, df, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 1.0, 0.0), *, algorithm='ffbp',
                backend='auto', precision='float32', window=True, T='auto', levels=None, pmax=0.4, pfa_guard=300.0, target_db=-40.0,
                ref=None, interp=None, upsample=None, center=None):
     """Form the complex image [nx, ny] (complex64). See the module docstring for the arguments. precision, T, levels,
