@@ -10,6 +10,33 @@ import subprocess
 import sys
 
 
+MACHINES = ('x86_64', 'AMD64', 'aarch64', 'arm64')
+
+
+def default_flags():
+    """The optimization flags of the C++ kernels for this machine: -O3 -march=native everywhere, and on x86-64 a
+    preference for 512-bit vectors (the kernels' 16-float vector type maps to one AVX-512 register; on ARM the
+    compiler splits it over NEON or SVE registers). FFBP_CPU_FLAGS replaces them."""
+    env = os.environ.get('FFBP_CPU_FLAGS')
+    if env:
+        return env.split()
+    flags = ['-O3', '-march=native']
+    if platform.machine() in ('x86_64', 'AMD64'):
+        flags.append('-mprefer-vector-width=512')
+    return flags
+
+
+def _check_gcc(cxx):
+    """On ARM the vector extensions need GCC 12 or later (earlier releases mis-lower the 64-byte vector type)."""
+    try:
+        out = subprocess.run([cxx, '-dumpfullversion'], capture_output=True, text=True, timeout=30).stdout.strip()
+        major = int(out.split('.')[0])
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return
+    if major < 12:
+        raise RuntimeError(f"fastsar's cpu backend needs GCC 12 or later on ARM; {cxx} is {out}")
+
+
 def _host_tag():
     """The machine and its CPU's instruction set extensions (a -march=native build must not be loaded on another
     CPU sharing the same home directory)."""
@@ -40,11 +67,13 @@ def cache_dir():
 def shared_object(name, src, flags):
     """Path of the shared object built from the C++ source text src with the compiler flags (a list), building it
     if it is not cached. The compiler is $CXX (default g++); OpenMP and -fPIC are added."""
-    if not sys.platform.startswith('linux') or platform.machine() not in ('x86_64', 'AMD64'):
-        raise RuntimeError(f"fastsar's cpu backend compiles C++ kernels for x86-64 Linux; this is "
+    if not sys.platform.startswith('linux') or platform.machine() not in MACHINES:
+        raise RuntimeError(f"fastsar's cpu backend compiles C++ kernels for Linux on x86-64 or 64-bit ARM; this is "
                            f'{platform.machine()} {sys.platform}. Use backend="jax" (any device JAX supports) '
-                           'or run on an x86-64 Linux machine')
+                           'or run on a Linux machine of those architectures')
     cxx = os.environ.get('CXX', 'g++')
+    if platform.machine() in ('aarch64', 'arm64'):
+        _check_gcc(cxx)
     key = '\0'.join([src, cxx, ' '.join(flags), _host_tag()])
     tag = hashlib.sha1(key.encode()).hexdigest()[:12]
     d = cache_dir()

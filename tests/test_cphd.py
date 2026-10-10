@@ -55,6 +55,7 @@ class Reader:
     def __init__(self, path):
         self.d = FILES[path]
         self.cphd_meta = self.d['meta']
+        self.cphd_details = NS(get_cphd_bytes=lambda: self.d.get('xml', b'<CPHD/>'))
 
     def read_pvp_variable(self, name, index):
         v = self.d['pvp'].get(name)
@@ -90,7 +91,7 @@ def ecf(local):
     return srp0 + local[..., :1] * N + local[..., 1:2] * E + local[..., 2:3] * U
 
 
-def cphd(path, S, ant, srp, f0, df, prf, sgn=-1, image_area=None, mode='SPOTLIGHT', domain='FX'):
+def cphd(path, S, ant, srp, f0, df, prf, sgn=-1, image_area=None, mode='SPOTLIGHT', domain='FX', xml=None):
     """Register a collection: S [P, K] in the CPHD convention for SGN = -1 (conjugated for +1), antenna and SRP
     positions [P, 3] (ECF)."""
     P, K = S.shape
@@ -105,7 +106,7 @@ def cphd(path, S, ant, srp, f0, df, prf, sgn=-1, image_area=None, mode='SPOTLIGH
               Channel=NS(Parameters=[NS(Polarization=NS(TxPol='V', RcvPol='V'))]),
               Global=NS(DomainType=domain, SGN=sgn), CollectionID=NS(CollectorName='SIMULATED', RadarMode=NS(ModeType=mode)),
               SceneCoordinates=sc)
-    FILES[path] = dict(meta=meta, pvp=pvp, S=np.conj(S) if sgn > 0 else S.copy())
+    FILES[path] = dict(meta=meta, pvp=pvp, S=np.conj(S) if sgn > 0 else S.copy(), xml=xml)
 
 
 def taylor(n):
@@ -285,3 +286,16 @@ def test_form_cphd_moving_srp():
         refp = acc.reshape(ii.shape)
         check(bad, f'target {n}: form_cphd against the direct sum ({2 * H} x {2 * H} pixels)', rel_db(img[i - H:i + H, j - H:j + H], refp), -46)
     assert not bad, 'FAILED: ' + '; '.join(bad)
+
+
+def test_mode_outside_enumeration(spot):
+    """A CPHD 1.1.0 file whose ModeType sarpy rejects (ICEYE writes EXPERIMENTAL; sarpy sets None): the mode comes
+    from the XML, with a note; a file without the element reads with mode None and no note."""
+    xml = (b'<CPHD xmlns="http://api.nsgreg.nga.mil/schema/cphd/1.1.0"><CollectionID><CollectorName>X</CollectorName>'
+           b'<RadarMode><ModeType>EXPERIMENTAL</ModeType></RadarMode></CollectionID></CPHD>')
+    cphd('exp.cphd', spot.S, spot.ant, np.repeat(srp0[None], spot.P, 0), spot.col.fmin, spot.col.df, spot.prf, mode=None, xml=xml)
+    _, meta = io.read_cphd('exp.cphd', meta=True)
+    assert meta['mode'] == 'EXPERIMENTAL' and any('outside the CPHD enumeration' in n for n in meta['notes']), meta
+    cphd('nomode.cphd', spot.S, spot.ant, np.repeat(srp0[None], spot.P, 0), spot.col.fmin, spot.col.df, spot.prf, mode=None)
+    _, meta = io.read_cphd('nomode.cphd', meta=True)
+    assert meta['mode'] is None and not any('enumeration' in n for n in meta['notes']), meta

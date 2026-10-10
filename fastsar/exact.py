@@ -248,9 +248,9 @@ _cpu_lib = None
 def _cpu():
     global _cpu_lib
     if _cpu_lib is None:
-        from ._build import shared_object
+        from ._build import shared_object, default_flags
         # -ffast-math is always added: without it the sines and cosines do not vectorize (libmvec)
-        flags = os.environ.get('FFBP_CPU_FLAGS', '-O3 -march=native').split() + ['-ffast-math']
+        flags = default_flags() + ['-ffast-math']
         L = ctypes.CDLL(shared_object('exact_cpu', _CPU_SRC, flags))
         f32 = np.ctypeslib.ndpointer(np.float32, flags='C_CONTIGUOUS')
         f64 = np.ctypeslib.ndpointer(np.float64, flags='C_CONTIGUOUS')

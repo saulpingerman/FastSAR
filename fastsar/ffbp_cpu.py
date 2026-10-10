@@ -3,7 +3,8 @@ same host-side orchestration as the CUDA pipeline (ffbp_cuda.py), with NumPy for
 
     form = make_ffbp_cpu(plan, coll); img = form(S)        # S [P, K] complex64 (windowed) -> complex64 [nx, ny]
 
-The shared library is compiled on first use with g++ (-O3 -march=native -fopenmp) into ~/.cache/fastsar.
+The shared library is compiled on first use with g++ (-O3 -march=native -fopenmp, and -mprefer-vector-width=512 on
+x86-64) into ~/.cache/fastsar; x86-64 and 64-bit ARM Linux.
 """
 import ctypes, os, time
 
@@ -29,9 +30,9 @@ def lib():
         return _lib
     with open(_SRC) as fh:
         src = fh.read()
-    from ._build import shared_object
-    flags = os.environ.get('FFBP_CPU_FLAGS', '-O3 -march=native -mprefer-vector-width=512 -funroll-loops')
-    so = shared_object('ffbp_cpu', src, flags.split() + ['-std=c++17'])
+    from ._build import shared_object, default_flags
+    flags = default_flags() + (['-funroll-loops'] if not os.environ.get('FFBP_CPU_FLAGS') else [])
+    so = shared_object('ffbp_cpu', src, flags + ['-std=c++17'])
     L = ctypes.CDLL(so)
     f32 = np.ctypeslib.ndpointer(np.float32, flags='C_CONTIGUOUS')
     f64 = np.ctypeslib.ndpointer(np.float64, flags='C_CONTIGUOUS')

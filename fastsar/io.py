@@ -86,6 +86,26 @@ def troposphere_delay(tx, rcv, srp):
     return out / C
 
 
+def _mode_type(r, m, notes):
+    """CollectionID/RadarMode/ModeType: sarpy's value, or the XML's own text when the value is outside the CPHD
+    enumeration (sarpy then reports None; ICEYE's CPHD 1.1.0 files write EXPERIMENTAL)."""
+    mode = getattr(getattr(m.CollectionID, 'RadarMode', None), 'ModeType', None)
+    if mode is not None:
+        return mode
+    try:
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(r.cphd_details.get_cphd_bytes())
+        for e in root.iter():
+            if e.tag.split('}')[-1] == 'ModeType' and e.text and e.text.strip():
+                mode = e.text.strip()
+                notes.append(f'radar mode {mode!r} is outside the CPHD enumeration (SPOTLIGHT, STRIPMAP, DYNAMIC STRIPMAP); '
+                             'taken from the XML')
+                return mode
+    except Exception:
+        pass
+    return None
+
+
 def _phase_rows(S, f, coef, sign):
     """In place, in row blocks: S[p, k] *= exp(sign 2j pi f[p, k] coef[p]) with f a function of a row slice giving
     its frequencies (Hz) [rows, K] (no full-size temporary)."""
@@ -306,7 +326,7 @@ def read_cphd(cphd, sicd=None, channel=0, meta=False, regrid_tol=1e-3, drop_flag
                 R=R, origin=origin, srp=s0, srp_pulses=(srp - origin) @ R.T,
                 sicd_transpose=None if sicd is None else grid['transpose'], tx_time=pv('TxTime')[lo:hi], rcv_time=pv('RcvTime')[lo:hi], pulses=(lo, hi),
                 polarization=None if pol is None else f'{pol.TxPol}{pol.RcvPol}', channel=ch.Identifier, channel_index=channel,
-                mode=getattr(m.CollectionID.RadarMode, 'ModeType', None),   # None for modes outside the CPHD enumeration (ICEYE: EXPERIMENTAL)
+                mode=_mode_type(r, m, notes),
                 notes=notes, start=_opt(m, 'Global.Timeline.CollectionStart', str),
                 collector=_opt(m, 'CollectionID.CollectorName'), core_name=_opt(m, 'CollectionID.CoreName'))
     return out, info

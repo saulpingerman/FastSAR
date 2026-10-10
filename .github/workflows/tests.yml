@@ -37,6 +37,20 @@ jobs:
       - run: uv tool install nox
       - run: nox -s tests-${{ matrix.python }} -- --durations=15
 
+  arm:
+    name: CPU, 64-bit ARM
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4.4.0
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e   # v6
+        with:
+          enable-cache: true
+      - run: g++ --version
+      - run: uv python install 3.12
+      - run: uv tool install nox
+      - run: nox -s tests-3.12 -- --durations=15
+
   lowest:
     name: CPU, lowest dependency versions
     runs-on: ubuntu-latest
