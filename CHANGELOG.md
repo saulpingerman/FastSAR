@@ -185,5 +185,5 @@ First release.
 - Products: multilook, interferogram, coherence, Pauli decomposition, range-Doppler projection and geocoding,
   GeoTIFF and SICD output.
 
-[0.1.1]: https://github.com/saulpingerman/FastSAR/compare/v0.1.0...v0.1.1
+[0.1.1]: https://github.com/saulpingerman/FastSAR/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/saulpingerman/FastSAR/releases/tag/v0.1.0

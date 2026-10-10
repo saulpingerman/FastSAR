@@ -106,7 +106,8 @@ that a missing one raises an `ImportError` naming the extra to install.
 
 1. Run the full suite on a CPU machine, on a machine with an Nvidia GPU (`nox -s cuda`) and on a Cloud TPU VM
    (`nox -s tpu`), and form a few collections that were not used in development.
-2. Set `__version__` in `fastsar/__init__.py` and date the version in `CHANGELOG.md`. The README links point at
+2. Set `__version__` in `fastsar/__init__.py`, date the version in `CHANGELOG.md` and point its compare link at the
+   new tag instead of `HEAD`. The README links point at
    `main` so that they resolve on GitHub between releases and on PyPI, whose copy of the README cannot be changed
    after upload.
 3. `rm -rf build dist *.egg-info && uv build && uvx twine check dist/*`, then install the wheel in a fresh
