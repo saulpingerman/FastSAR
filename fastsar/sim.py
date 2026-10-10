@@ -415,7 +415,8 @@ def write_palsar(directory, col, pos, amp, lat, lon, height=0.0, heading=0.0, sp
     put(idf, 249, f'{n:8d}'); put(idf, 273, ' 1'); put(idf, 275, ' 1'); put(idf, 277, f'{412:4d}'); put(idf, 281, f'{2 * n:8d}')
     put(idf, 289, f'{0:4d}')
     recs = np.zeros((P, rl), np.uint8)
-    secs = t                                        # seconds of the day, the scale of the platform position record
+    secs = t + 2.0 * r_near / C                     # the lines' times are those of their windows (seconds of the day, the
+                                                    # scale of the platform position record), one window delay after the pulse
     for i in range(P):
         pre = bytearray(412)
         pre[:12] = header(i + 2, (50, 10, 18, 20), rl)

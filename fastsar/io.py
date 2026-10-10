@@ -588,6 +588,9 @@ def read_palsar(path, polarization=None, meta=False, height=None, band_margin=1.
         ut = ut[0] + (fields['line'] - fields['line'][0]) / fields['prf']
         notes_time = 'line times from the first line and the PRF (no microsecond counter)'
     sr0 = fields['slant_range']
+    # the line's time counts to the PRI in which its window was sampled (the format's 1Mpps counter 'to this PRI');
+    # the echo in it is of the pulse sent one window delay (2 r0 / c, about 12 PRIs) earlier
+    ut = ut - 2.0 * sr0 / C
     height = float(lead['terrain_height'] if height is None else height)
     notes = [f'ALOS PALSAR level 1.0 {lead["scene_id"]}, {pol}, {P} lines of {n} samples at {fs / 1e6:.0f} MHz, chirp '
              f'{bw / 1e6:.0f} MHz over {T * 1e6:.0f} us, wavelength {lead["wavelength"]:.4f} m; orbit {len(lead["sv_time"])} '
