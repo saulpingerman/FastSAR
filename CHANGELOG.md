@@ -3,6 +3,12 @@
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The date of a version is the day it
 was published on PyPI.
 
+## [0.1.2] - unreleased
+
+### Added
+
+- `CITATION.cff` with the software citation and the paper as the preferred citation.
+
 ## [0.1.1] - 2026-10-10
 
 ### Added
@@ -185,5 +191,6 @@ First release.
 - Products: multilook, interferogram, coherence, Pauli decomposition, range-Doppler projection and geocoding,
   GeoTIFF and SICD output.
 
+[0.1.2]: https://github.com/saulpingerman/FastSAR/compare/v0.1.1...HEAD
 [0.1.1]: https://github.com/saulpingerman/FastSAR/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/saulpingerman/FastSAR/releases/tag/v0.1.0

@@ -1,0 +1,32 @@
+cff-version: 1.2.0
+message: If you use FastSAR, please cite the software and the paper below.
+title: FastSAR
+abstract: SAR image formation (exact and factorized backprojection, polar format) on CPUs, GPUs and TPUs.
+authors:
+  - family-names: Singerman
+    given-names: Paul
+    affiliation: Penn State University
+version: 0.1.1
+date-released: 2026-10-10
+repository-code: https://github.com/saulpingerman/FastSAR
+url: https://pypi.org/project/fastsar/
+license: MIT
+keywords:
+  - synthetic aperture radar
+  - backprojection
+  - image formation
+  - CPHD
+  - GPU
+  - TPU
+preferred-citation:
+  type: unpublished
+  title: "FastSAR: High-Throughput, High-Fidelity Open-Source SAR Image Formation on CPUs, GPUs and TPUs"
+  authors:
+    - family-names: Singerman
+      given-names: Paul
+      affiliation: Penn State University
+    - family-names: Braun
+      given-names: Tom
+      affiliation: Penn State University
+  year: 2026
+  notes: "Paper and measurement records: https://github.com/saulpingerman/sar-accel-study"

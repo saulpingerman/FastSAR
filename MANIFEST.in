@@ -1,4 +1,4 @@
-include CHANGELOG.md CONTRIBUTING.md noxfile.py
+include CHANGELOG.md CONTRIBUTING.md CITATION.cff noxfile.py
 graft tests
 graft examples
 global-exclude __pycache__ *.py[cod]
