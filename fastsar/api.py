@@ -38,6 +38,7 @@ square of the tile size and falls with range, so orbital collections keep T=32 a
 drop to 16. The prediction is kept as ImageFormer.predicted_error_db.
 """
 import os
+import platform
 import threading
 
 import numpy as np
@@ -237,7 +238,8 @@ class ImageFormer:
                  precision='float32', window=True, T='auto', levels=None, pmax=0.4, target_db=-40.0, aperture_weight=None,
                  ref=None):
         from . import ffbp2
-        import warnings
+        import platform
+import warnings
         self.ant = _check_positions(ant)
         self.P, self.K = self.ant.shape[0], int(K)
         if self.K < 2:
@@ -262,6 +264,9 @@ class ImageFormer:
                 if err > target_db:
                     warnings.warn(f'predicted error {err:.1f} dB at T={T} misses target {target_db:.1f} dB '
                                   '(short range for this pixel size)')
+                if self.backend == 'cpu' and T == 32 and platform.machine() in ('arm64', 'aarch64'):
+                    # NEON's four lanes make the 32-pixel tile's final stage the slower one; 16 is also more accurate
+                    T, err = 16, ffbp2.final_phase_error(self.ant, fmax, nx, ny, spx, spy, e1, e2, 16)
             self.predicted_error_db = float(err)
         self.T = T
         # levels=None: three, or more where three cannot split a long side into final tiles (factors up to 8)

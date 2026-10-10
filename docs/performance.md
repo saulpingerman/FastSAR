@@ -129,6 +129,21 @@ v6e (single-pass) and the L4 (float32 data, TF32 tensor-core matrix products), i
 
 Run scripts and records: [sar-accel-study](https://github.com/saulpingerman/sar-accel-study).
 
+## ARM and Apple silicon
+
+The factorized kernel's vectors are four lanes on ARM (NEON) and sixteen on x86, and the final tile stage is
+templated on the vectors per table row; the exact kernel evaluates its sines by polynomials on macOS, which has no
+vector sine library. On the synthetic collection of `oss/bench_cpu_synth.py` in sar-accel-study (5,794 pulses by
+5,794 samples at 0.5 m, a 4096 by 4096 image at 0.4 m; best of two warm calls):
+
+| machine | threads | factorized float32 | exact 1024 by 1024 |
+|---|---|---|---|
+| Threadripper PRO 7965WX (Zen 4, AVX-512) | 8 | 2.7 s (T=32) | 2.7 s |
+| MacBook Air M2 (4 performance and 4 efficiency cores) | 8 | 3.7 s (T=16), 4.4 s (T=32) | 3.5 s |
+
+The automatic tile choice takes 16 pixels on ARM. macOS builds the kernels with Apple's clang, `-fopenmp-simd` and
+`-mcpu=native`, with the parallel loops on `std::thread` (no OpenMP runtime, see `fastsar/par.hpp`).
+
 ## Exact backprojection
 
 `ExactFormer` on the Umbra Panama collection (12,207 by 8,808 pixels, 15,186 pulses), host memory to host memory,

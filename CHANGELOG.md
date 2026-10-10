@@ -40,6 +40,12 @@ was published on PyPI.
 - `fastsar/par.hpp`: the CPU kernels' parallel loops on OpenMP where the kernels are built with it and on
   `std::thread` otherwise; macOS builds with Apple's clang and `-fopenmp-simd`, with no OpenMP runtime (a second
   runtime next to the one finufft's wheel bundles deadlocked the test suite) and no Homebrew libomp.
+- ARM and Apple silicon: the factorized CPU kernel's vectors are four lanes on ARM (NEON) with the final tile
+  stage templated on the vectors per table row (the x86 code is unchanged), the exact kernel's sines are
+  vectorizable polynomials on macOS (no vector sine library there), macOS builds with `-mcpu=native`, and the
+  automatic tile choice takes 16 pixels on ARM. On an M2 MacBook Air the synthetic 4096 by 4096 image of
+  `oss/bench_cpu_synth.py` (5,794 pulses) forms in 3.7 s factorized and 3.5 s exact at 1024 by 1024, from 6.3 and
+  8.0 s before; eight Zen 4 threads with AVX-512 take 2.7 s for each.
 
 ### Changed
 
