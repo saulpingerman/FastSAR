@@ -391,7 +391,7 @@ def write_palsar(directory, col, pos, amp, lat, lon, height=0.0, heading=0.0, sp
     ds = bytearray(4096); ds[:12] = header(2, (18, 10, 18, 20), 4096)
     put(ds, 13, '   1'); put(ds, 21, scene_id.ljust(32)); put(ds, 117, num(lat, 16)); put(ds, 133, num(lon, 16))
     put(ds, 149, num(heading, 16)); put(ds, 309, num(height / 1e3, 16)); put(ds, 397, 'ALOS'.ljust(16))
-    put(ds, 501, num(C / fc, 16)); put(ds, 519, 'LINEAR FM CHIRP '); put(ds, 535, f'{0.0:16.7E}'); put(ds, 551, f'{k:16.7E}')
+    put(ds, 501, num(C / fc, 16)); put(ds, 519, 'LINEAR FM CHIRP '); put(ds, 535, f'{0.0:16.7E}'); put(ds, 551, f'{abs(k):16.7E}')     # JAXA writes the magnitude
     put(ds, 711, num(fs / 1e6, 16)); put(ds, 727, num(2 * r_near / C * 1e6, 16)); put(ds, 743, num(chirp_duration * 1e6, 16))
     put(ds, 759, 'YES '); put(ds, 763, 'NOT '); put(ds, 799, '       5'); put(ds, 819, num(16.0, 16)); put(ds, 835, num(16.0, 16))
     put(ds, 935, num(prf * 1e3, 16)); put(ds, 1095, '1.0'.ljust(16))

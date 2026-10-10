@@ -557,7 +557,7 @@ def read_palsar(path, polarization=None, meta=False, height=None, band_margin=1.
                          f"{hdr['bytes_per_group']} bytes per pixel")
     fs, fc = lead['sampling_rate'], C / lead['wavelength']
     T = lead['pulse_length']
-    k = lead['chirp_rate']
+    k = -abs(lead['chirp_rate'])                     # PALSAR's chirp sweeps downward; the leader gives the rate's magnitude
     bw = abs(k) * T
     L = int(round(T * fs))
     u = (np.arange(L) - 0.5 * (L - 1)) / fs
