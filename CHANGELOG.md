@@ -31,6 +31,15 @@ was published on PyPI.
   while ICEYE's images include the correction; an uncorrected image lay 6 m in ground range from ICEYE's on a
   26 degree incidence dwell.
 - `CITATION.cff` with the software citation and the paper as the preferred citation.
+- The raw readers remove the instruments' range delays, as the agencies' processors do: `read_nisar(range_delay=)`
+  subtracts JPL's calibration common delay (`io.NISAR_RANGE_DELAY`, 53.24 m for frequency A, 19.65 m for B);
+  `read_sentinel1(internal_delay=)` subtracts the internal time delay estimated from the product's calibration
+  packets (`sentinel1.internal_delay`, about 0.43 us, within 4 ns of ESA's annotated value on a 2014 datatake).
+  Images of a NISAR pass and of a Sentinel-1 stripmap datatake then fall within about 20 m of JPL's GCOV and
+  ESA's GRD of the same passes, from 100 to 180 m before. The raw readers take `troposphere='model'`.
+- `fastsar/par.hpp`: the CPU kernels' parallel loops on OpenMP where the kernels are built with it and on
+  `std::thread` otherwise; macOS builds with Apple's clang and `-fopenmp-simd`, with no OpenMP runtime (a second
+  runtime next to the one finufft's wheel bundles deadlocked the test suite) and no Homebrew libomp.
 
 ### Changed
 

@@ -22,8 +22,10 @@ the float64 reference ([performance](https://github.com/saulpingerman/FastSAR/bl
 
 ## Install
 
-Linux on x86-64, Python 3.10 to 3.13. The CPU kernels compile on first use with `g++` and OpenMP (Debian and
-Ubuntu: `apt install g++`); the `cuda` extra needs an Nvidia driver for CUDA 12 and the `tpu` extra a Cloud TPU VM.
+Linux on x86-64 or 64-bit ARM and macOS on Apple silicon, Python 3.10 to 3.13. The CPU kernels compile on first
+use: with `g++` and OpenMP on Linux (Debian and Ubuntu: `apt install g++`), with Apple's clang on macOS (the command
+line tools, `xcode-select --install`); the `cuda` extra needs an Nvidia driver for CUDA 12 and the `tpu` extra a
+Cloud TPU VM.
 
 ```bash
 pip install fastsar                  # CPU (and JAX on whatever device it has)

@@ -125,6 +125,14 @@ forms the collection in moving mode over the swath (or an `extent`); `height` se
 transmit gaps are zeroed; the per-receiver calibration tables (caltone, attenuation, TRM phases) are not applied.
 A 2 s, 20 MHz granule (4,096 pulses by 25,970 samples) reads in 6 s and forms a 12 by 24 km patch in 9 s on 8 cores.
 
+The file's slant ranges count from the transmit event, and the echoes arrive late by the instrument's delay, which
+JPL's processors subtract as a calibration constant (`commonDelay` in the metadata of RSLC and GCOV products: 53.24 m
+for frequency A and 19.65 m for B in the provisional products of 2026). `read_nisar(range_delay=)` subtracts it,
+by default these values (`io.NISAR_RANGE_DELAY`); 0 leaves the ranges as the file has them. On a Wisconsin pass of
+November 2025, a 6 km square formed from the L0B fell 98 m too far from the radar against Sentinel-2 before the
+correction and within 20 m of JPL's GCOV of the same pass after it (10 m grids; the troposphere, about 3 m in slant
+range at this incidence, is removed by `troposphere='model'`).
+
 ## ALOS PALSAR level 1.0
 
 `io.read_palsar` reads a PALSAR level 1.0 product (the CEOS leader and image files JAXA and ASF distribute, as a
@@ -143,6 +151,17 @@ decoder that was checked bit for bit against a public decoder on a real S1 strip
 compressed with the replica the headers describe (start frequency, ramp rate, length). The antenna positions come from
 the position and velocity records sub-commutated in the packets, interpolated at the transmit time of each echo (the
 packet time less RANK pulse intervals); sample 0 of the window lies RANK times the PRI plus SWST plus the decimation
-filter's suppressed transient after that pulse. A 15 s stripmap file (28,065 echo packets of 25,670 samples) decodes
-at about 35 million samples per second on one core; 1,500 pulses read in 4 s and form a 6 by 20 km patch in 8 s on
-8 cores. Stripmap (S1 to S6) and wave products; IW and EW bursts are not split yet.
+filter's suppressed transient after that pulse, less the instrument's internal time delay. A 15 s stripmap file
+(28,065 echo packets of 25,670 samples) decodes at about 35 million samples per second on one core; 1,500 pulses
+read in 4 s and form a 6 by 20 km patch in 8 s on 8 cores. Stripmap (S1 to S6) and wave products; IW and EW bursts
+are not split yet.
+
+The internal time delay (about 0.43 us two way, 65 m in range) is what ESA's processor estimates from the calibration
+packets of each datatake and annotates in Level-1 products as `internalTimeDelay`. `sentinel1.internal_delay` makes
+the same estimate from the Level-0 file: the correlation peak of each calibration pulse type with the nominal chirp,
+the tx, rx and ta positions less epdn and apdn as the replica reconstruction combines them (Level 1 Detailed
+Algorithm Definition, 4.2.1.4). On a 2014 San Francisco datatake it gives 429.7 ns where ESA annotated 433.2 ns;
+`read_sentinel1(internal_delay=)` takes a value in seconds instead, 0 for none. A 6 km square over the Santa Rosa
+plain formed from the Level-0 file then lies within 20 m of ESA's GRD of the same datatake on the GRD's own
+reference surface (ESA's GRD is projected at one height per scene, so a comparison in terrain must use that height,
+not a DEM), from 185 m before the correction.
