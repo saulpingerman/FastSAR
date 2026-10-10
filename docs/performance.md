@@ -153,4 +153,4 @@ pulses, warm formers) on an L4 (g2-standard-4), exact backprojection with cubic 
 and 14.9 s at 1024, 2048, 4096 and 8192 pixels on a side, against 1.00, 0.96, 1.42 and 2.63 s for `ImageFormer`:
 the two meet between 1024 and 2048 pixels on a side. On the c4d-highmem-16 factorized backprojection was faster at every size (7.5 against
 2.6 s at 1024 pixels, 269 against 7.2 s at 8192). On the three Panama regions exact backprojection is 19 to 21 dB more
-accurate against the 64 times truth. Records: `results/v3/crossover` in sar-accel-study.
+accurate against the 64 times truth. Records: `results/fastsar/crossover` in sar-accel-study.

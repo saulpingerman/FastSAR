@@ -49,4 +49,4 @@ Neither corrects the planar-wavefront displacement. Their log-amplitude correlat
 0.89 and 0.78 to 0.93, against 0.996 to 0.999 for FastSAR's corrected polar format (11.4 s).
 
 Scripts and records: [sar-accel-study](https://github.com/saulpingerman/sar-accel-study), directories `oss` and
-`results/oss`.
+`results/comparison`.
