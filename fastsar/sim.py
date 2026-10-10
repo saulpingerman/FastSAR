@@ -254,13 +254,14 @@ def raw_echoes(col, pos, amp, fs, chirp, r_near, n, lat, lon, height=0.0, headin
 
 
 def write_nisar(path, col, pos, amp, lat, lon, height=0.0, heading=0.0, speed=7500.0, bandwidth=None, fs=None,
-                chirp_duration=10e-6, r_margin=200.0, pol='HH', frequency='A', epoch='2026-01-01T00:00:00'):
+                chirp_duration=10e-6, r_margin=200.0, pol='HH', frequency='A', epoch='2026-01-01T00:00:00', range_delay=None):
     """Write a NISAR L0B RRSD look-alike (HDF5) of scatterers pos [N, 3] (simulator frame) with amplitudes amp:
     the raw echoes of a linear-FM chirp (bandwidth default the collection's, sampled at fs, default 1.2 times the
     bandwidth) in a receive window from r_margin m before the nearest scatterer to r_margin m past the farthest,
     block-floating-point encoded; the pulse times speed m/s apart along the track; the orbit as nine state vectors
     along the (straight) track; the datasets and attributes io.read_nisar reads. The radar looks right (to_ecf).
-    Needs h5py."""
+    range_delay: the instrument's range delay (m, default io.NISAR_RANGE_DELAY for the frequency): the echoes
+    arrive late by it, so each sample's slant range labels a target that far nearer. Needs h5py."""
     _deps.require('h5py')
     import h5py
     ant_l = np.asarray(col.ant, np.float64)
@@ -274,12 +275,14 @@ def write_nisar(path, col, pos, amp, lat, lon, height=0.0, heading=0.0, speed=75
     u = (np.arange(L) - 0.5 * (L - 1)) / fs
     slope = bw / chirp_duration
     chirp = np.exp(1j * np.pi * slope * u ** 2).astype(np.complex64)
+    from .io import NISAR_RANGE_DELAY
+    delay = float(NISAR_RANGE_DELAY.get(frequency, 0.0) if range_delay is None else range_delay)
     r = np.linalg.norm(pts[None, :, :] - ant[:, None, :], axis=2)
-    r_near = r.min() - r_margin
-    n = int(np.ceil(2.0 * (r.max() + r_margin - r_near) / C * fs)) + L
+    r_near = r.min() - r_margin + delay              # the labeled slant range of sample 0 (the echoes arrive late)
+    n = int(np.ceil(2.0 * (r.max() + r_margin - (r_near - delay)) / C * fs)) + L     # the physical window
     t = 1.0 + np.cumsum(np.r_[0.0, np.linalg.norm(np.diff(ant_l, axis=0), axis=1)]) / speed
     vel = np.gradient(ant, t, axis=0)
-    z = raw_echoes(col, pos, amp, fs, chirp, r_near, n, lat, lon, height, heading, vel=vel)
+    z = raw_echoes(col, pos, amp, fs, chirp, r_near - delay, n, lat, lon, height, heading, vel=vel)
     # nine state vectors on the straight track, one second apart around the aperture
     ts = np.linspace(t[0] - 4.0, t[-1] + 4.0, 9)
     v0 = vel[P // 2]
@@ -418,14 +421,17 @@ def write_palsar(directory, col, pos, amp, lat, lon, height=0.0, heading=0.0, sp
 
 
 def write_sentinel1(path, col, pos, amp, lat, lon, height=0.0, heading=0.0, speed=7500.0, bandwidth=None, range_decimation=0,
-                    chirp_duration=20e-6, r_margin=200.0, rank=None, pol='HH', swath=1, gps_start=1.4e9):
+                    chirp_duration=20e-6, r_margin=200.0, rank=None, pol='HH', swath=1, gps_start=1.4e9, internal_delay=433e-9,
+                    cal_packets=4):
     """Write a Sentinel-1 Level-0 measurement file look-alike of scatterers pos [N, 3] (simulator frame): one
     space packet per pulse with the primary and secondary headers io.read_sentinel1 reads (datation, radar
     configuration with the chirp encoded as start frequency, ramp rate and length, rank, PRI, SWST, SWL, SES
     message with the echo signal type, number of quads) and the echoes as 10-bit decimation-only user data (BAQ mode
     0); the position and velocity records sub-commutated over the first 22 packets of every 64. The sampling rate
     follows the range decimation code (default 0: 112.6 MHz) and the chirp bandwidth is the collection's unless
-    given; the data of each packet are the echo of the pulse sent `rank` intervals earlier (default: as many as the
+    given; internal_delay (s) the instrument's internal delay, which delays the echoes and positions the chirp in the
+    cal_packets calibration packets of each type written ahead of the echoes (io.read_sentinel1 estimates it from
+    them); the data of each packet are the echo of the pulse sent `rank` intervals earlier (default: as many as the
     near range spans). The radar looks right."""
     from . import sentinel1 as s1
     ant_l = np.asarray(col.ant, np.float64)
@@ -453,20 +459,26 @@ def write_sentinel1(path, col, pos, amp, lat, lon, height=0.0, heading=0.0, spee
     r = np.linalg.norm(pts[None, :, :] - ant[:, None, :], axis=2)
     r_near = r.min() - r_margin
     # the window starts SWST + the suppressed transient after the pulse sent `rank` intervals before the packet's own
-    tau_first = 2.0 * r_near / C
+    tau_first = 2.0 * r_near / C + internal_delay          # the window's label: the echoes arrive late by the delay
     if rank is None:                        # the pulse intervals the echo spans (default: as many as fit)
         rank = max(0, int((tau_first - s1.T_SUPPRESSED) // pri))
     swst_code = int(round((tau_first - rank * pri - s1.T_SUPPRESSED) * s1.F_REF))
     if swst_code < 0:
         raise ValueError('the near range is too short for this rank and PRI')
     tau0 = rank * pri + swst_code / s1.F_REF + s1.T_SUPPRESSED
-    n = int(np.ceil(2.0 * (r.max() + r_margin) / C * fs - tau0 * fs)) + L
+    n = int(np.ceil(2.0 * (r.max() + r_margin) / C * fs - (tau0 - internal_delay) * fs)) + L
     n += n % 2
     nq = n // 2
-    z = raw_echoes(col, pos, amp, fs, chirp, C * tau0 / 2.0, n, lat, lon, height, heading, vel=vel)
+    # the instrument's internal delay: echoes arrive late by it, and the calibration packets (the chirp through the
+    # internal paths, the packet data starting at the nominal transmit time) show it as the chirp's position
+    z = raw_echoes(col, pos, amp, fs, chirp, C * (tau0 - internal_delay) / 2.0, n, lat, lon, height, heading, vel=vel)
     scale = 400.0 / max(np.abs(z.real).max(), np.abs(z.imag).max(), 1e-30)
     zi = np.clip(np.round(z.real * scale), -511, 511).astype(int); zq = np.clip(np.round(z.imag * scale), -511, 511).astype(int)
     swl_code = int(round(n / fs * s1.F_REF))
+    n_cal = L + 2 * int(round(1.5e-6 * fs)); n_cal += n_cal % 2
+    tc_ = np.arange(n_cal) / fs - internal_delay
+    zc = np.where((tc_ >= 0) & (tc_ < txpl), np.exp(2j * np.pi * (txpsf * tc_ + 0.5 * txprr * tc_ ** 2)), 0) * 400.0
+    zci = np.clip(np.round(zc.real), -511, 511).astype(int); zcq = np.clip(np.round(zc.imag), -511, 511).astype(int)
     # sub-commutated position and velocity records: the state vector at the start of each 64-packet cycle
     words = {}
     for c0 in range(0, P, 64):
@@ -482,24 +494,34 @@ def write_sentinel1(path, col, pos, amp, lat, lon, height=0.0, heading=0.0, spee
     def align(b):
         return b + '0' * (-len(b) % 16)
 
-    out = bytearray()
-    for i in range(P):
-        user_bits = align(codes(zi[i, 0::2])) + align(codes(zi[i, 1::2])) + align(codes(zq[i, 0::2])) + align(codes(zq[i, 1::2]))
+    def packet(seq, time, zr, zq_, signal_type, nq_, subcom=0):
+        user_bits = align(codes(zr[0::2])) + align(codes(zr[1::2])) + align(codes(zq_[0::2])) + align(codes(zq_[1::2]))
         user_bits += '0' * (-len(user_bits) % 32)
         user = bytes(int(user_bits[k:k + 8], 2) for k in range(0, len(user_bits), 8))
         h = bytearray(68)
         pdl = 62 + len(user) - 1
-        h[0:2] = (0x0800 | 1052).to_bytes(2, 'big'); h[2:4] = (0xC000 | (i & 0x3FFF)).to_bytes(2, 'big'); h[4:6] = pdl.to_bytes(2, 'big')
-        coarse = int(np.floor(t[i])); fine = int(round((t[i] - coarse) * 65536)) & 0xFFFF
+        h[0:2] = (0x0800 | 1052).to_bytes(2, 'big'); h[2:4] = (0xC000 | (seq & 0x3FFF)).to_bytes(2, 'big'); h[4:6] = pdl.to_bytes(2, 'big')
+        coarse = int(np.floor(time)); fine = int(round((time - coarse) * 65536)) & 0xFFFF
         h[6:10] = coarse.to_bytes(4, 'big'); h[10:12] = fine.to_bytes(2, 'big'); h[12:16] = (0x352EF853).to_bytes(4, 'big')
         h[16:20] = (1).to_bytes(4, 'big'); h[20] = 11; h[21] = 1 if pol[1] == 'H' else 0
-        h[26] = (i % 64) + 1; h[27:29] = words.get(i, 0).to_bytes(2, 'big')
-        h[29:33] = i.to_bytes(4, 'big'); h[33:37] = i.to_bytes(4, 'big')
+        h[26] = subcom; h[27:29] = words.get(seq, 0).to_bytes(2, 'big') if subcom else b'\0\0'
+        h[29:33] = seq.to_bytes(4, 'big'); h[33:37] = seq.to_bytes(4, 'big')
         h[37] = 0; h[38] = 31; h[40] = range_decimation; h[41] = 0
         h[42:44] = (0x8000 | prr_code).to_bytes(2, 'big'); h[44:46] = (psf_code & 0x7FFF).to_bytes(2, 'big'); h[46:49] = pl_code.to_bytes(3, 'big')
         h[49] = rank; h[50:53] = pri_code.to_bytes(3, 'big'); h[53:56] = swst_code.to_bytes(3, 'big'); h[56:59] = swl_code.to_bytes(3, 'big')
-        h[59] = ({'HH': 1, 'HV': 2, 'VH': 5, 'VV': 6}[pol.upper()] << 4); h[62] = 0; h[63] = 0; h[64] = swath; h[65:67] = nq.to_bytes(2, 'big')
-        out += bytes(h) + user
+        h[59] = ({'HH': 1, 'HV': 2, 'VH': 5, 'VV': 6}[pol.upper()] << 4); h[62] = 0; h[63] = signal_type << 4; h[64] = swath
+        h[65:67] = nq_.to_bytes(2, 'big')
+        return bytes(h) + user
+
+    out = bytearray()
+    # the calibration sequence ahead of the echoes: tx, rx, epdn, ta and apdn calibration packets (bypass encoded)
+    ncal = 0
+    for st in (8, 9, 10, 11, 12):
+        for _ in range(cal_packets):
+            out += packet(0, t[0] - (5 * cal_packets - ncal) * pri, zci, zcq, st, n_cal // 2)
+            ncal += 1
+    for i in range(P):
+        out += packet(i, t[i], zi[i], zq[i], 0, nq, (i % 64) + 1)
     with open(path, 'wb') as fh:
         fh.write(bytes(out))
     return dict(fs=fs, chirp=chirp, n=n, tx=ant, times=t - rank * pri, tau0=tau0)

@@ -156,26 +156,32 @@ extern "C" __global__ void crop(const float2* prof, const long long* blo, int n,
 _CPU_SRC = r'''
 #include <cmath>
 #include <cstdlib>
-#include <omp.h>
-// one OpenMP task per tile of TX x TY pixels; per pulse the tile center's terms in float64, then the tile's pixels
-// in float32 in one vectorizable loop (the sines from the vector math library)
+#include <atomic>
+#include "par.hpp"
+// one task per tile of TX x TY pixels (par.hpp: OpenMP, or std::thread without the runtime); per pulse the tile
+// center's terms in float64, then the tile's pixels in float32 in one vectorizable loop (the sines from the vector
+// math library)
+struct TileScratch {
+  float* p = nullptr; size_t n = 0;
+  ~TileScratch() { free(p); }
+  float* get(size_t need) {
+    if (n < need) { free(p); p = (float*)aligned_alloc(64, sizeof(float) * need); n = p ? need : 0; }
+    return p;
+  }
+};
 extern "C" int bp_tiles(const float* wre, const float* wim, int P, int W, const int* lo, const double* ant,
                          const double* ref, const double* cen, int ntx, int nty, int TX, int TY, int nx, int ny,
                          float sx, float sy, const float* e1, const float* e2, double inv_dr, double kcyc, int cubic,
                          float* ore, float* oim) {
   const int T = TX * TY;
-  int failed = 0;
-  #pragma omp parallel
-  {
-    float* dx = (float*)aligned_alloc(64, sizeof(float) * T * 8);        // T even: a multiple of 64 bytes
-    if (!dx) {
-      #pragma omp atomic write
-      failed = 1;
-    }
+  std::atomic<int> failed(0);
+  par::for_dynamic((long)ntx * nty, 1, [&](long b_) {
+    const int b = (int)b_;
+    static thread_local TileScratch scratch;
+    float* dx = scratch.get((size_t)T * 8);                               // T even: a multiple of 64 bytes
+    if (!dx) { failed = 1; return; }
     float *dy = dx + T, *dz = dy + T, *dd = dz + T, *are = dd + T, *aim = are + T, *tt = aim + T, *pp = tt + T;
-    #pragma omp for schedule(dynamic, 1)
-    for (int b = 0; b < ntx * nty; ++b) {
-      if (!dx) continue;
+    {
       const int bx = b / nty, by = b % nty;
       for (int q = 0; q < T; ++q) {
         const int li = q / TY, lj = q % TY;
@@ -237,9 +243,8 @@ extern "C" int bp_tiles(const float* wre, const float* wim, int P, int W, const 
         if (ix < nx && iy < ny) { ore[(long)ix * ny + iy] += are[q]; oim[(long)ix * ny + iy] += aim[q]; }
       }
     }
-    free(dx);
-  }
-  return failed;
+  });
+  return failed.load();
 }
 '''
 _cpu_lib = None

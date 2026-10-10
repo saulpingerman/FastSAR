@@ -365,7 +365,24 @@ def read_collection(path, **kw):
     return out
 
 
-def read_nisar(path, frequency=None, polarization=None, meta=False, height=None, band_margin=1.0, block=1024):
+def _tropo(troposphere, tx, rcv, srp, notes):
+    """The two-way troposphere delay [P] (s) a raw reader subtracts from its echoes' delays: 'model' the standard
+    atmosphere of troposphere_delay, None or False nothing."""
+    if troposphere in (None, False):
+        return 0.0
+    if troposphere != 'model':
+        raise ValueError(f"troposphere must be 'model' or None for a raw collection, not {troposphere!r}")
+    td = troposphere_delay(tx, rcv, srp)
+    notes.append(f'modeled troposphere delay removed ({td.mean() * C / 2:.2f} m one way, standard atmosphere)')
+    return td
+
+
+NISAR_RANGE_DELAY = {'A': 53.24, 'B': 19.65}      # m, JPL's commonDelay for L-band frequencies A and B (RSLC and GCOV
+                                                   # metadata, calibrationInformation, provisional products of 2026)
+
+
+def read_nisar(path, frequency=None, polarization=None, meta=False, height=None, band_margin=1.0, block=1024, range_delay=None,
+               troposphere=None):
     """A NISAR L0B RRSD granule (HDF5) as read_cphd returns a CPHD: dict(S, ant, fmin, df) with the raw echoes of one
     frequency ('A' or 'B', default the file's first) and polarization ('HH', 'HV', 'VH', 'VV', default the first)
     range compressed with the file's chirp replica and taken to the frequency domain (fastsar.raw), compensated to
@@ -374,7 +391,10 @@ def read_nisar(path, frequency=None, polarization=None, meta=False, height=None,
     from the file's orbit state vectors at the transmit times (Hermite). band_margin: the fraction of the range
     bandwidth kept around the carrier (1.0: the chirp's band). With meta=True also the dict read_cphd gives, plus
     image_area (the swath's corners, local frame) and refpt. Transmit gaps (the file's valid-sample intervals) are
-    zeroed; the per-receiver calibration (caltone, attenuation, TRM phases) is not applied. Needs h5py
+    zeroed; the per-receiver calibration (caltone, attenuation, TRM phases) is not applied. range_delay: the
+    instrument's range delay in meters, subtracted from the file's slant ranges as JPL's processors subtract their
+    calibrated common delay (NISAR_RANGE_DELAY by frequency, 53.24 m for A, is the default; 0 removes none).
+    troposphere: 'model' removes the standard atmosphere's delay (troposphere_delay), default none. Needs h5py
     (pip install "fastsar[raw]")."""
     from . import _deps, raw
     h5py = _deps.require('h5py')
@@ -429,6 +449,16 @@ def read_nisar(path, frequency=None, polarization=None, meta=False, height=None,
                  f'{bw / 1e6:.0f} MHz at {fc / 1e9:.4f} GHz, {side}-looking; orbit {orbit_type(orb)} with {len(ot)} state vectors']
         if nsub > 1:
             notes.append(f'{nsub} sub-swaths: samples in the transmit gaps zeroed')
+        # the instrument's range delay: the file's slant ranges count from the transmit event; the echo of a point at
+        # range r arrives as if from r + delay, and JPL's processors subtract the calibrated delay
+        if range_delay is None:
+            range_delay = NISAR_RANGE_DELAY.get(frequency, 0.0)
+        range_delay = float(range_delay)
+        if range_delay:
+            sr = sr - range_delay
+            notes.append(f'instrument range delay of {range_delay:.2f} m removed')
+        else:
+            notes.append('no instrument range delay removed')
         # geometry: transmitter at the pulse time, the zero-Doppler point at mid swath, the receiver at the echo time
         tx_pos, tx_vel = orbit(ut)
         # the last chirp length of the window holds partial correlations: the far edge of the imaged swath is before it
@@ -439,7 +469,7 @@ def read_nisar(path, frequency=None, polarization=None, meta=False, height=None,
         srp = raw.zero_doppler_points(tx_pos, tx_vel, r_mid, side, height=height)
         rcv_pos, _ = orbit(ut + 2.0 * np.linalg.norm(srp - tx_pos, axis=1) / C)
         tau_ref = (np.linalg.norm(tx_pos - srp, axis=1) + np.linalg.norm(rcv_pos - srp, axis=1)) / C
-        tau0 = 2.0 * sr[0] / C
+        tau0 = 2.0 * sr[0] / C - _tropo(troposphere, tx_pos, rcv_pos, srp, notes)
         S = None
         for p0 in range(0, P, block):
             p1 = min(P, p0 + block)
@@ -476,7 +506,7 @@ def read_nisar(path, frequency=None, polarization=None, meta=False, height=None,
         f.close()
 
 
-def read_palsar(path, polarization=None, meta=False, height=None, band_margin=1.0, block=512):
+def read_palsar(path, polarization=None, meta=False, height=None, band_margin=1.0, block=512, troposphere=None):
     """An ALOS PALSAR level 1.0 product (raw signal data in CEOS format: a directory or zip holding the LED- leader
     and IMG- image files, or one IMG- file beside its leader) as read_cphd returns a CPHD: the 8-bit I and Q samples
     of one polarization (default the first image file), DC bias removed, range compressed with a linear FM replica
@@ -561,6 +591,7 @@ def read_palsar(path, polarization=None, meta=False, height=None, band_margin=1.
     srp = raw.zero_doppler_points(tx_pos, tx_vel, r_mid, 'right', height=height)
     rcv_pos, _ = orbit(ut + 2.0 * np.linalg.norm(srp - tx_pos, axis=1) / C)
     tau_ref = (np.linalg.norm(tx_pos - srp, axis=1) + np.linalg.norm(rcv_pos - srp, axis=1)) / C
+    tau0 = 2.0 * sr0 / C - _tropo(troposphere, tx_pos, rcv_pos, srp, notes)
     bias = complex(lead['dc_bias_i'] or 0.0, lead['dc_bias_q'] or 0.0)
     S = None
     for p0 in range(0, P, block):
@@ -570,7 +601,7 @@ def read_palsar(path, polarization=None, meta=False, height=None, band_margin=1.
             z -= z.mean()                               # no bias in the leader: the block's own mean
         else:
             z -= np.complex64(bias)
-        blk, fmin, df = raw.fx_history(raw.range_compress(z, chirp), fs, fc, 2.0 * sr0[p0:p1] / C, tau_ref[p0:p1], bw, band_margin)
+        blk, fmin, df = raw.fx_history(raw.range_compress(z, chirp), fs, fc, tau0[p0:p1], tau_ref[p0:p1], bw, band_margin)
         if S is None:
             S = np.empty((P, blk.shape[1]), np.complex64)
         S[p0:p1] = blk
@@ -589,7 +620,8 @@ def read_palsar(path, polarization=None, meta=False, height=None, band_margin=1.
     return out
 
 
-def read_sentinel1(path, polarization=None, meta=False, height=None, band_margin=1.0, block=512, pulses=None, swath=None):
+def read_sentinel1(path, polarization=None, meta=False, height=None, band_margin=1.0, block=512, pulses=None, swath=None,
+                   internal_delay=None, troposphere=None):
     """A Sentinel-1 Level-0 product (a .SAFE directory or its zip, or one measurement .dat file) as read_cphd returns
     a CPHD: the echo packets of one polarization (default the first measurement file; 'HH', 'HV', 'VV' or 'VH'
     picks the file), decoded (fastsar.sentinel1: FDBAQ, BAQ or bypass), range compressed with the replica of the
@@ -598,8 +630,11 @@ def read_sentinel1(path, polarization=None, meta=False, height=None, band_margin
     given height, the antenna positions interpolated (Hermite) from the position and velocity records
     sub-commutated in the packets, at the transmit time of each echo (the packet time less RANK pulse intervals).
     pulses: (first, last) packet indices among the echo packets to read a part of the collection. swath: the swath
-    number to keep when the file holds several (default the most frequent). Stripmap (S1 to S6) and wave products;
-    the bursts of IW and EW products need fastsar.burst."""
+    number to keep when the file holds several (default the most frequent). internal_delay: the instrument's
+    internal time delay (s, two way) subtracted from the echoes' delays as ESA's processor subtracts it; default
+    estimated from the product's calibration packets (fastsar.sentinel1.internal_delay, about 0.43 us), 0 none.
+    troposphere: 'model' removes the standard atmosphere's delay (troposphere_delay), default none. Stripmap (S1
+    to S6) and wave products; the bursts of IW and EW products need fastsar.burst."""
     import os
     import zipfile
     from . import raw, sentinel1 as s1
@@ -645,12 +680,24 @@ def read_sentinel1(path, polarization=None, meta=False, height=None, band_margin
     n = int(2 * nq.max())
     t_packet = hdr['time'][echo]
     tx_time = t_packet - rank * pri                     # the echo is of the pulse sent RANK intervals before
-    tau0 = rank * pri + swst + s1.T_SUPPRESSED           # two-way delay of sample 0 after that pulse
     ot, op, ov = s1.orbit_from_packets(hdr)
     orbit = raw.hermite_orbit(ot, op, ov)
     notes = [f'Sentinel-1 Level-0 {base.split("-")[0].upper()} {pol}, swath {swath}, {P} echo packets of {n} samples at {fs / 1e6:.2f} MHz, '
              f'chirp {bw / 1e6:.1f} MHz over {txpl * 1e6:.1f} us, PRI {pri[0] * 1e6:.1f} us, rank {int(rank[0])}; '
              f'{len(ot)} position records at {np.diff(ot).mean():.1f} s']
+    if internal_delay is None:
+        internal_delay, ncal = s1.internal_delay(data, hdr, k)
+        if internal_delay is None:
+            internal_delay = 0.0
+            notes.append('no calibration packets: the internal time delay is not removed')
+        else:
+            notes.append(f'internal time delay {internal_delay * 1e9:.1f} ns from {ncal} calibration packets removed')
+    else:
+        internal_delay = float(internal_delay)
+        notes.append(f'internal time delay {internal_delay * 1e9:.1f} ns removed' if internal_delay else 'no internal time delay removed')
+    # two-way delay of sample 0 after that pulse: the window opens SWST after the transmit event, the decimation
+    # filter's transient is dropped, and the instrument's internal delay makes echoes arrive late
+    tau0 = rank * pri + swst + s1.T_SUPPRESSED - internal_delay
     if np.ptp(nq) > 0:
         notes.append(f'number of samples varies ({2 * nq.min()} to {2 * nq.max()}); shorter packets zero padded')
     if np.ptp(swst) > 1e-9:
@@ -664,6 +711,7 @@ def read_sentinel1(path, polarization=None, meta=False, height=None, band_margin
     srp = raw.zero_doppler_points(tx_pos, tx_vel, r_mid, 'right', height=height)
     rcv_pos, _ = orbit(tx_time + 2.0 * np.linalg.norm(srp - tx_pos, axis=1) / C)
     tau_ref = (np.linalg.norm(tx_pos - srp, axis=1) + np.linalg.norm(rcv_pos - srp, axis=1)) / C
+    tau0 = tau0 - _tropo(troposphere, tx_pos, rcv_pos, srp, notes)
     S = None
     bad = 0
     for p0 in range(0, P, block):

@@ -115,7 +115,9 @@ def form_cphd(cphd, sicd=None, *, mode='auto', backend='auto', window=True, spac
             raise ValueError(f'{n} must be one or two positive lengths in meters, got {v!r}')
     if extent is not None and np.size(extent) != 2:
         raise ValueError(f'extent must be (along track, across track) in meters, got {extent!r}')
-    col, meta = io.read_collection(cphd, channel=channel, meta=True, troposphere=troposphere, height=height, **(reader_options or {}))
+    kw = dict(channel=channel, meta=True, troposphere=troposphere, height=height)
+    kw.update(reader_options or {})
+    col, meta = io.read_collection(cphd, **kw)
     S = col['S']
     P, K = S.shape
     f0, df = float(col['fmin']), float(col['df'])

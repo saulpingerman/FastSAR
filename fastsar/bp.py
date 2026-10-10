@@ -99,12 +99,11 @@ def _delta(d, w, r):
 _CPU_SRC = r'''
 #include <cmath>
 #include <complex>
-#include <omp.h>
+#include "par.hpp"
 extern "C" void bp_points(const float* rre, const float* rim, int P, int nfft, const double* tx, const double* rcv,
                           const double* ref, const double* pts, int N, double inv_dr, double kcyc, double* ore, double* oim) {
   const double two_pi = 6.283185307179586;
-  #pragma omp parallel for schedule(dynamic, 64)
-  for (int n = 0; n < N; ++n) {
+  par::for_dynamic(N, 64, [&](long n) {
     const double x = pts[3*n], y = pts[3*n+1], z = pts[3*n+2];
     double are = 0.0, aim = 0.0;
     for (int p = 0; p < P; ++p) {
@@ -134,7 +133,7 @@ extern "C" void bp_points(const float* rre, const float* rim, int P, int nfft, c
     }
     ore[n] += are;
     oim[n] += aim;
-  }
+  });
 }
 '''
 _cpu_lib = None

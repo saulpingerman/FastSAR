@@ -13,14 +13,15 @@
 //               over the pixel index) and the product register-blocked four output rows at a time; then the
 //               per-pixel quadratic phase correction
 //
-// Build: g++ -O3 -march=native -fopenmp -shared -fPIC ffbp_cpu.cpp -o libffbp_cpu.so (done by ffbp_cpu.py).
+// Build: g++ -O3 -march=native -fopenmp -shared -fPIC ffbp_cpu.cpp -o libffbp_cpu.so (done by ffbp_cpu.py); the
+// parallel loops are par.hpp's (OpenMP, or std::thread where the kernels are built without the OpenMP runtime).
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <algorithm>
 #include <vector>
-#include <omp.h>
+#include "par.hpp"
 
 namespace {
 
@@ -61,14 +62,13 @@ static void rot_fir_k_impl(const float* sre, const float* sim, int Np, int P, in
     const int kw = D * (Ko - 1) + L;                 // window of samples the outputs read: k = D j + r - pl, j < Ko, r < L
     const int kmin = -pl, kmax = kmin + kw;          // [kmin, kmax)
     const int ncv = (Cn + VL - 1) / VL;              // child vectors
-    #pragma omp parallel
-    {
+    par::for_dynamic((long)Np * P, 2, [&](long np_) {
         static thread_local Scratch sc;
         if ((int)sc.zr.size() < kw) { sc.zr.resize(kw); sc.zi.resize(kw); }
         if ((int)sc.yr.size() < Ko) { sc.yr.resize(Ko); sc.yi.resize(Ko); }
-        #pragma omp for schedule(dynamic, 2) collapse(2)
-        for (int n = 0; n < Np; ++n) {
-            for (int p = 0; p < P; ++p) {
+        const int n = (int)(np_ / P), p = (int)(np_ % P);
+        {
+            {
                 const float* xr = sre + ((size_t)n * P + p) * K * XS;
                 const float* xi = sim + ((size_t)n * P + p) * K * XS;
                 for (int cv = 0; cv < ncv; ++cv) {
@@ -147,7 +147,7 @@ static void rot_fir_k_impl(const float* sre, const float* sim, int Np, int P, in
                 }
             }
         }
-    }
+    });
 }
 
 extern "C" {
@@ -171,9 +171,9 @@ void fir_p(const float* yre, const float* yim, int B, int P, int Ko, const float
 {
     const int IC = 16;                                        // output rows per chunk (accumulators stay in L2)
     const int nch = (Po + IC - 1) / IC;
-    #pragma omp parallel for schedule(dynamic, 1) collapse(2)
-    for (int b = 0; b < B; ++b) {
-        for (int ch = 0; ch < nch; ++ch) {
+    par::for_dynamic((long)B * nch, 1, [&](long idx) {
+        const int b = (int)(idx / nch), ch = (int)(idx % nch);
+        {
             const int i0 = ch * IC, i1 = std::min(Po, i0 + IC);
             float* zr0 = zre + ((size_t)b * Po + i0) * Ko;
             float* zi0 = zim + ((size_t)b * Po + i0) * Ko;
@@ -200,7 +200,7 @@ void fir_p(const float* yre, const float* yim, int B, int P, int Ko, const float
                 }
             }
         }
-    }
+    });
 }
 
 // dre, dim [B, Pf, Qf]; ux, uy [B, Pf]; dlx, dly [T] (T = 16 or 32: pixel offsets, linear in the index); ucx, ucy, rc [B].
@@ -218,13 +218,12 @@ void final_tiles(const float* dre, const float* dim, int B, int Pf, int Qf, int 
     const int PC = std::max(1, 24576 / (Qf * T * 4 * 2));     // pulses per chunk: A and B chunks of about 24 KB each per plane
     const int NCmax = PC * Qf;
     const double spx = dlx[1] - dlx[0], spy = dly[1] - dly[0];
-    #pragma omp parallel
-    {
+    par::for_dynamic(B, 4, [&](long b_) {
+        const int b = (int)b_;
         static thread_local std::vector<v16> Ar, Ai, Br, Bi, accr, acci;
         if (Ar.size() < (size_t)NCmax * NH) { Ar.resize((size_t)NCmax * NH); Ai.resize((size_t)NCmax * NH); Br.resize((size_t)NCmax * NH); Bi.resize((size_t)NCmax * NH); }
         if (accr.size() < (size_t)T * NH) { accr.resize((size_t)T * NH); acci.resize((size_t)T * NH); }
-        #pragma omp for schedule(dynamic, 4)
-        for (int b = 0; b < B; ++b) {
+        {
             const float* dr = dre + (size_t)b * Pf * Qf;
             const float* di = dim + (size_t)b * Pf * Qf;
             for (size_t k = 0; k < (size_t)T * NH; ++k) { accr[k] = bcast(0.f); acci[k] = bcast(0.f); }
@@ -355,9 +354,9 @@ void final_tiles(const float* dre, const float* dim, int B, int Pf, int Qf, int 
                 }
             }
         }
-    }
+    });
 }
 
-int ffbp_cpu_threads(void) { return omp_get_max_threads(); }
+int ffbp_cpu_threads(void) { return par::max_threads(); }
 
 }  // extern "C"

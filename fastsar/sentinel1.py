@@ -290,3 +290,49 @@ def chirp(tx_start_frequency, tx_ramp_rate, tx_pulse_length, fs):
     L = int(round(tx_pulse_length * fs))
     t = np.arange(L) / fs
     return np.exp(2j * np.pi * (tx_start_frequency * t + 0.5 * tx_ramp_rate * t ** 2)).astype(np.complex64)
+
+
+CAL_TYPES = {8: 'tx', 9: 'rx', 10: 'epdn', 11: 'ta', 12: 'apdn'}
+
+
+def internal_delay(data, hdr, echo_packet, max_packets=64):
+    """The instrument's internal time delay (s) estimated as ESA's processor does from the calibration packets (Level
+    1 Detailed Algorithm Definition, 4.2.1.4): the correlation peak of each calibration pulse type with the nominal
+    chirp, located to a fraction of a sample by a parabola, the median over the packets of a type, and the five
+    types of the replica reconstruction combined as the replica is (tx, rx and ta less epdn and apdn; the packet data
+    start at the nominal transmit time, so the peak time is the delay). Only calibration packets with the pulse
+    length of the given echo packet, the tx type alone when the others are missing. -> (delay, packets used) or
+    (None, 0)."""
+    k = int(echo_packet)
+    # the calibration pulses of the echoes' pulse length (their start frequency and ramp are those of the mode's first
+    # sub-swath, so each packet's own values build its replica)
+    same = ((hdr['error_flag'] == 0) & (hdr['baq_mode'] == 0) & (hdr['quads'] > 0)
+            & (np.abs(hdr['tx_pulse_length'] - hdr['tx_pulse_length'][k]) < 1e-9))
+    peaks, used = {}, 0
+    for st in CAL_TYPES:
+        sel = np.nonzero(same & (hdr['signal_type'] == st))[0][:max_packets]
+        if sel.size == 0:
+            continue
+        c = int(sel[0])
+        fs = sampling_frequency(hdr['range_decimation'][c])
+        rep = chirp(float(hdr['tx_start_frequency'][c]), float(hdr['tx_ramp_rate'][c]), float(hdr['tx_pulse_length'][c]), fs)
+        z, _ = decode_user_data(data, hdr, sel)
+        n, L = z.shape[1], len(rep)
+        nfft = 1 << int(np.ceil(np.log2(n + L)))
+        X = np.abs(np.fft.ifft(np.fft.fft(z, nfft, axis=1) * np.conj(np.fft.fft(rep, nfft))[None, :], axis=1)[:, :n])
+        t = []
+        for r in range(X.shape[0]):
+            m = int(np.argmax(X[r]))
+            if not 0 < m < n - 1 or X[r, m] < 20 * np.median(X[r]):
+                continue
+            a, b, c = X[r, m - 1], X[r, m], X[r, m + 1]
+            d = 0.5 * (a - c) / (a - 2 * b + c) if (a - 2 * b + c) != 0 else 0.0
+            t.append((m + d) / fs)
+        if t:
+            peaks[st] = float(np.median(t))
+            used += len(t)
+    if all(st in peaks for st in CAL_TYPES):
+        return peaks[8] + peaks[9] + peaks[11] - peaks[10] - peaks[12], used
+    if 8 in peaks:
+        return peaks[8], used
+    return None, 0

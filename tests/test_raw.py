@@ -107,7 +107,7 @@ def test_form_nisar(nisar):
 
 def test_read_collection_dispatch(nisar):
     col, meta = io.read_collection(nisar['path'], channel=0, meta=True, troposphere='model')
-    assert col['S'].shape[0] > 0 and any('not applicable' in n and 'troposphere' in n for n in meta['notes'])
+    assert col['S'].shape[0] > 0 and any('troposphere delay removed' in n for n in meta['notes'])
 
 
 @pytest.fixture(scope='module')

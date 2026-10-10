@@ -31,30 +31,22 @@ def default_flags():
 
 
 def compiler():
-    """The C++ compiler and the OpenMP flags for compiling and linking: $CXX; on macOS clang++ with Homebrew's
-    libomp, else the newest Homebrew GCC (g++-20 down to g++-12) on the PATH. -> (cxx, compile flags, link flags)."""
+    """The C++ compiler and the threading flags for compiling and linking: $CXX with OpenMP; on Linux g++ with
+    OpenMP; on macOS Apple's clang++ with the simd pragmas only (-fopenmp-simd) and no OpenMP runtime, since a second
+    runtime next to the one a wheel such as finufft's bundles deadlocks (par.hpp then runs the loops on std::thread).
+    -> (cxx, compile flags, link flags)."""
     cxx = os.environ.get('CXX')
     if cxx:
         return cxx, ['-fopenmp'], ['-fopenmp']
     if sys.platform != 'darwin':
         return 'g++', ['-fopenmp'], ['-fopenmp']
-    # macOS: Apple's clang with Homebrew's libomp, the OpenMP runtime jaxlib and numpy's wheels already load (a
-    # second runtime in the process, GCC's libgomp, aborts on initialization); a Homebrew GCC only as a fallback
-    prefix = None
-    for brew in ('brew', '/opt/homebrew/bin/brew', '/usr/local/bin/brew'):
-        try:
-            prefix = subprocess.run([brew, '--prefix', 'libomp'], capture_output=True, text=True, timeout=60).stdout.strip()
-            if prefix:
-                break
-        except (OSError, subprocess.SubprocessError):
-            continue
-    if prefix and os.path.isdir(prefix) and shutil.which('clang++'):
-        return 'clang++', ['-Xpreprocessor', '-fopenmp', f'-I{prefix}/include'], [f'-L{prefix}/lib', '-lomp', f'-Wl,-rpath,{prefix}/lib']
+    if shutil.which('clang++'):
+        return 'clang++', ['-fopenmp-simd'], []
     for v in range(20, 11, -1):
         if shutil.which(f'g++-{v}'):
             return f'g++-{v}', ['-fopenmp'], ['-fopenmp']
-    raise RuntimeError("fastsar's cpu backend needs a C++ compiler with OpenMP: on macOS install libomp for Apple's clang "
-                       "(brew install libomp), or set CXX")
+    raise RuntimeError("fastsar's cpu backend needs a C++ compiler: on macOS install the command line tools "
+                       "(xcode-select --install), or set CXX")
 
 
 def _check_gcc(cxx):
@@ -102,7 +94,8 @@ def cache_dir():
 
 def shared_object(name, src, flags):
     """Path of the shared object built from the C++ source text src with the compiler flags (a list), building it
-    if it is not cached. The compiler is $CXX (default g++); OpenMP and -fPIC are added."""
+    if it is not cached. The compiler is $CXX (default g++); the threading flags, the include path of par.hpp and
+    -fPIC are added."""
     if not (sys.platform == 'darwin' or sys.platform.startswith('linux')) or platform.machine() not in MACHINES:
         raise RuntimeError(f"fastsar's cpu backend compiles C++ kernels for Linux and macOS on x86-64 or 64-bit ARM; "
                            f'this is {platform.machine()} {sys.platform}. Use backend="jax" (any device JAX supports) '
@@ -110,7 +103,10 @@ def shared_object(name, src, flags):
     cxx, omp_c, omp_l = compiler()
     if platform.machine() in ('aarch64', 'arm64') and 'g++' in os.path.basename(cxx):
         _check_gcc(cxx)
-    key = '\0'.join([src, cxx, ' '.join(flags), _host_tag()])
+    here = os.path.dirname(os.path.abspath(__file__))
+    with open(os.path.join(here, 'par.hpp')) as fh:
+        par = fh.read()
+    key = '\0'.join([src, par, cxx, ' '.join(flags), _host_tag()])
     tag = hashlib.sha1(key.encode()).hexdigest()[:12]
     d = cache_dir()
     so = os.path.join(d, f'lib{name}_{tag}.so')
@@ -121,7 +117,7 @@ def shared_object(name, src, flags):
     with open(cpp, 'w') as fh:
         fh.write(src)
     try:
-        for cmd in ([cxx] + list(flags) + omp_c + ['-fPIC', '-c', cpp, '-o', obj],
+        for cmd in ([cxx] + list(flags) + omp_c + ['-I' + here, '-fPIC', '-c', cpp, '-o', obj],
                     [cxx, '-shared'] + omp_l + [obj, '-o', tmp]):
             try:
                 subprocess.run(cmd, check=True, capture_output=True, text=True)
