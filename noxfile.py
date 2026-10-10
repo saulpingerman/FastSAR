@@ -12,6 +12,8 @@ test is pyproject.toml's.
 """
 import os
 
+import sys
+
 import nox
 
 nox.needs_version = '>=2025.2.9'
@@ -30,6 +32,10 @@ def _pytest(session, require):
 
 @nox.session(python=PYTHONS)
 def tests(session):
+    if sys.platform == 'darwin':
+        # two copies of LLVM's OpenMP runtime (Homebrew's libomp behind the kernels, the one in finufft's wheel) abort on
+        # the second initialization; the test environment allows the duplicate, a plain install has one copy
+        session.env['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
     """The CPU suite: hardware tests are skipped."""
     session.install('-e', '.', *TEST)
     _pytest(session, 'io')
