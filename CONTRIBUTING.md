@@ -106,9 +106,9 @@ that a missing one raises an `ImportError` naming the extra to install.
 
 1. Run the full suite on a CPU machine, on a machine with an Nvidia GPU (`nox -s cuda`) and on a Cloud TPU VM
    (`nox -s tpu`), and form a few collections that were not used in development.
-2. Set `__version__` in `fastsar/__init__.py`, date the version in `CHANGELOG.md`, and point the pinned links in
-   `README.md` at the new tag (`sed -i 's#/v0.1.0/#/v0.1.1/#g' README.md`); the README is the PyPI page and
-   cannot be changed after upload.
+2. Set `__version__` in `fastsar/__init__.py` and date the version in `CHANGELOG.md`. The README links point at
+   `main` so that they resolve on GitHub between releases and on PyPI, whose copy of the README cannot be changed
+   after upload.
 3. `rm -rf build dist *.egg-info && uv build && uvx twine check dist/*`, then install the wheel in a fresh
    environment with `g++` and run `python examples/chain.py --simulate out` (the `package` job does the same).
 4. Commit, tag annotated (`git tag -a v0.1.1 -m "FastSAR 0.1.1"`), push the tag, upload with `uvx twine upload
