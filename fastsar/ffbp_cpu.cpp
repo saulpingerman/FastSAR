@@ -258,14 +258,16 @@ void fir_p(const float* yre, const float* yim, int B, int P, int Ko, const float
 // out[i][j] = sum_{p,q} d[p,q] exp(-2 pi i (ux_p dlx_i + uy_p dly_j)(a0 + a1 q)), then times exp(2 pi i qc).
 // The tables are built and consumed a few pulses at a time so that they stay in the second-level cache; the
 // accumulators of every output block are carried across the chunks in a small array.
-void final_tiles(const float* dre, const float* dim, int B, int Pf, int Qf, int T, const double* ux, const double* uy,
-                 const double* dlx, const double* dly, double a0, double a1, const double* ucx, const double* ucy,
-                 const double* rc, double fc2, float* ore, float* oim, const float* w0, const float* gx, const float* gyr)
+}  // extern "C"
+
+// NH: the vectors per table row (T / VL): one or two on x86, four or eight with NEON's four lanes
+template <int NH>
+static void final_tiles_impl(const float* dre, const float* dim, int B, int Pf, int Qf, int T, const double* ux, const double* uy,
+                             const double* dlx, const double* dly, double a0, double a1, const double* ucx, const double* ucy,
+                             const double* rc, double fc2, float* ore, float* oim, const float* w0, const float* gx, const float* gyr)
 {
     // w0, gx, gyr [B, Pf] (or null): an aperture weight per subaperture and pixel, w0 + gx dx + gy dy, applied as
     // (w0 + gx dx)(1 + gyr dy) with gyr = gy / w0, the x factor on the data table and the y factor on the other
-    if (T % VL != 0 || T / VL > 8) { std::abort(); }          // the tables are one to eight vectors wide
-    const int NH = T / VL;
     const int PC = std::max(1, 24576 / (Qf * T * 4 * 2));     // pulses per chunk: A and B chunks of about 24 KB each per plane
     const int NCmax = PC * Qf;
     const double spx = dlx[1] - dlx[0], spy = dly[1] - dly[0];
@@ -291,7 +293,7 @@ void final_tiles(const float* dre, const float* dim, int B, int Pf, int Qf, int 
                     v16* Ti = tab == 0 ? Ai.data() : Bi.data();
                     for (int p = pc0; p < pc1; ++p) {
                         const double g = u[(size_t)b * Pf + p];
-                        v16 wr0, wi0, wr1, wi1, cr0, ci0, cr1, ci1;        // phase (w) and step (c = cos, ci = sin) per lane, two halves
+                        v16 wr[NH], wi[NH], cr[NH], ci[NH];        // phase (w) and step (c = cos, ci = sin) per lane, per vector
                         {
                             float r0s, r0c, r1s, r1c;
                             sincos_cyc(-(g * sp * a0), r0s, r0c);
@@ -300,27 +302,20 @@ void final_tiles(const float* dre, const float* dim, int B, int Pf, int Qf, int 
                                 float s0, c0_, s1, c1;
                                 sincos_cyc(-(g * dl[h * VL] * a0), s0, c0_);
                                 sincos_cyc(-(g * dl[h * VL] * a1), s1, c1);
-                                v16 wr, wi, cr, ci;
                                 for (int l = 0; l < VL; ++l) {
-                                    wr[l] = c0_; wi[l] = s0; cr[l] = c1; ci[l] = s1;
+                                    wr[h][l] = c0_; wi[h][l] = s0; cr[h][l] = c1; ci[h][l] = s1;
                                     const float n0 = c0_ * r0c - s0 * r0s; s0 = c0_ * r0s + s0 * r0c; c0_ = n0;
                                     const float n1 = c1 * r1c - s1 * r1s; s1 = c1 * r1s + s1 * r1c; c1 = n1;
                                 }
-                                if (h == 0) { wr0 = wr; wi0 = wi; cr0 = cr; ci0 = ci; } else { wr1 = wr; wi1 = wi; cr1 = cr; ci1 = ci; }
                             }
                         }
-                        v16 lw0 = bcast(1.f), lw1 = bcast(1.f);              // the weight factor per lane
+                        v16 lw[NH];                                            // the weight factor per lane
+                        for (int h = 0; h < NH; ++h) lw[h] = bcast(1.f);
                         if (w0 != nullptr) {
                             const size_t bp = (size_t)b * Pf + p;
-                            for (int l = 0; l < VL; ++l) {
-                                if (tab == 0) {
-                                    lw0[l] = w0[bp] + gx[bp] * (float)dl[l];
-                                    if (NH == 2) lw1[l] = w0[bp] + gx[bp] * (float)dl[VL + l];
-                                } else {
-                                    lw0[l] = 1.f + gyr[bp] * (float)dl[l];
-                                    if (NH == 2) lw1[l] = 1.f + gyr[bp] * (float)dl[VL + l];
-                                }
-                            }
+                            for (int h = 0; h < NH; ++h)
+                                for (int l = 0; l < VL; ++l)
+                                    lw[h][l] = tab == 0 ? w0[bp] + gx[bp] * (float)dl[h * VL + l] : 1.f + gyr[bp] * (float)dl[h * VL + l];
                         }
                         const float* drp = dr + (size_t)p * Qf;
                         const float* dip = di + (size_t)p * Qf;
@@ -329,19 +324,23 @@ void final_tiles(const float* dre, const float* dim, int B, int Pf, int Qf, int 
                             const size_t n = nb + q;
                             if (tab == 0) {
                                 const v16 d_r = bcast(drp[q]), d_i = bcast(dip[q]);
-                                Tr[n * NH] = (d_r * wr0 - d_i * wi0) * lw0;
-                                Ti[n * NH] = (d_r * wi0 + d_i * wr0) * lw0;
-                                if (NH == 2) { Tr[n * NH + 1] = (d_r * wr1 - d_i * wi1) * lw1; Ti[n * NH + 1] = (d_r * wi1 + d_i * wr1) * lw1; }
+                                FASTSAR_UNROLL
+                                for (int h = 0; h < NH; ++h) {
+                                    Tr[n * NH + h] = (d_r * wr[h] - d_i * wi[h]) * lw[h];
+                                    Ti[n * NH + h] = (d_r * wi[h] + d_i * wr[h]) * lw[h];
+                                }
                             } else {
-                                Tr[n * NH] = wr0 * lw0; Ti[n * NH] = wi0 * lw0;
-                                if (NH == 2) { Tr[n * NH + 1] = wr1 * lw1; Ti[n * NH + 1] = wi1 * lw1; }
+                                FASTSAR_UNROLL
+                                for (int h = 0; h < NH; ++h) { Tr[n * NH + h] = wr[h] * lw[h]; Ti[n * NH + h] = wi[h] * lw[h]; }
                             }
-                            v16 nr = wr0 * cr0 - wi0 * ci0; wi0 = wr0 * ci0 + wi0 * cr0; wr0 = nr;
-                            if (NH == 2) { nr = wr1 * cr1 - wi1 * ci1; wi1 = wr1 * ci1 + wi1 * cr1; wr1 = nr; }
+                            FASTSAR_UNROLL
+                            for (int h = 0; h < NH; ++h) {
+                                const v16 nr = wr[h] * cr[h] - wi[h] * ci[h]; wi[h] = wr[h] * ci[h] + wi[h] * cr[h]; wr[h] = nr;
+                            }
                         }
                     }
                 }
-                if (NH <= 2) {
+                if constexpr (NH <= 2) {
                 // the product over this chunk: four rows i at a time, j as NH vectors, accumulators carried in accr/acci
                 const float* Arf = reinterpret_cast<const float*>(Ar.data());
                 const float* Aif = reinterpret_cast<const float*>(Ai.data());
@@ -414,6 +413,21 @@ void final_tiles(const float* dre, const float* dim, int B, int Pf, int Qf, int 
             }
         }
     });
+}
+
+extern "C" {
+
+void final_tiles(const float* dre, const float* dim, int B, int Pf, int Qf, int T, const double* ux, const double* uy,
+                 const double* dlx, const double* dly, double a0, double a1, const double* ucx, const double* ucy,
+                 const double* rc, double fc2, float* ore, float* oim, const float* w0, const float* gx, const float* gyr)
+{
+    switch (T / VL) {                                         // the tables are one to eight vectors wide
+        case 1: final_tiles_impl<1>(dre, dim, B, Pf, Qf, T, ux, uy, dlx, dly, a0, a1, ucx, ucy, rc, fc2, ore, oim, w0, gx, gyr); break;
+        case 2: final_tiles_impl<2>(dre, dim, B, Pf, Qf, T, ux, uy, dlx, dly, a0, a1, ucx, ucy, rc, fc2, ore, oim, w0, gx, gyr); break;
+        case 4: final_tiles_impl<4>(dre, dim, B, Pf, Qf, T, ux, uy, dlx, dly, a0, a1, ucx, ucy, rc, fc2, ore, oim, w0, gx, gyr); break;
+        case 8: final_tiles_impl<8>(dre, dim, B, Pf, Qf, T, ux, uy, dlx, dly, a0, a1, ucx, ucy, rc, fc2, ore, oim, w0, gx, gyr); break;
+        default: std::abort();
+    }
 }
 
 int ffbp_cpu_threads(void) { return par::max_threads(); }
