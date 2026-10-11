@@ -452,7 +452,7 @@ def write_sentinel1(path, col, pos, amp, lat, lon, height=0.0, heading=0.0, spee
     given; internal_delay (s) the instrument's internal delay, which delays the echoes and positions the chirp in the
     cal_packets calibration packets of each type written ahead of the echoes (io.read_sentinel1 estimates it from
     them); the data of each packet are the echo of the pulse sent `rank` intervals earlier (default: as many as the
-    near range spans). The radar looks right. troposphere: the echoes carry the standard atmosphere's delay, which the reader removes by default."""
+    near range spans), and the packet is stamped at the latch time before its own pulse. The radar looks right. troposphere: the echoes carry the standard atmosphere's delay, which the reader removes by default."""
     from . import sentinel1 as s1
     ant_l = np.asarray(col.ant, np.float64)
     ant = to_ecf(ant_l, lat, lon, height, heading)
@@ -521,7 +521,7 @@ def write_sentinel1(path, col, pos, amp, lat, lon, height=0.0, heading=0.0, spee
         h = bytearray(68)
         pdl = 62 + len(user) - 1
         h[0:2] = (0x0800 | 1052).to_bytes(2, 'big'); h[2:4] = (0xC000 | (seq & 0x3FFF)).to_bytes(2, 'big'); h[4:6] = pdl.to_bytes(2, 'big')
-        coarse = int(np.floor(time)); fine = int(round((time - coarse) * 65536)) & 0xFFFF
+        coarse = int(np.floor(time)); fine = int(np.floor((time - coarse) * 65536)) & 0xFFFF     # read back as (code + 0.5) lsb
         h[6:10] = coarse.to_bytes(4, 'big'); h[10:12] = fine.to_bytes(2, 'big'); h[12:16] = (0x352EF853).to_bytes(4, 'big')
         h[16:20] = (1).to_bytes(4, 'big'); h[20] = 11; h[21] = 1 if pol[1] == 'H' else 0
         h[26] = subcom; h[27:29] = words.get(seq, 0).to_bytes(2, 'big') if subcom else b'\0\0'
@@ -538,10 +538,10 @@ def write_sentinel1(path, col, pos, amp, lat, lon, height=0.0, heading=0.0, spee
     ncal = 0
     for st in (8, 9, 10, 11, 12):
         for _ in range(cal_packets):
-            out += packet(0, t[0] - (5 * cal_packets - ncal) * pri, zci, zcq, st, n_cal // 2)
+            out += packet(0, t[0] - (5 * cal_packets - ncal) * pri - s1.T_LATCH, zci, zcq, st, n_cal // 2)
             ncal += 1
     for i in range(P):
-        out += packet(i, t[i], zi[i], zq[i], 0, nq, (i % 64) + 1)
+        out += packet(i, t[i] - s1.T_LATCH, zi[i], zq[i], 0, nq, (i % 64) + 1)      # stamped at the latch before the pulse
     with open(path, 'wb') as fh:
         fh.write(bytes(out))
     return dict(fs=fs, chirp=chirp, n=n, tx=ant, times=t - rank * pri, tau0=tau0)

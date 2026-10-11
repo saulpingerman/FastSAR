@@ -12,10 +12,15 @@ decimation-only data (formats A and B) they are 10 bits. The decoder is C++ (com
 kernels). orbit_from_packets assembles the sub-commutated position and velocity records (one every 64 packets)
 into state vectors on GPS time, the time base of the packet datation.
 
-The radar timing conventions used by io.read_sentinel1: the data of a packet are the echo of the pulse
-transmitted RANK pulse repetition intervals before the packet's own, and sample 0 of the window lies
-RANK * PRI + SWST + 320 / (8 f_ref) after that pulse (the decimation filter's suppressed transient); the chirp
-starts at TXPSF relative to the carrier and sweeps at TXPRR for TXPL.
+The radar timing conventions used by io.read_sentinel1: a packet's time stamp is latched T_LATCH (1.439 us) before
+the rising edge of the packet's own transmit pulse (ESA's Level 1 Detailed Algorithm Definition, 9.23.2); the data
+of the packet are the echo of the pulse transmitted RANK pulse repetition intervals before that one, so the echo's
+transmit time is the stamp plus T_LATCH less RANK * PRI, and sample 0 of the window lies RANK * PRI + SWST +
+320 / (8 f_ref) after that pulse (SWST from the pulse's rising edge to the window's, then the decimation filter's
+suppressed transient); the chirp starts at TXPSF relative to the carrier and sweeps at TXPRR for TXPL. ESA's
+processor treats the stamp as the receive time of the window's first sample unless its instrument timing correction
+is applied (9.23.1, 9.23.2), which puts the azimuth times of a Level-1 product SWST + T_LATCH, about 0.8 m of
+track, before the physical ones.
 """
 import ctypes
 import os
@@ -26,6 +31,7 @@ C = 299792458.0
 F_REF = 37.53472224e6                       # Hz, the instrument's reference frequency
 F_CARRIER = 5.405e9                         # Hz
 T_SUPPRESSED = 320.0 / (8.0 * F_REF)        # s, decimation filter transient at the start of the sampling window
+T_LATCH = 1.439e-6              # the time stamp's latch event before the rising edge of the transmit pulse (DAD 9.23.2)
 DECIMATION = {0: (3, 4), 1: (2, 3), 3: (5, 9), 4: (4, 9), 5: (3, 8), 6: (1, 3), 7: (1, 6), 8: (3, 7), 9: (5, 16), 10: (3, 26), 11: (4, 11)}
 SIGNAL_TYPES = {0: 'echo', 1: 'noise', 8: 'tx cal', 9: 'rx cal', 10: 'epdn cal', 11: 'ta cal', 12: 'apdn cal', 15: 'txh cal iso'}
 
@@ -206,7 +212,7 @@ def parse_packets(data):
                subcom_index=h[:, 26], subcom_word=be(27, 28), packet_count=be(29, 32), pri_count=be(33, 36),
                error_flag=h[:, 37] >> 7, baq_mode=h[:, 37] & 0x1F, baq_block_length=8 * (h[:, 38] + 1), range_decimation=h[:, 40],
                rx_gain_db=-0.5 * h[:, 41], rank=h[:, 49] & 0x1F)
-    out['time'] = out['coarse_time'] + out['fine_time'] / 65536.0
+    out['time'] = out['coarse_time'] + (out['fine_time'] + 0.5) / 65536.0      # the packet protocol's interpretation of the fine time code
     txprr_code, txpsf_code = be(42, 43), be(44, 45)
     s_prr = np.where(txprr_code >> 15 == 1, 1.0, -1.0)
     out['tx_ramp_rate'] = s_prr * (txprr_code & 0x7FFF) * F_REF ** 2 / 2 ** 21

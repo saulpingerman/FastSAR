@@ -175,9 +175,16 @@ datation, radar configuration, the SES and SAS messages, the sample count), the 
 (FDBAQ with the five Huffman trees and the reconstruction tables of the packet protocol, BAQ, or bypass) by a C++
 decoder that was checked bit for bit against a public decoder on a real S1 stripmap file, and each echo range
 compressed with the replica the headers describe (start frequency, ramp rate, length). The antenna positions come from
-the position and velocity records sub-commutated in the packets, interpolated at the transmit time of each echo (the
-packet time less RANK pulse intervals); sample 0 of the window lies RANK times the PRI plus SWST plus the decimation
-filter's suppressed transient after that pulse, less the instrument's internal time delay. A 15 s stripmap file
+the position and velocity records sub-commutated in the packets, interpolated at the transmit time of each echo. A
+packet's time stamp is latched 1.439 us before the rising edge of the packet's own transmit pulse (ESA's Level 1
+Detailed Algorithm Definition, 9.23.2), and the echo is of the pulse sent RANK intervals before that one, so the
+transmit time is the stamp plus the latch offset less RANK times the PRI; sample 0 of the window lies RANK times the
+PRI plus SWST plus the decimation filter's suppressed transient after that pulse, less the instrument's internal time
+delay. ESA's processor takes the stamp as the receive time of the window's first sample unless its instrument timing
+correction is applied (9.23.1, 9.23.2; not applied by default), so the azimuth times annotated in a Level-1 product
+lie SWST plus the latch offset, about 123 us or 0.8 m of track, before the physical ones; Schmidt et al. (2018) found
+an azimuth bias of about 2 m in Level-1 stripmap products of that era and 0.15 m when they processed the Level-0 data
+themselves. The reader keeps the physical convention. A 15 s stripmap file
 (28,065 echo packets of 25,670 samples) decodes at about 35 million samples per second on one core; 1,500 pulses
 read in 4 s and form a 6 by 20 km patch in 8 s on 8 cores. Stripmap (S1 to S6) and wave products; IW and EW bursts
 are not split yet.

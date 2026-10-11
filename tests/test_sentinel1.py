@@ -84,7 +84,7 @@ def test_parse_packets():
     p = packet_bytes(user=bytes(4)) + packet_bytes(coarse=1475594817, signal_type=1, nq=0, user=bytes(4))
     h = s1.parse_packets(p)
     assert len(h['offset']) == 2 and h['apid'][0] == 1052 and h['sync'][0] == 0x352EF853
-    assert h['time'][0] == pytest.approx(1475594816 + 38437 / 65536)
+    assert h['time'][0] == pytest.approx(1475594816 + 38437.5 / 65536)
     assert h['rank'][0] == 9 and h['pri'][0] == pytest.approx(20066 / s1.F_REF) and h['swst'][0] == pytest.approx(4971 / s1.F_REF)
     assert h['tx_ramp_rate'][0] == pytest.approx(2000 * s1.F_REF ** 2 / 2 ** 21)                   # polarity bit 1: positive
     assert h['tx_start_frequency'][0] == pytest.approx(h['tx_ramp_rate'][0] / (4 * s1.F_REF) - 19120 * s1.F_REF / 2 ** 14)

@@ -38,7 +38,12 @@ was published on PyPI.
   estimated from the product's calibration packets (`sentinel1.internal_delay`, about 0.43 us, within 4 ns of
   ESA's annotated value on a 2014 datatake). Compared in the agencies' own radar coordinates, the images agree
   with JPL's RSLC of a NISAR pass to 0.2 m and with ESA's SLC of a Sentinel-1 datatake to 0.5 m in slant range
-  (1.4 and 1.5 m along track), from 100 to 180 m before the delays were removed.
+  (1.4 m and 1.3 to 1.5 m along track), from 100 to 180 m before the delays were removed. The Sentinel-1 packet
+  time stamp is taken as latched 1.439 us before the packet's own transmit pulse (`sentinel1.T_LATCH`, ESA's Level 1
+  Detailed Algorithm Definition 9.23.2) and the fine time code as the protocol interprets it (code plus a half);
+  ESA's processor takes the stamp as the receive time of the window's first sample by default, which puts the
+  annotated azimuth times of its products about 0.8 m of track before the physical ones (the reader placed its
+  image 0.9 to 1.1 m along track from the SLC when it mimicked that convention, as a check).
 - `read_nisar(orbit=)`: JPL's orbit from an RSLC or GCOV product of the pass in place of the L0B's forecast orbit
   (10 m off radially on a September 2026 pass); `read_sentinel1(orbit=)`: an ESA precise or restituted orbit file
   (`sentinel1.orbit_from_file`) in place of the packets' records, which agree with the precise orbit to 1.4 m on a

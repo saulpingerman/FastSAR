@@ -720,7 +720,8 @@ def read_sentinel1(path, polarization=None, meta=False, height=None, band_margin
     transmitted pulse built from the packet headers (start frequency, ramp rate, length), taken to the frequency
     domain over the chirp's band and compensated to each pulse's zero-Doppler ground point at mid swath at the
     given height, the antenna positions interpolated (Hermite) from the position and velocity records
-    sub-commutated in the packets, at the transmit time of each echo (the packet time less RANK pulse intervals).
+    sub-commutated in the packets, at the transmit time of each echo (the packet time, latched 1.439 us before the
+    packet's own transmit pulse, less RANK pulse intervals).
     pulses: (first, last) packet indices among the echo packets to read a part of the collection. swath: the swath
     number to keep when the file holds several (default the most frequent). internal_delay: the instrument's
     internal time delay (s, two way) subtracted from the echoes' delays as ESA's processor subtracts it; default
@@ -774,7 +775,9 @@ def read_sentinel1(path, polarization=None, meta=False, height=None, band_margin
     nq = hdr['quads'][echo]
     n = int(2 * nq.max())
     t_packet = hdr['time'][echo]
-    tx_time = t_packet - rank * pri                     # the echo is of the pulse sent RANK intervals before
+    # the stamp is latched T_LATCH before the packet's own transmit pulse, and the echo is of the pulse sent RANK
+    # intervals before that one (ESA's Level 1 Detailed Algorithm Definition, 9.23.2)
+    tx_time = t_packet + s1.T_LATCH - rank * pri
     if orbit is None:
         ot, op, ov = s1.orbit_from_packets(hdr)
         osrc = 'position records'
