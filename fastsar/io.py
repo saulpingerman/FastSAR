@@ -377,12 +377,72 @@ def _tropo(troposphere, tx, rcv, srp, notes):
     return td
 
 
-NISAR_RANGE_DELAY = {'A': 53.24, 'B': 19.65}      # m, JPL's commonDelay for L-band frequencies A and B (RSLC and GCOV
-                                                   # metadata, calibrationInformation, provisional products of 2026)
+NISAR_RANGE_DELAY = {'A': 57.125, 'B': 19.65}
+# m, JPL's common delay for L-band frequencies A and B as read_nisar subtracts it: the commonDelay of the calibration
+# metadata of RSLC and GCOV products with the sign reversed (the products record the correction added to the ranges).
+# A calibration JPL revises: products processed in August 2026 carry 53.24 m for frequency A, those processed from
+# September 2026 carry 57.125 m. nisar_product(path) reads the values of any RSLC or GCOV file.
+
+
+def nisar_product(path):
+    """Ancillary data of a NISAR level 1 or 2 product (RSLC, GSLC, GCOV; HDF5) for read_nisar: dict(orbit=(time [n],
+    position [n, 3], velocity [n, 3]) (ECF, m, m/s), epoch (the times' reference, 'YYYY-MM-DDThh:mm:ss'), orbit_type
+    ('MOE', 'POE', ...), range_delay ({'A': m, 'B': m}, JPL's common delay per frequency as read_nisar subtracts it),
+    product ('RSLC', ...)). The products carry JPL's medium or precise orbit where an L0B carries a forecast, and the
+    delay calibration of their processing date. Needs h5py."""
+    from . import _deps
+    h5py = _deps.require('h5py')
+    with h5py.File(path, 'r') as f:
+        prods = [k for k in f['science/LSAR'] if k != 'identification' and 'metadata' in f['science/LSAR'][k]]
+        if not prods:
+            raise ValueError(f'{path}: no NISAR product with metadata under science/LSAR')
+        m = f['science/LSAR'][prods[0]]['metadata']
+        orb = m['orbit']
+        out = dict(orbit=(orb['time'][()].astype(np.float64), orb['position'][()].astype(np.float64), orb['velocity'][()].astype(np.float64)),
+                   epoch=_units_epoch(orb['time']), orbit_type=orbit_type(orb), range_delay={}, product=prods[0])
+        cal = m.get('calibrationInformation')
+        if cal is not None:
+            for k in cal:
+                if k.startswith('frequency') and 'commonDelay' in cal[k]:
+                    out['range_delay'][k[-1]] = -float(cal[k]['commonDelay'][()])
+    return out
+
+
+def _units_epoch(ds):
+    """The epoch of an HDF5 time dataset whose units attribute reads 'seconds since <epoch>'."""
+    u = ds.attrs.get('units', b'')
+    u = u.decode() if isinstance(u, bytes) else str(u)
+    return u.replace('seconds since', '').strip()
+
+
+def _epoch_offset(a, b):
+    """Seconds from epoch b to epoch a (ISO date-times): times counted since a, plus the offset, count since b."""
+    a, b = (s.strip().rstrip('Z').replace(' ', 'T') for s in (a, b))
+    if a == b:
+        return 0.0
+    try:
+        return float((np.datetime64(a, 'ns') - np.datetime64(b, 'ns')) / np.timedelta64(1, 's'))
+    except ValueError as e:
+        raise ValueError(f'cannot relate the epochs {a!r} and {b!r}: {e}') from None
+
+
+def _orbit_given(orbit, epoch):
+    """read_nisar's orbit argument -> (time, position, velocity, epoch, orbit type, source)."""
+    if isinstance(orbit, (str, bytes)) or hasattr(orbit, '__fspath__'):
+        prod = nisar_product(orbit)
+        t, p, v = prod['orbit']
+        return t, p, v, prod['epoch'], prod['orbit_type'], f'the {prod["product"]} file'
+    parts = list(orbit)
+    if len(parts) not in (3, 4):
+        raise ValueError('orbit must be the path of an RSLC or GCOV product or (time, position, velocity[, epoch])')
+    t, p, v = (np.asarray(a, np.float64) for a in parts[:3])
+    if t.ndim != 1 or p.shape != (len(t), 3) or v.shape != (len(t), 3):
+        raise ValueError(f'orbit arrays of shapes {t.shape}, {p.shape}, {v.shape}: need [n], [n, 3], [n, 3]')
+    return t, p, v, (str(parts[3]) if len(parts) == 4 else epoch), 'given', 'the orbit argument'
 
 
 def read_nisar(path, frequency=None, polarization=None, meta=False, height=None, band_margin=1.0, block=1024, range_delay=None,
-               troposphere=None):
+               troposphere='model', orbit=None, reference_range=None):
     """A NISAR L0B RRSD granule (HDF5) as read_cphd returns a CPHD: dict(S, ant, fmin, df) with the raw echoes of one
     frequency ('A' or 'B', default the file's first) and polarization ('HH', 'HV', 'VH', 'VV', default the first)
     range compressed with the file's chirp replica and taken to the frequency domain (fastsar.raw), compensated to
@@ -393,9 +453,15 @@ def read_nisar(path, frequency=None, polarization=None, meta=False, height=None,
     image_area (the swath's corners, local frame) and refpt. Transmit gaps (the file's valid-sample intervals) are
     zeroed; the per-receiver calibration (caltone, attenuation, TRM phases) is not applied. range_delay: the
     instrument's range delay in meters, subtracted from the file's slant ranges as JPL's processors subtract their
-    calibrated common delay (NISAR_RANGE_DELAY by frequency, 53.24 m for A, is the default; 0 removes none).
-    troposphere: 'model' removes the standard atmosphere's delay (troposphere_delay), default none. Needs h5py
-    (pip install "fastsar[raw]")."""
+    calibrated common delay: a number, the path of an RSLC or GCOV product to take the value from (nisar_product),
+    or by default NISAR_RANGE_DELAY for the frequency (57.125 m for A); 0 removes none. troposphere: 'model' (the
+    default, as JPL's processor) removes the standard atmosphere's delay (troposphere_delay); None keeps it.
+    orbit: state vectors in place of the L0B's, which are a forecast (10 m off radially on a September 2026 pass):
+    the path of an RSLC or GCOV product of the pass (JPL's medium or precise orbit), or (time, position, velocity[,
+    epoch]) in ECF with the times in seconds since the epoch ('YYYY-MM-DDThh:mm:ss', default the L0B's).
+    reference_range: the slant range (m) of the zero-Doppler reference points, default mid swath; the receiver
+    positions are taken at the reference points' echo times, which displaces targets along track by v (r -
+    reference) / c, 2.5 m per 100 km of range from the reference. Needs h5py (pip install "fastsar[raw]")."""
     from . import _deps, raw
     h5py = _deps.require('h5py')
     f = h5py.File(path, 'r')
@@ -435,39 +501,50 @@ def read_nisar(path, frequency=None, polarization=None, meta=False, height=None,
         nsub = int(g['numberOfSubSwaths'][()]) if 'numberOfSubSwaths' in g else 1
         valid = [g[f'validSamplesSubSwath{k}'][()] for k in range(1, nsub + 1) if f'validSamplesSubSwath{k}' in g]
         orb = f['science/LSAR/RRSD/lowRateTelemetry/orbit']
-        ot = orb['time'][()].astype(np.float64)
-        oepoch = orb['time'].attrs.get('units', b'')
-        oepoch = (oepoch.decode() if isinstance(oepoch, bytes) else str(oepoch)).replace('seconds since ', '')
-        if oepoch.strip() != epoch.strip():
-            raise ValueError(f'orbit epoch {oepoch!r} differs from the pulse time epoch {epoch!r}')
-        orbit = raw.hermite_orbit(ot, orb['position'][()], orb['velocity'][()])
+        ot, op, ov = orb['time'][()].astype(np.float64), orb['position'][()], orb['velocity'][()]
+        oepoch, otype, osrc = _units_epoch(orb['time']), orbit_type(orb), 'the file'
+        if orbit is not None:
+            ot, op, ov, oepoch, otype, osrc = _orbit_given(orbit, oepoch)
+        ot = ot + _epoch_offset(oepoch, epoch)
+        if ut.min() < ot[0] or ut.max() > ot[-1]:
+            raise ValueError(f'the orbit from {osrc} spans {ot[0]:.1f} to {ot[-1]:.1f} s, the pulses {ut.min():.1f} to {ut.max():.1f} s')
+        ephem = raw.hermite_orbit(ot, op, ov)
         side = ident['lookDirection'][()]
         side = (side.decode() if isinstance(side, bytes) else str(side)).lower()
         core = ident['granuleId'][()] if 'granuleId' in ident else b''
         core = core.decode() if isinstance(core, bytes) else str(core)
         notes = [f'NISAR L0B frequency {frequency}, {pol}, {P} pulses of {n} samples at {fs / 1e6:.1f} MHz, band '
-                 f'{bw / 1e6:.0f} MHz at {fc / 1e9:.4f} GHz, {side}-looking; orbit {orbit_type(orb)} with {len(ot)} state vectors']
+                 f'{bw / 1e6:.0f} MHz at {fc / 1e9:.4f} GHz, {side}-looking; orbit {otype} with {len(ot)} state vectors'
+                 + (f' from {osrc}' if orbit is not None else '')]
         if nsub > 1:
             notes.append(f'{nsub} sub-swaths: samples in the transmit gaps zeroed')
         # the instrument's range delay: the file's slant ranges count from the transmit event; the echo of a point at
         # range r arrives as if from r + delay, and JPL's processors subtract the calibrated delay
+        dsrc = ''
         if range_delay is None:
             range_delay = NISAR_RANGE_DELAY.get(frequency, 0.0)
+        elif isinstance(range_delay, (str, bytes)) or hasattr(range_delay, '__fspath__'):
+            prod = nisar_product(range_delay)
+            if frequency not in prod['range_delay']:
+                raise ValueError(f'{range_delay}: no common delay for frequency {frequency} in its calibration metadata')
+            dsrc, range_delay = f' (the {prod["product"]} file)', prod['range_delay'][frequency]
         range_delay = float(range_delay)
         if range_delay:
             sr = sr - range_delay
-            notes.append(f'instrument range delay of {range_delay:.2f} m removed')
+            notes.append(f'instrument range delay of {range_delay:.3f} m removed{dsrc}')
         else:
             notes.append('no instrument range delay removed')
         # geometry: transmitter at the pulse time, the zero-Doppler point at mid swath, the receiver at the echo time
-        tx_pos, tx_vel = orbit(ut)
+        tx_pos, tx_vel = ephem(ut)
         # the last chirp length of the window holds partial correlations: the far edge of the imaged swath is before it
         n_far = max(1, n - len(chirp))
         r_far = sr[n_far - 1]
-        r_mid = 0.5 * (sr[0] + r_far)
+        r_mid = 0.5 * (sr[0] + r_far) if reference_range is None else float(reference_range)
+        if reference_range is not None:
+            notes.append(f'zero-Doppler reference points at {r_mid / 1e3:.1f} km slant range')
         height = 0.0 if height is None else float(height)
         srp = raw.zero_doppler_points(tx_pos, tx_vel, r_mid, side, height=height)
-        rcv_pos, _ = orbit(ut + 2.0 * np.linalg.norm(srp - tx_pos, axis=1) / C)
+        rcv_pos, _ = ephem(ut + 2.0 * np.linalg.norm(srp - tx_pos, axis=1) / C)
         tau_ref = (np.linalg.norm(tx_pos - srp, axis=1) + np.linalg.norm(rcv_pos - srp, axis=1)) / C
         tau0 = np.broadcast_to(2.0 * sr[0] / C - _tropo(troposphere, tx_pos, rcv_pos, srp, notes), (P,))
         S = None
@@ -497,7 +574,7 @@ def read_nisar(path, frequency=None, polarization=None, meta=False, height=None,
             S, (tx_pos, rcv_pos, srp, tau_ref) = raw.resample_pulses(S, ut, uu, (tx_pos, rcv_pos, srp, tau_ref))
             notes.append(f'pulse timing dithered ({dt.min() * 1e6:.0f} to {dt.max() * 1e6:.0f} us): history resampled to uniform pulse times')
             ut = uu
-            tx_vel = orbit(ut)[1]
+            tx_vel = ephem(ut)[1]
         # the swath's corners: near and far range at zero Doppler on the first and last pulses
         near_far = [raw.zero_doppler_points(tx_pos[[0, -1]], tx_vel[[0, -1]], r, side, height=height) for r in (sr[0], r_far)]
         corners = np.stack([near_far[0][0], near_far[1][0], near_far[1][1], near_far[0][1]])
@@ -516,7 +593,7 @@ def read_nisar(path, frequency=None, polarization=None, meta=False, height=None,
         f.close()
 
 
-def read_palsar(path, polarization=None, meta=False, height=None, band_margin=1.0, block=512, troposphere=None):
+def read_palsar(path, polarization=None, meta=False, height=None, band_margin=1.0, block=512, troposphere='model', reference_range=None):
     """An ALOS PALSAR level 1.0 product (raw signal data in CEOS format: a directory or zip holding the LED- leader
     and IMG- image files, or one IMG- file beside its leader) as read_cphd returns a CPHD: the 8-bit I and Q samples
     of one polarization (default the first image file), DC bias removed, range compressed with a linear FM replica
@@ -600,7 +677,9 @@ def read_palsar(path, polarization=None, meta=False, height=None, band_margin=1.
         notes.append(f'PRF changes within the scene ({fields["prf"].min():.1f} to {fields["prf"].max():.1f} Hz)')
     tx_pos, tx_vel = orbit(ut)
     n_far = max(1, n - L)
-    r_mid = sr0 + 0.5 * n_far * dr
+    r_mid = sr0 + 0.5 * n_far * dr if reference_range is None else float(reference_range)
+    if reference_range is not None:
+        notes.append(f'zero-Doppler reference points at {r_mid / 1e3:.1f} km slant range')
     srp = raw.zero_doppler_points(tx_pos, tx_vel, r_mid, 'right', height=height)
     rcv_pos, _ = orbit(ut + 2.0 * np.linalg.norm(srp - tx_pos, axis=1) / C)
     tau_ref = (np.linalg.norm(tx_pos - srp, axis=1) + np.linalg.norm(rcv_pos - srp, axis=1)) / C
@@ -634,7 +713,7 @@ def read_palsar(path, polarization=None, meta=False, height=None, band_margin=1.
 
 
 def read_sentinel1(path, polarization=None, meta=False, height=None, band_margin=1.0, block=512, pulses=None, swath=None,
-                   internal_delay=None, troposphere=None):
+                   internal_delay=None, troposphere='model', reference_range=None, orbit=None):
     """A Sentinel-1 Level-0 product (a .SAFE directory or its zip, or one measurement .dat file) as read_cphd returns
     a CPHD: the echo packets of one polarization (default the first measurement file; 'HH', 'HV', 'VV' or 'VH'
     picks the file), decoded (fastsar.sentinel1: FDBAQ, BAQ or bypass), range compressed with the replica of the
@@ -646,8 +725,11 @@ def read_sentinel1(path, polarization=None, meta=False, height=None, band_margin
     number to keep when the file holds several (default the most frequent). internal_delay: the instrument's
     internal time delay (s, two way) subtracted from the echoes' delays as ESA's processor subtracts it; default
     estimated from the product's calibration packets (fastsar.sentinel1.internal_delay, about 0.43 us), 0 none.
-    troposphere: 'model' removes the standard atmosphere's delay (troposphere_delay), default none. Stripmap (S1
-    to S6) and wave products; the bursts of IW and EW products need fastsar.burst."""
+    troposphere: 'model' (default) removes the standard atmosphere's delay (troposphere_delay), None keeps it (ESA's
+    products do). reference_range: as read_nisar. orbit: state vectors in place of the packets' own records (which
+    agree with ESA's precise orbit to 1.4 m on a 2014 datatake): the path of an ESA orbit file (AUX_POEORB or
+    AUX_RESORB .EOF, fastsar.sentinel1.orbit_from_file) or (time, position, velocity) in GPS seconds and ECEF.
+    Stripmap (S1 to S6) and wave products; the bursts of IW and EW products need fastsar.burst."""
     import os
     import zipfile
     from . import raw, sentinel1 as s1
@@ -693,11 +775,21 @@ def read_sentinel1(path, polarization=None, meta=False, height=None, band_margin
     n = int(2 * nq.max())
     t_packet = hdr['time'][echo]
     tx_time = t_packet - rank * pri                     # the echo is of the pulse sent RANK intervals before
-    ot, op, ov = s1.orbit_from_packets(hdr)
-    orbit = raw.hermite_orbit(ot, op, ov)
+    if orbit is None:
+        ot, op, ov = s1.orbit_from_packets(hdr)
+        osrc = 'position records'
+    elif isinstance(orbit, (str, bytes)) or hasattr(orbit, '__fspath__'):
+        ot, op, ov = s1.orbit_from_file(orbit)
+        osrc = 'state vectors of the orbit file'
+    else:
+        ot, op, ov = (np.asarray(a, np.float64) for a in orbit)
+        osrc = 'state vectors given'
+    if orbit is not None and (tx_time.min() < ot[0] - np.median(np.diff(ot)) or tx_time.max() > ot[-1] + np.median(np.diff(ot))):
+        raise ValueError(f'the orbit given spans GPS seconds {ot[0]:.1f} to {ot[-1]:.1f}, the pulses {tx_time.min():.1f} to {tx_time.max():.1f}')
+    ephem = raw.hermite_orbit(ot, op, ov)
     notes = [f'Sentinel-1 Level-0 {base.split("-")[0].upper()} {pol}, swath {swath}, {P} echo packets of {n} samples at {fs / 1e6:.2f} MHz, '
              f'chirp {bw / 1e6:.1f} MHz over {txpl * 1e6:.1f} us, PRI {pri[0] * 1e6:.1f} us, rank {int(rank[0])}; '
-             f'{len(ot)} position records at {np.diff(ot).mean():.1f} s']
+             f'{len(ot)} {osrc} at {np.diff(ot).mean():.1f} s']
     if internal_delay is None:
         internal_delay, ncal = s1.internal_delay(data, hdr, k)
         if internal_delay is None:
@@ -716,13 +808,15 @@ def read_sentinel1(path, polarization=None, meta=False, height=None, band_margin
     if np.ptp(swst) > 1e-9:
         notes.append(f'sampling window start varies by {np.ptp(swst) * 1e6:.2f} us')
     height = 0.0 if height is None else float(height)
-    tx_pos, tx_vel = orbit(tx_time)
+    tx_pos, tx_vel = ephem(tx_time)
     dr = C / (2.0 * fs)
     n_far = max(1, n - len(chirp))
     r0 = C * tau0 / 2.0
-    r_mid = r0 + 0.5 * n_far * dr
+    r_mid = r0 + 0.5 * n_far * dr if reference_range is None else float(reference_range)
+    if reference_range is not None:
+        notes.append(f'zero-Doppler reference points at {r_mid / 1e3:.1f} km slant range')
     srp = raw.zero_doppler_points(tx_pos, tx_vel, r_mid, 'right', height=height)
-    rcv_pos, _ = orbit(tx_time + 2.0 * np.linalg.norm(srp - tx_pos, axis=1) / C)
+    rcv_pos, _ = ephem(tx_time + 2.0 * np.linalg.norm(srp - tx_pos, axis=1) / C)
     tau_ref = (np.linalg.norm(tx_pos - srp, axis=1) + np.linalg.norm(rcv_pos - srp, axis=1)) / C
     tau0 = tau0 - _tropo(troposphere, tx_pos, rcv_pos, srp, notes)
     S = None

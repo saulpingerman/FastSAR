@@ -132,12 +132,29 @@ pulse times (cubic splines across pulses, the positions and reference delays wit
 which restored -60 dB. Exact backprojection needs none of this.
 
 The file's slant ranges count from the transmit event, and the echoes arrive late by the instrument's delay, which
-JPL's processors subtract as a calibration constant (`commonDelay` in the metadata of RSLC and GCOV products: 53.24 m
-for frequency A and 19.65 m for B in the provisional products of 2026). `read_nisar(range_delay=)` subtracts it,
-by default these values (`io.NISAR_RANGE_DELAY`); 0 leaves the ranges as the file has them. On a Wisconsin pass of
-November 2025, a 6 km square formed from the L0B fell 98 m too far from the radar against Sentinel-2 before the
-correction and within 20 m of JPL's GCOV of the same pass after it (10 m grids; the troposphere, about 3 m in slant
-range at this incidence, is removed by `troposphere='model'`).
+JPL's processor subtracts as a calibration constant: `commonDelay` in the calibration metadata of RSLC and GCOV
+products, recorded with the correction's sign, -57.125 m for frequency A and -19.65 m for B in products processed
+from September 2026 (products processed in August 2026 carry -53.24 m for A; the value is JPL's to revise).
+`read_nisar(range_delay=)` subtracts it: a number, the path of an RSLC or GCOV product to take the value from
+(`io.nisar_product` reads it, with the product's orbit), by default `io.NISAR_RANGE_DELAY`; 0 leaves the ranges as
+the file has them. The L0B's own orbit is a forecast (`orbitType` FOE), 10 m off radially on a September 2026 pass,
+which moves an image 14 m in ground range; `read_nisar(orbit=)` takes JPL's medium or precise orbit from an RSLC or
+GCOV product of the pass instead (or state vectors given). The standard atmosphere's delay is removed by default
+(`troposphere='model'`; JPL's processor applies a dry troposphere model); `troposphere=None` keeps it.
+
+Checked against the surveyed corner reflectors of JPL's Rosamond calibration site (eleven 2.4 m trihedrals facing
+the pass) on NISAR's descending track 13 of 2026-09-19, each reflector imaged by exact backprojection on a 1 m
+grid at its surveyed position: with the L0B's orbit, the 53.24 m delay and no troposphere correction the
+reflectors fell 1.8 m along track and 30.6 m across track from the survey, away from the radar; with the 57.125 m
+delay 19.9 m; with JPL's orbit from the RSLC of the pass 10.2 m; with the troposphere model 5.7 m (the defaults,
+given the orbit; the spread over the reflectors is 0.1 m). JPL's own RSLC of the pass places the same reflectors
+3.8 m beyond their geometric slant range, 6 m in ground range, which is the atmosphere its processor does not
+model, the L-band ionosphere mostly: the two images agree to 0.2 m in slant range. The along-track remainder is
+the receiver's position: the readers take it at the echo time of each pulse's reference point at mid swath, so a
+target at range r sits v (r - r_mid) / c along track from its true position, 2.5 m per 100 km of range from the
+reference (0.7 m at the reflectors' range with `reference_range=938e3`, 1.4 m from mid swath, 2.9 m with the
+reference 100 km away); JPL's processor evaluates the delay per pixel from the transmit state and has no such
+term.
 
 ## ALOS PALSAR level 1.0
 
@@ -170,7 +187,17 @@ packets of each datatake and annotates in Level-1 products as `internalTimeDelay
 the same estimate from the Level-0 file: the correlation peak of each calibration pulse type with the nominal chirp,
 the tx, rx and ta positions less epdn and apdn as the replica reconstruction combines them (Level 1 Detailed
 Algorithm Definition, 4.2.1.4). On a 2014 San Francisco datatake it gives 429.7 ns where ESA annotated 433.2 ns;
-`read_sentinel1(internal_delay=)` takes a value in seconds instead, 0 for none. A 6 km square over the Santa Rosa
-plain formed from the Level-0 file then lies within 20 m of ESA's GRD of the same datatake on the GRD's own
-reference surface (ESA's GRD is projected at one height per scene, so a comparison in terrain must use that height,
-not a DEM), from 185 m before the correction.
+`read_sentinel1(internal_delay=)` takes a value in seconds instead, 0 for none. The packets' position records agree
+with ESA's precise orbit to 1.4 m on that datatake; `read_sentinel1(orbit=)` takes an ESA orbit file (AUX_POEORB or
+AUX_RESORB, `sentinel1.orbit_from_file`) or state vectors instead. The standard atmosphere's delay is removed by
+default (`troposphere=None` keeps it, as ESA's products do).
+
+Checked against ESA's SLC of the same datatake in the SLC's own coordinates (each SLC pixel's zero-Doppler time and
+slant range mapped to a ground point through ESA's annotation, our image formed on those points by exact
+backprojection, the two amplitude images cross-correlated): on two 1024 by 1024 patches at 23 and 25 degrees of
+incidence our image sits 0.5 m beyond ESA's in slant range (ESA removes an internal delay 3.5 ns longer than our
+estimate, 0.5 m) and 1.5 m behind it along track. ESA's GRD, compared the same way through its slant-to-ground
+polynomials, agrees to 1.6 m in slant range and 7 m along track at its 10 m posting. That SLC's annotated state
+vectors lie 450 m from the precise orbit (50 ms along track); the comparison maps through the annotation and removes
+the annotated orbit's departure from the precise one, and a check that geocodes against such a product must do the
+same.

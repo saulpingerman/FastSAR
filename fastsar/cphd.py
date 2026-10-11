@@ -96,7 +96,8 @@ def form_cphd(cphd, sicd=None, *, mode='auto', backend='auto', window=True, spac
     CPHD's image area reference point; a scatterer at another height appears displaced in range). patch:
     mosaic patch size in pixels. info: a list that receives one dict per mosaic patch. autofocus: phase gradient
     autofocus (fastsar.autofocus.autofocus, two rounds; spotlight only), which forms the image three times.
-    troposphere: remove the per-pulse troposphere delay the file gives (io.read_cphd; default: when nonzero);
+    troposphere: remove the per-pulse troposphere delay the file gives (io.read_cphd; default: when nonzero; a raw
+    collection's readers remove the standard atmosphere's by default, None keeps it);
         'model' removes a standard-atmosphere delay instead, for files that give none (ICEYE).
     reader_options: a dict of further keyword arguments for the reader of this file type (io.read_collection), such as
         pulses=(first, last) or polarization for the raw-data readers.
@@ -115,7 +116,9 @@ def form_cphd(cphd, sicd=None, *, mode='auto', backend='auto', window=True, spac
             raise ValueError(f'{n} must be one or two positive lengths in meters, got {v!r}')
     if extent is not None and np.size(extent) != 2:
         raise ValueError(f'extent must be (along track, across track) in meters, got {extent!r}')
-    kw = dict(channel=channel, meta=True, troposphere=troposphere, height=height)
+    kw = dict(channel=channel, meta=True, height=height)
+    if troposphere is not None:                   # else each reader's default: the file's delay (CPHD), the model (raw)
+        kw['troposphere'] = troposphere
     kw.update(reader_options or {})
     col, meta = io.read_collection(cphd, **kw)
     S = col['S']

@@ -220,12 +220,13 @@ def write_cphd(path, col, S, lat, lon, height=0.0, heading=0.0, speed=200.0, srp
 
 
 
-def raw_echoes(col, pos, amp, fs, chirp, r_near, n, lat, lon, height=0.0, heading=0.0, vel=None):
+def raw_echoes(col, pos, amp, fs, chirp, r_near, n, lat, lon, height=0.0, heading=0.0, vel=None, troposphere=False):
     """Baseband raw echo lines [Np, n] (complex64) of scatterers pos [N, 3] (simulator frame) with amplitudes amp
     [N], for a collection placed by to_ecf: the receive window starts at the slant range r_near (m) and holds n
     samples at the rate fs (Hz); each echo is the chirp [L] (baseband replica at fs) delayed by the two-way time
     and carrying the carrier phase exp(-j 2 pi fc tau) with fc the collection's center frequency. With vel [Np, 3]
-    (ECF, m/s) the receiver has moved on by the echo's travel time, as a satellite does. The sum is exact (direct
+    (ECF, m/s) the receiver has moved on by the echo's travel time, as a satellite does. troposphere: the echoes also
+    carry the standard atmosphere's delay (io.troposphere_delay), as real ones do. The sum is exact (direct
     O(Np N L))."""
     ant = to_ecf(np.asarray(col.ant, np.float64), lat, lon, height, heading)
     pts = to_ecf(np.asarray(pos, np.float64), lat, lon, height, heading)
@@ -240,6 +241,10 @@ def raw_echoes(col, pos, amp, fs, chirp, r_near, n, lat, lon, height=0.0, headin
         tau = 2.0 * np.linalg.norm(pts - a, axis=1) / C
         if vel is not None:                     # the receiver at the echo's arrival: one refinement of the delay
             tau = (np.linalg.norm(pts - a, axis=1) + np.linalg.norm(pts - (a[None] + vel[i][None] * tau[:, None]), axis=1)) / C
+        if troposphere:
+            from .io import troposphere_delay
+            rcv = a[None] + (vel[i][None] if vel is not None else 0.0) * tau[:, None]
+            tau = tau + troposphere_delay(np.repeat(a[None], len(pts), 0), rcv, pts)
         line = np.zeros(n, np.complex128)
         for d, A in zip(tau, np.asarray(amp)):
             m = (d - tau0) * fs                            # fractional start sample of this echo
@@ -255,7 +260,7 @@ def raw_echoes(col, pos, amp, fs, chirp, r_near, n, lat, lon, height=0.0, headin
 
 def write_nisar(path, col, pos, amp, lat, lon, height=0.0, heading=0.0, speed=7500.0, bandwidth=None, fs=None,
                 chirp_duration=10e-6, r_margin=200.0, pol='HH', frequency='A', epoch='2026-01-01T00:00:00', range_delay=None,
-                dither=0.0):
+                dither=0.0, troposphere=True):
     """Write a NISAR L0B RRSD look-alike (HDF5) of scatterers pos [N, 3] (simulator frame) with amplitudes amp:
     the raw echoes of a linear-FM chirp (bandwidth default the collection's, sampled at fs, default 1.2 times the
     bandwidth) in a receive window from r_margin m before the nearest scatterer to r_margin m past the farthest,
@@ -264,7 +269,8 @@ def write_nisar(path, col, pos, amp, lat, lon, height=0.0, heading=0.0, speed=75
     range_delay: the instrument's range delay (m, default io.NISAR_RANGE_DELAY for the frequency): the echoes
     arrive late by it, so each sample's slant range labels a target that far nearer. dither: the pulse timing varied
     at random by up to this fraction of the interval (NISAR dithers its PRI), the antenna positions following the
-    times along the track. Needs h5py."""
+    times along the track. troposphere: the echoes carry the standard atmosphere's delay, which the reader removes
+    by default. Needs h5py."""
     _deps.require('h5py')
     import h5py
     ant_l = np.asarray(col.ant, np.float64)
@@ -295,7 +301,7 @@ def write_nisar(path, col, pos, amp, lat, lon, height=0.0, heading=0.0, speed=75
         t = tj
         col = Collect(col.fmin, col.df, col.K, ant_l, col.res)
     vel = np.gradient(ant, t, axis=0)
-    z = raw_echoes(col, pos, amp, fs, chirp, r_near - delay, n, lat, lon, height, heading, vel=vel)
+    z = raw_echoes(col, pos, amp, fs, chirp, r_near - delay, n, lat, lon, height, heading, vel=vel, troposphere=troposphere)
     # nine state vectors on the straight track, one second apart around the aperture
     ts = np.linspace(t[0] - 4.0, t[-1] + 4.0, 9)
     v0 = vel[P // 2]
@@ -341,12 +347,12 @@ def write_nisar(path, col, pos, amp, lat, lon, height=0.0, heading=0.0, speed=75
 
 
 def write_palsar(directory, col, pos, amp, lat, lon, height=0.0, heading=0.0, speed=7500.0, bandwidth=None, fs=None,
-                 chirp_duration=27e-6, r_margin=200.0, pol='HH', scene_id='SIMULATED'):
+                 chirp_duration=27e-6, r_margin=200.0, pol='HH', scene_id='SIMULATED', troposphere=True):
     """Write an ALOS PALSAR level 1.0 look-alike (CEOS: LED- leader and IMG- image files in the directory) of
     scatterers pos [N, 3] (simulator frame): the raw echoes of a linear FM chirp (bandwidth default the
     collection's; sampled at fs, default 1.2 times the bandwidth; negative chirp rate as PALSAR's), 8-bit I and Q
     with a DC bias of 16; the per-line prefix fields (time, PRF, slant range to the first sample) and the leader's
-    data set summary and platform position records that io.read_palsar reads. The radar looks right (to_ecf)."""
+    data set summary and platform position records that io.read_palsar reads. The radar looks right (to_ecf). troposphere: the echoes carry the standard atmosphere's delay, which the reader removes by default."""
     import datetime
     import os
     ant_l = np.asarray(col.ant, np.float64)
@@ -365,7 +371,7 @@ def write_palsar(directory, col, pos, amp, lat, lon, height=0.0, heading=0.0, sp
     n = int(np.ceil(2.0 * (r.max() + r_margin - r_near) / C * fs)) + L
     t = 1.0 + np.cumsum(np.r_[0.0, np.linalg.norm(np.diff(ant_l, axis=0), axis=1)]) / speed
     vel = np.gradient(ant, t, axis=0)
-    z = raw_echoes(col, pos, amp, fs, chirp, r_near, n, lat, lon, height, heading, vel=vel)
+    z = raw_echoes(col, pos, amp, fs, chirp, r_near, n, lat, lon, height, heading, vel=vel, troposphere=troposphere)
     scale = 15.0 / max(np.abs(z.real).max(), np.abs(z.imag).max(), 1e-30)
     iq = np.empty((P, n, 2), np.uint8)
     iq[:, :, 0] = np.clip(np.round(z.real * scale) + 16, 0, 255)
@@ -436,7 +442,7 @@ def write_palsar(directory, col, pos, amp, lat, lon, height=0.0, heading=0.0, sp
 
 def write_sentinel1(path, col, pos, amp, lat, lon, height=0.0, heading=0.0, speed=7500.0, bandwidth=None, range_decimation=0,
                     chirp_duration=20e-6, r_margin=200.0, rank=None, pol='HH', swath=1, gps_start=1.4e9, internal_delay=433e-9,
-                    cal_packets=4):
+                    cal_packets=4, troposphere=True):
     """Write a Sentinel-1 Level-0 measurement file look-alike of scatterers pos [N, 3] (simulator frame): one
     space packet per pulse with the primary and secondary headers io.read_sentinel1 reads (datation, radar
     configuration with the chirp encoded as start frequency, ramp rate and length, rank, PRI, SWST, SWL, SES
@@ -446,7 +452,7 @@ def write_sentinel1(path, col, pos, amp, lat, lon, height=0.0, heading=0.0, spee
     given; internal_delay (s) the instrument's internal delay, which delays the echoes and positions the chirp in the
     cal_packets calibration packets of each type written ahead of the echoes (io.read_sentinel1 estimates it from
     them); the data of each packet are the echo of the pulse sent `rank` intervals earlier (default: as many as the
-    near range spans). The radar looks right."""
+    near range spans). The radar looks right. troposphere: the echoes carry the standard atmosphere's delay, which the reader removes by default."""
     from . import sentinel1 as s1
     ant_l = np.asarray(col.ant, np.float64)
     ant = to_ecf(ant_l, lat, lon, height, heading)
@@ -485,7 +491,7 @@ def write_sentinel1(path, col, pos, amp, lat, lon, height=0.0, heading=0.0, spee
     nq = n // 2
     # the instrument's internal delay: echoes arrive late by it, and the calibration packets (the chirp through the
     # internal paths, the packet data starting at the nominal transmit time) show it as the chirp's position
-    z = raw_echoes(col, pos, amp, fs, chirp, C * (tau0 - internal_delay) / 2.0, n, lat, lon, height, heading, vel=vel)
+    z = raw_echoes(col, pos, amp, fs, chirp, C * (tau0 - internal_delay) / 2.0, n, lat, lon, height, heading, vel=vel, troposphere=troposphere)
     scale = 400.0 / max(np.abs(z.real).max(), np.abs(z.imag).max(), 1e-30)
     zi = np.clip(np.round(z.real * scale), -511, 511).astype(int); zq = np.clip(np.round(z.imag * scale), -511, 511).astype(int)
     swl_code = int(round(n / fs * s1.F_REF))

@@ -261,6 +261,29 @@ def orbit_from_packets(hdr):
     return t[keep], np.stack([r[1] for r in recs])[keep], np.stack([r[2] for r in recs])[keep]
 
 
+def orbit_from_file(path):
+    """The state vectors of an ESA Sentinel-1 orbit file (AUX_POEORB precise or AUX_RESORB restituted, the .EOF XML):
+    (times [n] GPS seconds as the packets count them, positions [n, 3] ECEF m, velocities [n, 3] m/s). The file's
+    TAI stamps less 19 s are GPS time; the packets' time base is 1980-01-06T00:00:00 GPS. On a 2014 stripmap
+    datatake the packets' own records agree with the precise orbit to 1.4 m."""
+    import re
+    txt = open(path, 'rb').read().decode('utf-8', 'replace')
+    recs = re.findall(r'<OSV>(.*?)</OSV>', txt, re.S)
+    if not recs:
+        raise ValueError(f'{path}: no <OSV> state vectors')
+    def field(rec, tag):
+        m = re.search(rf'<{tag}[^>]*>(.*?)</{tag}>', rec)
+        if m is None:
+            raise ValueError(f'{path}: state vector without <{tag}>')
+        return m.group(1).split('=')[-1].strip()
+    gps0 = np.datetime64('1980-01-06T00:00:00', 'ns')
+    t = np.array([(np.datetime64(field(r, 'TAI'), 'ns') - gps0) / np.timedelta64(1, 's') for r in recs], np.float64) - 19.0
+    pos = np.array([[float(field(r, k)) for k in ('X', 'Y', 'Z')] for r in recs])
+    vel = np.array([[float(field(r, k)) for k in ('VX', 'VY', 'VZ')] for r in recs])
+    order = np.argsort(t)
+    return t[order], pos[order], vel[order]
+
+
 def decode_user_data(data, hdr, sel):
     """The complex samples of the packets sel (indices into hdr): complex64 [len(sel), 2 max quads], shorter
     packets zero padded; and the number of packets whose bit stream ran out."""

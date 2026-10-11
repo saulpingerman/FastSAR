@@ -53,17 +53,19 @@ Backends: `'cpu'`, `'cuda'`, `'tpu'`, `'jax'`, `'auto'`. Precision: `'float32'`,
   phase_sign=None)`: one channel as `dict(S, ant, fmin, df)`, plus `nx, ny, spx, spy, e1, e2` with a SICD.
   `channel`: index, identifier or polarization. `meta=True` also returns `tx`, `rcv`, `ref`, `R`, `origin`, `srp`,
   `tx_time`, `rcv_time`, `pulses`, `polarization`, `channel`, `mode`, `start`, `collector`, `core_name`, `notes`.
-- `read_nisar(path, frequency=None, polarization=None, meta=False, height=None, band_margin=1.0, block=1024, range_delay=None, troposphere=None)`: a
+- `read_nisar(path, frequency=None, polarization=None, meta=False, height=None, band_margin=1.0, block=1024, range_delay=None, troposphere='model', orbit=None, reference_range=None)`: a
   NISAR L0B RRSD granule as `read_cphd` returns a CPHD (range compressed, frequency domain, a moving scene
   reference point at mid swath); `meta` adds `image_area` (the swath's corners). `read_collection(path, **kw)`
   dispatches on the extension (`.h5`: NISAR). Needs h5py (`fastsar[raw]`).
-- `read_palsar(path, polarization=None, meta=False, height=None, band_margin=1.0, block=512, troposphere=None)`: an ALOS PALSAR
+- `nisar_product(path)`: the orbit (time, position, velocity, epoch, type) and the common delays per frequency of an
+  RSLC, GSLC or GCOV product, for `read_nisar(orbit=, range_delay=)`.
+- `read_palsar(path, polarization=None, meta=False, height=None, band_margin=1.0, block=512, troposphere='model', reference_range=None)`: an ALOS PALSAR
   level 1.0 product (CEOS directory, zip, or `IMG-` file beside its `LED-` leader) as `read_cphd` returns a CPHD;
   `read_collection` dispatches directories, zips and `IMG-`/`LED-` files to it.
-- `read_sentinel1(path, polarization=None, meta=False, height=None, band_margin=1.0, block=512, pulses=None, swath=None, internal_delay=None, troposphere=None)`:
+- `read_sentinel1(path, polarization=None, meta=False, height=None, band_margin=1.0, block=512, pulses=None, swath=None, internal_delay=None, troposphere='model', reference_range=None, orbit=None)`:
   a Sentinel-1 Level-0 product (.SAFE directory, zip, or one measurement .dat file) as `read_cphd` returns a CPHD;
   `pulses=(first, last)` reads a part. `fastsar.sentinel1` holds the packet parser, the user-data decoder and the
-  orbit assembly.
+  orbit assembly. `orbit=` takes an ESA orbit file (`sentinel1.orbit_from_file`).
 - `troposphere_delay(tx, rcv, srp)`: two-way delay [P] (s) of a standard atmosphere at the scene reference point
   (Saastamoinen hydrostatic zenith delay, cosecant mapping); what `read_cphd(troposphere='model')` removes.
 - `sicd_points(sicd, rows, cols, meta, hae=None)`: local positions of SICD pixels on any grid type.

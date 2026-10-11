@@ -240,3 +240,64 @@ def test_form_sentinel1(sentinel1):
     pk = img.max() / np.median(img)
     print(f'Sentinel-1 look-alike: {img.shape} image, peak to median {pk:.0f}, worst target offset {max(err):.2f} m')
     assert max(err) < 1.0 and pk > 50
+
+
+def test_nisar_product_options(nisar, tmp_path):
+    """orbit= and range_delay= from an RSLC-like product file: the look-alike's own orbit written under a product's
+    metadata group with another epoch, and its delay as JPL records it (sign reversed) give the same positions and
+    the same history, with notes naming the file; a tuple orbit with its own epoch; an orbit that does not cover the
+    pulses is refused; the reference range option is noted."""
+    import h5py
+    path = nisar['path']
+    col0, meta0 = io.read_nisar(path, meta=True)
+    with h5py.File(path, 'r') as f:
+        orb = f['science/LSAR/RRSD/lowRateTelemetry/orbit']
+        ot, op, ov = orb['time'][()], orb['position'][()], orb['velocity'][()]
+    prod = os.path.join(tmp_path, 'rslc_like.h5')
+    with h5py.File(prod, 'w') as f:
+        o = f.create_group('science/LSAR/RSLC/metadata/orbit')
+        d = o.create_dataset('time', data=ot - 3600.0)
+        d.attrs['units'] = 'seconds since 2026-01-01T01:00:00'            # an hour after the look-alike's epoch
+        o['position'], o['velocity'], o['orbitType'] = op, ov, np.bytes_(b'MOE')
+        f.create_group('science/LSAR/RSLC/metadata/calibrationInformation/frequencyA')['commonDelay'] = -io.NISAR_RANGE_DELAY['A']
+        f.create_group('science/LSAR/identification')
+    info = io.nisar_product(prod)
+    assert info['product'] == 'RSLC' and info['orbit_type'] == 'MOE' and info['epoch'] == '2026-01-01T01:00:00'
+    assert info['range_delay'] == {'A': pytest.approx(io.NISAR_RANGE_DELAY['A'])}
+    col1, meta1 = io.read_nisar(path, meta=True, orbit=prod, range_delay=prod)
+    assert np.abs(meta1['tx'] - meta0['tx']).max() < 1e-6 and np.abs(meta1['ref'] - meta0['ref']).max() < 1e-6
+    assert np.allclose(col1['S'], col0['S'])
+    assert any('from the RSLC file' in n for n in meta1['notes']) and any('(the RSLC file)' in n for n in meta1['notes'])
+    _, meta2 = io.read_nisar(path, meta=True, orbit=(ot + 60.0, op, ov, '2025-12-31T23:59:00'))
+    assert np.abs(meta2['tx'] - meta0['tx']).max() < 1e-6
+    with pytest.raises(ValueError, match='spans'):
+        io.read_nisar(path, orbit=(ot + 60.0, op, ov))
+    _, meta3 = io.read_nisar(path, meta=True, reference_range=float(meta0['ref'].mean()) + 500.0, troposphere=None)
+    assert any('reference points at' in n for n in meta3['notes']) and not any('troposphere' in n for n in meta3['notes'])
+    assert any('troposphere delay removed' in n for n in meta0['notes'])            # the model by default
+
+
+def test_sentinel1_orbit_file(sentinel1, tmp_path):
+    """orbit= for Sentinel-1: the look-alike's packet records written as an ESA orbit file (TAI stamps, 19 s ahead
+    of GPS) read back through sentinel1.orbit_from_file give the same positions and the same image geometry."""
+    from fastsar import sentinel1 as s1
+    dat = safe = sentinel1['path']
+    hdr = s1.parse_packets(np.memmap(dat, np.uint8, 'r'))
+    ot, op, ov = s1.orbit_from_packets(hdr)
+    gps0 = np.datetime64('1980-01-06T00:00:00', 'ns')
+    eof = os.path.join(tmp_path, 'S1A_OPER_AUX_POEORB_OPOD_test.EOF')
+    with open(eof, 'w') as f:
+        f.write('<?xml version="1.0"?>\n<Earth_Explorer_File><Data_Block><List_of_OSVs>\n')
+        for ti, pi, vi in zip(ot, op, ov):
+            tai = gps0 + np.timedelta64(int(round((ti + 19.0) * 1e9)), 'ns')
+            f.write(f'<OSV><TAI>TAI={str(tai)}</TAI><UTC>UTC=unused</UTC><X unit="m">{pi[0]:.6f}</X><Y unit="m">{pi[1]:.6f}</Y>'
+                    f'<Z unit="m">{pi[2]:.6f}</Z><VX unit="m/s">{vi[0]:.6f}</VX><VY unit="m/s">{vi[1]:.6f}</VY><VZ unit="m/s">{vi[2]:.6f}</VZ>'
+                    f'<Quality>NOMINAL</Quality></OSV>\n')
+        f.write('</List_of_OSVs></Data_Block></Earth_Explorer_File>\n')
+    t2, p2, v2 = s1.orbit_from_file(eof)
+    assert np.abs(t2 - ot).max() < 1e-6 and np.abs(p2 - op).max() < 1e-5 and np.abs(v2 - ov).max() < 1e-5
+    _, meta0 = io.read_sentinel1(safe, meta=True)
+    _, meta1 = io.read_sentinel1(safe, meta=True, orbit=eof)
+    assert np.abs(meta1['tx'] - meta0['tx']).max() < 1e-5 and any('orbit file' in n for n in meta1['notes'])
+    with pytest.raises(ValueError, match='spans'):
+        io.read_sentinel1(safe, orbit=(ot + 100.0, op, ov))

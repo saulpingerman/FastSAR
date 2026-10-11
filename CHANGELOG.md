@@ -32,11 +32,22 @@ was published on PyPI.
   26 degree incidence dwell.
 - `CITATION.cff` with the software citation and the paper as the preferred citation.
 - The raw readers remove the instruments' range delays, as the agencies' processors do: `read_nisar(range_delay=)`
-  subtracts JPL's calibration common delay (`io.NISAR_RANGE_DELAY`, 53.24 m for frequency A, 19.65 m for B);
-  `read_sentinel1(internal_delay=)` subtracts the internal time delay estimated from the product's calibration
-  packets (`sentinel1.internal_delay`, about 0.43 us, within 4 ns of ESA's annotated value on a 2014 datatake).
-  Images of a NISAR pass and of a Sentinel-1 stripmap datatake then fall within about 20 m of JPL's GCOV and
-  ESA's GRD of the same passes, from 100 to 180 m before. The raw readers take `troposphere='model'`.
+  subtracts JPL's calibration common delay (`io.NISAR_RANGE_DELAY`, 57.125 m for frequency A and 19.65 m for B,
+  the values of JPL's products processed from September 2026; a number, or an RSLC or GCOV path to read the
+  product's value, `io.nisar_product`); `read_sentinel1(internal_delay=)` subtracts the internal time delay
+  estimated from the product's calibration packets (`sentinel1.internal_delay`, about 0.43 us, within 4 ns of
+  ESA's annotated value on a 2014 datatake). Compared in the agencies' own radar coordinates, the images agree
+  with JPL's RSLC of a NISAR pass to 0.2 m and with ESA's SLC of a Sentinel-1 datatake to 0.5 m in slant range
+  (1.4 and 1.5 m along track), from 100 to 180 m before the delays were removed.
+- `read_nisar(orbit=)`: JPL's orbit from an RSLC or GCOV product of the pass in place of the L0B's forecast orbit
+  (10 m off radially on a September 2026 pass); `read_sentinel1(orbit=)`: an ESA precise or restituted orbit file
+  (`sentinel1.orbit_from_file`) in place of the packets' records, which agree with the precise orbit to 1.4 m on a
+  2014 datatake. The raw readers remove the standard atmosphere's troposphere delay by default (`troposphere=None`
+  keeps it; the look-alike writers put the delay into their echoes) and take `reference_range=`, the slant range of
+  the zero-Doppler reference points, since the receiver's position is taken at the reference point's echo time
+  (2.5 m along track per 100 km of range from the reference). Against the surveyed corner reflectors of the
+  Rosamond site, a NISAR image with JPL's orbit falls 1.4 m along track and 5.7 m across track from the survey and
+  within 0.2 m of slant range of JPL's RSLC of the pass; the remainder is the ionosphere neither models.
 - `read_nisar` resamples dithered pulse timing onto uniform pulse times for the factorized former (-60 dB against
   exact backprojection on a dithered granule, from -38 dB); `read_palsar` uses the downward chirp and the sample
   count from the record length, as JAXA's files need.
