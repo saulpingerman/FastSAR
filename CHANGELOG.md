@@ -3,6 +3,22 @@
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The date of a version is the day it
 was published on PyPI.
 
+## [0.1.3] - unreleased
+
+### Changed
+
+- CUDA backend: the phase history is uploaded through two pinned staging buffers, the copy of the next block (on
+  several threads) overlapping the transfer of the current one, and the image is returned in pinned host memory
+  (`FASTSAR_PINNED=0` restores the plain copy). On an H100 the Panama image of the paper goes from 1.04 to 0.69 s
+  (float32) and from 1.09 to 0.59 s (float16); on an A100 from 1.87 to 1.31 s; on an L4 from 3.86 to 3.41 s.
+- CUDA float16: the reference scale of the half-precision planes is the first uploaded block's peak, taken on the
+  device, instead of a pass over the whole history on the host (0.3 to 0.5 s per image); float16's relative
+  precision does not depend on the scale, and the errors are unchanged.
+- CUDA pulse filter: cards with at least 100 streaming multiprocessors read the filter's rows from global memory
+  (the cache serves their reuse), which was faster on the A100 and H100 and slower on the L4; `FASTSAR_FIRP`
+  overrides. `FASTSAR_CUDA_PB`, `FASTSAR_CUDA_JT`, `FASTSAR_FIRP_SMEM` and `FASTSAR_FINAL_PPS` expose the kernels'
+  launch parameters for testing (the defaults were the fastest on all three cards).
+
 ## [0.1.2] - 2026-10-14
 
 ### Added

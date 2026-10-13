@@ -64,6 +64,15 @@ formation already uses every core; a GPU or TPU uses up to four, which would oth
 for host preparation. On a 2 by 4 patch Capella sub-mosaic on the c4d-highmem-16, one prefetch thread cuts the
 time per patch from 1.08 s to 0.91 s.
 
+## Transfers on the cuda backend
+
+The phase history goes to the GPU in row blocks of 4,096 pulses through two pinned staging buffers: several threads
+copy the next block into its buffer while the current one transfers, and the blocks are windowed, checked and
+converted on the device. The image comes back in pinned host memory from CuPy's pinned pool, which keeps the block
+for the next image (`FASTSAR_PINNED=0` returns a plain copy). On the Panama image of the paper the transfers fell
+from 0.39 to 0.1 s on an H100 and from 0.67 to 0.2 s on an L4, and the whole image from 1.04 to 0.69 s and from
+3.86 to 3.41 s. The float16 build takes its reference scale from the first block's peak on the device.
+
 ## Memory
 
 When device or host memory is short, a former takes a slower path and issues a `fastsar.MemoryWarning`.

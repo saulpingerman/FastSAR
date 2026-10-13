@@ -36,7 +36,9 @@ _SRC = r'''
 #ifndef PB
 #define PB 32          /* pulses per block in rot_fir_k (16 or 8 when a wide window would overflow shared memory) */
 #endif
-#define JT 8           /* threads per pulse, each two consecutive outputs: 16 columns per block */
+#ifndef JT
+#define JT 8           /* threads per pulse, each two consecutive outputs: 2 JT columns per block */
+#endif
 extern "C" __global__
 void rot_fir_k(const sample_t* __restrict__ sre, const sample_t* __restrict__ sim, const float* __restrict__ c0, const float* __restrict__ sl,
                const float* __restrict__ taps, sample_t* __restrict__ yre, sample_t* __restrict__ yim,
@@ -206,7 +208,8 @@ void final_tile(const sample_t* __restrict__ dre, const sample_t* __restrict__ d
     const int b = blockIdx.x, tid = threadIdx.x, HX = T / 4, tx = tid % HX, ty = tid / HX;
     extern __shared__ float2 sm2[];
     const int rowlen = pps * Qf;                          // pps pulses side by side
-    float2* A2 = sm2; float2* B2 = sm2 + T * rowlen;      // (re, im) pairs: one 8-byte load per complex table entry
+    const int ld = rowlen;                                // row stride (a padded stride against bank conflicts gained nothing)
+    float2* A2 = sm2; float2* B2 = sm2 + T * ld;          // (re, im) pairs: one 8-byte load per complex table entry
     const sample_t* dr = dre + (size_t)b * Pf * Qf;
     const sample_t* di = dim + (size_t)b * Pf * Qf;
     float acc_r[4][2], acc_i[4][2];
@@ -221,7 +224,7 @@ void final_tile(const sample_t* __restrict__ dre, const sample_t* __restrict__ d
         {
             const bool isA = row < T;
             const int tr = isA ? row : row - T;
-            float2* R2 = (isA ? A2 : B2) + tr * rowlen;
+            float2* R2 = (isA ? A2 : B2) + tr * ld;
             // segment [qa, qb) of the row: entries q < Qf belong to pulse p0, the rest to the following pulses
             int q = qa;
             while (q < qb) {
@@ -253,15 +256,15 @@ void final_tile(const sample_t* __restrict__ dre, const sample_t* __restrict__ d
             }
         }
         __syncthreads();
-        const float2* a0 = A2 + (4 * tx) * rowlen;
-        const float2* b0 = B2 + (2 * ty) * rowlen;
+        const float2* a0 = A2 + (4 * tx) * ld;
+        const float2* b0 = B2 + (2 * ty) * ld;
         #pragma unroll 2
         for (int q = 0; q < rowlen; ++q) {
-            const float2 y0 = b0[q], y1 = b0[rowlen + q];
+            const float2 y0 = b0[q], y1 = b0[ld + q];
             const float y0r = y0.x, y0i = y0.y, y1r = y1.x, y1i = y1.y;
             #pragma unroll
             for (int u = 0; u < 4; ++u) {
-                const float2 x = a0[u * rowlen + q];
+                const float2 x = a0[u * ld + q];
                 const float xr = x.x, xi = x.y;
                 acc_r[u][0] = fmaf(xr, y0r, acc_r[u][0]); acc_r[u][0] = fmaf(-xi, y0i, acc_r[u][0]);
                 acc_i[u][0] = fmaf(xr, y0i, acc_i[u][0]); acc_i[u][0] = fmaf(xi, y0r, acc_i[u][0]);
@@ -285,9 +288,10 @@ _PB_CHOICES = (32, 16, 8)        # pulses per block tried in order by the level 
 
 def _kernels(store='fp32', pb=32):
     bits = 16 if store == 'f16' else 32
-    key = (bits, pb)
+    jt = int(os.environ.get('FASTSAR_CUDA_JT', 0) or 0) or 8          # threads per pulse in rot_fir_k (testing)
+    key = (bits, pb, jt)
     if key not in _mods:
-        _mods[key] = cp.RawModule(code=_SRC, options=('--std=c++14', '--use_fast_math', f'-DSTORE={bits}', f'-DPB={pb}'))
+        _mods[key] = cp.RawModule(code=_SRC, options=('--std=c++14', '--use_fast_math', f'-DSTORE={bits}', f'-DPB={pb}', f'-DJT={jt}'))
     out = {k: _mods[key].get_function(k) for k in ('rot_fir_k', 'fir_p', 'fir_p_g', 'final_tile')}
     # opt in once to the device's largest shared memory per block: the limit belongs to the kernel, which every former
     # shares, so a former must never lower it (a former built on another thread while one runs would break its launch)
@@ -296,6 +300,7 @@ def _kernels(store='fp32', pb=32):
         k.max_dynamic_shared_size_bytes = smax
     out['dtype'] = cp.float16 if bits == 16 else cp.float32
     out['store'] = store
+    out['jt'] = jt
     return out
 
 
@@ -325,11 +330,13 @@ def _children(kern, pre, pim, c0, sl, lv):
         L, pl = fk['L'], fk['pl']
         yre = cp.empty((Np * Cn, P, Ko), kern['dtype'])
         yim = cp.empty((Np * Cn, P, Ko), kern['dtype'])
-        W = 16 * Dk + L
+        jt = kern['jt']
+        cols = 2 * jt                                     # output columns per block
+        W = cols * Dk + L
         smem_max = int(cp.cuda.Device().attributes.get('MaxSharedMemoryPerBlockOptin', 48 * 1024))
         pb_env = int(os.environ.get('FASTSAR_CUDA_PB', 0) or 0)           # testing: force the pulses per block
         for pb in ((pb_env,) if pb_env else _PB_CHOICES):   # pulses per block: the largest whose window fits the device
-            smem = (2 * pb * (W | 1) + L + 2 * pb * 16) * 4
+            smem = (2 * pb * (W | 1) + L + 2 * pb * cols) * 4
             if smem <= smem_max:
                 break
         if smem > smem_max:
@@ -337,7 +344,7 @@ def _children(kern, pre, pim, c0, sl, lv):
                              f"{L}-tap filter, a small image from a wide-band collection) exceeds the GPU's shared memory "
                              f"({smem_max // 1024} KB): use backend='cpu' or 'jax', or a larger image")
         kl = kern['rot_fir_k'] if pb == 32 else _kernels(kern['store'], pb)['rot_fir_k']
-        kl(((Ko + 15) // 16, (P + pb - 1) // pb, Np), (pb * 8,),
+        kl(((Ko + cols - 1) // cols, (P + pb - 1) // pb, Np), (pb * jt,),
                           (pre, pim, c0, sl, taps, yre, yim, np.int32(Cn), np.int32(P), np.int32(K), np.int32(Ko), np.int32(Dk),
                            np.int32(L), np.int32(pl), np.float32(kc)), shared_mem=smem)
     else:
@@ -364,11 +371,13 @@ def _children(kern, pre, pim, c0, sl, lv):
         rows = (nout - 1) * Dp + fp['L']
         smem = (2 * rows * 64 + fp['L']) * 4
         name = 'fir_p'
-        if os.environ.get('FASTSAR_FIRP_GLOBAL'):        # testing: force the global-memory kernel
-            name, smem = 'fir_p_g', 0
-        elif smem > int(cp.cuda.Device().attributes.get('MaxSharedMemoryPerBlockOptin', 96 * 1024)):
-            # beyond what the kernels opted in to (_kernels): read the rows from global memory
-            name, smem = 'fir_p_g', 0
+        # the rows through shared memory, or straight from global memory with the cache serving their reuse: the
+        # latter was faster on the A100 and H100 (0.14 against 0.16 s and 0.07 against 0.09 s on Panama) and slower
+        # on the L4, so cards with at least 100 streaming multiprocessors take it; FASTSAR_FIRP=smem|global overrides
+        attrs = cp.cuda.Device().attributes
+        mode = os.environ.get('FASTSAR_FIRP') or ('global' if attrs.get('MultiProcessorCount', 0) >= 100 else 'smem')
+        if mode == 'global' or smem > int(attrs.get('MaxSharedMemoryPerBlockOptin', 96 * 1024)):
+            name, smem = 'fir_p_g', 0           # (also beyond what the kernels opted in to in _kernels)
         kern[name](((Ko + 63) // 64, (Po + nout - 1) // nout, Np * Cn), (256,),
                    (yre, yim, taps, zre, zim, np.int32(P), np.int32(Ko), np.int32(Po), np.int32(Dp), np.int32(fp['L']), np.int32(fp['pl']), np.int32(nout)),
                    shared_mem=smem)
@@ -783,6 +792,10 @@ using namespace nvcuda;
 #define TT 32
 #define PPS 2
 #define NSEG 2
+typedef half tab_t;
+#define FRAG_K 16
+#define KALIGN 16
+#define TOTAB(v) __float2half(v)
 extern "C" __global__
 void final_tile_tc(const sample_t* __restrict__ dre, const sample_t* __restrict__ dim, const float* __restrict__ ux, const float* __restrict__ uy,
                    const float* __restrict__ dlx, const float* __restrict__ dly, float* __restrict__ ore, float* __restrict__ oim,
@@ -791,17 +804,17 @@ void final_tile_tc(const sample_t* __restrict__ dre, const sample_t* __restrict_
     // grid: x = tile; block = 512 threads (16 warps, one output fragment each). A_s and B_s: [2T][KP] half,
     // KP = PPS Qf rounded up to 16, ld = KP + 8. The tables are built by 512 threads: NSEG segments of each row.
     const int b = blockIdx.x, tid = threadIdx.x, warp = tid / 32;
-    const int K2 = PPS * Qf, KP = (K2 + 15) / 16 * 16, LD = KP + 8;
+    const int K2 = PPS * Qf, KP = (K2 + KALIGN - 1) / KALIGN * KALIGN, LD = KP + 8;
     extern __shared__ __align__(32) unsigned char smraw[];
-    half* A_s = reinterpret_cast<half*>(smraw);
-    half* B_s = A_s + 2 * TT * LD;
+    tab_t* A_s = reinterpret_cast<tab_t*>(smraw);
+    tab_t* B_s = A_s + 2 * TT * LD;
     float* M_s = reinterpret_cast<float*>(smraw);                 // reused at the end: [2T][2T + 4]
     const sample_t* dr = dre + (size_t)b * Pf * Qf;
     const sample_t* di = dim + (size_t)b * Pf * Qf;
     // zero the padding columns once
     for (int i = tid; i < 2 * TT * (LD - K2); i += 512) {
         const int row = i / (LD - K2), col = K2 + i % (LD - K2);
-        A_s[row * LD + col] = __float2half(0.f); B_s[row * LD + col] = __float2half(0.f);
+        A_s[row * LD + col] = TOTAB(0.f); B_s[row * LD + col] = TOTAB(0.f);
     }
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
     wmma::fill_fragment(acc, 0.f);
@@ -825,7 +838,7 @@ void final_tile_tc(const sample_t* __restrict__ dre, const sample_t* __restrict_
         float wr, wi, sr, si_;
         sincospif(2.0f * cyc0, &wi, &wr);
         sincospif(2.0f * cs, &si_, &sr);
-        half* R = (which == 0 ? A_s : B_s) + row2 * LD + ph * Qf;
+        tab_t* R = (which == 0 ? A_s : B_s) + row2 * LD + ph * Qf;
         for (int q = qa; q < qb; ++q) {
             float v;
             if (which == 0) {
@@ -834,12 +847,12 @@ void final_tile_tc(const sample_t* __restrict__ dre, const sample_t* __restrict_
             } else {
                 v = imag ? wi : wr;
             }
-            R[q] = __float2half(v);
+            R[q] = TOTAB(v);
             const float nr = wr * sr - wi * si_;
             wi = wr * si_ + wi * sr; wr = nr;
         }
         __syncthreads();
-        for (int k = 0; k < KP; k += 16) {
+        for (int k = 0; k < KP; k += FRAG_K) {
             wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> fa;
             wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> fb;
             wmma::load_matrix_sync(fa, A_s + (fi * 16) * LD + k, LD);
