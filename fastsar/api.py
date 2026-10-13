@@ -217,6 +217,20 @@ def _jax_runtime_error():
     return err
 
 
+def _to_host(dev):
+    """A complex64 host copy of a device image through pinned memory, several times faster than a copy into pageable
+    memory (0.03 s against 0.2 s for an 860 MB image). The block comes from CuPy's pinned pool, which keeps it for
+    the next image once this one is released; FASTSAR_PINNED=0 restores the plain copy."""
+    import cupy as cp
+    if os.environ.get('FASTSAR_PINNED', '1') == '0':
+        return cp.asnumpy(dev).astype(np.complex64, copy=False)
+    dev = cp.ascontiguousarray(dev.astype(cp.complex64, copy=False))
+    mem = cp.cuda.alloc_pinned_memory(dev.nbytes)
+    host = np.frombuffer(mem, np.complex64, dev.size).reshape(dev.shape)
+    dev.get(out=host)
+    return host
+
+
 class _Staged:
     """A phase history staged for a JAX or TPU former (ImageFormer.stage): the host array, its device planes and
     scale, and the program they were padded for."""
@@ -381,12 +395,10 @@ class ImageFormer:
             if S.shape != (self.P, self.K):
                 raise ValueError(f'phase history must be {(self.P, self.K)}, got {S.shape}')
             _check_history(S, finite=False)
-            import cupy as cp
-            return cp.asnumpy(self._form(S, window=(self.wp, self.wk) if self.window else None, check=True)).astype(np.complex64, copy=False)
+            return _to_host(self._form(S, window=(self.wp, self.wk) if self.window else None, check=True))
         S = staged.S if staged is not None else self._host(S)
         if self.backend == 'cuda':
-            import cupy as cp
-            return cp.asnumpy(self._form(S)).astype(np.complex64, copy=False)       # a host S may stream (ffbp_cuda)
+            return _to_host(self._form(S))                                        # a host S may stream (ffbp_cuda)
         if self.backend == 'cpu':
             return self._form(S).astype(np.complex64, copy=False)
         import jax

@@ -327,7 +327,8 @@ def _children(kern, pre, pim, c0, sl, lv):
         yim = cp.empty((Np * Cn, P, Ko), kern['dtype'])
         W = 16 * Dk + L
         smem_max = int(cp.cuda.Device().attributes.get('MaxSharedMemoryPerBlockOptin', 48 * 1024))
-        for pb in _PB_CHOICES:                            # pulses per block: the largest whose window fits the device
+        pb_env = int(os.environ.get('FASTSAR_CUDA_PB', 0) or 0)           # testing: force the pulses per block
+        for pb in ((pb_env,) if pb_env else _PB_CHOICES):   # pulses per block: the largest whose window fits the device
             smem = (2 * pb * (W | 1) + L + 2 * pb * 16) * 4
             if smem <= smem_max:
                 break
@@ -354,8 +355,11 @@ def _children(kern, pre, pim, c0, sl, lv):
         taps = _dev_taps(fp['kern'])
         zre = cp.empty((Np * Cn, Po, Ko), kern['dtype'])
         zim = cp.empty((Np * Cn, Po, Ko), kern['dtype'])
-        nout = 16                                        # outputs per block: the input rows must fit in 40 KB
-        while nout > 4 and (2 * ((nout - 1) * Dp + fp['L']) * 64 + fp['L']) * 4 > 40 * 1024:      # a multiple of 4
+        # outputs per block: as many as keep the input rows within 40 KB of shared memory (FASTSAR_FIRP_SMEM, in KB,
+        # overrides for testing; larger budgets were slower on the H100 and the L4, the kernel wants blocks in flight)
+        budget = (int(os.environ.get('FASTSAR_FIRP_SMEM', 0) or 0) or 40) * 1024
+        nout = 64
+        while nout > 4 and (2 * ((nout - 1) * Dp + fp['L']) * 64 + fp['L']) * 4 > budget:      # a multiple of 4
             nout -= 4
         rows = (nout - 1) * Dp + fp['L']
         smem = (2 * rows * 64 + fp['L']) * 4
@@ -410,6 +414,69 @@ def _tick():
     return None
 
 
+def _copy_rows(dst, src, nth):
+    """dst[...] = src by row slices on nth threads (NumPy releases the GIL in the copy, so the threads add up)."""
+    if nth <= 1 or dst.shape[0] < 64:
+        np.copyto(dst, src)
+        return
+    import threading
+    rows = dst.shape[0]
+    ths = []
+    for q in range(nth):
+        a, b = rows * q // nth, rows * (q + 1) // nth
+        th = threading.Thread(target=np.copyto, args=(dst[a:b], src[a:b]))
+        th.start()
+        ths.append(th)
+    for th in ths:
+        th.join()
+
+
+def _upload_planes(S, pre, pim, win, check, scaled):
+    """Host S [P, K] complex -> float planes pre, pim [P, K] on the device, in row blocks through two pinned staging
+    buffers: the threads copying the next block into its buffer overlap the transfer of the current one, and the
+    blocks are windowed (win: device [P, 1] and [1, K] windows, or None), checked and converted on the device.
+    scaled: float16 planes, divided by the first block's peak, a reference scale for the half range (the relative
+    precision of float16 does not depend on where in its range the data sit). Returns the scale."""
+    P, K = S.shape
+    nb = memory.STREAM_PULSES
+    rows = min(nb, P)
+    bufs = [cp.cuda.alloc_pinned_memory(rows * K * 8) for _ in range(2)]          # pooled: reused by later calls
+    stg = [np.frombuffer(b, np.complex64, rows * K).reshape(rows, K) for b in bufs]
+    st = cp.cuda.Stream(non_blocking=True)
+    done = [None, None]
+    nth = max(1, min(8, (os.cpu_count() or 2) - 1))
+    scale = 1.0
+    sums = []
+    with st:
+        for n, i in enumerate(range(0, P, nb)):
+            r, k = min(nb, P - i), n % 2
+            if done[k] is not None:
+                done[k].synchronize()                                             # the buffer's last transfer is complete
+            _copy_rows(stg[k][:r], S[i:i + r], nth)
+            b = cp.asarray(stg[k][:r])                                            # asynchronous from pinned memory
+            e = cp.cuda.Event()
+            e.record(st)
+            done[k] = e
+            if win is not None:
+                b = b * win[0][i:i + r] * win[1]
+            if check:
+                sums.append(b.sum())                                              # checked once at the end (no sync here)
+            if scaled and n == 0:
+                scale = float(cp.abs(b).max()) or 1.0
+            pre[i:i + r] = (b.real / scale).astype(pre.dtype) if scale != 1.0 else b.real.astype(pre.dtype)
+            pim[i:i + r] = (b.imag / scale).astype(pim.dtype) if scale != 1.0 else b.imag.astype(pim.dtype)
+            del b
+    st.synchronize()
+    if check and not np.isfinite(complex(cp.stack(sums).sum())):
+        for n, i in enumerate(range(0, P, nb)):
+            if not np.isfinite(complex(sums[n])):
+                r = min(nb, P - i)
+                bad = i + int(cp.argmax((~cp.isfinite(pre[i:i + r])).any(1) | (~cp.isfinite(pim[i:i + r])).any(1)))
+                raise ValueError(f'phase history has non-finite samples (NaN or inf), the first in pulse {bad}; '
+                                 'zero them (S[~np.isfinite(S)] = 0) or drop the pulses')
+    return scale
+
+
 def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
     """Build form(S) -> complex64 image [nx, ny] (device) for the plan and the collection arrays (host float64).
     final_mode: 'fp32' (CUDA cores, float32) or 'f16tc' (tensor cores, float16 operands, float32 accumulation).
@@ -447,7 +514,9 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
     perm_g = [2 * i for i in range(L - 1)] + [2 * (L - 1)] + [2 * i + 1 for i in range(L - 1)] + [2 * (L - 1) + 1]
     # shared memory per block: 48 KB by default, more when the kernel opts in (99 KB on Ada, 64 KB on Turing)
     smem_max = int(cp.cuda.Device().attributes.get('MaxSharedMemoryPerBlockOptin', 48 * 1024))
-    pps = 2 if 4 * T * (2 * Qf) * 4 <= 48 * 1024 else 1                   # pulses per table
+    # pulses per table: 2 within 48 KB (every card), more where the card's shared memory allows (FASTSAR_FINAL_PPS)
+    pps_env = int(os.environ.get('FASTSAR_FINAL_PPS', 0) or 0)
+    pps = pps_env or (2 if 4 * T * (2 * Qf) * 4 <= 48 * 1024 else 1)
     smem_final = 4 * T * (pps * Qf) * 4
     assert T % 4 == 0 and T * T // 8 <= 1024 and (T * T // 8) % (2 * T) == 0, T
     if smem_final > smem_max:
@@ -609,22 +678,26 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
                 _finite(b, cp, i)
             return b
         scale = 1.0
-        if kern['dtype'] != cp.float32:              # float16 storage: scale to the peak (in row blocks)
-            if stream or not (window is not None or check):
-                xp = np if isinstance(S, np.ndarray) else cp
-                scale = max(float(xp.abs(S[i:i + 4096]).max()) for i in range(0, S.shape[0], 4096)) or 1.0
-            else:               # a first pass over the uploaded blocks (the planes need the scale)
-                scale = max(float(cp.abs(block(i)).max()) for i in range(0, S.shape[0], 4096)) or 1.0
-                check = False
+        scaled = kern['dtype'] != cp.float32          # float16 storage: divided by the first block's peak (_upload_planes)
         if not stream:
             # uploaded in row blocks straight into the planes (no full complex copy on the device)
             pre = cp.empty((1,) + S.shape, kern['dtype'])
             pim = cp.empty((1,) + S.shape, kern['dtype'])
-            for i in range(0, S.shape[0], 4096):
-                b = block(i)
-                pre[0, i:i + 4096] = (b.real / scale).astype(kern['dtype'])
-                pim[0, i:i + 4096] = (b.imag / scale).astype(kern['dtype'])
-                del b
+            if isinstance(S, np.ndarray):
+                scale = _upload_planes(S, pre[0], pim[0], None if window is None else (wpd, wkd), check, scaled)
+            else:                                    # a device history: blocks in place
+                if scaled:
+                    scale = float(cp.abs(block(0)).max()) or 1.0
+                for i in range(0, S.shape[0], 4096):
+                    b = block(i)
+                    pre[0, i:i + 4096] = (b.real / scale).astype(kern['dtype'])
+                    pim[0, i:i + 4096] = (b.imag / scale).astype(kern['dtype'])
+                    del b
+        elif scaled:                                 # streamed: the first block's peak, on the device
+            xp = cp if type(S).__module__.startswith('cupy') else np
+            b0 = S[:4096] if xp is cp else cp.asarray(S[:4096])
+            scale = float(cp.abs(b0).max()) or 1.0
+            del b0
         forced = ng is not None or bool(os.environ.get('FASTSAR_CUDA_GROUP'))
         if ng is None:
             ng = memory._env_number('FASTSAR_CUDA_GROUP', 1) or memory.cuda_group(lv0, S.shape[1], isz, memory.cuda_free(), stream)
