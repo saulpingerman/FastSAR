@@ -833,8 +833,10 @@ _SRC_TC = r'''
 #endif
 using namespace nvcuda;
 #define TT 32
-#define PPS 2
-#define NSEG 2
+#ifndef PPS
+#define PPS 2          /* pulses per shared-memory table (one synchronization pair per PPS pulses) */
+#endif
+#define NSEG (4 / PPS) /* segments per table row in the build: 2 tables x 2T rows x PPS x NSEG = 512 threads */
 typedef half tab_t;
 #define FRAG_K 16
 #define KALIGN 16
@@ -920,14 +922,19 @@ _mods_tc = {}
 
 
 def final_tile_tc(are, aim, ux, uy, dlx, dly, a0, a1, T, store='fp32'):
-    """are, aim [B, Pf, Qf] float32 or float16; ux, uy [B, Pf]; -> (re, im) [B, T, T] via the tensor-core kernel (T must be 32)."""
+    """are, aim [B, Pf, Qf] float32 or float16; ux, uy [B, Pf]; -> (re, im) [B, T, T] via the tensor-core kernel (T must be 32).
+    FASTSAR_TC_PPS (1, 2 or 4) sets the pulses per shared-memory table; 2 fits every card, 4 needs about 85 KB of
+    shared memory per block (testing)."""
     assert T == 32
     bits = 16 if store == 'f16' else 32
-    if bits not in _mods_tc:
-        _mods_tc[bits] = cp.RawModule(code=_SRC_TC, backend='nvcc', options=('-std=c++14', '--use_fast_math', f'-DSTORE={bits}', '-arch=sm_' + cp.cuda.Device().compute_capability))
-    k = _mods_tc[bits].get_function('final_tile_tc')
+    smax = int(cp.cuda.Device().attributes.get('MaxSharedMemoryPerBlockOptin', 48 * 1024))
+    pps = int(os.environ.get('FASTSAR_TC_PPS', 0) or 0) or (4 if smax >= 160 * 1024 else 2)    # four pulses per table (84 KB) where two blocks still fit an SM: 5% faster on the H100, 45% slower on the L4
+    key = (bits, pps)
+    if key not in _mods_tc:
+        _mods_tc[key] = cp.RawModule(code=_SRC_TC, backend='nvcc', options=('-std=c++14', '--use_fast_math', f'-DSTORE={bits}', f'-DPPS={pps}', '-arch=sm_' + cp.cuda.Device().compute_capability))
+    k = _mods_tc[key].get_function('final_tile_tc')
     B, Pf, Qf = are.shape
-    K2 = 2 * Qf
+    K2 = pps * Qf
     KP = (K2 + 15) // 16 * 16
     LD = KP + 8
     smem = max(2 * 2 * T * LD * 2, 2 * T * (2 * T + 4) * 4)

@@ -18,6 +18,12 @@ was published on PyPI.
   (the cache serves their reuse), which was faster on the A100 and H100 and slower on the L4; `FASTSAR_FIRP`
   overrides. `FASTSAR_CUDA_PB`, `FASTSAR_CUDA_JT`, `FASTSAR_FIRP_SMEM` and `FASTSAR_FINAL_PPS` expose the kernels'
   launch parameters for testing (the defaults were the fastest on all three cards).
+- CUDA float16: the tensor-core final stage builds its tables four pulses at a time on cards with at least 160 KB of
+  shared memory per block (5% faster on an H100; two pulses on the L4, where four would halve the occupancy);
+  `FASTSAR_TC_PPS` overrides.
+- Mosaics: the decimation filters are memoized across patches and the band-center phases and the final stage's
+  per-pulse geometry run as one fused kernel each on `cuda`; the 84-patch Capella stripmap of the paper goes from
+  6.9 to 6.0 s on an H100 with the image unchanged.
 
 ## [0.1.2] - 2026-10-14
 
