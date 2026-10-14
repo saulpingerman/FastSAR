@@ -64,6 +64,21 @@ formation already uses every core; a GPU or TPU uses up to four, which would oth
 for host preparation. On a 2 by 4 patch Capella sub-mosaic on the c4d-highmem-16, one prefetch thread cuts the
 time per patch from 1.08 s to 0.91 s.
 
+## Release 0.1.3 on the GPUs
+
+The final stage runs on the tensor cores: float32 as three bfloat16 products (compute capability 8.0 and later), float16
+as one, both in a double-buffered kernel that builds the next pulses' tables while the current products run. With
+the transfers below and the mosaic changes in the changelog, the Panama image on the development instances
+(single warm image, host memory to host memory):
+
+| GPU | float32 | float16 | before (0.1.2, float32) |
+|---|---|---|---|
+| H100 80GB | 0.575 s | 0.524 s | 1.04 s |
+| L4 | 2.94 s | 2.52 s | 3.8 s |
+
+Errors are unchanged (-59.9 and -58.9 dB). The 84-patch 2021 Capella stripmap takes 5.0 s on the H100 (from 6.9 s)
+and 22.2 s on an L4 host with 4 vCPUs, where the mosaic is bound by the host.
+
 ## Transfers on the cuda backend
 
 The phase history goes to the GPU in row blocks of 4,096 pulses through two pinned staging buffers: several threads
@@ -118,9 +133,11 @@ warnings.simplefilter('ignore', fastsar.MemoryWarning)   # silence the fallback 
 | `FASTSAR_COMPILE_PATCHES` | `11` (TPU), `3` (JAX) | patch formations one compilation is worth, for the pulse counts a mosaic compiles |
 | `FASTSAR_PULSE_SLACK` | `0.04` | relative widening of mosaic range gates and pulse counts so patches share compiled programs |
 | `FASTSAR_TIMING` | off | `1` times mosaic steps; `patches.report_timing()` returns them |
+| `FASTSAR_PINNED` | `1` | `0` returns the cuda image by a plain copy instead of through pinned memory |
+| `FASTSAR_FINAL` | `tc3` | `fp32` keeps the cuda float32 final stage on the CUDA cores instead of three bfloat16 tensor-core passes |
 
 Numeric settings out of range raise `ValueError`. The `FFBP_` prefix is a legacy name. `FASTSAR_CPU_BLOCKED` (`1`
-forces the CPU's pulse blocks, `0` forbids them), `FASTSAR_PROFILE_WINDOW_ROWS`, `FASTSAR_FIRP_GLOBAL`,
+forces the CPU's pulse blocks, `0` forbids them), `FASTSAR_PROFILE_WINDOW_ROWS`, `FASTSAR_FIRP` (`smem` or `global`; `FASTSAR_FIRP_GLOBAL` as before), the cuda launch parameters `FASTSAR_CUDA_PB`, `FASTSAR_CUDA_JT`, `FASTSAR_FIRP_SMEM`, `FASTSAR_FINAL_PPS`, `FASTSAR_FINAL_COLB`, `FASTSAR_TC_KERNEL`, `FASTSAR_TC_PPS`, `FASTSAR_TC_MW`, `FASTSAR_TC_SPEC`, `FASTSAR_TC_NH`,
 `FFBP_FORCE_TPU_KERNELS` and `FASTSAR_TEST_MAX_GB` (the default of the tests' `--max-rss-gb` option) exist for the
 tests only.
 

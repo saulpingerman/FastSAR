@@ -418,7 +418,7 @@ def _children(kern, pre, pim, c0, sl, lv):
         # latter was faster on the A100 and H100 (0.14 against 0.16 s and 0.07 against 0.09 s on Panama) and slower
         # on the L4, so cards with at least 100 streaming multiprocessors take it; FASTSAR_FIRP=smem|global overrides
         attrs = cp.cuda.Device().attributes
-        mode = os.environ.get('FASTSAR_FIRP') or ('global' if attrs.get('MultiProcessorCount', 0) >= 100 else 'smem')
+        mode = os.environ.get('FASTSAR_FIRP') or ('global' if os.environ.get('FASTSAR_FIRP_GLOBAL') or attrs.get('MultiProcessorCount', 0) >= 100 else 'smem')
         if mode == 'global' or smem > int(attrs.get('MaxSharedMemoryPerBlockOptin', 96 * 1024)):
             name, smem = 'fir_p_g', 0           # (also beyond what the kernels opted in to in _kernels)
         kern[name](((Ko + 63) // 64, (Po + nout - 1) // nout, Np * Cn), (256,),
