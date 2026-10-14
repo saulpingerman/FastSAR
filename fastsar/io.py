@@ -107,12 +107,19 @@ def _mode_type(r, m, notes):
 
 
 def _phase_rows(S, f, coef, sign):
-    """In place, in row blocks: S[p, k] *= exp(sign 2j pi f[p, k] coef[p]) with f a function of a row slice giving
-    its frequencies (Hz) [rows, K] (no full-size temporary)."""
-    P = S.shape[0]
-    for p0 in range(0, P, 1024):
-        sl = slice(p0, min(P, p0 + 1024))
-        S[sl] *= np.exp(sign * 2j * np.pi * f(sl) * np.asarray(coef, np.float64)[sl, None]).astype(np.complex64)
+    """In place, in row blocks on all cores: S[p, k] *= exp(sign 2j pi f[p, k] coef[p]) with f a function of a row
+    slice giving its frequencies (Hz) [rows, K] (no full-size temporary). The phase is formed in float64 and its
+    cosine and sine taken straight into complex64 (on one core a 17 GB history took 100 s, the most of a read)."""
+    from .patches import _rows
+    c = sign * 2 * np.pi * np.asarray(coef, np.float64)
+
+    def blk(sl):
+        ph = f(sl) * c[sl, None]
+        e = np.empty(ph.shape, np.complex64)
+        np.cos(ph, out=e.real, casting='same_kind')
+        np.sin(ph, out=e.imag, casting='same_kind')
+        S[sl] *= e
+    _rows(blk, S.shape[0], chunk=128)
     return S
 
 

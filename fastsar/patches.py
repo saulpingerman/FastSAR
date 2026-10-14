@@ -209,6 +209,13 @@ def _rows(fn, n, chunk=256):
     list(_ROWS_POOL[0].map(fn, sl))
 
 
+def _pinned_empty(shape, dtype):
+    """An empty host array in pinned (page-locked) memory from CuPy's pinned pool, for fast uploads."""
+    import cupy as cp
+    n = int(np.prod(shape)) * np.dtype(dtype).itemsize
+    return np.frombuffer(cp.cuda.alloc_pinned_memory(max(n, 1)), dtype, int(np.prod(shape))).reshape(shape)
+
+
 def _padding(fx, guard=None):
     """Frequency padding of fx to band +- guard: (guard, npl, K2, f0) with K2 a fast FFT length and f0 = fmin - npl df."""
     S, fmin, df = fx['S'], float(fx['fmin']), float(fx['df'])
@@ -296,9 +303,22 @@ def patch_history(fx, ant, center, pts, lo, hi, margin=None, guard=None, prof=No
         m = np.rint(sft).astype(np.int64)
         tm('host geometry')
         win = prof.get('win')
+        uh = None
+        if isinstance(Q, np.ndarray) and not (win is not None and hi - lo <= win['rows']):
+            # gathered on the host before the lock is taken, in row blocks on the shared pool: a long aperture's gate
+            # is gigabytes per patch, and gathered under the lock on one thread it kept the GPU idle (a 297-patch
+            # sliding spotlight spent 12 of its 24 minutes here)
+            uh = _pinned_empty((hi - lo, N), np.complex64)
+
+            def gather(sl):
+                uh[sl] = Q[lo + sl.start + np.arange(sl.stop - sl.start)[:, None], (j[None, :] - m[sl, None]) % K2]
+            _rows(gather, hi - lo, chunk=1024)
+            tm('host gather')
         with prof['lock']:               # patches are prepared on several threads; the window is shared, and the
             # GPU work takes turns with the patch forming (form_mosaic), whose groups are sized to the memory left
-            if isinstance(Q, np.ndarray) and win is not None and hi - lo <= win['rows']:
+            if uh is not None:
+                u = cp.asarray(uh)                   # from pinned memory
+            elif isinstance(Q, np.ndarray) and win is not None and hi - lo <= win['rows']:
                 # a window of the profiles on the GPU, moved along the strip when a patch's pulses leave it (patches
                 # run along track, so a window serves many of them; it starts an eighth of its length behind the
                 # patch, for patches prepared slightly out of order)
@@ -311,7 +331,9 @@ def patch_history(fx, ant, center, pts, lo, hi, margin=None, guard=None, prof=No
                 Q, lo_q = win['buf'], lo - win['w0']
             else:
                 lo_q = lo
-            if isinstance(Q, np.ndarray):
+            if uh is not None:
+                del uh
+            elif isinstance(Q, np.ndarray):
                 u = cp.asarray(Q[lo + np.arange(hi - lo)[:, None], (j[None, :] - m[:, None]) % K2])
             else:
                 md = cp.asarray(m)
