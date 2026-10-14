@@ -33,6 +33,9 @@ _SRC = r'''
   #define LD(v) (v)
   #define ST(v) (v)
 #endif
+#ifndef COLB
+#define COLB 1         /* final_tile builds its tables by columns (0: by rows, as in 0.1.2) */
+#endif
 #ifndef PB
 #define PB 32          /* pulses per block in rot_fir_k (16 or 8 when a wide window would overflow shared memory) */
 #endif
@@ -221,6 +224,44 @@ void final_tile(const sample_t* __restrict__ dre, const sample_t* __restrict__ d
     const int qlen = (rowlen + nseg - 1) / nseg;
     const int qa = seg * qlen, qb = min(rowlen, qa + qlen);
     for (int p0 = 0; p0 < Pf; p0 += pps) {
+#if COLB
+        {
+            // the tables by columns, as in final_tile_tc2: the phase of sample q of pulse p is linear in the pixel
+            // offset, so a walk along the rows costs one complex multiply per entry and loads the sample once
+            const int units = 2 * 2 * pps * Qf;                         // two tables, two row groups per column
+            const float stepx = (dlx[T - 1] - dlx[0]) * (1.0f / (float)(T - 1));
+            const float stepy = (dly[T - 1] - dly[0]) * (1.0f / (float)(T - 1));
+            for (int u = tid; u < units; u += nthr) {
+                const int qq = u % Qf; int r = u / Qf;
+                const int ph = r % pps; r /= pps;
+                const int h = r % 2; const bool isA = (r / 2) == 0;
+                const int p = p0 + ph;
+                const bool pok = p < Pf;
+                const float* dl = isA ? dlx : dly;
+                const float c = pok ? (isA ? ux[b * Pf + p] : uy[b * Pf + p]) * (a0 + a1 * (float)qq) : 0.f;
+                const int rows = T / 2, tr0 = h * rows;
+                float f0 = -(c * dl[tr0]); f0 -= rintf(f0);
+                float fs = -(c * (isA ? stepx : stepy)); fs -= rintf(fs);
+                float wr, wi, sr, si_;
+                sincospif(2.0f * f0, &wi, &wr);
+                sincospif(2.0f * fs, &si_, &sr);
+                float vr = wr, vi = wi;
+                if (isA) {
+                    const float d_r = pok ? LD(dr[p * Qf + qq]) : 0.f, d_i = pok ? LD(di[p * Qf + qq]) : 0.f;
+                    vr = d_r * wr - d_i * wi; vi = d_r * wi + d_i * wr;
+                }
+                float2* col = (isA ? A2 : B2) + ph * Qf + qq;
+                const size_t bp = (size_t)b * Pf + p;
+                for (int tr = tr0; tr < tr0 + rows; ++tr) {
+                    float lw = 1.f;
+                    if (has_w && pok) lw = isA ? w0[bp] + gx[bp] * dlx[tr] : 1.f + gyr[bp] * dly[tr];
+                    col[tr * ld] = make_float2(vr * lw, vi * lw);
+                    const float nr = vr * sr - vi * si_;
+                    vi = vr * si_ + vi * sr; vr = nr;
+                }
+            }
+        }
+#else
         {
             const bool isA = row < T;
             const int tr = isA ? row : row - T;
@@ -255,6 +296,7 @@ void final_tile(const sample_t* __restrict__ dre, const sample_t* __restrict__ d
                 }
             }
         }
+#endif
         __syncthreads();
         const float2* a0 = A2 + (4 * tx) * ld;
         const float2* b0 = B2 + (2 * ty) * ld;
@@ -289,9 +331,10 @@ _PB_CHOICES = (32, 16, 8)        # pulses per block tried in order by the level 
 def _kernels(store='fp32', pb=32):
     bits = 16 if store == 'f16' else 32
     jt = int(os.environ.get('FASTSAR_CUDA_JT', 0) or 0) or 8          # threads per pulse in rot_fir_k (testing)
-    key = (bits, pb, jt)
+    colb = int(os.environ.get('FASTSAR_FINAL_COLB', '1'))             # final_tile's table build by columns (testing)
+    key = (bits, pb, jt, colb)
     if key not in _mods:
-        _mods[key] = cp.RawModule(code=_SRC, options=('--std=c++14', '--use_fast_math', f'-DSTORE={bits}', f'-DPB={pb}', f'-DJT={jt}'))
+        _mods[key] = cp.RawModule(code=_SRC, options=('--std=c++14', '--use_fast_math', f'-DSTORE={bits}', f'-DPB={pb}', f'-DJT={jt}', f'-DCOLB={colb}'))
     out = {k: _mods[key].get_function(k) for k in ('rot_fir_k', 'fir_p', 'fir_p_g', 'final_tile')}
     # opt in once to the device's largest shared memory per block: the limit belongs to the kernel, which every former
     # shares, so a former must never lower it (a former built on another thread while one runs would break its launch)
@@ -578,6 +621,15 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
         raise ValueError(f"the cuda final stage's tables ({smem_final // 1024} KB for {Qf} frequency samples per final "
                          f"tile) exceed the GPU's shared memory ({smem_max // 1024} KB): use backend='cpu' or 'jax'")
 
+    cc = cp.cuda.Device().compute_capability
+    tc_ver = int(os.environ.get('FASTSAR_TC_KERNEL', 0) or 0) or 2
+    if tc_ver == 2 and _tc_smem(2, 1, Qf, False) > _smem_max():
+        tc_ver = 1                                              # the double-buffered tables do not fit: the 0.1.2 kernel
+    # float32 on the tensor cores as three bfloat16 passes (Ampere and later, T = 32, when the tables fit), the CUDA-core
+    # kernel otherwise; FASTSAR_FINAL=fp32 keeps the CUDA cores
+    use_tc3 = (final_mode == 'fp32' and T == 32 and int(cc) >= 80 and tc_ver == 2 and _tc_smem(2, 1, Qf, True) <= _smem_max()
+               and os.environ.get('FASTSAR_FINAL', 'tc3') == 'tc3')
+
     def final(are, aim, cen, wts=None):
         """are, aim [B, Pf, Qf]; cen [B, 3] float64; wts None or (w0, gx, gyr) [B, Pf] float32 -> (re, im) [B, T, T]."""
         B = are.shape[0]
@@ -591,9 +643,12 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
         oim = cp.empty((B, T, T), cp.float32)
         _mark('final_geom', t0)
         t0 = _tick()
-        if final_mode == 'f16tc':
+        mode = final_mode
+        if mode == 'fp32' and use_tc3:
+            mode = 'bf16x3'                                     # three bfloat16 passes on the tensor cores: float32-class
+        if mode in ('f16tc', 'bf16x3'):
             ore, oim = final_tile_tc(cp.ascontiguousarray(are), cp.ascontiguousarray(aim), cp.ascontiguousarray(ux.astype(cp.float32)),
-                                     cp.ascontiguousarray(uy.astype(cp.float32)), dlx, dly, a0, a1, T, store=store)
+                                     cp.ascontiguousarray(uy.astype(cp.float32)), dlx, dly, a0, a1, T, store=store, split3=mode == 'bf16x3', wts=wts, ver=tc_ver)
         else:
             kern['final_tile']((B,), (T * T // 8,), (cp.ascontiguousarray(are), cp.ascontiguousarray(aim), cp.ascontiguousarray(ux.astype(cp.float32)),
                                                 cp.ascontiguousarray(uy.astype(cp.float32)), dlx, dly, ore, oim,
@@ -631,7 +686,7 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
                 _mark('device_phases', t0)
                 a, b = _children(kern, a, b, c0, sl, lv)
         cen = fcen.reshape(G, -1, 3)[gi].reshape(-1, 3)
-        if wfd is not None and wfd.ndim == 3 and final_mode != 'f16tc':     # weights in the final kernel
+        if wfd is not None and wfd.ndim == 3 and (final_mode != 'f16tc' or tc_ver == 2):     # weights in the final kernel
             w = wfd.reshape(3, G, -1, Pf)[:, gi].reshape(3, -1, Pf)
             w0 = w[0]
             big = cp.abs(w0) > 1e-6 * cp.maximum(cp.abs(w0).max(), 1e-30)    # on the device: no wait for the host
@@ -917,30 +972,234 @@ void final_tile_tc(const sample_t* __restrict__ dre, const sample_t* __restrict_
         oim[o] = M_s[t * LM + t2 + TT] + M_s[(t + TT) * LM + t2];
     }
 }
+
+#ifndef MW
+#define MW 4           /* warps doing the products: 4 (2 x 2 fragments each), 8 (1 x 2) or 16 (1 x 1) */
+#endif
+#ifndef SPEC
+#define SPEC 1         /* 1: the other warps build the tables (warp specialization); 0: every warp builds */
+#endif
+#define NSEG2 4        /* segments per table row in the build */
+#define NFR (16 / MW)
+#ifndef SPLIT3
+#define SPLIT3 0       /* 1: bfloat16 tables in high and low parts, three products (float32-class accuracy) */
+#endif
+#if SPLIT3
+  #include <cuda_bf16.h>
+  typedef __nv_bfloat16 tc_t;
+  #define TO_TC(v) __float2bfloat16(v)
+  #define NTAB 4       /* A_hi, B_hi, A_lo, B_lo */
+#else
+  typedef half tc_t;
+  #define TO_TC(v) __float2half(v)
+  #define NTAB 2
+#endif
+extern "C" __global__
+void final_tile_tc2(const sample_t* __restrict__ dre, const sample_t* __restrict__ dim, const float* __restrict__ ux, const float* __restrict__ uy,
+                    const float* __restrict__ dlx, const float* __restrict__ dly, float* __restrict__ ore, float* __restrict__ oim,
+                    int Pf, int Qf, float a0, float a1, const float* __restrict__ w0, const float* __restrict__ gx,
+                    const float* __restrict__ gyr, int has_w)
+{
+    // final_tile_tc with two table buffers: the tables of the next PPS pulses are built while the products of the
+    // current ones run (one synchronization per step instead of two), by warps other than the MW product warps when
+    // SPEC, and each product warp owns NFR output fragments (2 x 2 for MW = 4), loading each A and B fragment once
+    // per k step for all of them
+    const int b = blockIdx.x, tid = threadIdx.x, warp = tid / 32;
+    const int K2 = PPS * Qf, KP = (K2 + 15) / 16 * 16, LDS = KP + 8;
+    extern __shared__ __align__(32) unsigned char smraw[];
+    tc_t* buf = reinterpret_cast<tc_t*>(smraw);                   // buffer s at buf + s NTAB 2T LDS: A, B (high parts), then the low parts
+    const int BUFE = NTAB * 2 * TT * LDS;
+    float* M_s = reinterpret_cast<float*>(smraw);                 // reused at the end: [2T][2T + 4]
+    const sample_t* dr = dre + (size_t)b * Pf * Qf;
+    const sample_t* di = dim + (size_t)b * Pf * Qf;
+    for (int i = tid; i < 2 * NTAB * 2 * TT * (LDS - K2); i += 512) {  // padding columns of every table, once
+        const int row = i / (LDS - K2), col = K2 + i % (LDS - K2);
+        buf[row * LDS + col] = TO_TC(0.f);
+    }
+    const bool mw = warp < MW;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[NFR];
+    #pragma unroll
+    for (int j = 0; j < NFR; ++j) wmma::fill_fragment(acc[j], 0.f);
+    int fi0, fj0;                                                 // the warp's first fragment row and column
+    if (MW == 4) { fi0 = 2 * (warp / 2); fj0 = 2 * (warp % 2); }
+    else if (MW == 8) { fi0 = warp / 2; fj0 = 2 * (warp % 2); }
+    else { fi0 = warp / 4; fj0 = warp % 4; }
+    const int nbt = SPEC ? 512 - 32 * MW : 512;                   // builder threads
+    const int btid = SPEC ? tid - 32 * MW : tid;
+    const bool builder = !SPEC || !mw;
+#ifndef NH
+#define NH 2           /* row groups per table column in the build */
+#endif
+    // the tables by columns: for frequency sample q of pulse p the phase is linear in the pixel offset dl[tr], so
+    // walking the rows multiplies by one step per row: one complex multiply per complex entry, both the real-part
+    // and the imaginary-part rows from it, and the data sample loaded once per column (consecutive threads take
+    // consecutive q, so the loads and the shared-memory stores are contiguous)
+    const int units = 2 * NH * PPS * Qf;
+    const int nsteps = (Pf + PPS - 1) / PPS;
+    auto build = [&](int s, tc_t* A_s) {
+        tc_t* B_s = A_s + 2 * TT * LDS;
+        for (int u = btid; u < units; u += nbt) {
+            const int q = u % Qf; int r = u / Qf;
+            const int ph = r % PPS; r /= PPS;
+            const int h = r % NH, which = r / NH;
+            const int p = s * PPS + ph;
+            const bool pok = p < Pf;
+            const float* dl = which == 0 ? dlx : dly;
+            const float c = pok ? (which == 0 ? ux[b * Pf + p] : uy[b * Pf + p]) * (a0 + a1 * (float)q) : 0.f;
+            const int tr0 = h * (TT / NH);
+            float f0 = -(c * dl[tr0]); f0 -= rintf(f0);
+            float fs = -(c * ((dl[TT - 1] - dl[0]) * (1.0f / (TT - 1)))); fs -= rintf(fs);     // the spacing from the span: an adjacent difference of float32 offsets loses six digits
+            float wr, wi, sr, si_;
+            sincospif(2.0f * f0, &wi, &wr);
+            sincospif(2.0f * fs, &si_, &sr);
+            float vr = wr, vi = wi;
+            if (which == 0) {
+                const float d_r = pok ? LD(dr[p * Qf + q]) : 0.f, d_i = pok ? LD(di[p * Qf + q]) : 0.f;
+                vr = d_r * wr - d_i * wi; vi = d_r * wi + d_i * wr;
+            }
+            tc_t* R = (which == 0 ? A_s : B_s) + ph * Qf + q;
+            const size_t bp = (size_t)b * Pf + p;
+            const bool wt = has_w && pok;
+            const float wa = wt ? (which == 0 ? w0[bp] : 1.f) : 1.f, wb = wt ? (which == 0 ? gx[bp] : gyr[bp]) : 0.f;   // weight of row tr: wa + wb dl[tr]
+            #pragma unroll 4
+            for (int tr = tr0; tr < tr0 + TT / NH; ++tr) {
+                const float lw = wa + wb * dl[tr];
+                const float er = vr * lw, ei = vi * lw;
+                const tc_t hr = TO_TC(er), hi = TO_TC(ei);
+                R[tr * LDS] = hr;
+                R[(tr + TT) * LDS] = hi;
+#if SPLIT3
+                R[4 * TT * LDS + tr * LDS] = TO_TC(er - __bfloat162float(hr));        // the low parts, 4T LDS further
+                R[4 * TT * LDS + (tr + TT) * LDS] = TO_TC(ei - __bfloat162float(hi));
+#endif
+                const float nr = vr * sr - vi * si_;
+                vi = vr * si_ + vi * sr; vr = nr;
+            }
+        }
+    };
+    if (builder) build(0, buf);
+    __syncthreads();
+    for (int s = 0; s < nsteps; ++s) {
+        tc_t* cur = buf + (s & 1) * BUFE;
+        if (builder && s + 1 < nsteps) build(s + 1, buf + ((s + 1) & 1) * BUFE);
+        if (mw) {
+            const tc_t* A_s = cur; const tc_t* B_s = cur + 2 * TT * LDS;
+            for (int k = 0; k < KP; k += 16) {
+#if SPLIT3
+                {                                                 // MW = 4: high x high + high x low + low x high
+                    const tc_t* Al = A_s + 4 * TT * LDS; const tc_t* Bl = B_s + 4 * TT * LDS;
+                    wmma::fragment<wmma::matrix_a, 16, 16, 16, tc_t, wmma::row_major> fa0, fa1, ga0, ga1;
+                    wmma::fragment<wmma::matrix_b, 16, 16, 16, tc_t, wmma::col_major> fb0, fb1, gb0, gb1;
+                    wmma::load_matrix_sync(fa0, A_s + (fi0 * 16) * LDS + k, LDS);
+                    wmma::load_matrix_sync(fa1, A_s + ((fi0 + 1) * 16) * LDS + k, LDS);
+                    wmma::load_matrix_sync(fb0, B_s + (fj0 * 16) * LDS + k, LDS);
+                    wmma::load_matrix_sync(fb1, B_s + ((fj0 + 1) * 16) * LDS + k, LDS);
+                    wmma::load_matrix_sync(ga0, Al + (fi0 * 16) * LDS + k, LDS);
+                    wmma::load_matrix_sync(ga1, Al + ((fi0 + 1) * 16) * LDS + k, LDS);
+                    wmma::load_matrix_sync(gb0, Bl + (fj0 * 16) * LDS + k, LDS);
+                    wmma::load_matrix_sync(gb1, Bl + ((fj0 + 1) * 16) * LDS + k, LDS);
+                    wmma::mma_sync(acc[0], ga0, fb0, acc[0]); wmma::mma_sync(acc[0], fa0, gb0, acc[0]); wmma::mma_sync(acc[0], fa0, fb0, acc[0]);
+                    wmma::mma_sync(acc[1 % NFR], ga0, fb1, acc[1 % NFR]); wmma::mma_sync(acc[1 % NFR], fa0, gb1, acc[1 % NFR]); wmma::mma_sync(acc[1 % NFR], fa0, fb1, acc[1 % NFR]);
+                    wmma::mma_sync(acc[2 % NFR], ga1, fb0, acc[2 % NFR]); wmma::mma_sync(acc[2 % NFR], fa1, gb0, acc[2 % NFR]); wmma::mma_sync(acc[2 % NFR], fa1, fb0, acc[2 % NFR]);
+                    wmma::mma_sync(acc[3 % NFR], ga1, fb1, acc[3 % NFR]); wmma::mma_sync(acc[3 % NFR], fa1, gb1, acc[3 % NFR]); wmma::mma_sync(acc[3 % NFR], fa1, fb1, acc[3 % NFR]);
+                }
+#else
+                if (MW == 4) {
+                    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> fa0, fa1;
+                    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> fb0, fb1;
+                    wmma::load_matrix_sync(fa0, A_s + (fi0 * 16) * LDS + k, LDS);
+                    wmma::load_matrix_sync(fa1, A_s + ((fi0 + 1) * 16) * LDS + k, LDS);
+                    wmma::load_matrix_sync(fb0, B_s + (fj0 * 16) * LDS + k, LDS);
+                    wmma::load_matrix_sync(fb1, B_s + ((fj0 + 1) * 16) * LDS + k, LDS);
+                    wmma::mma_sync(acc[0], fa0, fb0, acc[0]); wmma::mma_sync(acc[1], fa0, fb1, acc[1]);
+                    wmma::mma_sync(acc[2 % NFR], fa1, fb0, acc[2 % NFR]); wmma::mma_sync(acc[3 % NFR], fa1, fb1, acc[3 % NFR]);
+                } else if (MW == 8) {
+                    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> fa0;
+                    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> fb0, fb1;
+                    wmma::load_matrix_sync(fa0, A_s + (fi0 * 16) * LDS + k, LDS);
+                    wmma::load_matrix_sync(fb0, B_s + (fj0 * 16) * LDS + k, LDS);
+                    wmma::load_matrix_sync(fb1, B_s + ((fj0 + 1) * 16) * LDS + k, LDS);
+                    wmma::mma_sync(acc[0], fa0, fb0, acc[0]); wmma::mma_sync(acc[1 % NFR], fa0, fb1, acc[1 % NFR]);
+                } else {
+                    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> fa0;
+                    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> fb0;
+                    wmma::load_matrix_sync(fa0, A_s + (fi0 * 16) * LDS + k, LDS);
+                    wmma::load_matrix_sync(fb0, B_s + (fj0 * 16) * LDS + k, LDS);
+                    wmma::mma_sync(acc[0], fa0, fb0, acc[0]);
+                }
+#endif
+            }
+        }
+        __syncthreads();
+    }
+    const int LM = 2 * TT + 4;
+    if (mw) {
+        #pragma unroll
+        for (int j = 0; j < NFR; ++j) {
+            const int fi = (MW == 4) ? fi0 + j / 2 : fi0, fj = (MW == 4) ? fj0 + j % 2 : fj0 + j;
+            wmma::store_matrix_sync(M_s + (fi * 16) * LM + fj * 16, acc[j], LM, wmma::mem_row_major);
+        }
+    }
+    __syncthreads();
+    for (int i = tid; i < TT * TT; i += 512) {
+        const int t = i / TT, t2 = i % TT;
+        const size_t o = ((size_t)b * TT + t) * TT + t2;
+        ore[o] = M_s[t * LM + t2] - M_s[(t + TT) * LM + t2 + TT];
+        oim[o] = M_s[t * LM + t2 + TT] + M_s[(t + TT) * LM + t2];
+    }
+}
 '''
 _mods_tc = {}
 
 
-def final_tile_tc(are, aim, ux, uy, dlx, dly, a0, a1, T, store='fp32'):
+def _tc_smem(ver, pps, Qf, split3, T=32):
+    """Shared memory (bytes) of the tensor-core final stage: buffers x tables x 2T rows x padded row length x 2 bytes."""
+    LD = (pps * Qf + 15) // 16 * 16 + 8
+    return max((1 if ver == 1 else 2) * (4 if split3 else 2) * 2 * T * LD * 2, 2 * T * (2 * T + 4) * 4)
+
+
+def _smem_max():
+    return int(cp.cuda.Device().attributes.get('MaxSharedMemoryPerBlockOptin', 48 * 1024))
+
+
+def final_tile_tc(are, aim, ux, uy, dlx, dly, a0, a1, T, store='fp32', split3=False, wts=None, ver=None):
     """are, aim [B, Pf, Qf] float32 or float16; ux, uy [B, Pf]; -> (re, im) [B, T, T] via the tensor-core kernel (T must be 32).
     FASTSAR_TC_PPS (1, 2 or 4) sets the pulses per shared-memory table; 2 fits every card, 4 needs about 85 KB of
     shared memory per block (testing)."""
     assert T == 32
     bits = 16 if store == 'f16' else 32
     smax = int(cp.cuda.Device().attributes.get('MaxSharedMemoryPerBlockOptin', 48 * 1024))
-    pps = int(os.environ.get('FASTSAR_TC_PPS', 0) or 0) or (4 if smax >= 160 * 1024 else 2)    # four pulses per table (84 KB) where two blocks still fit an SM: 5% faster on the H100, 45% slower on the L4
-    key = (bits, pps)
+    ver = ver or int(os.environ.get('FASTSAR_TC_KERNEL', 0) or 0) or 2                         # 1: the 0.1.2 kernel (testing)
+    default_pps = (4 if smax >= 160 * 1024 else 2) if ver == 1 else (2 if smax >= 160 * 1024 else 1)
+    pps = int(os.environ.get('FASTSAR_TC_PPS', 0) or 0) or default_pps
+    while pps > 1 and _tc_smem(ver, pps, are.shape[2], split3) > smax:   # wide final tiles (mosaic patches): fewer pulses per table
+        pps //= 2
+    mwarps = int(os.environ.get('FASTSAR_TC_MW', 0) or 0) or 4
+    spec = int(os.environ.get('FASTSAR_TC_SPEC', '1'))
+    nh = int(os.environ.get('FASTSAR_TC_NH', 0) or 0) or 2
+    if split3:
+        ver, mwarps = 2, 4                                          # the three-pass products exist in final_tile_tc2 with MW = 4
+    key = (bits, pps, ver, mwarps, spec, nh, bool(split3))
     if key not in _mods_tc:
-        _mods_tc[key] = cp.RawModule(code=_SRC_TC, backend='nvcc', options=('-std=c++14', '--use_fast_math', f'-DSTORE={bits}', f'-DPPS={pps}', '-arch=sm_' + cp.cuda.Device().compute_capability))
-    k = _mods_tc[key].get_function('final_tile_tc')
+        _mods_tc[key] = cp.RawModule(code=_SRC_TC, backend='nvcc', options=('-std=c++17', '--use_fast_math', f'-DSTORE={bits}', f'-DPPS={pps}', f'-DMW={mwarps}', f'-DSPEC={spec}', f'-DNH={nh}', f'-DSPLIT3={int(bool(split3))}', '-arch=sm_' + cp.cuda.Device().compute_capability))
+    k = _mods_tc[key].get_function('final_tile_tc' if ver == 1 else 'final_tile_tc2')
     B, Pf, Qf = are.shape
     K2 = pps * Qf
     KP = (K2 + 15) // 16 * 16
     LD = KP + 8
-    smem = max(2 * 2 * T * LD * 2, 2 * T * (2 * T + 4) * 4)
+    nbuf = 1 if ver == 1 else 2
+    ntab = 4 if split3 else 2
+    smem = max(nbuf * ntab * 2 * T * LD * 2, 2 * T * (2 * T + 4) * 4)
     if smem > max(48 * 1024, k.max_dynamic_shared_size_bytes):     # wide final tiles: opt in (never lowered)
         k.max_dynamic_shared_size_bytes = smem
     ore = cp.empty((B, T, T), cp.float32)
     oim = cp.empty((B, T, T), cp.float32)
-    k((B,), (512,), (are, aim, ux, uy, dlx, dly, ore, oim, np.int32(Pf), np.int32(Qf), np.float32(a0), np.float32(a1)), shared_mem=smem)
+    if ver == 1:
+        assert wts is None, 'the 0.1.2 tensor-core kernel takes no aperture weights'
+        k((B,), (512,), (are, aim, ux, uy, dlx, dly, ore, oim, np.int32(Pf), np.int32(Qf), np.float32(a0), np.float32(a1)), shared_mem=smem)
+    else:
+        dummy = cp.zeros(1, cp.float32)
+        w = (dummy,) * 3 if wts is None else tuple(cp.ascontiguousarray(x, cp.float32) for x in wts)
+        k((B,), (512,), (are, aim, ux, uy, dlx, dly, ore, oim, np.int32(Pf), np.int32(Qf), np.float32(a0), np.float32(a1), *w,
+                         np.int32(0 if wts is None else 1)), shared_mem=smem)
     return ore, oim

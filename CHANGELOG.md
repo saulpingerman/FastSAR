@@ -18,9 +18,21 @@ was published on PyPI.
   (the cache serves their reuse), which was faster on the A100 and H100 and slower on the L4; `FASTSAR_FIRP`
   overrides. `FASTSAR_CUDA_PB`, `FASTSAR_CUDA_JT`, `FASTSAR_FIRP_SMEM` and `FASTSAR_FINAL_PPS` expose the kernels'
   launch parameters for testing (the defaults were the fastest on all three cards).
-- CUDA float16: the tensor-core final stage builds its tables four pulses at a time on cards with at least 160 KB of
-  shared memory per block (5% faster on an H100; two pulses on the L4, where four would halve the occupancy);
-  `FASTSAR_TC_PPS` overrides.
+- CUDA final stage: a new tensor-core kernel builds the next pulses' tables while the current products run (two
+  shared-memory buffers, table-building warps beside four product warps of 2 by 2 fragments) and builds the tables
+  by columns: the phase of a frequency sample is linear in the pixel offset, so one complex multiply per entry walks
+  the rows and the sample is read once instead of once per row. The float16 final stage of the Panama image goes
+  from 0.122 to 0.055 s on an H100 and from 0.41 to 0.20 s on an L4, with the error unchanged, and aperture weights
+  are applied in the kernel (mosaics), which also makes the weighted float16 image 12 dB closer to float32.
+- CUDA float32: the final stage runs on the tensor cores as three bfloat16 products (high by high, high by low, low
+  by high), as the TPU does, on cards of compute capability 8.0 and later when its tables fit the shared memory; the
+  image agrees with the CUDA-core kernel to 87 dB and its error is unchanged (59.94 dB on Panama). The Panama float32
+  image goes from 0.68 to 0.575 s on an H100 and from 3.41 to 2.94 s on an L4; `FASTSAR_FINAL=fp32` keeps the CUDA
+  cores. The CUDA-core kernel builds its tables by columns too (7 to 17% faster).
+- Mosaics: the aperture weights' quadrature is summed in place of a BLAS product, which on large hosts started a
+  thread pool per prefetch worker and starved the launching thread; the weights' gradient takes the center pulse at
+  the four offset points in one call. The 84-patch Capella stripmap goes from 5.9 to 5.0 s on an H100 (26 vCPUs)
+  and from 26.9 to 22.2 s on an L4 host with 4 vCPUs.
 - Mosaics: the decimation filters are memoized across patches and the band-center phases and the final stage's
   per-pulse geometry run as one fused kernel each on `cuda`; the 84-patch Capella stripmap of the paper goes from
   6.9 to 6.0 s on an H100 with the image unchanged.

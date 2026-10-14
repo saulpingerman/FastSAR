@@ -157,3 +157,47 @@ def test_profile_window(monkeypatch):
             bad.append(f'profile window, {nw} prefetch workers: {ew:.1f} dB')
         print(f'mosaic, profiles in a moving GPU window vs resident, {nw} prefetch workers: {ew:.1f} dB')
     assert not bad, 'FAILED: ' + '; '.join(bad)
+
+
+@pytest.mark.parametrize('weighted', [False, True])
+def test_tensor_core_final(scene, weighted, monkeypatch):
+    """The final stage on the tensor cores at T = 32: the three bfloat16 passes (the float32 default on Ampere and later)
+    against the float32 CUDA-core kernel, and the double-buffered float16 kernel against the 0.1.2 one, with and
+    without aperture weights in the kernel."""
+    import cupy as cp
+    from fastsar import ffbp_cuda
+    from fastsar.api import final_weights
+    col, S = scene
+    plan = ffbp2.make_plan(col, 128, 128, 0.5, 0.5, T=32, nlev=2, pmax=0.4)
+    coll = ffbp2.collection_arrays(plan, col.ant)
+    P = len(col.ant)
+    wf = None
+    if weighted:
+        def weight(q, pul):
+            q, pul = np.asarray(q, np.float64), np.asarray(pul, np.float64)
+            return (1.0 + 0.3 * np.cos(2 * np.pi * pul / P))[:, None] * (1.0 + 0.01 * q[None, :, 0] - 0.005 * q[None, :, 1])
+        wf = final_weights(plan, weight, P, grad=True)
+
+    def form(mode='fp32', store='fp32', **env):
+        with monkeypatch.context() as mp:
+            for k, v in env.items():
+                mp.setenv(k, v)
+            ffbp_cuda._mods_tc.clear()
+            return cp.asnumpy(ffbp_cuda.make_ffbp_cuda(plan, coll, final_mode=mode, store=store, wf=wf)(S, ng=2))
+
+    def rel(a, b):
+        return 10 * np.log10(np.sum(np.abs(a - b) ** 2) / np.sum(np.abs(b) ** 2) + 1e-300)
+    bad = []
+    cores = form(FASTSAR_FINAL='fp32')
+    if int(cp.cuda.Device().compute_capability) >= 80:
+        e = rel(form(), cores)
+        print(f'weighted {weighted}: three bfloat16 passes vs float32 CUDA cores: {e:.1f} dB')
+        if e > -80:                                     # measured -87 to -90 dB (L4, H100)
+            bad.append(f'three passes {e:.1f} dB')
+    f2 = form('f16tc', 'f16')
+    f1 = form('f16tc', 'f16', FASTSAR_TC_KERNEL='1')
+    e2, e1, e21 = rel(f2, cores), rel(f1, cores), rel(f2, f1)
+    print(f'weighted {weighted}: float16 new kernel vs float32 {e2:.1f} dB, 0.1.2 kernel vs float32 {e1:.1f} dB, new vs 0.1.2 {e21:.1f} dB')
+    if e2 > e1 + 1.0 or e2 > -63:                       # measured -68.8 to -69.1 dB; the 0.1.2 kernel -56.3 weighted
+        bad.append(f'float16 new kernel {e2:.1f} dB against {e1:.1f} dB')
+    assert not bad, 'FAILED: ' + '; '.join(bad)

@@ -179,18 +179,23 @@ def _jax_group(plan, K):
     return ng
 
 
-def final_weights(plan, weight, P, grad=False, points=None):
+def final_weights(plan, weight, P, grad=False, points=None, nodes=3):
     """Weight of each final subaperture at each final tile [ntiles, Pf] (float32), for ImageFormer's aperture_weight:
     weight(points [m, 3], pulses [n] int) -> [n, m], the per-pulse weights at the tile centers, averaged over the
     pulses that each final subaperture spans (its center on the input pulse axis composed through the levels'
-    decimations, width the product of the decimation factors) by 3-point Gauss-Legendre quadrature. grad=True
-    also returns the gradient along e1 and e2 (per metre) at the tile centers: [3, ntiles, Pf]."""
+    decimations, width the product of the decimation factors) by 3-point Gauss-Legendre quadrature (nodes=1: the
+    center pulse alone). grad=True also returns the gradient along e1 and e2 (per metre) at the tile centers:
+    [3, ntiles, Pf], by central differences of the center-pulse weights at four points half a tile away, the four
+    point sets in one call of weight. The quadrature sum is written out rather than a BLAS product: a mosaic calls
+    this on several prefetch threads at once, and each BLAS call there started a thread pool the size of the host."""
     cen = np.asarray(plan['final']['cen'], np.float64)
     if grad:
         h1, h2 = 0.5 * plan['T'] * plan['spx'], 0.5 * plan['T'] * plan['spy']
         e1, e2 = np.asarray(plan['e1'], np.float64), np.asarray(plan['e2'], np.float64)
-        w = [final_weights(plan, weight, P, points=q) for q in (cen, cen + h1 * e1, cen - h1 * e1, cen + h2 * e2, cen - h2 * e2)]
-        return np.stack([w[0], (w[1] - w[2]) / (2 * h1), (w[3] - w[4]) / (2 * h2)]).astype(np.float32)
+        w0 = final_weights(plan, weight, P, points=cen)
+        m = len(cen)
+        wq = final_weights(plan, weight, P, points=np.concatenate([cen + h1 * e1, cen - h1 * e1, cen + h2 * e2, cen - h2 * e2]), nodes=1)
+        return np.stack([w0, (wq[:m] - wq[m:2 * m]) / (2 * h1), (wq[2 * m:3 * m] - wq[3 * m:]) / (2 * h2)]).astype(np.float32)
     q = cen if points is None else points
     idx, D = np.arange(plan['final']['P'], dtype=np.float64), 1.0
     for lv in reversed(plan['levels']):
@@ -198,13 +203,18 @@ def final_weights(plan, weight, P, grad=False, points=None):
         D *= lv['Dp']
     # pulse p covers [p - 1/2, p + 1/2); a subaperture spans [idx - D/2, idx + D/2] within the collection
     a = np.clip(idx - D / 2, -0.5, P - 0.5); b = np.clip(idx + D / 2, -0.5, P - 0.5)
-    t, gw = np.array([-np.sqrt(0.6), 0.0, np.sqrt(0.6)]), np.array([5.0, 8.0, 5.0]) / 18.0
-    nodes = np.clip(np.rint(0.5 * (a + b)[:, None] + 0.5 * (b - a)[:, None] * t[None, :]), 0, P - 1).astype(np.int64)
-    U, inv = np.unique(nodes.ravel(), return_inverse=True)
-    W = np.asarray(weight(q, U), np.float64)[inv].reshape(len(idx), 3, -1)    # [Pf, 3, ntiles]
+    if nodes == 1:
+        t, gw = np.array([0.0]), np.array([1.0])
+    else:
+        t, gw = np.array([-np.sqrt(0.6), 0.0, np.sqrt(0.6)]), np.array([5.0, 8.0, 5.0]) / 18.0
+    nodes_ = np.clip(np.rint(0.5 * (a + b)[:, None] + 0.5 * (b - a)[:, None] * t[None, :]), 0, P - 1).astype(np.int64)
+    U, inv = np.unique(nodes_.ravel(), return_inverse=True)
+    W = np.asarray(weight(q, U), np.float64)[inv].reshape(len(idx), len(t), -1)    # [Pf, nodes, npoints]
     # a subaperture centered beyond the collection holds the filter tails of the edge pulses (the decimators run m
     # outputs past each end): it takes the weight of the nearest pulse (its nodes clip to it), not zero
-    m = np.tensordot(gw, W, axes=(0, 1))                                          # [Pf, ntiles]
+    m = gw[0] * W[:, 0]
+    for k in range(1, len(t)):
+        m = m + gw[k] * W[:, k]                                                     # [Pf, npoints]
     return np.ascontiguousarray(m.T, np.float32)
 
 
