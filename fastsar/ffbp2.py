@@ -17,6 +17,7 @@ a separable matrix product). This version differs in four ways.
   * The device program takes one first-level tile at a time, so that only the
     intermediate data of that tile exist on the device.
 """
+import functools
 import math
 import os
 
@@ -99,7 +100,14 @@ class LazyDecimator:
 
 def decimator_fir(n_in, D, pass_frac, atten=70.0):
     """The kernel form of ffbp.decimator (as fir(F, D, m) returns it) without the dense matrix: F is shift-invariant,
-    each column one Kaiser-windowed sinc divided by the row sums of its inputs."""
+    each column one Kaiser-windowed sinc divided by the row sums of its inputs. Memoized: the patches of a mosaic
+    share their filters, and the design (Kaiser windows by Bessel functions) cost about 20 ms per patch."""
+    d, m = _decimator_fir(int(n_in), int(D), float(pass_frac), float(atten))
+    return dict(d), m
+
+
+@functools.lru_cache(maxsize=512)
+def _decimator_fir(n_in, D, pass_frac, atten):
     dw = (2.0 - 2.0 * pass_frac) * np.pi / D
     half = math.ceil((atten - 8.0) / (2.285 * dw)) / 2.0 + 1.0
     m = int(math.ceil(half / D))

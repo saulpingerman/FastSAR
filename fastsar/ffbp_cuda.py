@@ -387,20 +387,44 @@ def _children(kern, pre, pim, c0, sl, lv):
 
 
 
+_PHASES_KERN = None
+
+
 def _device_phases(la, refs, lv):
     """Band-center phase and slope of every child of every parent (float64 on the device): refs [Np, 3] ->
-    c0, slope [Np, C, P] float32. Same formula as ffbp2.device_phases."""
+    c0, slope [Np, C, P] float32. Same formula as ffbp2.device_phases, in one fused kernel (the dozen separate
+    array operations it replaces cost a mosaic about 2 ms of host time per call)."""
+    global _PHASES_KERN
     k0c = 2.0 * (lv['f0'] + (lv['K'] - 1) / 2.0 * lv['df']) / C
     k1 = 2.0 * lv['df'] / C
     u, r0, d = la['u'], la['r0'], la['d']                                   # [P, 3], [P], [C, 3] float64 device
-    uc = refs @ u.T                                                          # [Np, P]
-    wn = r0[None, :] * cp.sqrt(1 + ((refs * refs).sum(1)[:, None] - 2 * r0[None, :] * uc) / (r0 * r0)[None, :])
-    ud = d @ u.T                                                             # [C, P]
-    wd = r0[None, None, :] * ud[None] - (d[None, :, :] * refs[:, None, :]).sum(2)[:, :, None]      # [Np, C, P]
-    num = (d * d).sum(1)[None, :, None] - 2 * wd
-    ddr = num / (cp.sqrt(wn[:, None, :] ** 2 + num) + wn[:, None, :])
-    c0 = ddr * k0c
-    return (c0 - cp.rint(c0)).astype(cp.float32), (ddr * k1).astype(cp.float32)
+    Np, Cn, P = refs.shape[0], d.shape[0], u.shape[0]
+    if _PHASES_KERN is None:
+        _PHASES_KERN = cp.ElementwiseKernel(
+            'raw float64 refs, raw float64 u, raw float64 r0, raw float64 d, int32 Cn, int32 P, float64 k0c, float64 k1',
+            'float32 c0, float32 sl',
+            '''
+            const int p = i % P; const int c = (i / P) % Cn; const int n = i / (P * Cn);
+            const double rx = refs[3 * n], ry = refs[3 * n + 1], rz = refs[3 * n + 2];
+            const double ux = u[3 * p], uy = u[3 * p + 1], uz = u[3 * p + 2];
+            const double dx = d[3 * c], dy = d[3 * c + 1], dz = d[3 * c + 2];
+            const double r = r0[p];
+            const double uc = rx * ux + ry * uy + rz * uz;
+            const double rr = rx * rx + ry * ry + rz * rz;
+            const double wn = r * sqrt(1.0 + (rr - 2.0 * r * uc) / (r * r));
+            const double ud = dx * ux + dy * uy + dz * uz;
+            const double wd = r * ud - (dx * rx + dy * ry + dz * rz);
+            const double num = (dx * dx + dy * dy + dz * dz) - 2.0 * wd;
+            const double ddr = num / (sqrt(wn * wn + num) + wn);
+            const double cc = ddr * k0c;
+            c0 = (float)(cc - rint(cc));
+            sl = (float)(ddr * k1);
+            ''', 'fastsar_device_phases')
+    c0 = cp.empty((Np, Cn, P), cp.float32)
+    sl = cp.empty((Np, Cn, P), cp.float32)
+    _PHASES_KERN(cp.ascontiguousarray(refs, cp.float64), cp.ascontiguousarray(u, cp.float64), cp.ascontiguousarray(r0, cp.float64),
+                 cp.ascontiguousarray(d, cp.float64), np.int32(Cn), np.int32(P), np.float64(k0c), np.float64(k1), c0, sl)
+    return c0, sl
 
 
 PROFILE = {}
@@ -486,6 +510,28 @@ def _upload_planes(S, pre, pim, win, check, scaled):
     return scale
 
 
+_GEOM_KERN = None
+
+
+def _final_geom_kernel():
+    """[B, Pf] unit-vector components (along e1, e2, their normal) and lengths of the vectors from the tile centers
+    cen [B, 3] to the final subapertures' antenna positions r0 u (fu [Pf, 3], fr0 [Pf]), one fused kernel."""
+    global _GEOM_KERN
+    if _GEOM_KERN is None:
+        _GEOM_KERN = cp.ElementwiseKernel(
+            'raw float64 fu, raw float64 fr0, raw float64 cen, raw float64 e1, raw float64 e2, raw float64 en, int32 Pf',
+            'float64 ux, float64 uy, float64 uz, float64 wn',
+            '''
+            const int p = i % Pf; const int b = i / Pf;
+            const double wx = fr0[p] * fu[3 * p] - cen[3 * b], wy = fr0[p] * fu[3 * p + 1] - cen[3 * b + 1], wz = fr0[p] * fu[3 * p + 2] - cen[3 * b + 2];
+            wn = sqrt(wx * wx + wy * wy + wz * wz);
+            ux = (wx * e1[0] + wy * e1[1] + wz * e1[2]) / wn;
+            uy = (wx * e2[0] + wy * e2[1] + wz * e2[2]) / wn;
+            uz = (wx * en[0] + wy * en[1] + wz * en[2]) / wn;
+            ''', 'fastsar_final_geom')
+    return _GEOM_KERN
+
+
 def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
     """Build form(S) -> complex64 image [nx, ny] (device) for the plan and the collection arrays (host float64).
     final_mode: 'fp32' (CUDA cores, float32) or 'f16tc' (tensor cores, float16 operands, float32 accumulation).
@@ -536,11 +582,8 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
         """are, aim [B, Pf, Qf]; cen [B, 3] float64; wts None or (w0, gx, gyr) [B, Pf] float32 -> (re, im) [B, T, T]."""
         B = are.shape[0]
         t0 = _tick()
-        w = fr0[None, :, None] * fu[None, :, :] - cen[:, None, :]                       # [B, Pf, 3]
-        wn = cp.sqrt((w * w).sum(2))
-        ux = (w @ e1d) / wn
-        uy = (w @ e2d) / wn
-        uz = (w @ end) / wn
+        ux, uy, uz, wn = (cp.empty((B, Pf), cp.float64) for _ in range(4))
+        _final_geom_kernel()(fu, fr0, cp.ascontiguousarray(cen, cp.float64), e1d, e2d, end, np.int32(Pf), ux, uy, uz, wn)   # one kernel for the per-pulse unit vectors
         mxv, myv, mzv = ux.mean(1), uy.mean(1), uz.mean(1)
         mn = cp.sqrt(mxv * mxv + myv * myv + mzv * mzv)
         ucx, ucy, rc = mxv / mn, myv / mn, wn.mean(1)
