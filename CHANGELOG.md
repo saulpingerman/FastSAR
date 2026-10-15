@@ -36,6 +36,14 @@ was published on PyPI.
 - Mosaics: the decimation filters are memoized across patches and the band-center phases and the final stage's
   per-pulse geometry run as one fused kernel each on `cuda`; the 84-patch Capella stripmap of the paper goes from
   6.9 to 6.0 s on an H100 with the image unchanged.
+- `form_cphd`: the host work runs on all cores in row blocks: the reader's troposphere and spotlight
+  re-reference phases (one pass over the whole history each, single-threaded since 0.1.1), the window, and, on
+  `cuda` mosaics whose profiles do not fit a quarter of the GPU memory, the gather of a patch's profiles, which now
+  happens in parallel into pinned memory outside the lock that serializes the GPU. On a g2-standard-32 host with an
+  L4, a 17 GB Capella spotlight goes from 188 to 46 s on `cuda` and from 217 to 74 s on `cpu`, and a 24 GB sliding
+  spotlight from 1450 to 331 s on `cuda`; before, the L4 ran end to end slower than the host's CPU backend. The
+  window and the gather are bitwise unchanged; the phases, now a float32 cosine and sine of the float64 angle, differ
+  from 0.1.2's in the last bit of some samples (-193 dB relative).
 
 ## [0.1.2] - 2026-10-14
 
