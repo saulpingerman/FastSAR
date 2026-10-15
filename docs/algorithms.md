@@ -13,8 +13,9 @@ linearized about the tile center, so each final T by T tile is a product of two 
 phase correction. 
 
 The TPU kernels fuse rotation and decimation and run the final stage on the matrix units; the CUDA kernels use
-shared-memory filters and, for float16, tensor cores. CUDA and C++ use float64 geometry at every level and agree to
-about -87 dB in float32; the JAX program and the TPU kernels compute the last level's geometry in float32.
+shared-memory filters and run the final stage on the tensor cores (float16, and float32 as three bfloat16 products on
+compute capability 8.0 and later). CUDA and C++ use float64 geometry at every level and their float32 images agree to
+about -87 dB; the JAX program and the TPU kernels compute the last level's geometry in float32.
 
 ### Tile size and range
 

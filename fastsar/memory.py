@@ -45,6 +45,14 @@ def _env_number(name, least, kind=int):
     return x
 
 
+def _env_choice(name, default, allowed):
+    """The environment variable `name` (default when unset or empty), which must be one of `allowed` (strings)."""
+    v = os.environ.get(name) or default
+    if v not in allowed:
+        raise ValueError(f'{name}={v!r}: expected one of {", ".join(sorted(allowed))}')
+    return v
+
+
 def host_available():
     """Bytes of host memory available (MemAvailable on Linux, else total physical memory)."""
     try:
@@ -129,6 +137,17 @@ def cuda_child(lv0, isz, stream):
     return CUDA_CHILD * isz * lv0['Ko'] * lv0['P']
 
 
+def cuda_rest(plan, isz):
+    """Device bytes of one first-level child carried through the later levels at the largest of them: per child its
+    input planes, the range-decimated intermediate of all its input pulses and the output planes; the deeper levels
+    multiply the children by the earlier levels' C. isz: bytes per complex sample in storage."""
+    n, worst = 1, 1
+    for lv in plan['levels'][1:]:
+        worst = max(worst, n * isz * (lv['P'] * lv['K'] + lv['C'] * (lv['P'] + lv['Po']) * lv['Ko']))
+        n *= lv['C']
+    return worst
+
+
 def cuda_streams(planes, free):
     """Whether a host history of `planes` device bytes streams through the CUDA first level, given `free` bytes."""
     return planes > STREAM_FRACTION * free
@@ -150,8 +169,8 @@ def full_speed(plan, K, backend, isz=8):
     """Device memory the full-speed configuration requires, with the headroom FastSAR's sizing keeps: (total, parts
     dict of what full speed holds). isz: bytes per complex sample of the CUDA storage (4 for float16).
     CPU: groups of 8 children within a quarter of the available memory. CUDA: the image, the history uploaded (its
-    planes within STREAM_FRACTION of the memory left after the image) and groups of 8 children in what remains, as
-    ffbp_cuda sizes them. TPU: the history and groups of TPU_GROUP children within 95% of the device memory."""
+    planes within STREAM_FRACTION of the memory left after the image), groups of 8 children and one child carried
+    through the later levels in what remains, as ffbp_cuda sizes them. TPU: the history and groups of TPU_GROUP children within 95% of the device memory."""
     lv = plan['levels'][0]
     image = 8.0 * plan['Nx'] * plan['Ny']
     if backend == 'tpu':
@@ -159,6 +178,8 @@ def full_speed(plan, K, backend, isz=8):
         return (hist + groups) / 0.95, dict(history=hist, first_level=groups, image=image)
     if backend == 'cuda':
         hist, groups = float(isz) * lv['P'] * K, min(CUDA_GROUP, lv['C']) * cuda_child(lv, isz, False)
-        return image + max(hist / STREAM_FRACTION, hist + groups), dict(history=hist, first_level=groups, image=image)
+        rest = float(cuda_rest(plan, isz)) if len(plan['levels']) > 1 else 0.0
+        return (image + max(hist / STREAM_FRACTION, hist + groups + rest),
+                dict(history=hist, first_level=groups, later_levels=rest, image=image))
     groups = 8 * child_bytes(plan, backend)
     return 4 * groups + image, dict(history=0.0, first_level=groups, image=image)

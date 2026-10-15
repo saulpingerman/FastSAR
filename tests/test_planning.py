@@ -323,3 +323,26 @@ def test_environment_variables(monkeypatch):
             r = 'ValueError'
     check(bad, 'FASTSAR_TPU_GROUP=0 raises ValueError in the TPU sizing', float(r != 'ValueError'), 0)
     done(bad)
+
+
+def test_env_choice(monkeypatch):
+    """Settings with fixed choices: the default when unset or empty, a ValueError naming the variable otherwise."""
+    from fastsar import memory
+    monkeypatch.delenv('FASTSAR_TEST_CHOICE', raising=False)
+    assert memory._env_choice('FASTSAR_TEST_CHOICE', 'a', {'a', 'b'}) == 'a'
+    monkeypatch.setenv('FASTSAR_TEST_CHOICE', 'b')
+    assert memory._env_choice('FASTSAR_TEST_CHOICE', 'a', {'a', 'b'}) == 'b'
+    monkeypatch.setenv('FASTSAR_TEST_CHOICE', 'c')
+    with pytest.raises(ValueError, match='FASTSAR_TEST_CHOICE'):
+        memory._env_choice('FASTSAR_TEST_CHOICE', 'a', {'a', 'b'})
+
+
+def test_cuda_full_speed_counts_later_levels():
+    """The CUDA full-speed estimate includes one first-level child carried through the later levels, as the CUDA
+    former's group sizing reserves it."""
+    from fastsar import memory, ffbp2
+    col = fastsar.sim.make_collect(res=0.5, scene=60.0, r0=5e3)
+    plan = ffbp2.make_plan(col, 128, 128, 0.5, 0.5, T=16, nlev=3, pmax=0.4)
+    total, parts = memory.full_speed(plan, col.K, 'cuda')
+    assert parts['later_levels'] == memory.cuda_rest(plan, 8) > 0
+    assert total >= parts['image'] + parts['history'] + parts['first_level'] + parts['later_levels'] - 1

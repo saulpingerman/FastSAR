@@ -125,7 +125,7 @@ def test_out_of_memory_retry(three, monkeypatch):
 
 def test_later_level_split(three, monkeypatch):
     """A later level whose intermediate of all output children does not fit is formed over parts of its children
-    (round 5, UMBRA-10 on the L4): the image is unchanged."""
+    (a 12 GB UMBRA-10 spotlight on an L4): the image is unchanged."""
     import cupy as cp
     from fastsar import ffbp_cuda
     lvs = three.plan['levels']
@@ -193,16 +193,84 @@ def test_profile_window(monkeypatch):
     raw = sm.simulate(p, np.array([[x[len(x) // 2], r[len(r) // 2]]]))
     rows = (len(x) // 2 - 140, len(x) // 2 + 140)
     img_res, _, _ = pt.form_stripmap(raw, p, rows=rows, backend='cuda', rwin='taylor', awin='taylor')
-    monkeypatch.setenv('FASTSAR_PROFILE_WINDOW_ROWS', '1200')
-    for nw in ('1', '4'):              # patches prepared on one thread and on four sharing the window
-        monkeypatch.setenv('FASTSAR_MOSAIC_PREFETCH', nw)
-        img_win, _, _ = pt.form_stripmap(raw, p, rows=rows, backend='cuda', rwin='taylor', awin='taylor')
-        ew = 10 * np.log10(np.sum(np.abs(img_win - img_res) ** 2) / np.sum(np.abs(img_res) ** 2))
-        if ew > -100:
-            bad.append(f'profile window, {nw} prefetch workers: {ew:.1f} dB')
-        print(f'mosaic, profiles in a moving GPU window vs resident, {nw} prefetch workers: {ew:.1f} dB')
+    # a window of 1200 rows serves the patches; one of 16 rows is smaller than any patch, whose profiles are then
+    # gathered on the host into pinned memory (on four threads at once with four prefetch workers)
+    for wr in ('1200', '16'):
+        monkeypatch.setenv('FASTSAR_PROFILE_WINDOW_ROWS', wr)
+        for nw in ('1', '4'):          # patches prepared on one thread and on four sharing the window
+            monkeypatch.setenv('FASTSAR_MOSAIC_PREFETCH', nw)
+            img_win, _, _ = pt.form_stripmap(raw, p, rows=rows, backend='cuda', rwin='taylor', awin='taylor')
+            ew = 10 * np.log10(np.sum(np.abs(img_win - img_res) ** 2) / np.sum(np.abs(img_res) ** 2))
+            if ew > -100:
+                bad.append(f'profile window of {wr} rows, {nw} prefetch workers: {ew:.1f} dB')
+            print(f'mosaic, profiles in a {wr}-row GPU window vs resident, {nw} prefetch workers: {ew:.1f} dB')
     assert not bad, 'FAILED: ' + '; '.join(bad)
 
+
+
+def test_pinned_off(three, monkeypatch):
+    """FASTSAR_PINNED=0 (a plain copy of the image) against the pinned copy: the same image; a bad value raises."""
+    import cupy as cp
+    from fastsar import api
+    dev = three.form(three.S, ng=2)
+    a = api._to_host(dev)
+    monkeypatch.setenv('FASTSAR_PINNED', '0')
+    b = api._to_host(dev)
+    assert np.array_equal(a, b) and np.array_equal(a, cp.asnumpy(dev))
+    monkeypatch.setenv('FASTSAR_PINNED', 'no')
+    with pytest.raises(ValueError, match='FASTSAR_PINNED'):
+        api._to_host(dev)
+
+
+def test_float16_zero_first_block(scene, monkeypatch):
+    """float16 storage scales by the first uploaded block's peak; a history whose first block is zero (dropped
+    pulses, zeroed) falls back to the whole history's peak and forms the same image as float32 within float16's
+    error, where a scale of 1 would overflow the half range."""
+    import cupy as cp
+    from fastsar import ffbp_cuda
+    col, S = scene
+    plan, coll = _plan(col, 3)
+    monkeypatch.setattr(memory, 'STREAM_PULSES', 32)          # upload blocks of 32 pulses
+    S0 = S.copy()
+    S0[:32] = 0
+    S0 *= 1e4 / np.abs(S0).max()                   # a peak of 10^4: above float16's range times any block's share
+    f32 = cp.asnumpy(ffbp_cuda.make_ffbp_cuda(plan, coll)(S0))
+    f16 = cp.asnumpy(ffbp_cuda.make_ffbp_cuda(plan, coll, final_mode='f16tc', store='f16')(S0))
+    assert np.isfinite(f16).all()
+    e = 10 * np.log10(np.sum(np.abs(f16 - f32) ** 2) / np.sum(np.abs(f32) ** 2))
+    print(f'float16 with a zero first block vs float32: {e:.1f} dB')
+    assert e < -40, e
+
+
+def test_env_validation(scene, monkeypatch):
+    """The CUDA settings with fixed choices reject other values, naming the variable."""
+    from fastsar import ffbp_cuda
+    col, S = scene
+    plan = ffbp2.make_plan(col, 128, 128, 0.5, 0.5, T=32, nlev=2, pmax=0.4)       # T = 32: the tensor-core stage
+    coll = ffbp2.collection_arrays(plan, col.ant)
+    for name, bad in (('FASTSAR_FINAL', 'foo'), ('FASTSAR_TC_PPS', '3'), ('FASTSAR_TC_MW', '16'), ('FASTSAR_FIRP', 'x')):
+        with monkeypatch.context() as mp:
+            mp.setenv(name, bad)
+            with pytest.raises(ValueError, match=name):
+                ffbp_cuda.make_ffbp_cuda(plan, coll, final_mode='f16tc', store='f16')(S)
+
+
+def test_no_nvcc(scene, monkeypatch):
+    """Without nvcc the float32 final stage falls back to the CUDA cores with one warning (the same image as
+    FASTSAR_FINAL=fp32), and float16 raises an error that names the remedy."""
+    import cupy as cp
+    from fastsar import ffbp_cuda
+    col, S = scene
+    plan, coll = _plan(col, 3)
+    monkeypatch.setenv('FASTSAR_FINAL', 'fp32')
+    ref = cp.asnumpy(ffbp_cuda.make_ffbp_cuda(plan, coll)(S))
+    monkeypatch.delenv('FASTSAR_FINAL')
+    monkeypatch.setattr(ffbp_cuda, '_NVCC', {'path': None})
+    with pytest.warns(RuntimeWarning, match='nvcc not found'):
+        img = cp.asnumpy(ffbp_cuda.make_ffbp_cuda(plan, coll)(S))
+    assert np.array_equal(img, ref)
+    with pytest.raises(RuntimeError, match='nvcc'):
+        ffbp_cuda.make_ffbp_cuda(plan, coll, final_mode='f16tc', store='f16')
 
 @pytest.mark.parametrize('weighted', [False, True])
 def test_tensor_core_final(scene, weighted, monkeypatch):

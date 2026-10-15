@@ -14,6 +14,7 @@ All arithmetic is float32 with float64 geometry on the host and, for the device 
 """
 import math
 import os
+import warnings
 
 import numpy as np
 import cupy as cp
@@ -330,8 +331,8 @@ _PB_CHOICES = (32, 16, 8)        # pulses per block tried in order by the level 
 
 def _kernels(store='fp32', pb=32):
     bits = 16 if store == 'f16' else 32
-    jt = int(os.environ.get('FASTSAR_CUDA_JT', 0) or 0) or 8          # threads per pulse in rot_fir_k (testing)
-    colb = int(os.environ.get('FASTSAR_FINAL_COLB', '1'))             # final_tile's table build by columns (testing)
+    jt = memory._env_number('FASTSAR_CUDA_JT', 1) or 8                 # threads per pulse in rot_fir_k (testing)
+    colb = int(memory._env_choice('FASTSAR_FINAL_COLB', '1', {'0', '1'}))     # final_tile's table build by columns (testing)
     key = (bits, pb, jt, colb)
     if key not in _mods:
         _mods[key] = cp.RawModule(code=_SRC, options=('--std=c++14', '--use_fast_math', f'-DSTORE={bits}', f'-DPB={pb}', f'-DJT={jt}', f'-DCOLB={colb}'))
@@ -377,7 +378,7 @@ def _children(kern, pre, pim, c0, sl, lv):
         cols = 2 * jt                                     # output columns per block
         W = cols * Dk + L
         smem_max = int(cp.cuda.Device().attributes.get('MaxSharedMemoryPerBlockOptin', 48 * 1024))
-        pb_env = int(os.environ.get('FASTSAR_CUDA_PB', 0) or 0)           # testing: force the pulses per block
+        pb_env = memory._env_number('FASTSAR_CUDA_PB', 1) or 0          # testing: force the pulses per block
         for pb in ((pb_env,) if pb_env else _PB_CHOICES):   # pulses per block: the largest whose window fits the device
             smem = (2 * pb * (W | 1) + L + 2 * pb * cols) * 4
             if smem <= smem_max:
@@ -407,7 +408,7 @@ def _children(kern, pre, pim, c0, sl, lv):
         zim = cp.empty((Np * Cn, Po, Ko), kern['dtype'])
         # outputs per block: as many as keep the input rows within 40 KB of shared memory (FASTSAR_FIRP_SMEM, in KB,
         # overrides for testing; larger budgets were slower on the H100 and the L4, the kernel wants blocks in flight)
-        budget = (int(os.environ.get('FASTSAR_FIRP_SMEM', 0) or 0) or 40) * 1024
+        budget = (memory._env_number('FASTSAR_FIRP_SMEM', 1) or 40) * 1024
         nout = 64
         while nout > 4 and (2 * ((nout - 1) * Dp + fp['L']) * 64 + fp['L']) * 4 > budget:      # a multiple of 4
             nout -= 4
@@ -416,9 +417,11 @@ def _children(kern, pre, pim, c0, sl, lv):
         name = 'fir_p'
         # the rows through shared memory, or straight from global memory with the cache serving their reuse: the
         # latter was faster on the A100 and H100 (0.14 against 0.16 s and 0.07 against 0.09 s on Panama) and slower
-        # on the L4, so cards with at least 100 streaming multiprocessors take it; FASTSAR_FIRP=smem|global overrides
+        # on the L4, so cards with at least 100 streaming multiprocessors take it (consumer cards of that size, not
+        # measured, too); FASTSAR_FIRP=smem|global overrides
         attrs = cp.cuda.Device().attributes
-        mode = os.environ.get('FASTSAR_FIRP') or ('global' if os.environ.get('FASTSAR_FIRP_GLOBAL') or attrs.get('MultiProcessorCount', 0) >= 100 else 'smem')
+        mode = memory._env_choice('FASTSAR_FIRP', 'global' if os.environ.get('FASTSAR_FIRP_GLOBAL') or attrs.get('MultiProcessorCount', 0) >= 100 else 'smem',
+                                  {'smem', 'global'})
         if mode == 'global' or smem > int(attrs.get('MaxSharedMemoryPerBlockOptin', 96 * 1024)):
             name, smem = 'fir_p_g', 0           # (also beyond what the kernels opted in to in _kernels)
         kern[name](((Ko + 63) // 64, (Po + nout - 1) // nout, Np * Cn), (256,),
@@ -433,10 +436,10 @@ def _children(kern, pre, pim, c0, sl, lv):
 def _children_split(kern, pre, pim, c0, sl, lv):
     """_children, and when its range-decimated intermediate of all output children does not fit in the GPU memory, the
     same outputs formed over halves (quarters, ...) of the children into one preallocated output: the same values."""
+    Np, Cn = c0.shape[0], c0.shape[1]
     try:
         return _children(kern, pre, pim, c0, sl, lv)
     except cp.cuda.memory.OutOfMemoryError:
-        Np, Cn = c0.shape[0], c0.shape[1]
         if Cn == 1:
             raise
     cp.get_default_memory_pool().free_all_blocks()
@@ -444,15 +447,18 @@ def _children_split(kern, pre, pim, c0, sl, lv):
     cols = lv['Ko'] if lv['Dk'] > 1 else pre.shape[2]
     zre = cp.empty((Np, Cn, rows, cols), kern['dtype'])
     zim = cp.empty((Np, Cn, rows, cols), kern['dtype'])
-    step = Cn
+    step = Cn // 2
     j0 = 0
     while j0 < Cn:
         j1 = min(Cn, j0 + step)
         try:
             a, b = _children(kern, pre, pim, cp.ascontiguousarray(c0[:, j0:j1]), cp.ascontiguousarray(sl[:, j0:j1]), lv)
+            failed = False
         except cp.cuda.memory.OutOfMemoryError:
             if step == 1:
                 raise
+            failed = True
+        if failed:                              # freed outside the handler, whose traceback holds the failed arrays
             cp.get_default_memory_pool().free_all_blocks()
             step = max(1, step // 2)
             continue
@@ -540,21 +546,37 @@ def _copy_rows(dst, src, nth):
         th.join()
 
 
-def _upload_planes(S, pre, pim, win, check, scaled):
+def _host_peak(S):
+    """The largest magnitude of a host history (1.0 for an all-zero one), on all cores in row blocks."""
+    from .patches import _rows
+    peaks = []
+
+    def blk(sl):
+        peaks.append(float(np.abs(S[sl]).max()) if sl.stop > sl.start else 0.0)
+    _rows(blk, S.shape[0], chunk=1024)
+    return max(peaks, default=0.0) or 1.0
+
+
+def _upload_planes(S, pre, pim, win, check, scaled, scale=None):
     """Host S [P, K] complex -> float planes pre, pim [P, K] on the device, in row blocks through two pinned staging
     buffers: the threads copying the next block into its buffer overlap the transfer of the current one, and the
     blocks are windowed (win: device [P, 1] and [1, K] windows, or None), checked and converted on the device.
     scaled: float16 planes, divided by the first block's peak, a reference scale for the half range (the relative
-    precision of float16 does not depend on where in its range the data sit). Returns the scale."""
+    precision of float16 does not depend on where in its range the data sit, within its normal range); when the first
+    block is zero, or a later block overflows the half range, the whole history's peak (scale: given, testing).
+    Returns the scale."""
     P, K = S.shape
     nb = memory.STREAM_PULSES
     rows = min(nb, P)
     bufs = [cp.cuda.alloc_pinned_memory(rows * K * 8) for _ in range(2)]          # pooled: reused by later calls
     stg = [np.frombuffer(b, np.complex64, rows * K).reshape(rows, K) for b in bufs]
     st = cp.cuda.Stream(non_blocking=True)
+    st.wait_event(cp.cuda.get_current_stream().record())         # the planes and windows, allocated on that stream
     done = [None, None]
-    nth = max(1, min(8, (os.cpu_count() or 2) - 1))
-    scale = 1.0
+    from .patches import _ncpu
+    nth = max(1, min(8, _ncpu() - 1))
+    given = scale is not None
+    scale = scale if given else 1.0
     sums = []
     with st:
         for n, i in enumerate(range(0, P, nb)):
@@ -570,12 +592,17 @@ def _upload_planes(S, pre, pim, win, check, scaled):
                 b = b * win[0][i:i + r] * win[1]
             if check:
                 sums.append(b.sum())                                              # checked once at the end (no sync here)
-            if scaled and n == 0:
-                scale = float(cp.abs(b).max()) or 1.0
+            if scaled and n == 0 and not given:
+                scale = float(cp.abs(b).max()) or _host_peak(S)
             pre[i:i + r] = (b.real / scale).astype(pre.dtype) if scale != 1.0 else b.real.astype(pre.dtype)
             pim[i:i + r] = (b.imag / scale).astype(pim.dtype) if scale != 1.0 else b.imag.astype(pim.dtype)
             del b
     st.synchronize()
+    cp.get_default_memory_pool().free_all_blocks(stream=st)     # the stream's cached blocks, for the null stream's sizing
+    if scaled and not given and not (bool(cp.isfinite(pre).all()) and bool(cp.isfinite(pim).all())) and \
+            (not check or np.isfinite(complex(cp.stack(sums).sum()))):
+        # a block far above the first one's peak overflowed the half range: again with the whole history's peak
+        return _upload_planes(S, pre, pim, win, False, scaled, _host_peak(S))
     if check and not np.isfinite(complex(cp.stack(sums).sum())):
         for n, i in enumerate(range(0, P, nb)):
             if not np.isfinite(complex(sums[n])):
@@ -646,7 +673,7 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
     # shared memory per block: 48 KB by default, more when the kernel opts in (99 KB on Ada, 64 KB on Turing)
     smem_max = int(cp.cuda.Device().attributes.get('MaxSharedMemoryPerBlockOptin', 48 * 1024))
     # pulses per table: 2 within 48 KB (every card), more where the card's shared memory allows (FASTSAR_FINAL_PPS)
-    pps_env = int(os.environ.get('FASTSAR_FINAL_PPS', 0) or 0)
+    pps_env = memory._env_number('FASTSAR_FINAL_PPS', 1) or 0
     pps = pps_env or (2 if 4 * T * (2 * Qf) * 4 <= 48 * 1024 else 1)
     smem_final = 4 * T * (pps * Qf) * 4
     assert T % 4 == 0 and T * T // 8 <= 1024 and (T * T // 8) % (2 * T) == 0, T
@@ -655,13 +682,23 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
                          f"tile) exceed the GPU's shared memory ({smem_max // 1024} KB): use backend='cpu' or 'jax'")
 
     cc = cp.cuda.Device().compute_capability
-    tc_ver = int(os.environ.get('FASTSAR_TC_KERNEL', 0) or 0) or 2
+    tc_ver = int(memory._env_choice('FASTSAR_TC_KERNEL', '2', {'1', '2'}))
     if tc_ver == 2 and _tc_smem(2, 1, Qf, False) > _smem_max():
         tc_ver = 1                                              # the double-buffered tables do not fit: the 0.1.2 kernel
     # float32 on the tensor cores as three bfloat16 passes (Ampere and later, T = 32, when the tables fit), the CUDA-core
     # kernel otherwise; FASTSAR_FINAL=fp32 keeps the CUDA cores
+    fin = memory._env_choice('FASTSAR_FINAL', 'tc3', {'tc3', 'fp32'})
     use_tc3 = (final_mode == 'fp32' and T == 32 and int(cc) >= 80 and tc_ver == 2 and _tc_smem(2, 1, Qf, True) <= _smem_max()
-               and os.environ.get('FASTSAR_FINAL', 'tc3') == 'tc3')
+               and fin == 'tc3')
+    if use_tc3 and not _have_nvcc():
+        use_tc3 = False                                         # the CUDA-core kernel needs only NVRTC
+        if not _NVCC.get('warned'):
+            _NVCC['warned'] = True
+            warnings.warn('cuda: nvcc not found (install the CUDA toolkit or set CUDA_PATH); the float32 final stage '
+                          'runs on the CUDA cores instead of the tensor cores, which is slower', RuntimeWarning, stacklevel=2)
+    if final_mode == 'f16tc' and not _have_nvcc():
+        raise RuntimeError("cuda: precision='float16' needs the CUDA compiler nvcc for its tensor-core kernel: install "
+                           "the CUDA toolkit or set CUDA_PATH, or use precision='float32'")
 
     def final(are, aim, cen, wts=None):
         """are, aim [B, Pf, Qf]; cen [B, 3] float64; wts None or (w0, gx, gyr) [B, Pf] float32 -> (re, im) [B, T, T]."""
@@ -743,13 +780,7 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
     # level-0 children carried through the later levels together: as many as fit in the free memory at the largest
     # level, per level-0 child its input planes, the range-decimated intermediate of all its input pulses (_children)
     # and the output planes; the deeper levels multiply the children by the earlier levels' C
-    def _rest():
-        isz, n, worst = 2 * np.dtype(kern['dtype']).itemsize, 1, 1
-        for lv in levels[1:]:
-            worst = max(worst, n * isz * (lv['P'] * lv['K'] + lv['C'] * (lv['P'] + lv['Po']) * lv['Ko']))
-            n *= lv['C']
-        return worst
-    rest = _rest() if L > 1 else 1
+    rest = memory.cuda_rest(plan, 2 * np.dtype(kern['dtype']).itemsize) if L > 1 else 1
 
     ox, oy, nx, ny = plan['ox'], plan['oy'], plan['nx'], plan['ny']
 
@@ -826,17 +857,16 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
             if isinstance(S, np.ndarray):
                 scale = _upload_planes(S, pre[0], pim[0], None if window is None else (wpd, wkd), check, scaled)
             else:                                    # a device history: blocks in place
-                if scaled:
-                    scale = float(cp.abs(block(0)).max()) or 1.0
+                if scaled:                           # the first block's peak, or the whole history's if it is zero
+                    scale = float(cp.abs(block(0)).max()) or float(cp.abs(S).max()) or 1.0
                 for i in range(0, S.shape[0], 4096):
                     b = block(i)
                     pre[0, i:i + 4096] = (b.real / scale).astype(kern['dtype'])
                     pim[0, i:i + 4096] = (b.imag / scale).astype(kern['dtype'])
                     del b
         elif scaled:                                 # streamed: the first block's peak, on the device
-            xp = cp if type(S).__module__.startswith('cupy') else np
-            b0 = S[:4096] if xp is cp else cp.asarray(S[:4096])
-            scale = float(cp.abs(b0).max()) or 1.0
+            b0 = cp.asarray(S[:4096])                # (only a host history streams)
+            scale = float(cp.abs(b0).max()) or _host_peak(S)
             del b0
         forced = ng is not None or bool(os.environ.get('FASTSAR_CUDA_GROUP'))
         if ng is None:
@@ -864,7 +894,7 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
                     A, Bm = _children(kern, pre, pim, c0, sl, lv0)                   # [ng, Po, Ko]
             except cp.cuda.memory.OutOfMemoryError:
                 if ng == 1:
-                    _out_of_memory(free + full.nbytes)
+                    _out_of_memory(free + full.nbytes, kern['dtype'])
                 # the model sized the groups too large for this device: half the group, from this one on
                 del c0, sl
                 cp.get_default_memory_pool().free_all_blocks()
@@ -885,7 +915,7 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
                         bt //= 2
                         continue
                     if ng == 1:
-                        _out_of_memory(free + full.nbytes)
+                        _out_of_memory(free + full.nbytes, kern['dtype'])
                     break                       # one child does not fit beside the group: a smaller group, below
                 k0 += len(sub)
                 for k, g in enumerate(sub):
@@ -903,12 +933,26 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
     return form
 
 
-def _out_of_memory(free):
+_NVCC = {}
+
+
+def _have_nvcc():
+    """Whether the CUDA compiler that the tensor-core kernels need is installed (CuPy compiles the other kernels with
+    NVRTC, which its wheels bring)."""
+    if 'path' not in _NVCC:
+        try:
+            _NVCC['path'] = cp.cuda.get_nvcc_path()
+        except Exception:
+            _NVCC['path'] = None
+    return bool(_NVCC['path'])
+
+
+def _out_of_memory(free, dtype):
     """Raise MemoryError when one first-level child does not fit through the levels on this GPU."""
-    import cupy as cp
     cp.get_default_memory_pool().free_all_blocks()
+    half = "precision='float16' (half the memory), " if np.dtype(dtype) == np.float32 else ''
     raise MemoryError(f'cuda: one first-level child of this image does not fit in the GPU memory ({memory._gb(free)} '
-                      "free): use precision='float16' (half the memory), a smaller image, or backend='cpu'")
+                      f"free): use {half}a smaller image, or backend='cpu'")
 
 
 def _finite(S, xp, first=0):
@@ -1219,14 +1263,14 @@ def final_tile_tc(are, aim, ux, uy, dlx, dly, a0, a1, T, store='fp32', split3=Fa
     assert T == 32
     bits = 16 if store == 'f16' else 32
     smax = int(cp.cuda.Device().attributes.get('MaxSharedMemoryPerBlockOptin', 48 * 1024))
-    ver = ver or int(os.environ.get('FASTSAR_TC_KERNEL', 0) or 0) or 2                         # 1: the 0.1.2 kernel (testing)
+    ver = ver or int(memory._env_choice('FASTSAR_TC_KERNEL', '2', {'1', '2'}))              # 1: the 0.1.2 kernel (testing)
     default_pps = (4 if smax >= 160 * 1024 else 2) if ver == 1 else (2 if smax >= 160 * 1024 else 1)
-    pps = int(os.environ.get('FASTSAR_TC_PPS', 0) or 0) or default_pps
+    pps = int(memory._env_choice('FASTSAR_TC_PPS', str(default_pps), {'1', '2', '4'}))
     while pps > 1 and _tc_smem(ver, pps, are.shape[2], split3) > smax:   # wide final tiles (mosaic patches): fewer pulses per table
         pps //= 2
-    mwarps = int(os.environ.get('FASTSAR_TC_MW', 0) or 0) or 4
-    spec = int(os.environ.get('FASTSAR_TC_SPEC', '1'))
-    nh = int(os.environ.get('FASTSAR_TC_NH', 0) or 0) or 2
+    spec = int(memory._env_choice('FASTSAR_TC_SPEC', '1', {'0', '1'}))
+    mwarps = int(memory._env_choice('FASTSAR_TC_MW', '4', {'4', '8'} if spec else {'4', '8', '16'}))   # SPEC needs builder warps
+    nh = int(memory._env_choice('FASTSAR_TC_NH', '2', {'1', '2', '4', '8'}))
     if split3:
         ver, mwarps = 2, 4                                          # the three-pass products exist in final_tile_tc2 with MW = 4
     key = (bits, pps, ver, mwarps, spec, nh, bool(split3))

@@ -102,10 +102,13 @@ of 2. The number of first-level children carried together through the later leve
 memory) does not affect speed. Batches of 1, 2 and 4 formed that spotlight within 1% of each other, and a smaller batch is not reported as a fallback.
 
 The fallbacks are smaller groups or pulse blocks on the CPU, smaller groups on GPU and TPU, and streaming of the
-history through the first level on CUDA. A CUDA mosaic keeps a GPU window of the range profiles and cuts the gates in
+history through the first level on CUDA. On CUDA a later level whose intermediate does not fit is formed over parts
+of its children (the same values, quietly), and a later level that runs out of memory for one first-level child
+halves the group, with a `MemoryWarning`. A CUDA mosaic keeps a GPU window of the range profiles and cuts the gates in
 host memory when a patch's profiles exceed it. Each fallback issues a `MemoryWarning` naming it; warnings issued before formation also give the bytes full speed needs and the bytes free. A size set by
 `FASTSAR_CPU_GROUP_GB`, `FASTSAR_CUDA_GROUP`, `FASTSAR_TPU_GROUP` or an explicit `ng` issues none. A TPU that cannot
-hold the history and one first-level child raises `MemoryError` with the memory those two need.
+hold the history and one first-level child raises `MemoryError` with the memory those two need; on CUDA, a
+first-level child that does not fit through the levels even alone raises `MemoryError` naming the remedies.
 
 ```python
 import warnings

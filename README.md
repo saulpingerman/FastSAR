@@ -9,7 +9,7 @@ backprojection, and provides autofocus, interferometry, geolocation, map GeoTIFF
 
 ![FastSAR image of the Panama Canal's Pacific entrance from an Umbra spotlight collection](https://raw.githubusercontent.com/saulpingerman/FastSAR/main/docs/images/hero_panama.jpg)
 
-*Panama Canal, Pacific entrance (Umbra open data, 2023-07-18): 12,207 by 8,808 pixels in 3.8 s on an Nvidia L4
+*Panama Canal, Pacific entrance (Umbra open data, 2023-07-18): 12,207 by 8,808 pixels in 2.9 s on an Nvidia L4
 (warm former, transfers included; float32, -59.9 dB against the float64 reference of
 [precision.md](https://github.com/saulpingerman/FastSAR/blob/main/docs/precision.md)), downsampled. A
 c4d-highmem-16 CPU instance (16 vCPUs, 8 cores) takes 11.3 s. ISCE3, the fastest open-source code that forms this
@@ -33,10 +33,11 @@ pip install "fastsar[io]"            # io: sarpy for CPHD and SICD
 pip install "fastsar[cuda]"          # cuda: CuPy for Nvidia GPUs
 pip install "fastsar[tpu]"           # tpu: jax[tpu] for Cloud TPUs
 pip install "fastsar[geo]"           # geo: rasterio for GeoTIFFs and DEMs
+pip install "fastsar[raw]"           # raw: h5py for the NISAR raw reader
 pip install "fastsar[cuda,io,geo]"   # extras combine
 ```
 
-From a clone: `pip install -e ".[cuda,io]"` or `uv sync`. The float16 CUDA kernel needs `nvcc`. On the CPU set
+From a clone: `pip install -e ".[cuda,io]"` or `uv sync`. The CUDA tensor-core kernels (float16, and float32 on compute capability 8.0 and later) need `nvcc` from the CUDA toolkit; without it float32 runs on the CUDA cores, more slowly. On the CPU set
 `OMP_NUM_THREADS=<physical cores> OMP_PLACES=cores OMP_PROC_BIND=close`. Importing `fastsar` sets
 `XLA_PYTHON_CLIENT_PREALLOCATE=false` unless it is already set, so that JAX does not reserve most of a GPU's memory
 before the CUDA kernels run ([performance.md](https://github.com/saulpingerman/FastSAR/blob/main/docs/performance.md#environment-variables)).
@@ -81,8 +82,8 @@ Polar format (`algorithm='pfa'`) runs as a JAX program on any device.
 ## Documentation
 
 [docs/README.md](https://github.com/saulpingerman/FastSAR/blob/main/docs/README.md) lists every page; start with the [processing chain](https://github.com/saulpingerman/FastSAR/blob/main/docs/processing-chain.md).
-Measurement records are in [sar-accel-study](https://github.com/saulpingerman/sar-accel-study). A citation file
-will come with the preprint.
+Measurement records are in [sar-accel-study](https://github.com/saulpingerman/sar-accel-study). To cite FastSAR, use
+[CITATION.cff](https://github.com/saulpingerman/FastSAR/blob/main/CITATION.cff).
 
 ## Contributing and license
 

@@ -188,6 +188,8 @@ def final_weights(plan, weight, P, grad=False, points=None, nodes=3):
     [3, ntiles, Pf], by central differences of the center-pulse weights at four points half a tile away, the four
     point sets in one call of weight. The quadrature sum is written out rather than a BLAS product: a mosaic calls
     this on several prefetch threads at once, and each BLAS call there started a thread pool the size of the host."""
+    if nodes not in (1, 3):
+        raise ValueError(f'final_weights: nodes must be 1 or 3, got {nodes!r}')
     cen = np.asarray(plan['final']['cen'], np.float64)
     if grad:
         h1, h2 = 0.5 * plan['T'] * plan['spx'], 0.5 * plan['T'] * plan['spy']
@@ -230,9 +232,10 @@ def _jax_runtime_error():
 def _to_host(dev):
     """A complex64 host copy of a device image through pinned memory, several times faster than a copy into pageable
     memory (0.03 s against 0.2 s for an 860 MB image). The block comes from CuPy's pinned pool, which keeps it for
-    the next image once this one is released; FASTSAR_PINNED=0 restores the plain copy."""
+    the next image once this one is released (the returned image is itself page-locked memory while it is held);
+    FASTSAR_PINNED=0 restores the plain copy."""
     import cupy as cp
-    if os.environ.get('FASTSAR_PINNED', '1') == '0':
+    if _mem._env_choice('FASTSAR_PINNED', '1', {'0', '1'}) == '0':
         return cp.asnumpy(dev).astype(np.complex64, copy=False)
     dev = cp.ascontiguousarray(dev.astype(cp.complex64, copy=False))
     mem = cp.cuda.alloc_pinned_memory(dev.nbytes)

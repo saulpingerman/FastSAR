@@ -132,6 +132,7 @@ def _decimator_fir(n_in, D, pass_frac, atten):
     lo, L = int(i[0]) - D * (j0 - m), int(i[-1] - i[0] + 1)
     pl = D * m - lo
     assert pl >= 0 and L == len(kern)
+    kern.flags.writeable = False          # memoized: shared by every caller
     pr = max(D * (n_out - 1) + L - pl - n_in, 0)
     return dict(kern=kern, pl=int(pl), pr=int(pr), n_out=int(n_out), L=int(L)), m
 

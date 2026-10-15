@@ -205,8 +205,16 @@ def _rows(fn, n, chunk=256):
         return
     with _ROWS_LOCK:
         if not _ROWS_POOL:
-            _ROWS_POOL.append(ThreadPoolExecutor(os.cpu_count() or 1, thread_name_prefix='fastsar-rows'))
+            _ROWS_POOL.append(ThreadPoolExecutor(_ncpu(), thread_name_prefix='fastsar-rows'))
     list(_ROWS_POOL[0].map(fn, sl))
+
+
+def _ncpu():
+    """CPUs this process may run on (the affinity mask where the platform has one)."""
+    try:
+        return len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        return os.cpu_count() or 1
 
 
 def _pinned_empty(shape, dtype):
@@ -317,7 +325,8 @@ def patch_history(fx, ant, center, pts, lo, hi, margin=None, guard=None, prof=No
         with prof['lock']:               # patches are prepared on several threads; the window is shared, and the
             # GPU work takes turns with the patch forming (form_mosaic), whose groups are sized to the memory left
             if uh is not None:
-                u = cp.asarray(uh)                   # from pinned memory
+                u = cp.asarray(uh)                   # from pinned memory, asynchronously: complete before the block
+                cp.cuda.get_current_stream().synchronize()     # returns to the pool for another patch's gather
             elif isinstance(Q, np.ndarray) and win is not None and hi - lo <= win['rows']:
                 # a window of the profiles on the GPU, moved along the strip when a patch's pulses leave it (patches
                 # run along track, so a window serves many of them; it starts an eighth of its length behind the
@@ -689,7 +698,7 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
     # otherwise wait on the host
     order = [(i0, j0) for i0 in range(0, nx, mx) for j0 in range(0, ny, my)]
     nw = _env_number('FASTSAR_MOSAIC_PREFETCH', 0)
-    nw = nw if nw is not None else (1 if backend == 'cpu' else max(1, min(4, (os.cpu_count() or 4) // 4)))
+    nw = nw if nw is not None else (1 if backend == 'cpu' else max(1, min(4, _ncpu() // 4)))
     nw = nw if len(order) > 1 else 0
     from concurrent.futures import ThreadPoolExecutor
     from collections import deque
@@ -775,6 +784,9 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
     finally:
         if ex is not None:            # after an error in either thread, a patch not yet started is dropped
             ex.shutdown(cancel_futures=True)
+        if backend == 'cuda':         # the patches' pinned gathers (sizes vary per patch): back to the system
+            import cupy as cp
+            cp.get_default_pinned_memory_pool().free_all_blocks()
     if os.environ.get('FASTSAR_TIMING') == '1' and prof is not None and prof.get('win') is not None:
         _Timer.acc['form_mosaic: profile window moves (count)'] = float(prof['win'].get('loads', 0))
     return out

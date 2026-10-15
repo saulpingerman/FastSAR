@@ -56,3 +56,17 @@ def test_geodetic_round_trip(draws):
     err = max(np.abs(la - lat).max() * 111e3, np.abs((lo - lon + 180) % 360 - 180).max() * 111e3, np.abs(hh - h).max())
     print(f'geodetic round trip: {err:.2e} m')
     assert err < 1e-4, err
+
+
+def test_phase_rows_parallel():
+    """The reader's phase pass in row blocks on all cores against the serial complex exponential, on more rows than
+    one block: equal to float32 rounding."""
+    rng = np.random.default_rng(3)
+    P, K = 1000, 257
+    S = (rng.standard_normal((P, K)) + 1j * rng.standard_normal((P, K))).astype(np.complex64)
+    f = 9.6e9 + 3e5 * np.arange(K)
+    coef = rng.uniform(1e-9, 3e-7, P)
+    ref = S * np.exp(-2j * np.pi * f[None, :] * coef[:, None]).astype(np.complex64)
+    out = io._phase_rows(S.copy(), lambda sl: f[None, :], coef, -1)
+    e = 20 * np.log10(np.linalg.norm(out - ref) / np.linalg.norm(ref))
+    assert e < -130, e

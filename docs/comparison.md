@@ -26,9 +26,9 @@ min against 433 s measured.
 | ISCE3 `backproject`, CUDA | -31.5 to -52.2 | 27 min (est.) |
 | torchbp, exact | no image | 16.0 s |
 | torchbp, factorized | out of memory | |
-| FastSAR, exact backprojection, cubic, 8x | -77.5 to -81.7 (truth) | 24.1 s |
-| FastSAR, factorized, float32 | -56.7 to -61.1 | 3.8 s |
-| FastSAR, factorized, float16 | -55.3 to -60.4 | 3.5 s |
+| FastSAR, exact backprojection, cubic, 8x | -77.5 to -81.7 (truth) | 25.5 s |
+| FastSAR, factorized, float32 | -57.1 to -62.6 | 2.9 s |
+| FastSAR, factorized, float16 | -55.6 to -61.6 | 2.5 s |
 
 - RITSAR: a `linspace` range axis too coarse by one part in N_fft - 1, and a frequency axis that assumes an even
   sample count (the collection has 14,399).

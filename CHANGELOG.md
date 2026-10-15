@@ -5,50 +5,55 @@ was published on PyPI.
 
 ## [0.1.3] - unreleased
 
+### Added
+
+- `FASTSAR_PINNED` (`0` returns the cuda image by a plain copy instead of through pinned memory) and `FASTSAR_FINAL`
+  (`fp32` keeps the cuda float32 final stage on the CUDA cores). Testing settings for the cuda kernels' launch
+  parameters: `FASTSAR_FIRP`, `FASTSAR_CUDA_PB`, `FASTSAR_CUDA_JT`, `FASTSAR_FIRP_SMEM`, `FASTSAR_FINAL_PPS`,
+  `FASTSAR_FINAL_COLB`, `FASTSAR_TC_KERNEL`, `FASTSAR_TC_PPS`, `FASTSAR_TC_MW`, `FASTSAR_TC_SPEC`, `FASTSAR_TC_NH`
+  ([performance.md](docs/performance.md#environment-variables)). Settings with fixed choices reject other values
+  with a `ValueError` that names the variable.
+
 ### Changed
 
-- CUDA backend: the phase history is uploaded through two pinned staging buffers, the copy of the next block (on
-  several threads) overlapping the transfer of the current one, and the image is returned in pinned host memory
-  (`FASTSAR_PINNED=0` restores the plain copy). On an H100 the Panama image of the paper goes from 1.04 to 0.69 s
-  (float32) and from 1.09 to 0.59 s (float16); on an A100 from 1.87 to 1.31 s; on an L4 from 3.86 to 3.41 s.
-- CUDA float16: the reference scale of the half-precision planes is the first uploaded block's peak, taken on the
-  device, instead of a pass over the whole history on the host (0.3 to 0.5 s per image); float16's relative
-  precision does not depend on the scale, and the errors are unchanged.
-- CUDA pulse filter: cards with at least 100 streaming multiprocessors read the filter's rows from global memory
-  (the cache serves their reuse), which was faster on the A100 and H100 and slower on the L4; `FASTSAR_FIRP`
-  overrides. `FASTSAR_CUDA_PB`, `FASTSAR_CUDA_JT`, `FASTSAR_FIRP_SMEM` and `FASTSAR_FINAL_PPS` expose the kernels'
-  launch parameters for testing (the defaults were the fastest on all three cards).
-- CUDA final stage: a new tensor-core kernel builds the next pulses' tables while the current products run (two
-  shared-memory buffers, table-building warps beside four product warps of 2 by 2 fragments) and builds the tables
-  by columns: the phase of a frequency sample is linear in the pixel offset, so one complex multiply per entry walks
-  the rows and the sample is read once instead of once per row. The float16 final stage of the Panama image goes
-  from 0.122 to 0.055 s on an H100 and from 0.41 to 0.20 s on an L4, with the error unchanged, and aperture weights
-  are applied in the kernel (mosaics), which also makes the weighted float16 image 12 dB closer to float32.
 - CUDA float32: the final stage runs on the tensor cores as three bfloat16 products (high by high, high by low, low
-  by high), as the TPU does, on cards of compute capability 8.0 and later when its tables fit the shared memory; the
-  image agrees with the CUDA-core kernel to 87 dB and its error is unchanged (59.94 dB on Panama). The Panama float32
-  image goes from 0.68 to 0.575 s on an H100 and from 3.41 to 2.94 s on an L4; `FASTSAR_FINAL=fp32` keeps the CUDA
-  cores. The CUDA-core kernel builds its tables by columns too (7 to 17% faster).
-- Mosaics: the aperture weights' quadrature is summed in place of a BLAS product, which on large hosts started a
-  thread pool per prefetch worker and starved the launching thread; the weights' gradient takes the center pulse at
-  the four offset points in one call. The 84-patch Capella stripmap goes from 5.9 to 5.0 s on an H100 (26 vCPUs)
-  and from 26.9 to 22.2 s on an L4 host with 4 vCPUs.
-- Mosaics: the decimation filters are memoized across patches and the band-center phases and the final stage's
-  per-pulse geometry run as one fused kernel each on `cuda`; the 84-patch Capella stripmap of the paper goes from
-  6.9 to 6.0 s on an H100 with the image unchanged.
-- `form_cphd`: the host work runs on all cores in row blocks: the reader's troposphere and spotlight
-  re-reference phases (one pass over the whole history each, single-threaded since 0.1.1), the window, and, on
-  `cuda` mosaics whose profiles do not fit a quarter of the GPU memory, the gather of a patch's profiles, which now
-  happens in parallel into pinned memory outside the lock that serializes the GPU. On a g2-standard-32 host with an
-  L4, a 17 GB Capella spotlight goes from 188 to 46 s on `cuda` and from 217 to 74 s on `cpu`, and a 24 GB sliding
-  spotlight from 1450 to 331 s on `cuda`; before, the L4 ran end to end slower than the host's CPU backend. The
-  window and the gather are bitwise unchanged; the phases, now a float32 cosine and sine of the float64 angle, differ
-  from 0.1.2's in the last bit of some samples (-193 dB relative).
-- CUDA: the first-level group is sized with room for one of its children carried through the later levels, a later
-  level whose intermediate of all output children does not fit is formed over parts of them (the same values), and
-  a later level that runs out of memory for one child halves the first-level group; when nothing fits, a
-  MemoryError names what to change instead of CuPy's OutOfMemoryError. A 12.3 GB UMBRA-10 spotlight (14390 by 14109
-  pixels) failed on an L4 in both precisions and now forms in 157 s (float32) and 72 s (float16).
+  by high), as on the TPU, on cards of compute capability 8.0 and later when its tables fit the shared memory. The
+  image agrees with the CUDA-core kernel's to -87 dB and its error is unchanged (-59.94 dB on Panama). This kernel
+  needs `nvcc`; without it float32 stays on the CUDA cores, with a warning.
+- CUDA final stage: a new tensor-core kernel builds the next pulses' tables while the current products run, and builds
+  each table by columns, reading each phase-history sample once instead of once per pixel row. The CUDA-core kernel
+  builds its tables by columns too (7 to 17% faster). Aperture weights of mosaics are applied in the kernel, which
+  makes the weighted float16 image 12 dB closer to float32.
+- CUDA uploads: the phase history goes to the GPU through two pinned staging buffers, the copy of the next block
+  overlapping the transfer of the current one, and the image comes back through pinned host memory.
+- CUDA float16: the scale of the half-precision planes is the first uploaded block's peak, taken on the device,
+  instead of a pass over the whole history on the host (0.3 to 0.5 s per image). A zero first block, or a later block
+  that would overflow the half range, falls back to the whole history's peak.
+- CUDA pulse filter: cards with at least 100 streaming multiprocessors read the filter's rows from global memory,
+  which was faster on the A100 and H100 and slower on the L4.
+- Mosaics: the decimation filters are memoized across patches, the band-center phases and the final stage's
+  per-pulse geometry run as one fused kernel each on `cuda`, and the aperture weights' quadrature is summed in place
+  of a BLAS product (which on large hosts started a thread pool per prefetch worker).
+- `form_cphd`: the host work runs on all cores: the reader's troposphere and spotlight re-reference phases (one pass
+  over the whole history each), the window, and in `cuda` mosaics the gather of a patch's range profiles when they
+  exceed the GPU window, now done outside the lock that serializes the GPU. The phases are float64 cosines and
+  sines rounded to float32 and differ from 0.1.2's in the last bit of some samples (-193 dB relative).
+- Speed on the Panama image of the paper: float32 from 3.86 to 2.9 s on an L4, from 1.87 to 1.07 s on an A100 and
+  from 1.04 to 0.57 s on an H100; the float16 final stage from 0.41 to 0.20 s on an L4. The 84-patch Capella
+  stripmap goes from 6.9 to 5.0 s on an H100 and from 26.9 to 22.2 s on an L4 with a 4-vCPU host. End to end from
+  the file on a g2-standard-32 host with an L4, a Capella spotlight (17 GB in memory) goes from 188 to 46 s and a
+  sliding spotlight (24 GB) from 1450 to 331 s; before, the L4 was slower end to end than the host's CPU backend.
+
+### Fixed
+
+- CUDA out of memory in the later levels: the first-level group is sized with room for one of its children carried
+  through the later levels, a later level that does not fit is formed over parts of its children, and one that runs
+  out of memory for a single child halves the group. A 12.3 GB UMBRA-10 spotlight that failed on an L4 in both
+  precisions now forms in 157 s (float32) and 72 s (float16). When nothing fits, a `MemoryError` names the remedy
+  instead of CuPy's `OutOfMemoryError`.
+- CUDA mosaics return the pinned memory of their patch gathers after the mosaic, and the pinned gather of a patch is
+  complete before its buffer is reused.
+- `ImageFormer.memory()` and the full-speed figure of the CUDA `MemoryWarning` include the later levels.
 
 ## [0.1.2] - 2026-10-14
 
@@ -309,6 +314,7 @@ First release.
 - Products: multilook, interferogram, coherence, Pauli decomposition, range-Doppler projection and geocoding,
   GeoTIFF and SICD output.
 
-[0.1.2]: https://github.com/saulpingerman/FastSAR/compare/v0.1.1...HEAD
+[0.1.3]: https://github.com/saulpingerman/FastSAR/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/saulpingerman/FastSAR/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/saulpingerman/FastSAR/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/saulpingerman/FastSAR/releases/tag/v0.1.0

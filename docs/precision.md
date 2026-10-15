@@ -2,7 +2,8 @@
 
 ## Precision options
 
-`precision=` takes `'float32'` (default; on a TPU, three bfloat16 passes per product), `'float16'` (CUDA: float16
+`precision=` takes `'float32'` (default; on a TPU, three bfloat16 passes per product, and in the CUDA final stage on
+compute capability 8.0 and later as well, `FASTSAR_FINAL=fp32` keeping it on the CUDA cores), `'float16'` (CUDA: float16
 history and intermediates, float32 accumulation, tensor-core final stage, `T=32`; on `jax`, float16 throughout), or
 `'single-pass'` and `'three-pass'` (the TPU's bfloat16 products). Single-pass is what the TPU's matrix unit does
 without FastSAR's correction passes; FastSAR's TPU default is three-pass. Geometry is evaluated in float64

@@ -38,7 +38,8 @@
   kernel on an Apple GPU (`fastsar.metal`; `'auto'` picks it on a Mac), the tile centers' float64 terms computed
   by numpy per chunk since Apple GPUs have no float64.
 - `MemoryWarning`: a `UserWarning` subclass issued when a former falls back to a slower path for lack of memory
-  ([performance.md](performance.md#memory)). A TPU that cannot hold the history raises `MemoryError`.
+  ([performance.md](performance.md#memory)). A TPU that cannot hold the history, or a GPU that cannot form one
+  first-level child, raises `MemoryError`.
 - `backproject(S, ant, fmin, df, points, *, rcv=None, ref=None, backend='auto', upsample=8, window=True, chunk=256)`:
   exact backprojection at points [..., 3]; `rcv` for bistatic, `ref` for per-pulse reference ranges.
 - `plane_points(nx, ny, spx, spy, e1, e2, height=None)`: the `form_image` grid as points [nx, ny, 3].
