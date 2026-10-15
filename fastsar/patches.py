@@ -191,7 +191,6 @@ def _window_start(lo, hi, rows):
     return max(0, min(lo, max(hi - rows, lo - rows // 8)))
 
 
-_PINNED_KEEP = 16         # free blocks of CuPy's pinned pool kept after a cuda mosaic (form_mosaic)
 _ROWS_POOL = []
 _ROWS_LOCK = threading.Lock()
 
@@ -877,19 +876,19 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
         made = prof['stage'].get('made', 0) if prof is not None and prof.get('stage') is not None else 0
         if prof is not None:          # the gathers' page-locked buffers, freed with their last reference
             prof['stage'] = None
+        img = job = S = None          # the last patch's page-locked blocks, back in the pool before it is emptied
         if backend == 'cuda' and 'cupy' in sys.modules:
-            # CuPy's pinned pool keeps the patches' image blocks for the next mosaic (page-locking them again cost
-            # 2.6 of 13 s in an 84-patch stripmap on an L4); it reuses a block only at the same size class
-            # (memory._pinned), so after mosaics of other sizes it is emptied, which bounds it
+            # CuPy's pinned pool is emptied: its blocks fit only requests of their own size class (memory._pinned),
+            # so kept over mosaics of other sizes it would only grow. The next mosaic page-locks its blocks again, but
+            # its large uploads (_to_device) take two 64 MiB blocks instead of one of the range profiles' size
             pool = sys.modules['cupy'].get_default_pinned_memory_pool()
             pinned_blocks = pool.n_free_blocks()
-            if pinned_blocks > _PINNED_KEEP:
-                pool.free_all_blocks()
+            pool.free_all_blocks()
     if os.environ.get('FASTSAR_TIMING') == '1' and prof is not None and prof.get('win') is not None:
         _Timer.acc['form_mosaic: profile window moves (count)'] = float(prof['win'].get('loads', 0))
         _Timer.acc['form_mosaic: page-locked staging buffers made (count)'] = float(made)
     if os.environ.get('FASTSAR_TIMING') == '1' and backend == 'cuda' and 'cupy' in sys.modules:
-        _Timer.acc['form_mosaic: free blocks in the pinned pool at the end (count)'] = float(pinned_blocks)
+        _Timer.acc['form_mosaic: free blocks in the pinned pool before it is emptied (count)'] = float(pinned_blocks)
     return out
 
 

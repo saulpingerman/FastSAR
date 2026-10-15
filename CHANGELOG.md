@@ -8,17 +8,16 @@ was published on PyPI.
 ### Fixed
 
 - CUDA mosaics were 1 to 40% slower in 0.1.3 than in its first candidate, from two causes. `form_mosaic` freed
-  CuPy's pinned memory pool at its end, so every later mosaic page-locked its host buffers again (2.6 s of the 13 s
-  of the 84-patch 2021 Capella stripmap on an L4). The gather of a patch's range profiles now goes through
-  page-locked staging buffers kept for the mosaic and released with it. The pool keeps its blocks for the next mosaic,
-  and since it reuses a block only at the same size, requests from it are rounded up to size classes (at most 1/8
-  larger), so patches of slightly different sizes share blocks; it is emptied after a mosaic only when it holds
-  more than 16 free blocks. The reader's
-  row passes (troposphere and re-reference phases, the window), which 0.1.3 runs on all cores, allocated large
-  temporaries in every worker thread; the allocator kept them, and the later mosaic took more page faults (about
-  0.5 s on the same stripmap). Their scratch arrays are now made on the calling thread, one per block in flight. On
-  the L4 the three Capella mosaics take as long as before 0.1.3 (9.8, 52.3 and 195.9 s), and every image is bitwise
-  the same as in 0.1.3.
+  CuPy's pinned memory pool at its end, so every later mosaic page-locked its host buffers again, among them the
+  block of the range profiles' size that `cupy.asarray` copies them through on the way to the device (2.3 GB on the
+  84-patch 2021 Capella stripmap). Large uploads now go through two 64 MiB page-locked blocks, a patch's gathered
+  profiles through page-locked staging buffers kept for the mosaic, and pinned requests are rounded up to size
+  classes (at most 1/8 larger) so that patches of slightly different sizes share blocks; the pool is still emptied
+  after every mosaic. The reader's row passes (troposphere and re-reference phases, the window), which 0.1.3 runs on
+  all cores, allocated large temporaries in every worker thread; the allocator kept them, and the later mosaic took
+  more page faults. Their scratch arrays are now made on the calling thread, one per block in flight. On an L4 the
+  three Capella mosaics take 9.4, 50.8 and 189.0 s (12.8, 53.6 and 197.7 s in 0.1.3) at 4 to 8 GB less peak memory,
+  and every image is bitwise the same as in 0.1.3.
 
 ## [0.1.3] - 2026-10-15
 

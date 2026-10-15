@@ -88,7 +88,9 @@ for the next image (`FASTSAR_PINNED=0` returns a plain copy). On the Panama imag
 from 0.39 to 0.1 s on an H100 and from 0.67 to 0.2 s on an L4, and the whole image from 1.04 to 0.69 s and from
 3.86 to 3.41 s. The float16 build takes its reference scale from the first block's peak on the device. In a mosaic
 whose range profiles exceed the GPU window, a patch's profiles are gathered on the host into page-locked staging
-buffers that the mosaic keeps for all its patches.
+buffers that the mosaic keeps for all its patches. The range profiles, or their window, go up through two 64 MiB
+page-locked blocks; uploaded with `cupy.asarray`, they were first copied into a pinned block of their own size (2.3
+GB on the 2021 Capella stripmap), page-locked anew by every mosaic. After a mosaic CuPy's pinned pool is emptied.
 
 ## Memory
 
