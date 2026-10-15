@@ -248,6 +248,33 @@ def _pinned_empty(shape, dtype):
     return np.frombuffer(_pinned(n), dtype, int(np.prod(shape))).reshape(shape)
 
 
+def _to_device(a, block=64 << 20):
+    """A host array copied to the GPU through two page-locked blocks of `block` bytes, the copy of one into its block
+    overlapping the transfer of the other. cp.asarray page-locks a block of the array's own size from CuPy's pinned
+    pool for every call: 2.3 GB for the range profiles of a 2021 Capella stripmap, kept by the pool after the mosaic
+    or locked again by the next one. Arrays below one block go through cp.asarray."""
+    import cupy as cp
+    from .memory import _pinned
+    a = np.ascontiguousarray(a)
+    if a.nbytes < block:
+        return cp.asarray(a)
+    d = cp.empty(a.shape, a.dtype)
+    src = a.reshape(-1).view(np.uint8)
+    host = [np.frombuffer(_pinned(block), np.uint8, block) for _ in range(2)]
+    st = cp.cuda.Stream(non_blocking=True)
+    st.wait_event(cp.cuda.get_current_stream().record())         # d, allocated on the current stream
+    done = [None, None]
+    for k, off in enumerate(range(0, a.nbytes, block)):
+        m, i = min(block, a.nbytes - off), k % 2
+        if done[i] is not None:
+            done[i].synchronize()               # its block's previous transfer is complete
+        host[i][:m] = src[off:off + m]
+        cp.cuda.runtime.memcpyAsync(d.data.ptr + off, host[i].ctypes.data, m, cp.cuda.runtime.memcpyHostToDevice, st.ptr)
+        done[i] = st.record()
+    st.synchronize()
+    return d
+
+
 def _staging_take(stage, shape, dtype):
     """A host array in page-locked memory from a mosaic's staging buffers (stage: dict(lock, free)), for a patch's
     gather: a free buffer large enough, or a new one an eighth larger than asked (the patches' sizes differ slightly).
@@ -384,8 +411,9 @@ def patch_history(fx, ant, center, pts, lo, hi, margin=None, guard=None, prof=No
             # GPU work takes turns with the patch forming (form_mosaic), whose groups are sized to the memory left
             if uh is not None:
                 try:
-                    u = cp.asarray(uh)               # from pinned memory, asynchronously: complete before the buffer
-                    cp.cuda.get_current_stream().synchronize()     # serves another patch's gather
+                    u = cp.empty(uh.shape, uh.dtype)     # from the page-locked buffer directly (cp.asarray would
+                    u.set(uh)                            # copy it into a block of CuPy's pinned pool first),
+                    cp.cuda.get_current_stream().synchronize()     # complete before it serves another gather
                 finally:
                     uh = None
                     if ubuf is not None:
@@ -398,7 +426,7 @@ def patch_history(fx, ant, center, pts, lo, hi, margin=None, guard=None, prof=No
                     win['buf'] = None
                     w0 = _window_start(lo, hi, win['rows'])
                     win['w0'], win['w1'] = w0, min(Q.shape[0], w0 + win['rows'])
-                    win['buf'] = cp.asarray(Q[win['w0']:win['w1']])
+                    win['buf'] = _to_device(Q[win['w0']:win['w1']])
                     win['loads'] = win.get('loads', 0) + 1
                 Q, lo_q = win['buf'], lo - win['w0']
             else:
@@ -629,7 +657,7 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
         row = prof['Q'].shape[1] * 8
         force = _env_number('FASTSAR_PROFILE_WINDOW_ROWS', 0) or 0              # testing: the window, of this many rows
         if prof['Q'].nbytes < 0.4 * free and not force:      # profiles in GPU memory when they fit
-            prof['Qd'] = cp.asarray(prof['Q'])
+            prof['Qd'] = _to_device(prof['Q'])
         else:                                  # else a window of them, a quarter of the free memory
             prof['win'] = dict(w0=0, w1=0, buf=None, rows=force or int(0.25 * free // row), free=free, row=row)
     # JAX and TPU: each pulse count compiles a program. The first count is padded to a multiple of 256; a patch
