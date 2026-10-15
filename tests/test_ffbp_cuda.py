@@ -207,6 +207,34 @@ def test_profile_window(monkeypatch):
     assert not bad, 'FAILED: ' + '; '.join(bad)
 
 
+def test_staging_reuse(monkeypatch):
+    """A mosaic's page-locked staging buffers are reused: a smaller request takes a free buffer, a larger one replaces
+    it (the count stays bounded), and the patches of a host-gathered mosaic make at most one per gather in flight."""
+    import threading
+    stage = dict(lock=threading.Lock(), free=[])
+    a, ba = pt._staging_take(stage, (100, 1000), np.complex64)
+    a[:] = 1
+    pt._staging_give(stage, ba)
+    b, bb = pt._staging_take(stage, (90, 1000), np.complex64)
+    assert bb is ba and b.shape == (90, 1000) and stage.get('made') == 1
+    pt._staging_give(stage, bb)
+    c, bc = pt._staging_take(stage, (400, 1000), np.complex64)
+    assert bc is not ba and stage['made'] == 2 and not stage['free']
+    pt._staging_give(stage, bc)
+    p = sm.make_params(squint_deg=0.0)
+    r, x = sm.axes(p)
+    raw = sm.simulate(p, np.array([[x[len(x) // 2], r[len(r) // 2]]]))
+    rows = (len(x) // 2 - 140, len(x) // 2 + 140)
+    monkeypatch.setenv('FASTSAR_PROFILE_WINDOW_ROWS', '16')
+    monkeypatch.setenv('FASTSAR_MOSAIC_PREFETCH', '1')
+    monkeypatch.setenv('FASTSAR_TIMING', '1')
+    pt._Timer.acc.clear()
+    info = []
+    pt.form_stripmap(raw, p, rows=rows, backend='cuda', rwin='taylor', awin='taylor', info=info)
+    made = pt._Timer.acc.get('form_mosaic: page-locked staging buffers made (count)')
+    print(f'{len(info)} patches, {made} staging buffers')
+    assert len(info) > 2 and made is not None and 1 <= made <= 4
+
 
 def test_pinned_off(three, monkeypatch):
     """FASTSAR_PINNED=0 (a plain copy of the image) against the pinned copy: the same image; a bad value raises."""

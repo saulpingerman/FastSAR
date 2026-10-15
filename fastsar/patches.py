@@ -224,6 +224,36 @@ def _pinned_empty(shape, dtype):
     return np.frombuffer(cp.cuda.alloc_pinned_memory(max(n, 1)), dtype, int(np.prod(shape))).reshape(shape)
 
 
+def _staging_take(stage, shape, dtype):
+    """A host array in page-locked memory from a mosaic's staging buffers (stage: dict(lock, free)), for a patch's
+    gather: a free buffer large enough, or a new one an eighth larger than asked (the patches' sizes differ slightly).
+    Page-locking is slow (a new buffer per patch took 2.6 of 13 s in an 84-patch stripmap on an L4), so a mosaic keeps
+    one buffer per gather in flight and reuses it; the buffers are outside CuPy's pool and are freed with the mosaic.
+    Returns (array, buffer); give the buffer back with _staging_give once its upload is complete."""
+    import cupy as cp
+    n = max(1, int(np.prod(shape)) * np.dtype(dtype).itemsize)
+    with stage['lock']:
+        fit = [b for b in stage['free'] if b.mem.size >= n]
+        if fit:
+            buf = min(fit, key=lambda b: b.mem.size)
+            stage['free'].remove(buf)
+        else:
+            if stage['free']:               # a buffer too small for this patch: replaced, so the count stays bounded
+                stage['free'].remove(max(stage['free'], key=lambda b: b.mem.size))
+            buf = None
+    if buf is None:
+        size = -(-(n + n // 8) // (1 << 21)) << 21
+        buf = cp.cuda.PinnedMemoryPointer(cp.cuda.PinnedMemory(size), 0)
+        stage['made'] = stage.get('made', 0) + 1
+    return np.frombuffer(buf, dtype, int(np.prod(shape))).reshape(shape), buf
+
+
+def _staging_give(stage, buf):
+    """Return a staging buffer taken with _staging_take."""
+    with stage['lock']:
+        stage['free'].append(buf)
+
+
 def _padding(fx, guard=None):
     """Frequency padding of fx to band +- guard: (guard, npl, K2, f0) with K2 a fast FFT length and f0 = fmin - npl df."""
     S, fmin, df = fx['S'], float(fx['fmin']), float(fx['df'])
@@ -316,7 +346,10 @@ def patch_history(fx, ant, center, pts, lo, hi, margin=None, guard=None, prof=No
             # gathered on the host before the lock is taken, in row blocks on the shared pool: a long aperture's gate
             # is gigabytes per patch, and gathered under the lock on one thread it kept the GPU idle (a 297-patch
             # sliding spotlight spent 12 of its 24 minutes here)
-            uh = _pinned_empty((hi - lo, N), np.complex64)
+            if prof.get('stage') is not None:
+                uh, ubuf = _staging_take(prof['stage'], (hi - lo, N), np.complex64)
+            else:
+                uh, ubuf = _pinned_empty((hi - lo, N), np.complex64), None
 
             def gather(sl):
                 uh[sl] = Q[lo + sl.start + np.arange(sl.stop - sl.start)[:, None], (j[None, :] - m[sl, None]) % K2]
@@ -325,8 +358,8 @@ def patch_history(fx, ant, center, pts, lo, hi, margin=None, guard=None, prof=No
         with prof['lock']:               # patches are prepared on several threads; the window is shared, and the
             # GPU work takes turns with the patch forming (form_mosaic), whose groups are sized to the memory left
             if uh is not None:
-                u = cp.asarray(uh)                   # from pinned memory, asynchronously: complete before the block
-                cp.cuda.get_current_stream().synchronize()     # returns to the pool for another patch's gather
+                u = cp.asarray(uh)                   # from pinned memory, asynchronously: complete before the buffer
+                cp.cuda.get_current_stream().synchronize()     # serves another patch's gather
             elif isinstance(Q, np.ndarray) and win is not None and hi - lo <= win['rows']:
                 # a window of the profiles on the GPU, moved along the strip when a patch's pulses leave it (patches
                 # run along track, so a window serves many of them; it starts an eighth of its length behind the
@@ -342,6 +375,8 @@ def patch_history(fx, ant, center, pts, lo, hi, margin=None, guard=None, prof=No
                 lo_q = lo
             if uh is not None:
                 del uh
+                if ubuf is not None:
+                    _staging_give(prof['stage'], ubuf)
             elif isinstance(Q, np.ndarray):
                 u = cp.asarray(Q[lo + np.arange(hi - lo)[:, None], (j[None, :] - m[:, None]) % K2])
             else:
@@ -562,6 +597,7 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
     if prof is not None and backend == 'cuda' and not exact:
         import cupy as cp
         prof['device'], prof['lock'] = True, threading.Lock()
+        prof['stage'] = dict(lock=threading.Lock(), free=[])      # page-locked buffers of the patches' host gathers
         from .memory import cuda_free
         free = cuda_free()
         row = prof['Q'].shape[1] * 8
@@ -784,11 +820,12 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
     finally:
         if ex is not None:            # after an error in either thread, a patch not yet started is dropped
             ex.shutdown(cancel_futures=True)
-        if backend == 'cuda':         # the patches' pinned gathers (sizes vary per patch): back to the system
-            import cupy as cp
-            cp.get_default_pinned_memory_pool().free_all_blocks()
+        made = prof['stage'].get('made', 0) if prof is not None and prof.get('stage') is not None else 0
+        if prof is not None:          # the gathers' page-locked buffers, freed with their last reference
+            prof['stage'] = None
     if os.environ.get('FASTSAR_TIMING') == '1' and prof is not None and prof.get('win') is not None:
         _Timer.acc['form_mosaic: profile window moves (count)'] = float(prof['win'].get('loads', 0))
+        _Timer.acc['form_mosaic: page-locked staging buffers made (count)'] = float(made)
     return out
 
 
