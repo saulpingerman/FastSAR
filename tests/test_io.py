@@ -67,6 +67,37 @@ def test_phase_rows_parallel():
     f = 9.6e9 + 3e5 * np.arange(K)
     coef = rng.uniform(1e-9, 3e-7, P)
     ref = S * np.exp(-2j * np.pi * f[None, :] * coef[:, None]).astype(np.complex64)
-    out = io._phase_rows(S.copy(), lambda sl: f[None, :], coef, -1)
+    def freq(sl, out):
+        out[:] = f
+    out = io._phase_rows(S.copy(), freq, coef, -1)
     e = 20 * np.log10(np.linalg.norm(out - ref) / np.linalg.norm(ref))
     assert e < -130, e
+    # each block's scratch is the calling thread's (patches._rows_with): the same values, bit for bit, as one block
+    # formed directly
+    c = -2 * np.pi * coef
+    ph = f[None, :] * c[:, None]
+    e1 = np.empty(ph.shape, np.complex64)
+    np.cos(ph, out=e1.real, casting='same_kind')
+    np.sin(ph, out=e1.imag, casting='same_kind')
+    assert np.array_equal(out, S * e1)
+
+
+def test_rows_with():
+    """_rows_with: every row once, scratch made on the calling thread and never shared by two blocks at a time."""
+    import threading
+    from fastsar import patches
+    made, seen, busy, lock = [], np.zeros(5000, int), set(), threading.Lock()
+
+    def make():
+        made.append(threading.get_ident())
+        return np.empty(10)
+
+    def fn(sl, s):
+        with lock:
+            assert id(s) not in busy
+            busy.add(id(s))
+        seen[sl] += 1
+        with lock:
+            busy.discard(id(s))
+    patches._rows_with(fn, 5000, make, chunk=64)
+    assert (seen == 1).all() and set(made) == {threading.get_ident()} and len(made) <= patches._ncpu()

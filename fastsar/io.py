@@ -107,19 +107,22 @@ def _mode_type(r, m, notes):
 
 
 def _phase_rows(S, f, coef, sign):
-    """In place, in row blocks on all cores: S[p, k] *= exp(sign 2j pi f[p, k] coef[p]) with f a function of a row
-    slice giving its frequencies (Hz) [rows, K] (no full-size temporary). The phase is formed in float64 and its
+    """In place, in row blocks on all cores: S[p, k] *= exp(sign 2j pi f[p, k] coef[p]) with f(slice, out) writing the
+    frequencies (Hz) of a row slice into out [rows, K] (no full-size temporary). The phase is formed in float64 and its
     cosine and sine taken straight into complex64 (on one core a 17 GB history took 100 s, the most of a read)."""
-    from .patches import _rows
+    from .patches import _rows_with
     c = sign * 2 * np.pi * np.asarray(coef, np.float64)
+    P, K = S.shape
+    rows = 128
 
-    def blk(sl):
-        ph = f(sl) * c[sl, None]
-        e = np.empty(ph.shape, np.complex64)
+    def blk(sl, scratch):
+        ph, e = scratch[0][:sl.stop - sl.start], scratch[1][:sl.stop - sl.start]
+        f(sl, ph)
+        ph *= c[sl, None]
         np.cos(ph, out=e.real, casting='same_kind')
         np.sin(ph, out=e.imag, casting='same_kind')
         S[sl] *= e
-    _rows(blk, S.shape[0], chunk=128)
+    _rows_with(blk, P, lambda: (np.empty((min(rows, P), K)), np.empty((min(rows, P), K), np.complex64)), chunk=rows)
     return S
 
 
@@ -172,7 +175,11 @@ def _assemble(S, tx, rcv, srp, f0, df, notes, sicd, meta, info):
     if moved > 1e-6:
         if moved < 0.25 * C / (2 * df):
             # exp(-j 4 pi f (|x - a| - ref)) -> exp(-j 4 pi f (|x - a| - ref0))
-            _phase_rows(S, lambda sl: np.broadcast_to(f0 + df * np.arange(K), (len(range(*sl.indices(len(S)))), K)), 2 * (ref - ref0) / C, -1)
+            fk = f0 + df * np.arange(K)
+
+            def freq(sl, out):
+                out[:] = fk
+            _phase_rows(S, freq, 2 * (ref - ref0) / C, -1)
             notes.append(f're-referenced to the mid-aperture scene reference point (range change up to {moved:.1f} m)')
         else:
             fixed_ref = False
@@ -323,7 +330,12 @@ def read_cphd(cphd, sicd=None, channel=0, meta=False, regrid_tol=1e-3, drop_flag
     else:
         # the data hold the SRP's echo at its tropospheric delay td beyond the geometric one: exp(+j 2 pi f td)
         # moves it back, f from each pulse's own grid
-        _phase_rows(S, lambda sl: sc0[sl, None] + scss[sl, None] * np.arange(K)[None, :], td, +1)
+        kk = np.arange(K)
+
+        def freq(sl, out):                      # sc0 + scss k, formed in out
+            np.multiply(scss[sl, None], kk[None, :], out=out)
+            out += sc0[sl, None]
+        _phase_rows(S, freq, td, +1)
         notes.append(f'removed {what} at the SRP (mean {td.mean() * 1e9:.2f} ns, span {np.ptp(td) * 1e9:.3f} ns)')
     f0, df = float(np.median(sc0)), float(np.median(scss))
     t1, t2 = pv('TOA1'), pv('TOA2')

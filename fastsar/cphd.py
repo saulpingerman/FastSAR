@@ -185,11 +185,13 @@ def form_cphd(cphd, sicd=None, *, mode='auto', backend='auto', window=True, spac
     if window:
         wk = _taylor(K)
         wp = _taylor(P) if spot else np.ones(P, np.float32)
-        from .patches import _rows
+        from .patches import _rows_with
 
-        def _win(sl):                           # in place, row blocks on all cores
-            S[sl] *= wp[sl, None] * wk[None, :]
-        _rows(_win, P, chunk=256)
+        def _win(sl, w):                        # in place, row blocks on all cores
+            w = w[:sl.stop - sl.start]
+            np.multiply(wp[sl, None], wk[None, :], out=w)
+            S[sl] *= w
+        _rows_with(_win, P, lambda: np.empty((min(256, P), K), np.result_type(wp, wk)), chunk=256)
     # azimuth band of a moving beam (spread of sin(look angle) about each pulse's SRP)
     if not spot:
         if sm is not None:
@@ -244,7 +246,9 @@ def form_cphd(cphd, sicd=None, *, mode='auto', backend='auto', window=True, spac
         ref_new = np.linalg.norm(ant - c, axis=1)
         dref = ref_r - ref_new
         f = f0 + df * np.arange(K)
-        io._phase_rows(S, lambda sl: f[None, :], 2 * dref / C, -1)             # in place, on all cores
+        def freq(sl, out):
+            out[:] = f
+        io._phase_rows(S, freq, 2 * dref / C, -1)             # in place, on all cores
         notes.append(f'phase reference moved {np.linalg.norm(c):.1f} m to the grid center')
         kw = dict(backend=backend, precision=precision, window=False, target_db=target_db)
         if autofocus:

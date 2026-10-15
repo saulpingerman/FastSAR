@@ -209,6 +209,28 @@ def _rows(fn, n, chunk=256):
     list(_ROWS_POOL[0].map(fn, sl))
 
 
+def _rows_with(fn, n, make, chunk=256):
+    """_rows with scratch: fn(slice, scratch), the scratch objects made by make() on the calling thread, one per block
+    in flight. The workers then allocate nothing large: glibc keeps what a worker thread allocates in that thread's
+    arena, and after a read whose row passes allocated their temporaries on 32 workers, the next stripmap mosaic took
+    13% more page faults and 0.5 of 10 s longer on an L4 host."""
+    import queue
+    if -(-n // chunk) <= 1:
+        fn(slice(0, n), make())
+        return
+    q = queue.SimpleQueue()
+    for _ in range(min(-(-n // chunk), _ncpu())):
+        q.put(make())
+
+    def blk(sl):
+        s = q.get()
+        try:
+            fn(sl, s)
+        finally:
+            q.put(s)
+    _rows(blk, n, chunk)
+
+
 def _ncpu():
     """CPUs this process may run on (the affinity mask where the platform has one)."""
     try:
