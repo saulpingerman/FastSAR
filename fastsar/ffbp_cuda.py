@@ -430,6 +430,39 @@ def _children(kern, pre, pim, c0, sl, lv):
 
 
 
+def _children_split(kern, pre, pim, c0, sl, lv):
+    """_children, and when its range-decimated intermediate of all output children does not fit in the GPU memory, the
+    same outputs formed over halves (quarters, ...) of the children into one preallocated output: the same values."""
+    try:
+        return _children(kern, pre, pim, c0, sl, lv)
+    except cp.cuda.memory.OutOfMemoryError:
+        Np, Cn = c0.shape[0], c0.shape[1]
+        if Cn == 1:
+            raise
+    cp.get_default_memory_pool().free_all_blocks()
+    rows = lv['Po'] if lv['Dp'] > 1 else pre.shape[1]
+    cols = lv['Ko'] if lv['Dk'] > 1 else pre.shape[2]
+    zre = cp.empty((Np, Cn, rows, cols), kern['dtype'])
+    zim = cp.empty((Np, Cn, rows, cols), kern['dtype'])
+    step = Cn
+    j0 = 0
+    while j0 < Cn:
+        j1 = min(Cn, j0 + step)
+        try:
+            a, b = _children(kern, pre, pim, cp.ascontiguousarray(c0[:, j0:j1]), cp.ascontiguousarray(sl[:, j0:j1]), lv)
+        except cp.cuda.memory.OutOfMemoryError:
+            if step == 1:
+                raise
+            cp.get_default_memory_pool().free_all_blocks()
+            step = max(1, step // 2)
+            continue
+        zre[:, j0:j1] = a.reshape(Np, j1 - j0, rows, cols)
+        zim[:, j0:j1] = b.reshape(Np, j1 - j0, rows, cols)
+        del a, b
+        j0 = j1
+    return zre.reshape(Np * Cn, rows, cols), zim.reshape(Np * Cn, rows, cols)
+
+
 _PHASES_KERN = None
 
 
@@ -677,14 +710,14 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
             if i < HOST_LEVELS:
                 c0 = la['c0'][gi].reshape((-1,) + la['c0'].shape[1:])
                 sl = la['slope'][gi].reshape((-1,) + la['slope'].shape[1:])
-                a, b = _children(kern, a, b, c0, sl, lv)
+                a, b = _children_split(kern, a, b, c0, sl, lv)
             else:
                 nb_par = a.shape[0] // n
                 refs = la['ref'].reshape(G, nb_par, 3)[gi].reshape(-1, 3)
                 t0 = _tick()
                 c0, sl = _device_phases(la, refs, lv)
                 _mark('device_phases', t0)
-                a, b = _children(kern, a, b, c0, sl, lv)
+                a, b = _children_split(kern, a, b, c0, sl, lv)
         cen = fcen.reshape(G, -1, 3)[gi].reshape(-1, 3)
         if wfd is not None and wfd.ndim == 3 and (final_mode != 'f16tc' or tc_ver == 2):     # weights in the final kernel
             w = wfd.reshape(3, G, -1, Pf)[:, gi].reshape(3, -1, Pf)
@@ -807,7 +840,9 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
             del b0
         forced = ng is not None or bool(os.environ.get('FASTSAR_CUDA_GROUP'))
         if ng is None:
-            ng = memory._env_number('FASTSAR_CUDA_GROUP', 1) or memory.cuda_group(lv0, S.shape[1], isz, memory.cuda_free(), stream)
+            # the group leaves room for one child carried through the later levels (rest)
+            ng = memory._env_number('FASTSAR_CUDA_GROUP', 1) or memory.cuda_group(lv0, S.shape[1], isz,
+                                                                                   memory.cuda_free() - rest, stream)
         if (stream and os.environ.get('FASTSAR_CUDA_STREAM') != '1') or (ng < min(memory.CUDA_GROUP, G) and not forced):
             how = []
             if stream:
@@ -829,7 +864,7 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
                     A, Bm = _children(kern, pre, pim, c0, sl, lv0)                   # [ng, Po, Ko]
             except cp.cuda.memory.OutOfMemoryError:
                 if ng == 1:
-                    raise
+                    _out_of_memory(free + full.nbytes)
                 # the model sized the groups too large for this device: half the group, from this one on
                 del c0, sl
                 cp.get_default_memory_pool().free_all_blocks()
@@ -837,7 +872,6 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
                 memory._warn(f'cuda: out of GPU memory in the first level; FastSAR continues in groups of '
                              f'{memory._nchildren(ng)}, which is slower ({memory._gb(memory.cuda_free())} free)')
                 continue
-            g0 += len(gs)
             # the batch does not set the speed (docs/performance.md): sized with room to spare, halved quietly
             bt = batch or int(max(1, min(len(gs), (0.45 * memory.cuda_free()) // rest)))
             k0 = 0
@@ -846,19 +880,35 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
                 try:
                     re, im = tiles(A[k0:k0 + len(sub)], Bm[k0:k0 + len(sub)], sub)
                 except cp.cuda.memory.OutOfMemoryError:
-                    if bt == 1:
-                        raise
-                    cp.get_default_memory_pool().free_all_blocks()
-                    bt //= 2
-                    continue
+                    if bt > 1:
+                        cp.get_default_memory_pool().free_all_blocks()
+                        bt //= 2
+                        continue
+                    if ng == 1:
+                        _out_of_memory(free + full.nbytes)
+                    break                       # one child does not fit beside the group: a smaller group, below
                 k0 += len(sub)
                 for k, g in enumerate(sub):
                     x, y = g // sy0, g % sy0
                     full[x * mx:(x + 1) * mx, y * my:(y + 1) * my] = re[k] + 1j * im[k]
             del A, Bm
+            g0 += k0                            # the children done; the rest of the group again, in smaller groups
+            if k0 < len(gs):
+                cp.get_default_memory_pool().free_all_blocks()
+                ng = max(1, ng // 2)
+                memory._warn(f'cuda: out of GPU memory in the later levels; FastSAR continues in first-level groups of '
+                             f'{memory._nchildren(ng)}, which is slower ({memory._gb(memory.cuda_free())} free)')
         return full[ox:ox + nx, oy:oy + ny] if scale == 1.0 else full[ox:ox + nx, oy:oy + ny] * np.float32(scale)
 
     return form
+
+
+def _out_of_memory(free):
+    """Raise MemoryError when one first-level child does not fit through the levels on this GPU."""
+    import cupy as cp
+    cp.get_default_memory_pool().free_all_blocks()
+    raise MemoryError(f'cuda: one first-level child of this image does not fit in the GPU memory ({memory._gb(free)} '
+                      "free): use precision='float16' (half the memory), a smaller image, or backend='cpu'")
 
 
 def _finite(S, xp, first=0):

@@ -44,6 +44,11 @@ was published on PyPI.
   spotlight from 1450 to 331 s on `cuda`; before, the L4 ran end to end slower than the host's CPU backend. The
   window and the gather are bitwise unchanged; the phases, now a float32 cosine and sine of the float64 angle, differ
   from 0.1.2's in the last bit of some samples (-193 dB relative).
+- CUDA: the first-level group is sized with room for one of its children carried through the later levels, a later
+  level whose intermediate of all output children does not fit is formed over parts of them (the same values), and
+  a later level that runs out of memory for one child halves the first-level group; when nothing fits, a
+  MemoryError names what to change instead of CuPy's OutOfMemoryError. A 12.3 GB UMBRA-10 spotlight (14390 by 14109
+  pixels) failed on an L4 in both precisions and now forms in 157 s (float32) and 72 s (float16).
 
 ## [0.1.2] - 2026-10-14
 

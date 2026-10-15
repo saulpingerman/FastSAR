@@ -122,6 +122,51 @@ def test_out_of_memory_retry(three, monkeypatch):
         f'out-of-memory retry: {three.rel(img_o):.1f} dB, warnings {msg}'
 
 
+
+def test_later_level_split(three, monkeypatch):
+    """A later level whose intermediate of all output children does not fit is formed over parts of its children
+    (round 5, UMBRA-10 on the L4): the image is unchanged."""
+    import cupy as cp
+    from fastsar import ffbp_cuda
+    lvs = three.plan['levels']
+    real_children = ffbp_cuda._children
+
+    def failing_children(kern, pre, pim, c0, sl, lv):
+        if lv is lvs[1] and c0.shape[1] > 1:
+            raise cp.cuda.memory.OutOfMemoryError(1 << 40, 0)
+        return real_children(kern, pre, pim, c0, sl, lv)
+
+    with monkeypatch.context() as mp:
+        mp.setattr(ffbp_cuda, '_children', failing_children)
+        img_s = cp.asnumpy(three.form(three.S, ng=2))
+    print(f'later level formed one output child at a time: {three.rel(img_s):.1f} dB')
+    assert not three.rel(img_s) > -100, f'later-level split: {three.rel(img_s):.1f} dB'
+
+
+def test_out_of_memory_message(three, monkeypatch):
+    """A later level that fails even for one child of one first-level child: smaller groups first (a MemoryWarning),
+    then a MemoryError that names what to change, not CuPy's error."""
+    import cupy as cp
+    from fastsar import ffbp_cuda
+    lvs = three.plan['levels']
+    real_children = ffbp_cuda._children
+
+    def failing_children(kern, pre, pim, c0, sl, lv):
+        if lv is lvs[1]:
+            raise cp.cuda.memory.OutOfMemoryError(1 << 40, 0)
+        return real_children(kern, pre, pim, c0, sl, lv)
+
+    with monkeypatch.context() as mp:
+        mp.setattr(ffbp_cuda, '_children', failing_children)
+        with warnings.catch_warnings(record=True) as wl:
+            warnings.simplefilter('always')
+            with pytest.raises(MemoryError, match="precision='float16'") as ei:
+                three.form(three.S, ng=2)
+    msg = [str(w.message) for w in wl if issubclass(w.category, memory.MemoryWarning)]
+    print(f'out of memory for one child: {ei.value}; warnings: {msg}')
+    assert not isinstance(ei.value, cp.cuda.memory.OutOfMemoryError)
+    assert any('later levels' in m for m in msg), msg
+
 def test_memory_warning_before_forming(three, monkeypatch):
     """The sizing warns before forming when told the memory is short, and the image is unchanged."""
     import cupy as cp
