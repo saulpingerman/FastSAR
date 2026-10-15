@@ -67,6 +67,7 @@ def test_phase_rows_parallel():
     f = 9.6e9 + 3e5 * np.arange(K)
     coef = rng.uniform(1e-9, 3e-7, P)
     ref = S * np.exp(-2j * np.pi * f[None, :] * coef[:, None]).astype(np.complex64)
+
     def freq(sl, out):
         out[:] = f
     out = io._phase_rows(S.copy(), freq, coef, -1)
@@ -101,3 +102,12 @@ def test_rows_with():
             busy.discard(id(s))
     patches._rows_with(fn, 5000, make, chunk=64)
     assert (seen == 1).all() and set(made) == {threading.get_ident()} and len(made) <= patches._ncpu()
+
+    def bad(sl, s):                     # a failing block: the error reaches the caller, and a later call completes
+        if sl.start == 640:
+            raise RuntimeError('block')
+    with pytest.raises(RuntimeError, match='block'):
+        patches._rows_with(bad, 5000, make, chunk=64)
+    seen[:] = 0
+    patches._rows_with(fn, 5000, make, chunk=64)
+    assert (seen == 1).all()

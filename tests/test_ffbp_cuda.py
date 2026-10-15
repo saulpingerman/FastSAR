@@ -211,6 +211,7 @@ def test_staging_reuse(monkeypatch):
     """A mosaic's page-locked staging buffers are reused: a smaller request takes a free buffer, a larger one replaces
     it (the count stays bounded), and the patches of a host-gathered mosaic make at most one per gather in flight."""
     import threading
+    import cupy as cp
     from fastsar import stripmap as sm, patches as pt
     stage = dict(lock=threading.Lock(), free=[])
     a, ba = pt._staging_take(stage, (100, 1000), np.complex64)
@@ -227,14 +228,24 @@ def test_staging_reuse(monkeypatch):
     raw = sm.simulate(p, np.array([[x[len(x) // 2], r[len(r) // 2]]]))
     rows = (len(x) // 2 - 140, len(x) // 2 + 140)
     monkeypatch.setenv('FASTSAR_PROFILE_WINDOW_ROWS', '16')
-    monkeypatch.setenv('FASTSAR_MOSAIC_PREFETCH', '1')
     monkeypatch.setenv('FASTSAR_TIMING', '1')
-    pt._Timer.acc.clear()
-    info = []
-    pt.form_stripmap(raw, p, rows=rows, backend='cuda', rwin='taylor', awin='taylor', info=info)
-    made = pt._Timer.acc.get('form_mosaic: page-locked staging buffers made (count)')
-    print(f'{len(info)} patches, {made} staging buffers')
-    assert len(info) > 2 and made is not None and 1 <= made <= 4
+    imgs = {}
+    for nw in (1, 3):
+        monkeypatch.setenv('FASTSAR_MOSAIC_PREFETCH', str(nw))
+        pt._Timer.acc.clear()
+        info = []
+        imgs[nw] = pt.form_stripmap(raw, p, rows=rows, backend='cuda', rwin='taylor', awin='taylor', info=info)
+        made = pt._Timer.acc.get('form_mosaic: page-locked staging buffers made (count)')
+        kept = pt._Timer.acc.get('form_mosaic: free blocks in the pinned pool at the end (count)')
+        print(f'prefetch {nw}: {len(info)} patches, {made} staging buffers, {kept} free pinned-pool blocks')
+        assert len(info) > 2 and made is not None and 1 <= made <= 2 * (nw + 1)
+        assert kept is not None and cp.get_default_pinned_memory_pool().n_free_blocks() <= pt._PINNED_KEEP
+    # the same patches gathered into CuPy's pool instead of the staging buffers give the same image
+    real = pt._staging_take
+    monkeypatch.setattr(pt, '_staging_take', lambda stage, shape, dtype: (pt._pinned_empty(shape, dtype), None))
+    plain = pt.form_stripmap(raw, p, rows=rows, backend='cuda', rwin='taylor', awin='taylor')
+    monkeypatch.setattr(pt, '_staging_take', real)
+    assert np.array_equal(plain, imgs[1]) and np.array_equal(plain, imgs[3])
 
 
 def test_pinned_off(three, monkeypatch):

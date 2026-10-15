@@ -246,9 +246,10 @@ def form_cphd(cphd, sicd=None, *, mode='auto', backend='auto', window=True, spac
         ref_new = np.linalg.norm(ant - c, axis=1)
         dref = ref_r - ref_new
         f = f0 + df * np.arange(K)
+
         def freq(sl, out):
             out[:] = f
-        io._phase_rows(S, freq, 2 * dref / C, -1)             # in place, on all cores
+        io._phase_rows(S, freq, 2 * dref / C, -1)     # in place, on all cores
         notes.append(f'phase reference moved {np.linalg.norm(c):.1f} m to the grid center')
         kw = dict(backend=backend, precision=precision, window=False, target_db=target_db)
         if autofocus:
