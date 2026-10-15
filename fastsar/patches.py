@@ -191,7 +191,7 @@ def _window_start(lo, hi, rows):
     return max(0, min(lo, max(hi - rows, lo - rows // 8)))
 
 
-_PINNED_KEEP = 8          # free blocks of CuPy's pinned pool kept after a cuda mosaic (form_mosaic)
+_PINNED_KEEP = 16         # free blocks of CuPy's pinned pool kept after a cuda mosaic (form_mosaic)
 _ROWS_POOL = []
 _ROWS_LOCK = threading.Lock()
 
@@ -243,9 +243,9 @@ def _ncpu():
 
 def _pinned_empty(shape, dtype):
     """An empty host array in pinned (page-locked) memory from CuPy's pinned pool, for fast uploads."""
-    import cupy as cp
+    from .memory import _pinned
     n = int(np.prod(shape)) * np.dtype(dtype).itemsize
-    return np.frombuffer(cp.cuda.alloc_pinned_memory(max(n, 1)), dtype, int(np.prod(shape))).reshape(shape)
+    return np.frombuffer(_pinned(n), dtype, int(np.prod(shape))).reshape(shape)
 
 
 def _staging_take(stage, shape, dtype):
@@ -850,9 +850,9 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
         if prof is not None:          # the gathers' page-locked buffers, freed with their last reference
             prof['stage'] = None
         if backend == 'cuda' and 'cupy' in sys.modules:
-            # CuPy's pinned pool keeps the patches' image and upload blocks for the next mosaic (page-locking them
-            # again cost 2.6 of 13 s in an 84-patch stripmap on an L4); it reuses a block only at the same size, so
-            # after mosaics of other sizes it is emptied, which bounds it
+            # CuPy's pinned pool keeps the patches' image blocks for the next mosaic (page-locking them again cost
+            # 2.6 of 13 s in an 84-patch stripmap on an L4); it reuses a block only at the same size class
+            # (memory._pinned), so after mosaics of other sizes it is emptied, which bounds it
             pool = sys.modules['cupy'].get_default_pinned_memory_pool()
             pinned_blocks = pool.n_free_blocks()
             if pinned_blocks > _PINNED_KEEP:

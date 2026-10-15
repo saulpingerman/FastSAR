@@ -10,8 +10,10 @@ was published on PyPI.
 - CUDA mosaics were 1 to 40% slower in 0.1.3 than in its first candidate, from two causes. `form_mosaic` freed
   CuPy's pinned memory pool at its end, so every later mosaic page-locked its host buffers again (2.6 s of the 13 s
   of the 84-patch 2021 Capella stripmap on an L4). The gather of a patch's range profiles now goes through
-  page-locked staging buffers kept for the mosaic and released with it, and the pool keeps its blocks for the next
-  mosaic unless it holds more than eight free ones (it reuses a block only at the same size). The reader's
+  page-locked staging buffers kept for the mosaic and released with it. The pool keeps its blocks for the next mosaic,
+  and since it reuses a block only at the same size, requests from it are rounded up to size classes (at most 1/8
+  larger), so patches of slightly different sizes share blocks; it is emptied after a mosaic only when it holds
+  more than 16 free blocks. The reader's
   row passes (troposphere and re-reference phases, the window), which 0.1.3 runs on all cores, allocated large
   temporaries in every worker thread; the allocator kept them, and the later mosaic took more page faults (about
   0.5 s on the same stripmap). Their scratch arrays are now made on the calling thread, one per block in flight. On

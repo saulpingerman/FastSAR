@@ -53,6 +53,21 @@ def _env_choice(name, default, allowed):
     return v
 
 
+def _pinned_size(n):
+    """n bytes rounded up to a size class of CuPy's pinned pool: at most 1/8 more, with 8 to 16 classes per factor of
+    two. The pool reuses a block only at the same size, and patches of a mosaic ask for sizes a few percent apart,
+    which without classes left tens of blocks in it."""
+    n = max(int(n), 1)
+    g = 1 << max(0, n.bit_length() - 4)
+    return -(-n // g) * g
+
+
+def _pinned(n):
+    """A block of at least n bytes from CuPy's pinned pool, its size rounded to a class (_pinned_size)."""
+    import cupy as cp
+    return cp.cuda.alloc_pinned_memory(_pinned_size(n))
+
+
 def host_available():
     """Bytes of host memory available (MemAvailable on Linux, else total physical memory)."""
     try:

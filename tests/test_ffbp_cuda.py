@@ -211,7 +211,6 @@ def test_staging_reuse(monkeypatch):
     """A mosaic's page-locked staging buffers are reused: a smaller request takes a free buffer, a larger one replaces
     it (the count stays bounded), and the patches of a host-gathered mosaic make at most one per gather in flight."""
     import threading
-    import cupy as cp
     from fastsar import stripmap as sm, patches as pt
     stage = dict(lock=threading.Lock(), free=[])
     a, ba = pt._staging_take(stage, (100, 1000), np.complex64)
@@ -239,7 +238,7 @@ def test_staging_reuse(monkeypatch):
         kept = pt._Timer.acc.get('form_mosaic: free blocks in the pinned pool at the end (count)')
         print(f'prefetch {nw}: {len(info)} patches, {made} staging buffers, {kept} free pinned-pool blocks')
         assert len(info) > 2 and made is not None and 1 <= made <= 2 * (nw + 1)
-        assert kept is not None and cp.get_default_pinned_memory_pool().n_free_blocks() <= pt._PINNED_KEEP
+        assert kept is not None and kept <= pt._PINNED_KEEP      # the patches' pinned blocks share size classes
     # the same patches gathered into CuPy's pool instead of the staging buffers give the same image
     real = pt._staging_take
     monkeypatch.setattr(pt, '_staging_take', lambda stage, shape, dtype: (pt._pinned_empty(shape, dtype), None))

@@ -238,7 +238,7 @@ def _to_host(dev):
     if _mem._env_choice('FASTSAR_PINNED', '1', {'0', '1'}) == '0':
         return cp.asnumpy(dev).astype(np.complex64, copy=False)
     dev = cp.ascontiguousarray(dev.astype(cp.complex64, copy=False))
-    mem = cp.cuda.alloc_pinned_memory(dev.nbytes)
+    mem = _mem._pinned(dev.nbytes)
     host = np.frombuffer(mem, np.complex64, dev.size).reshape(dev.shape)
     dev.get(out=host)
     return host

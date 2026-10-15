@@ -568,7 +568,7 @@ def _upload_planes(S, pre, pim, win, check, scaled, scale=None):
     P, K = S.shape
     nb = memory.STREAM_PULSES
     rows = min(nb, P)
-    bufs = [cp.cuda.alloc_pinned_memory(rows * K * 8) for _ in range(2)]          # pooled: reused by later calls
+    bufs = [memory._pinned(rows * K * 8) for _ in range(2)]                       # pooled: reused by later calls
     stg = [np.frombuffer(b, np.complex64, rows * K).reshape(rows, K) for b in bufs]
     st = cp.cuda.Stream(non_blocking=True)
     st.wait_event(cp.cuda.get_current_stream().record())         # the planes and windows, allocated on that stream

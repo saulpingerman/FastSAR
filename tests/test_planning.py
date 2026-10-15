@@ -346,3 +346,14 @@ def test_cuda_full_speed_counts_later_levels():
     total, parts = memory.full_speed(plan, col.K, 'cuda')
     assert parts['later_levels'] == memory.cuda_rest(plan, 8) > 0
     assert total >= parts['image'] + parts['history'] + parts['first_level'] + parts['later_levels'] - 1
+
+
+def test_pinned_size():
+    """Pinned-pool size classes: never smaller than asked, at most 1/8 larger, and sizes a few percent apart share one."""
+    from fastsar.memory import _pinned_size
+    rng = np.random.default_rng(0)
+    for n in list(range(1, 300)) + [int(x) for x in rng.integers(1, 1 << 34, 2000)]:
+        c = _pinned_size(n)
+        assert n <= c <= n + n // 8 + 1 and _pinned_size(c) == c
+    sizes = {_pinned_size(int(1.0e8 * (1 + 0.003 * k))) for k in range(10)}
+    assert len(sizes) <= 2
