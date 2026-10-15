@@ -3,6 +3,21 @@
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The date of a version is the day it
 was published on PyPI.
 
+## [0.1.4] - 2026-10-15
+
+### Fixed
+
+- CUDA mosaics were 1 to 40% slower in 0.1.3 than in its first candidate, from two causes. `form_mosaic` freed
+  CuPy's pinned memory pool at its end, so every later mosaic page-locked its host buffers again (2.6 s of the 13 s
+  of the 84-patch 2021 Capella stripmap on an L4). The gather of a patch's range profiles now goes through
+  page-locked staging buffers kept for the mosaic and released with it, and the pool keeps its blocks for the next
+  mosaic unless it holds more than eight free ones (it reuses a block only at the same size). The reader's
+  row passes (troposphere and re-reference phases, the window), which 0.1.3 runs on all cores, allocated large
+  temporaries in every worker thread; the allocator kept them, and the later mosaic took more page faults (about
+  0.5 s on the same stripmap). Their scratch arrays are now made on the calling thread, one per block in flight. On
+  the L4 the three Capella mosaics take as long as before 0.1.3 (9.8, 52.3 and 195.9 s), and every image is bitwise
+  the same as in 0.1.3.
+
 ## [0.1.3] - 2026-10-15
 
 ### Added
@@ -314,7 +329,8 @@ First release.
 - Products: multilook, interferogram, coherence, Pauli decomposition, range-Doppler projection and geocoding,
   GeoTIFF and SICD output.
 
-[0.1.3]: https://github.com/saulpingerman/FastSAR/compare/v0.1.2...HEAD
+[0.1.4]: https://github.com/saulpingerman/FastSAR/compare/v0.1.3...v0.1.4
+[0.1.3]: https://github.com/saulpingerman/FastSAR/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/saulpingerman/FastSAR/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/saulpingerman/FastSAR/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/saulpingerman/FastSAR/releases/tag/v0.1.0
