@@ -21,9 +21,9 @@ def scene():
     return col, sim.simulate_brute(col, pos, amp).astype(np.complex64)
 
 
-def _plan(col, nlev):
+def _plan(col, nlev, T=16):
     n = 128
-    plan = ffbp2.make_plan(col, n, n, 0.5, 0.5, T=16, nlev=nlev, pmax=0.4)
+    plan = ffbp2.make_plan(col, n, n, 0.5, 0.5, T=T, nlev=nlev, pmax=0.4)
     return plan, ffbp2.collection_arrays(plan, col.ant)
 
 
@@ -229,16 +229,16 @@ def test_float16_zero_first_block(scene, monkeypatch):
     import cupy as cp
     from fastsar import ffbp_cuda
     col, S = scene
-    plan, coll = _plan(col, 3)
+    plan, coll = _plan(col, 2, T=32)                 # float16 on cuda: T = 32
     monkeypatch.setattr(memory, 'STREAM_PULSES', 32)          # upload blocks of 32 pulses
     S0 = S.copy()
     S0[:32] = 0
     S0 *= 1e4 / np.abs(S0).max()                   # a peak of 10^4: above float16's range times any block's share
     f32 = cp.asnumpy(ffbp_cuda.make_ffbp_cuda(plan, coll)(S0))
     f16 = cp.asnumpy(ffbp_cuda.make_ffbp_cuda(plan, coll, final_mode='f16tc', store='f16')(S0))
-    assert np.isfinite(f16).all()
     e = 10 * np.log10(np.sum(np.abs(f16 - f32) ** 2) / np.sum(np.abs(f32) ** 2))
-    print(f'float16 with a zero first block vs float32: {e:.1f} dB')
+    print(f'float16 with a zero first block vs float32: {e:.1f} dB, finite {np.isfinite(f16).all()}')
+    assert np.isfinite(f16).all()
     assert e < -40, e
 
 
@@ -261,7 +261,7 @@ def test_no_nvcc(scene, monkeypatch):
     import cupy as cp
     from fastsar import ffbp_cuda
     col, S = scene
-    plan, coll = _plan(col, 3)
+    plan, coll = _plan(col, 2, T=32)                 # T = 32: the tensor-core final stage applies
     monkeypatch.setenv('FASTSAR_FINAL', 'fp32')
     ref = cp.asnumpy(ffbp_cuda.make_ffbp_cuda(plan, coll)(S))
     monkeypatch.delenv('FASTSAR_FINAL')

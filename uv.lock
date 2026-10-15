@@ -712,7 +712,7 @@ test = [
 
 [package.metadata]
 requires-dist = [
-    { name = "cupy-cuda12x", marker = "extra == 'cuda'" },
+    { name = "cupy-cuda12x", marker = "extra == 'cuda'", specifier = ">=13" },
     { name = "finufft", marker = "extra == 'test'" },
     { name = "h5py", marker = "extra == 'raw'", specifier = ">=3.10" },
     { name = "h5py", marker = "extra == 'test'", specifier = ">=3.10" },
