@@ -229,6 +229,17 @@ def test_staging_reuse(monkeypatch):
     rows = (len(x) // 2 - 140, len(x) // 2 + 140)
     monkeypatch.setenv('FASTSAR_PROFILE_WINDOW_ROWS', '16')
     monkeypatch.setenv('FASTSAR_TIMING', '1')
+    pool, emptied = cp.get_default_pinned_memory_pool(), []
+
+    class Spy:                # CuPy's pinned pool, recording the free blocks before and after each emptying
+        def n_free_blocks(self):
+            return pool.n_free_blocks()
+
+        def free_all_blocks(self):
+            n = pool.n_free_blocks()
+            pool.free_all_blocks()
+            emptied.append((n, pool.n_free_blocks()))
+    monkeypatch.setattr(cp, 'get_default_pinned_memory_pool', Spy)
     imgs = {}
     for nw in (1, 3):
         monkeypatch.setenv('FASTSAR_MOSAIC_PREFETCH', str(nw))
@@ -239,7 +250,8 @@ def test_staging_reuse(monkeypatch):
         kept = pt._Timer.acc.get('form_mosaic: free blocks in the pinned pool before it is emptied (count)')
         print(f'prefetch {nw}: {len(info)} patches, {made} staging buffers, {kept} free pinned-pool blocks')
         assert len(info) > 2 and made is not None and 1 <= made <= 2 * (nw + 1)
-        assert kept is not None and cp.get_default_pinned_memory_pool().n_free_blocks() == 0      # emptied after the mosaic
+        assert kept is not None and len(emptied) == 1 and emptied[0] == (kept, 0)      # emptied after the mosaic
+        emptied.clear()
     # the same patches gathered into CuPy's pool instead of the staging buffers give the same image
     real = pt._staging_take
     monkeypatch.setattr(pt, '_staging_take', lambda stage, shape, dtype: (pt._pinned_empty(shape, dtype), None))
