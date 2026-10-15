@@ -211,6 +211,7 @@ def test_staging_reuse(monkeypatch):
     """A mosaic's page-locked staging buffers are reused: a smaller request takes a free buffer, a larger one replaces
     it (the count stays bounded), and the patches of a host-gathered mosaic make at most one per gather in flight."""
     import threading
+    from fastsar import stripmap as sm, patches as pt
     stage = dict(lock=threading.Lock(), free=[])
     a, ba = pt._staging_take(stage, (100, 1000), np.complex64)
     a[:] = 1
