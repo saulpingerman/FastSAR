@@ -245,7 +245,7 @@ def test_staging_reuse(monkeypatch):
         monkeypatch.setenv('FASTSAR_MOSAIC_PREFETCH', str(nw))
         pt._Timer.acc.clear()
         info = []
-        imgs[nw] = pt.form_stripmap(raw, p, rows=rows, backend='cuda', rwin='taylor', awin='taylor', info=info)
+        imgs[nw] = pt.form_stripmap(raw, p, rows=rows, backend='cuda', rwin='taylor', awin='taylor', info=info)[0]
         made = pt._Timer.acc.get('form_mosaic: page-locked staging buffers made (count)')
         kept = pt._Timer.acc.get('form_mosaic: free blocks in the pinned pool before it is emptied (count)')
         print(f'prefetch {nw}: {len(info)} patches, {made} staging buffers, {kept} free pinned-pool blocks')
@@ -255,7 +255,7 @@ def test_staging_reuse(monkeypatch):
     # the same patches gathered into CuPy's pool instead of the staging buffers give the same image
     real = pt._staging_take
     monkeypatch.setattr(pt, '_staging_take', lambda stage, shape, dtype: (pt._pinned_empty(shape, dtype), None))
-    plain = pt.form_stripmap(raw, p, rows=rows, backend='cuda', rwin='taylor', awin='taylor')
+    plain = pt.form_stripmap(raw, p, rows=rows, backend='cuda', rwin='taylor', awin='taylor')[0]
     monkeypatch.setattr(pt, '_staging_take', real)
     assert np.array_equal(plain, imgs[1]) and np.array_equal(plain, imgs[3])
 
