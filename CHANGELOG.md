@@ -5,6 +5,14 @@ was published on PyPI.
 
 ## [Unreleased]
 
+### Changed
+
+- cuda `ExactFormer`: the thread blocks take their tiles along the grid axis closer to constant range, so that the
+  blocks resident together read the same range bins from the L2 cache instead of the image's whole range window, and
+  the image comes back through pinned memory, as `ImageFormer`'s does. On an RTX PRO 6000 Blackwell Max-Q the 12,207
+  by 8,808 pixel, 15,186-pulse Panama image took 2.59 s with linear and 3.82 s with cubic interpolation (4.54 and
+  5.84 s in 0.1.4); the images are bitwise the same.
+
 ### Fixed
 
 - After a cuda `ExactFormer` image, CuPy's FFT plan cache kept the plan of its range compression, and with it a work

@@ -59,13 +59,17 @@ _CUDA_SRC = r'''
 extern "C" __global__ void bp_tiles(const float2* rc, int P, int W, const int* lo, const double* ant, const double* ref,
                                     const double* cen, int nty, int nx, int ny, float sx, float sy,
                                     float e1x, float e1y, float e1z, float e2x, float e2y, float e2z,
-                                    double inv_dr, double kcyc, float2* out) {
+                                    double inv_dr, double kcyc, int along1, float2* out) {
   // one thread block per tile of TX x TY pixels, PX pixels per thread; the tile center's terms for TB pulses at a
   // time are computed in float64 by the block's threads and shared
   __shared__ float s_ux[TB], s_uy[TB], s_uz[TB], s_ir[TB], s_i2[TB], s_tf[TB], s_ph[TB];
   __shared__ int s_ti[TB];
-  const int b = blockIdx.x, j = threadIdx.x;
-  const int bx = b / nty, by = b % nty;
+  // consecutive blocks along the grid axis closer to constant range (along1: e1), so that the blocks resident together
+  // lie at nearly one range and read the same profile bins from the L2 cache: 1.3 times faster on the Panama image
+  // than blocks along range, whose resident blocks spanned the image's whole range window
+  const int j = threadIdx.x, ntx = gridDim.x / nty;
+  const int bx = along1 ? blockIdx.x % ntx : blockIdx.x / nty, by = along1 ? blockIdx.x / ntx : blockIdx.x % nty;
+  const int b = bx * nty + by;
   const double cx = cen[3*b], cy = cen[3*b+1], cz = cen[3*b+2];
   float dx[PX], dy[PX], dz[PX], dd[PX], are[PX], aim[PX];
   int ix[PX], iy[PX];
@@ -485,6 +489,9 @@ class ExactFormer:
         self._pin = [cp.cuda.alloc_pinned_memory(ch * self.K * 8) for _ in range(2)]
         self._hbuf = [np.frombuffer(b, np.complex64, ch * self.K).reshape(ch, self.K) for b in self._pin]
         self._stream = cp.cuda.Stream(non_blocking=True)
+        # the grid axis closer to constant range: the one less aligned with the line of sight at mid-aperture
+        los = self.ant[self.P // 2] - self.center
+        self._along1 = int(abs(los @ self.e1) <= abs(los @ self.e2))
 
     def _form_cuda(self, S, check=False):
         import cupy as cp
@@ -541,11 +548,12 @@ class ExactFormer:
                        (win, np.int32(n), np.int32(W), d['lo'][p0:p1], d['ant'][p0:p1], d['ref'][p0:p1], d['cen'],
                         np.int32(self.nty), np.int32(self.nx), np.int32(self.ny), f32(self.spx), f32(self.spy),
                         f32(self.e1[0]), f32(self.e1[1]), f32(self.e1[2]), f32(self.e2[0]), f32(self.e2[1]), f32(self.e2[2]),
-                        np.float64(self.inv_dr), np.float64(self.kcyc), out))
+                        np.float64(self.inv_dr), np.float64(self.kcyc), np.int32(self._along1), out))
         if check and bool(bad):
             from .api import _check_history
             _check_history(S if isinstance(S, np.ndarray) else cp.asnumpy(S))       # raises, naming the first pulse
-        return cp.asnumpy(out)
+        from .api import _to_host
+        return _to_host(out)                 # through pinned memory, as ImageFormer returns its image
 
     # ---------------------------------------------------------------- CPU
     def _form_cpu(self, S):

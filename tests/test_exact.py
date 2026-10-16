@@ -265,3 +265,19 @@ def test_cuda_releases_memory(col20):
     del a
     assert held < 1 << 20, held
     print(f'cuda: {held} bytes of device memory in use after a call, beyond the former\'s geometry')
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize('axes', ['e1 azimuth', 'e2 azimuth'])
+def test_cuda_block_order(ranges, axes):
+    """The order in which the cuda kernel takes its tiles (along the grid axis closer to constant range, for the L2
+    cache) leaves the image bitwise unchanged: each pixel sums its pulses in the same order either way."""
+    c = ranges[600e3]
+    e1, e2 = ((0.0, 1.0, 0.0), (1.0, 0.0, 0.0)) if axes == 'e1 azimuth' else ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0))
+    f = fastsar.ExactFormer(c.col.ant, c.col.fmin, c.col.df, c.S.shape[1], 100, 120, 0.5, 0.5, e1, e2, backend='cuda')
+    a = f(c.S).copy()
+    chosen = f._along1
+    f._along1 = 1 - chosen
+    b = f(c.S)
+    assert np.array_equal(a, b), axes
+    print(f'cuda: {axes}, blocks along e{2 - chosen} chosen, the other order gives the same image')
