@@ -111,6 +111,25 @@ def test_decimation_filters():
 
 # ---------------------------------------------------------------------------------------------- JAX program cache
 
+@pytest.mark.parametrize('policy', ['fp32', 'fp64'])
+def test_prepare_blocked(monkeypatch, policy):
+    """prepare's block-wise upload (TPU) gives the planes and scale of the whole-plane one, with a partial last block."""
+    import jax
+    rng = np.random.default_rng(3)
+    S = (rng.standard_normal((1000, 96)) + 1j * rng.standard_normal((1000, 96))).astype(np.complex64)
+    if policy == 'fp64' and not jax.config.jax_enable_x64:
+        pytest.skip('float64 planes need jax_enable_x64')
+    a = ffbp2.prepare(policy, S)
+    monkeypatch.setattr(ffbp2, '_blocked_upload', lambda: True)
+    monkeypatch.setattr(ffbp2, 'UPLOAD_ROWS', 128)
+    with warnings.catch_warnings():
+        warnings.filterwarnings('ignore', message='Some donated buffers were not usable')
+        b = ffbp2.prepare(policy, S)
+    assert a[2] == b[2] and a[0].dtype == b[0].dtype
+    assert np.array_equal(np.asarray(a[0]), np.asarray(b[0])) and np.array_equal(np.asarray(a[1]), np.asarray(b[1]))
+    print(f'  prepare {policy}: block-wise planes equal the whole-plane ones')
+
+
 def test_jax_program_cache(scene):
     print('\nJAX program cache (plan_signature)')
     bad = []

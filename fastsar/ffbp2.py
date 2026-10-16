@@ -379,12 +379,36 @@ def device_arrays(policy, plan, coll, static):
     return dict(levels=lv, final=dict(static['final'], **up['final']))
 
 
+UPLOAD_ROWS = 4096       # pulses per block when prepare uploads a host history to a TPU
+
+
+@functools.partial(jax.jit, donate_argnums=0)
+def _put_rows(dst, blk, i):
+    return lax.dynamic_update_slice(dst, blk, (i, 0))
+
+
+def _blocked_upload():
+    return jax.devices()[0].platform == 'tpu'
+
+
 def prepare(policy, S):
-    """Phase history [P, K] -> real and imaginary planes in the element-wise type, scaled to unit peak, and the scale."""
+    """Phase history [P, K] -> real and imaginary planes in the element-wise type, scaled to unit peak, and the scale.
+
+    On a TPU the planes are uploaded in blocks of UPLOAD_ROWS pulses into planes allocated on the device: the upload of
+    a whole 5 GB plane took 26 s in every call of a process on a v6e (1 s for a block-wise one; the 2024 Capella
+    spotlight), against 0.9 s for the same upload from an array allocated once. The planes are the same either way."""
     p = POLICIES[policy]
     h = np.float64 if p['ew'] == 'float64' else np.float32
     scale = float(np.abs(S).max()) or 1.0          # an all-zero history: zero planes, not 0/0
-    return (jnp.asarray((S.real / scale).astype(h)).astype(p['ew']), jnp.asarray((S.imag / scale).astype(h)).astype(p['ew']), scale)
+    P = S.shape[0]
+    if not _blocked_upload() or P <= UPLOAD_ROWS:
+        return (jnp.asarray((S.real / scale).astype(h)).astype(p['ew']), jnp.asarray((S.imag / scale).astype(h)).astype(p['ew']), scale)
+    hre, him = jnp.zeros(S.shape, h), jnp.zeros(S.shape, h)
+    for i in range(0, P, UPLOAD_ROWS):
+        b = S[i:i + UPLOAD_ROWS]
+        hre = _put_rows(hre, (b.real / scale).astype(h), i)
+        him = _put_rows(him, (b.imag / scale).astype(h), i)
+    return hre.astype(p['ew']), him.astype(p['ew']), scale
 
 
 def _pulse_block(P, pb_max):
