@@ -3,7 +3,7 @@
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The date of a version is the day it
 was published on PyPI.
 
-## [0.1.4] - 2026-10-15
+## [0.1.4] - 2026-10-16
 
 ### Fixed
 
@@ -18,6 +18,12 @@ was published on PyPI.
   more page faults. Their scratch arrays are now made on the calling thread, one per block in flight. On an L4 the
   three Capella mosaics take 9.4, 50.8 and 189.0 s (12.8, 53.6 and 197.7 s in 0.1.3) at 4 to 8 GB less peak memory,
   and every image is bitwise the same as in 0.1.3.
+
+### Known issues
+
+- On a GPU whose memory is nearly filled by an earlier former (an 8192 by 8192 `ExactFormer` image of a wide-band
+  Umbra collection on an L4), a following float16 `ImageFormer` can fail with CuPy's `OutOfMemoryError` instead of
+  FastSAR's `MemoryError` or a slower path. Release 0.1.3 behaves the same way.
 
 ## [0.1.3] - 2026-10-15
 
