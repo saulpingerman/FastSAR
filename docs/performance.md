@@ -192,19 +192,27 @@ sar-accel-study.
 ## Exact backprojection
 
 `ExactFormer` on the Umbra Panama collection (12,207 by 8,808 pixels, 15,186 pulses), host memory to host memory,
-warm former, against the float64 reference:
+warm former, against the float64 reference (the GPUs at 0.1.5, the CPU at 0.1.4; 0.1.4's GPU times in brackets):
 
 | Device | Cubic, `upsample=8` (default) | Linear, `upsample=8` |
 |---|---|---|
-| L4 (g2-standard-4) | 23.9 s, -67.4 dB | 19.4 s, -56.9 dB |
+| L4 (g2-standard-4) | 16.4 s (23.9 s), -67.4 dB | 11.4 s (19.4 s), -56.9 dB |
+| A100 80GB (a2-ultragpu-1g) | 8.28 s (9.3 s), -67.4 dB | 5.64 s (6.9 s), -56.9 dB |
+| H100 80GB (a3-highgpu-1g) | 4.53 s (5.3 s), -67.4 dB | 2.98 s (4.2 s), -56.9 dB |
 | c4d-highmem-16 | 374 s, -67.4 dB | 224 s, -56.9 dB |
+
+The 0.1.5 images are bitwise those of 0.1.4 on all three GPUs and the three Umbra scenes. Two changes made the
+difference: the CUDA kernel's thread blocks take their tiles along the grid axis closer to constant range, so that
+the blocks resident together read the same range bins from the L2 cache instead of the image's whole range window,
+and the image comes back through pinned memory (0.25 s or more for the 860 MB image through pageable memory).
+Records: the bucket prefix `v7` of sar-accel-study (`cloud/r013/queue_exact_v015.sh`).
 
 The cubic error is the reference's own: against a float64 backprojection oversampled 64 times, the reference is
 -67.3 to -68.8 dB on the lock, port and ship regions and the cubic image -77.5 to -81.7 dB (the float32 factorized
-images -57 to -63 dB). Cubic at 4 times, the default before 0.1.1, reaches -59.8 to -69.6 dB against that truth. The CUDA kernel runs at about 68
-billion pixel-pulse pairs per second on the L4 (cubic, 23.9 s); in development it ran at 86% of the L1 cache's throughput for its
+images -57 to -63 dB). Cubic at 4 times, the default before 0.1.1, reaches -59.8 to -69.6 dB against that truth. The CUDA kernel runs at about 100
+billion pixel-pulse pairs per second on the L4 (cubic, 16.4 s); in development (0.1.1) it ran at 86% of the L1 cache's throughput for its
 data-dependent reads (Nsight Compute), and staging the profiles in shared memory or reading sample
-pairs as 16-byte words did not make it faster. The C++ kernel runs at about 4.4 billion per second on the
+pairs as 16-byte words did not make it faster (the latter again in 0.1.5). The C++ kernel runs at about 4.4 billion per second on the
 c4d-highmem-16, limited by its vector gathers.
 
 Exact backprojection costs pulses times pixels, factorized backprojection about pixels times the logarithm of the

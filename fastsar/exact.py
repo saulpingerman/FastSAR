@@ -25,10 +25,11 @@ cubic at upsample=4 -59.8 to -69.6 dB and linear at upsample=8 -53.7 to -56.4 dB
 scenes from 0.5 to 20 km and at 600 km, cubic at upsample=4 measures -67 to -68 dB against a float64
 backprojection at 64 times oversampling.
 
-On an Nvidia L4 the CUDA kernel runs at about 68 billion pixel-pulse pairs per second with cubic interpolation,
-bound by the L1 cache's throughput for its data-dependent reads (86% of it, Nsight Compute), and forms the 12,207 by
-8,808 pixel, 15,186-pulse Panama image in 24 s; factorized backprojection (ImageFormer) is faster above about 1024 to
-2048 pixels on a side and exact backprojection below.
+On an Nvidia L4 the CUDA kernel runs at about 100 billion pixel-pulse pairs per second with cubic interpolation and
+forms the 12,207 by 8,808 pixel, 15,186-pulse Panama image in 16 s (11 s with linear interpolation); its thread blocks
+take their tiles along the grid axis closer to constant range, so that the blocks resident together read the same
+range bins from the L2 cache. Factorized backprojection (ImageFormer) is faster above about 1024 to 2048 pixels on a
+side and exact backprojection below.
 
 Backends: 'cuda' (CuPy kernel; pinned, overlapped upload), 'cpu' (C++ with OpenMP, vectorized over each tile's
 pixels), 'jax' or 'tpu' (fastsar.backproject's JAX path on the grid's points, without the tiling above).
