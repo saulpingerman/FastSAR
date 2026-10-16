@@ -84,13 +84,14 @@ and 22.2 s on an L4 host with 4 vCPUs, where the mosaic is bound by the host.
 The phase history goes to the GPU in row blocks of 4,096 pulses through two pinned staging buffers: several threads
 copy the next block into its buffer while the current one transfers, and the blocks are windowed, checked and
 converted on the device. The image comes back in pinned host memory from CuPy's pinned pool, which keeps the block
-for the next image (`FASTSAR_PINNED=0` returns a plain copy). On the Panama image of the paper the transfers fell
-from 0.39 to 0.1 s on an H100 and from 0.67 to 0.2 s on an L4, and the whole image from 1.04 to 0.69 s and from
-3.86 to 3.41 s. The float16 build takes its reference scale from the first block's peak on the device. In a mosaic
+for the next image (`FASTSAR_PINNED=0` returns a plain copy). On the Umbra Panama image the transfers fell
+from 0.39 to 0.1 s on an H100 and from 0.67 to 0.2 s on an L4, and with this change alone the whole image from 1.04
+to 0.69 s and from 3.86 to 3.41 s. The float16 build takes its reference scale from the first block's peak on the device. In a mosaic
 whose range profiles exceed the GPU window, a patch's profiles are gathered on the host into page-locked staging
 buffers that the mosaic keeps for all its patches. The range profiles, or their window, go up through two 64 MiB
-page-locked blocks; uploaded with `cupy.asarray`, they were first copied into a pinned block of their own size (2.3
-GB on the 2021 Capella stripmap), page-locked anew by every mosaic. After a mosaic CuPy's pinned pool is emptied.
+page-locked blocks; before 0.1.4 they were uploaded with `cupy.asarray`, which first copied them into a pinned block
+of their own size (2.3 GB on the 2021 Capella stripmap), page-locked anew by every mosaic. After a mosaic CuPy's
+pinned pool is emptied.
 
 ## Memory
 
@@ -125,10 +126,10 @@ warnings.simplefilter('ignore', fastsar.MemoryWarning)   # silence the fallback 
 
 | Variable | Default | Effect |
 |---|---|---|
-| `CXX` | `g++` | CPU kernel compiler |
+| `CXX` | `g++` on Linux, `clang++` on macOS | CPU kernel compiler |
 | `FASTSAR_CACHE_DIR` | `$XDG_CACHE_HOME/fastsar`, else `~/.cache/fastsar` | where compiled CPU kernels are cached (one shared object per source, compiler, flags and CPU) |
 | `XLA_PYTHON_CLIENT_PREALLOCATE` | set to `false` by `import fastsar` unless already set | JAX otherwise reserves 75% of a GPU's memory on first use, which the CUDA kernels and JAX programs then could not share; set it before the import to keep JAX's default |
-| `FFBP_CPU_FLAGS` | `-O3 -march=native -mprefer-vector-width=512 -funroll-loops` (`backproject` and `ExactFormer`: `-O3 -march=native`) | compiler flags; `ExactFormer` always adds `-ffast-math` (its sines and cosines vectorize only with it), at compile time only: the shared objects are linked without it, so loading them leaves the process's floating-point mode alone. Builds are cached per source, compiler, flags and CPU |
+| `FFBP_CPU_FLAGS` | `-O3 -march=native`, with `-mprefer-vector-width=512` on x86-64 (`-O3 -mcpu=native` on macOS); the factorized kernel adds `-funroll-loops`; `backproject`: `-O3 -march=native` | compiler flags; `ExactFormer` always adds `-ffast-math`, at compile time only: the shared objects are linked without it, so loading them leaves the process's floating-point mode alone. Builds are cached per source, compiler, flags and CPU |
 | `FASTSAR_CPU_GROUP_GB` | a quarter of available memory | CPU first-level group budget (GB) |
 | `FASTSAR_CUDA_GROUP` | from free memory: 8 at full speed | CUDA first-level children per group |
 | `FASTSAR_TPU_GROUP` | from the device's memory: 4 at full speed | TPU first-level children per group |
@@ -165,8 +166,8 @@ Run scripts and records: [sar-accel-study](https://github.com/saulpingerman/sar-
 ## ARM and Apple silicon
 
 The factorized kernel's vectors are four lanes on ARM (NEON) and sixteen on x86, and the final tile stage is
-templated on the vectors per table row; the exact kernel evaluates its sines by polynomials on macOS, which has no
-vector sine library. On the synthetic collection of `oss/bench_cpu_synth.py` in sar-accel-study (5,794 pulses by
+templated on the vectors per table row; the exact kernel evaluates its sines by vectorizable polynomials on every
+target (faster than glibc's vector library on x86, and the only vector option on macOS and ARM). On the synthetic collection of `oss/bench_cpu_synth.py` in sar-accel-study (5,794 pulses by
 5,794 samples at 0.5 m, a 4096 by 4096 image at 0.4 m; best of two warm calls):
 
 | machine | threads | factorized float32 | exact 1024 by 1024 |
@@ -178,7 +179,7 @@ vector sine library. On the synthetic collection of `oss/bench_cpu_synth.py` in 
 The automatic tile choice takes 16 pixels on ARM. macOS builds the kernels with Apple's clang, `-fopenmp-simd` and
 `-mcpu=native`, with the parallel loops on `std::thread` (no OpenMP runtime, see `fastsar/par.hpp`).
 
-On the Panama collection of the paper (15,186 pulses by 14,399 samples, 12,207 by 8,808 pixels) a c4a-highmem-16
+On the Umbra Panama collection (15,186 pulses by 14,399 samples, 12,207 by 8,808 pixels) a c4a-highmem-16
 (Google Axion, Neoverse V2, 16 cores) forms the factorized float32 image in 20.3 s with these kernels, from 43.7 s
 with the 16-lane vectors of 0.1.1 (the c4d-highmem-16 of record: 11.4 s). Record: `results/fastsar/logs/arm2` in
 sar-accel-study.

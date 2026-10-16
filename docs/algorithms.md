@@ -21,7 +21,8 @@ about -87 dB; the JAX program and the TPU kernels compute the last level's geome
 
 The final stage models each tile with a plane wave plus an aperture-mean curvature term. The residual grows as the
 square of the tile size and falls with range. With `T='auto'` the error of each tile size is predicted from the geometry; the larger of 32 and 16 that meets `target_db` (default -40 dB) is used, with a warning when neither does
-(`ImageFormer.predicted_error_db`). Spaceborne collections keep T=32; CUDA float16 always uses it. Test results
+(`ImageFormer.predicted_error_db`). Spaceborne collections keep T=32 (16 on ARM CPUs, whose four-lane vectors make the 32-pixel final stage the
+slower one); CUDA float16 always uses 32. Test results
 (`tests/test_accuracy.py`, 128 by 128 pixels of 0.5 m): at 1 km, T=16 gives -34.8 dB (T=32: -22.5 dB); at 4 km,
 T=16 gives -47.0 dB (T=32: -35.7 dB); at 16 km, T=32 gives -47.7 dB. The prediction is within 1.3 dB of these. At
 600 km both tile sizes give about -63 dB, set by errors other than the tile model.

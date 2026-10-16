@@ -7,7 +7,7 @@ was published on PyPI.
 
 ### Fixed
 
-- CUDA mosaics were 1 to 40% slower in 0.1.3 than in its first candidate, from two causes. `form_mosaic` freed
+- CUDA mosaics were 1 to 40% slower in 0.1.3 than in its first release candidate, from two causes. `form_mosaic` freed
   CuPy's pinned memory pool at its end, so every later mosaic page-locked its host buffers again, among them the
   block of the range profiles' size that `cupy.asarray` copies them through on the way to the device (2.3 GB on the
   84-patch 2021 Capella stripmap). Large uploads now go through two 64 MiB page-locked blocks, a patch's gathered
@@ -60,7 +60,7 @@ was published on PyPI.
   over the whole history each), the window, and in `cuda` mosaics the gather of a patch's range profiles when they
   exceed the GPU window, now done outside the lock that serializes the GPU. The phases are float64 cosines and
   sines rounded to float32 and differ from 0.1.2's in the last bit of some samples (-193 dB relative).
-- Speed on the Panama image of the paper: float32 from 3.86 to 2.9 s on an L4, from 1.87 to 1.07 s on an A100 and
+- Speed on the Umbra Panama image: float32 from 3.86 to 2.9 s on an L4, from 1.87 to 1.07 s on an A100 and
   from 1.04 to 0.57 s on an H100; the float16 final stage from 0.41 to 0.20 s on an L4. The 84-patch Capella
   stripmap goes from 6.9 to 5.0 s on an H100 and from 26.9 to 22.2 s on an L4 with a 4-vCPU host. End to end from
   the file on a g2-standard-32 host with an L4, a Capella spotlight (17 GB in memory) goes from 188 to 46 s and a
@@ -109,11 +109,11 @@ was published on PyPI.
   subtracts JPL's calibration common delay (`io.NISAR_RANGE_DELAY`, 57.125 m for frequency A and 19.65 m for B,
   the values of JPL's products processed from September 2026; a number, or an RSLC or GCOV path to read the
   product's value, `io.nisar_product`); `read_sentinel1(internal_delay=)` subtracts the internal time delay
-  estimated from the product's calibration packets (`sentinel1.internal_delay`, about 0.43 us, within 4 ns of
+  estimated from the product's calibration packets (`sentinel1.internal_delay`, about 0.43 µs, within 4 ns of
   ESA's annotated value on a 2014 datatake). Compared in the agencies' own radar coordinates, the images agree
   with JPL's RSLC of a NISAR pass to 0.2 m and with ESA's SLC of a Sentinel-1 datatake to 0.5 m in slant range
   (1.4 m and 1.3 to 1.5 m along track), from 100 to 180 m before the delays were removed. The Sentinel-1 packet
-  time stamp is taken as latched 1.439 us before the packet's own transmit pulse (`sentinel1.T_LATCH`, ESA's Level 1
+  time stamp is taken as latched 1.439 µs before the packet's own transmit pulse (`sentinel1.T_LATCH`, ESA's Level 1
   Detailed Algorithm Definition 9.23.2) and the fine time code as the protocol interprets it (code plus a half);
   ESA's processor takes the stamp as the receive time of the window's first sample by default, which puts the
   annotated azimuth times of its products about 0.8 m of track before the physical ones (the reader placed its
@@ -145,7 +145,7 @@ was published on PyPI.
   vectorizable polynomials (3.7e-9 maximum error) on every target (15% faster than glibc's vector library on x86,
   the only vector option on macOS and ARM), macOS builds with `-mcpu=native`, and the automatic tile choice takes
   16 pixels on ARM. On a c4a-highmem-16 (Axion) the factorized Panama image takes 20.3 s, from 43.7 s. On an M2 MacBook Air the synthetic 4096 by 4096 image of
-  `oss/bench_cpu_synth.py` (5,794 pulses) forms in 3.7 s factorized and 3.5 s exact at 1024 by 1024, from 6.3 and
+  `oss/bench_cpu_synth.py` in sar-accel-study (5,794 pulses) forms in 3.7 s factorized and 3.5 s exact at 1024 by 1024, from 6.3 and
   8.0 s before; eight Zen 4 threads with AVX-512 take 2.7 s for each.
 
 ### Changed

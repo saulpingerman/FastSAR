@@ -4,8 +4,9 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://github.com/saulpingerman/FastSAR/blob/main/pyproject.toml)
 
 FastSAR forms synthetic aperture radar (SAR) images on x86 and ARM CPUs, Nvidia GPUs and Google Cloud TPUs from
-Python. It reads frequency-domain CPHD files, forms spotlight, stripmap and sliding spotlight images by factorized
-backprojection, and provides autofocus, interferometry, geolocation, map GeoTIFFs and SICD output.
+Python. It reads frequency-domain CPHD files and NISAR, Sentinel-1 and ALOS PALSAR raw data, forms spotlight,
+stripmap and sliding spotlight images by factorized backprojection, and provides autofocus, interferometry,
+geolocation, map GeoTIFFs and SICD output.
 
 ![FastSAR image of the Panama Canal's Pacific entrance from an Umbra spotlight collection](https://raw.githubusercontent.com/saulpingerman/FastSAR/main/docs/images/hero_panama.jpg)
 
@@ -23,7 +24,7 @@ the float64 reference ([performance](https://github.com/saulpingerman/FastSAR/bl
 ## Install
 
 Linux on x86-64 or 64-bit ARM and macOS on Apple silicon, Python 3.10 to 3.13. The CPU kernels compile on first
-use: with `g++` and OpenMP on Linux (Debian and Ubuntu: `apt install g++`), with Apple's clang on macOS (the command
+use: with `g++` and OpenMP on Linux (GCC 12 or later on ARM; Debian and Ubuntu: `apt install g++`), with Apple's clang on macOS (the command
 line tools, `xcode-select --install`, which also serve the Metal backend of `ExactFormer` on Apple GPUs); the
 `cuda` extra needs an Nvidia driver for CUDA 12 and the `tpu` extra a Cloud TPU VM.
 
@@ -68,12 +69,15 @@ vendor grids.
 | Capella CPHD | stripmap, spotlight, sliding spotlight | checked against vendor SICDs; a 2022 dynamic stripmap is correct near the center only |
 | Umbra CPHD | spotlight | three open-data collections on the vendor's grid |
 | ICEYE CPHD | dwell spotlight | formed (28 GB history); not compared with the vendor image |
-| TOA-domain CPHD, raw Level-0 | | not supported |
+| NISAR L0B (RRSD) | stripmap | `io.read_nisar`; corner reflectors placed against the survey and JPL's RSLC |
+| Sentinel-1 Level-0 | stripmap, wave | `io.read_sentinel1`; IW and EW bursts not split |
+| ALOS PALSAR level 1.0 | stripmap (FBS, FBD) | `io.read_palsar`; ScanSAR not handled |
+| TOA-domain CPHD | | not supported |
 | Simulated echoes | stripmap, ScanSAR, TOPS, any track | `fastsar.stripmap`, `burst`, `patches` |
 
 | | CPU (`cpu`) | Nvidia GPU (`cuda`) | Cloud TPU (`tpu`) | Any JAX device (`jax`) |
 |---|---|---|---|---|
-| Factorized backprojection | C++/OpenMP: AVX-512 or AVX2 on x86-64, NEON or SVE on ARM | CUDA via CuPy | Pallas | reference program |
+| Factorized backprojection | C++ (OpenMP on Linux): AVX-512 or AVX2 on x86-64, NEON on ARM | CUDA via CuPy | Pallas | reference program |
 | Precision | float32 | float32, float16 | three-pass (default), single-pass | float32, float16 |
 | Exact backprojection (`ExactFormer`) | C++/OpenMP, float32 with float64 tile centers | CUDA, the same | falls back to `jax` | float32, float64 block centers |
 

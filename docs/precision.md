@@ -7,7 +7,8 @@ compute capability 8.0 and later as well, `FASTSAR_FINAL=fp32` keeping it on the
 history and intermediates, float32 accumulation, tensor-core final stage, `T=32`; on `jax`, float16 throughout), or
 `'single-pass'` and `'three-pass'` (the TPU's bfloat16 products). Single-pass is what the TPU's matrix unit does
 without FastSAR's correction passes; FastSAR's TPU default is three-pass. Geometry is evaluated in float64
-on the host; only offsets within tiles use reduced precision.
+on the host; only offsets within tiles use reduced precision (the JAX program and the TPU kernels compute the last
+level's geometry in float32).
 
 ## Measured on the Umbra Panama collection
 

@@ -45,7 +45,8 @@
 - `plane_points(nx, ny, spx, spy, e1, e2, height=None)`: the `form_image` grid as points [nx, ny, 3].
   `available_backends()`: backends this machine runs, in `'auto'` order.
 
-Backends: `'cpu'`, `'cuda'`, `'tpu'`, `'jax'`, `'auto'`. Precision: `'float32'`, `'float16'` (CUDA, JAX),
+Backends: `'cpu'`, `'cuda'`, `'tpu'`, `'jax'`, `'metal'` (`ExactFormer` on Apple GPUs; the factorized former runs on
+the CPU), `'auto'`. Precision: `'float32'`, `'float16'` (CUDA, JAX),
 `'single-pass'`, `'three-pass'` (TPU) ([precision.md](precision.md)).
 
 ## `fastsar.io`

@@ -12,7 +12,7 @@ uv sync --group test            # the versions pinned in uv.lock, with the test 
 ```
 
 or, with pip, `pip install -e ".[io,test]"` (add `cuda` on a machine with an Nvidia GPU: `".[cuda,io,test]"`).
-The CPU backend needs `g++` with OpenMP. The `test` dependency group (and the `test` extra) holds pytest and the
+The CPU backend needs a C++ compiler: `g++` with OpenMP on Linux (GCC 12 or later on ARM), Apple's clang on macOS. The `test` dependency group (and the `test` extra) holds pytest and the
 packages some tests need that are not dependencies of the library: `sarpy` (`tests/test_chain.py`), `finufft`
 (`tests/test_insar.py`), `rasterio` (`products.write_geotiff`, `read_dem` and map projections other than
 latitude/longitude) and `sarkit` (consistency checks in `tests/test_chain.py`).
@@ -50,13 +50,12 @@ nox -s tpu           # on a Cloud TPU VM: installs the tpu extra, runs with --re
 nox -s tests-3.12 -- -k exact -s     # arguments after -- go to pytest
 ```
 
-The nox sessions pass `--require io`. GitHub Actions runs `tests` on each Python, `lowest`, and a packaging job
+The nox sessions pass `--require io`. GitHub Actions runs `tests` on each Python, the Python 3.12 tests on 64-bit ARM Linux, `lowest`, and a packaging job
 (sdist and wheel built and checked, the wheel installed with the `io` and `geo` extras, its CPU kernel compiled
 from site-packages and `examples/chain.py --simulate` run) on every push and pull request, and weekly (CPU only). `python tests/run_all.py` remains for scripts written for
 the former runner: it runs pytest with the same options (`-t` seconds per test, `--max-rss-gb`, `--require`,
-module names to select, `-v` for every test's output) and, as before, fails when a test package is missing.
-`pyproject.toml` sets the 600 s limit per test (`pytest-timeout`); `run_all.py -t` and `pytest --timeout` override
-it.
+module names to select, `-v` for every test's output) and, as before, fails when a test package is missing;
+`run_all.py -t` overrides the 600 s limit per test as `pytest --timeout` does.
 
 | Module | Checks |
 |---|---|
@@ -81,6 +80,9 @@ it.
 | `test_cphd.py` | read_cphd and form_cphd on simulated collections (stand-in CPHD reader) |
 | `test_planning.py` | bucket planning, memory models, TPU out-of-memory retry, program cache |
 | `test_accuracy.py` | tile-size and oversampling errors against exact backprojection |
+| `test_raw.py` | raw-data range compression, a NISAR L0B look-alike read by `read_nisar` and formed by `form_cphd` |
+| `test_sentinel1.py` | Sentinel-1 Level-0 packet decoder against the specification's worked examples, header parser, orbit record |
+| `test_metal.py` | Metal `ExactFormer` against the CPU kernel (Apple GPUs; skipped elsewhere) |
 
 `test_ffbp_cpu.py`, `test_ffbp_cuda.py` and the three `test_pallas_*.py` modules compare each error with a limit
 set about 5 dB above the value measured when the limit was set. A test that checks several cases reports every
@@ -106,13 +108,13 @@ that a missing one raises an `ImportError` naming the extra to install.
 
 1. Run the full suite on a CPU machine, on a machine with an Nvidia GPU (`nox -s cuda`) and on a Cloud TPU VM
    (`nox -s tpu`), and form a few collections that were not used in development.
-2. Set `__version__` in `fastsar/__init__.py`, date the version in `CHANGELOG.md` and point its compare link at the
-   new tag instead of `HEAD`. The README links point at
-   `main` so that they resolve on GitHub between releases and on PyPI, whose copy of the README cannot be changed
+2. Set `__version__` in `fastsar/__init__.py` and the version in `CITATION.cff`, date the version in `CHANGELOG.md`
+   and `CITATION.cff`, and point the changelog's compare link at the new tag instead of `HEAD`. The README links
+   point at `main` so that they resolve on GitHub between releases and on PyPI, whose copy of the README cannot be changed
    after upload.
 3. `rm -rf build dist *.egg-info && uv build && uvx twine check dist/*`, then install the wheel in a fresh
-   environment with `g++` and run `python examples/chain.py --simulate out` (the `package` job does the same).
-4. Commit, tag annotated (`git tag -a v0.1.1 -m "FastSAR 0.1.1"`), push the tag, upload with `uvx twine upload
+   environment with a C++ compiler and run `python examples/chain.py --simulate out` (the `package` job does the same).
+4. Commit, tag annotated (`git tag -a vX.Y.Z -m "FastSAR X.Y.Z"`), push the tag, upload with `uvx twine upload
    dist/*`, and publish the GitHub release with the changelog section as its notes.
 
 ## Reporting a bug
