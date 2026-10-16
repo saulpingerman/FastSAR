@@ -13,13 +13,13 @@ geolocation, map GeoTIFFs and SICD output.
 *Panama Canal, Pacific entrance (Umbra open data, 2023-07-18): 12,207 by 8,808 pixels in 3.0 s on an Nvidia L4
 (warm former, transfers included; float32, -59.9 dB against the float64 reference of
 [precision.md](https://github.com/saulpingerman/FastSAR/blob/main/docs/precision.md)), downsampled. A
-c4d-highmem-16 CPU instance (16 vCPUs, 8 cores) takes 11.1 s. ISCE3, the fastest open-source code that forms this
+c4d-highmem-16 CPU instance (16 vCPUs, 8 cores) takes 11.1 s. ISCE3, the fastest open-source backprojection that forms this
 collection, would take an estimated 4.8 h on that CPU and 27 min on the L4.*
 
 ![Cost per 1000 images against error for FastSAR and five open-source implementations](https://raw.githubusercontent.com/saulpingerman/FastSAR/main/docs/images/teaser.png)
 
-*Cost per 1000 Panama images (October 2026 prices) against error over the lock, port and ship regions, relative to
-the float64 reference ([performance](https://github.com/saulpingerman/FastSAR/blob/main/docs/performance.md), [comparison](https://github.com/saulpingerman/FastSAR/blob/main/docs/comparison.md)).*
+*Cost per 1000 Panama images (October 2026 prices) against error over the lock, port and ship regions (FastSAR relative to
+a float64 backprojection at 64 times oversampling, the open-source codes to the float64 reference; [performance](https://github.com/saulpingerman/FastSAR/blob/main/docs/performance.md), [comparison](https://github.com/saulpingerman/FastSAR/blob/main/docs/comparison.md)).*
 
 ## Install
 
@@ -77,7 +77,7 @@ vendor grids.
 
 | | CPU (`cpu`) | Nvidia GPU (`cuda`) | Cloud TPU (`tpu`) | Any JAX device (`jax`) |
 |---|---|---|---|---|
-| Factorized backprojection | C++ (OpenMP on Linux): AVX-512 or AVX2 on x86-64, NEON on ARM | CUDA via CuPy | Pallas | reference program |
+| Factorized backprojection | C++ (OpenMP on Linux): AVX-512 or AVX2 on x86-64, NEON on ARM | CUDA via CuPy | Pallas | JAX program |
 | Precision | float32 | float32, float16 | three-pass (default), single-pass | float32, float16 |
 | Exact backprojection (`ExactFormer`) | C++ (OpenMP on Linux), float32 with float64 tile centers | CUDA, the same | falls back to `jax` | float32, float64 block centers |
 

@@ -27,7 +27,7 @@ was published on PyPI.
   FastSAR's `MemoryError` or a slower path. Release 0.1.3 behaves the same way.
 - On a TPU v6e the host preparation of a 10 GB phase history (the 2024 Capella spotlight: scaling to float32 planes
   and upload, `ffbp2.prepare`) takes 4 s in most calls but 23 to 96 s in some, at random within a process, so a
-  12 s image can take up to 104 s. Earlier releases behave the same way.
+  12 s image took up to 149 s. Earlier releases behave the same way.
 
 ## [0.1.3] - 2026-10-15
 

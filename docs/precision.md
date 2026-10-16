@@ -4,7 +4,8 @@
 
 `precision=` takes `'float32'` (default; on a TPU, three bfloat16 passes per product, and in the CUDA final stage on
 compute capability 8.0 and later as well, `FASTSAR_FINAL=fp32` keeping it on the CUDA cores), `'float16'` (CUDA: float16
-history and intermediates, float32 accumulation, tensor-core final stage, `T=32`; on `jax`, float16 throughout), or
+throughout, that is float16 history, intermediates and tensor-core operands with float32 accumulation, `T=32`; on
+`jax`, float16 products), or
 `'single-pass'` and `'three-pass'` (the TPU's bfloat16 products). Single-pass is what the TPU's matrix unit does
 without FastSAR's correction passes; FastSAR's TPU default is three-pass. Geometry is evaluated in float64
 on the host; only offsets within tiles use reduced precision (the JAX program and the TPU kernels compute the last
@@ -40,7 +41,7 @@ of the difference over the whole image.
   exact backprojection. With linear interpolation at 8 times, range interpolation
   sets the error (-53.7 to -56.4 dB against the truth).
 
-On Melbourne and Iowa the factorized configurations are within 1.1 dB of the Panama values.
+On Melbourne and Iowa the factorized configurations are within 1.2 dB of the Panama values.
 
 ![Four Panama regions formed by each configuration, with coherence maps against the reference](images/zoom_panama.png)
 

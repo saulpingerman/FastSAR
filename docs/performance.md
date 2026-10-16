@@ -18,7 +18,7 @@ The Umbra Panama image ([real-data.md](real-data.md#umbra-spotlight)) at float32
 | TPU v6e (three-pass) | 2.70 | 2.9 | 1.55 |
 | TPU v5e (three-pass) | 1.20 | 5.0 | 1.31 |
 | L4 (float32) | 0.707 | 3.0 | 0.59 |
-| L4 (float16 storage, float32 accumulation) | 0.707 | 2.5 | 0.50 |
+| L4 (float16 throughout, float32 accumulation) | 0.707 | 2.5 | 0.50 |
 | A100 (float32) | 5.02 | 1.1 | 1.50 |
 | H100 (float32) | 10.97 | 0.6 | 1.74 |
 | c4d-highmem-16 | 0.964 | 11.1 | 2.97 |
@@ -107,7 +107,7 @@ At full speed the phase history stays on the device and the first level runs in 
 On a v6e, groups of 4 and 8 formed the 2025 Capella spotlight equally fast, and groups of 2 took 1% longer. On the
 L4 the same spotlight took 17.9 s in groups of 8 in development. It took 2% longer in groups of 4 and 44% longer
 with the history streamed from host memory. Full speed for it needs 25.4 GB, above the 22.9 GB free on the L4,
-so the release forms it in groups of 4 (16.2 s in the 0.1.4 records); the 74,203-pulse 2024 spotlight needs 35.8 GB
+so the release forms it in groups of 4 (15.9 s in the 0.1.4 records); the 74,203-pulse 2024 spotlight needs 35.8 GB
 and runs in groups of 2. The number of first-level children carried together through the later levels (up to half the free
 memory) does not affect speed. Batches of 1, 2 and 4 formed that spotlight within 1% of each other, and a smaller batch is not reported as a fallback.
 

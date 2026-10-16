@@ -100,9 +100,9 @@ vendor's image is -0.01 to 0.05). `read_cphd` takes -1 for Capella and says so i
 
 ### Capella dynamic stripmap: scene center only
 
-The 2022 Capella dynamic stripmap collection forms correctly only near the scene center. Its valid delay window is
-2,962 m long, 4.1 to 7.1 km beyond the scene reference point, but its 114.3 kHz frequency spacing gives an unambiguous
-range of 1,311 m. FastSAR does not model this convention, and `read_cphd` warns about it. Near the center `form_cphd`
+The 2022 Capella dynamic stripmap collection (mode SS, the sliding spotlight of the study's paper) forms correctly
+only near the scene center. Its valid delay window is 2,962 m long, 4.1 to 7.1 km beyond the scene reference point,
+but its 114.3 kHz frequency spacing gives an unambiguous range of 1,311 m. FastSAR does not model this convention, and `read_cphd` warns about it. Near the center `form_cphd`
 and exact backprojection match the vendor's image after a 2-pixel registration (intensity correlation 0.75 after 5 by
 5 averaging); near the swath edge they fail. The mosaic agrees with a float64 backprojection of the same samples to
 -62 dB; this tests internal consistency only.
