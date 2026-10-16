@@ -15,9 +15,10 @@ was published on PyPI.
   classes (at most 1/8 larger) so that patches of slightly different sizes share blocks; the pool is still emptied
   after every mosaic. The reader's row passes (troposphere and re-reference phases, the window), which 0.1.3 runs on
   all cores, allocated large temporaries in every worker thread; the allocator kept them, and the later mosaic took
-  more page faults. Their scratch arrays are now made on the calling thread, one per block in flight. On an L4 the
-  three Capella mosaics take 9.4, 50.8 and 189.0 s (12.8, 53.6 and 197.7 s in 0.1.3) at 4 to 8 GB less peak memory,
-  and every image is bitwise the same as in 0.1.3.
+  more page faults. Their scratch arrays are now made on the calling thread, one per block in flight. In paired runs
+  on one L4 instance (g2-standard-32) the three Capella mosaics took 9.4, 50.8 and 189.0 s (12.8, 53.6 and 197.7 s
+  in 0.1.3) at 4 to 8 GB less peak memory, and every image is
+  bitwise the same as in 0.1.3.
 
 ### Known issues
 

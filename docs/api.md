@@ -18,7 +18,7 @@
   image on a grid centered on the frame origin ([algorithms.md](algorithms.md)). `algorithm`: `'ffbp'`, `'pfa'` or
   `'bp'` (exact backprojection, `ExactFormer`). `ref` [P]: the one-way range each pulse's samples are referenced to
   when it is not `|ant|` (a bistatic half path, a vendor's reference point). `precision`, `T`, `levels`, `pmax` and
-  `target_db` apply to `'ffbp'`, `pfa_guard` to `'pfa'`; `interp` (`'cubic'` or `'linear'`), `upsample` and
+  `target_db` apply to `'ffbp'`, `pfa_guard` and `pfa_support` to `'pfa'`; `interp` (`'cubic'` or `'linear'`), `upsample` and
   `center` (the point the grid is centered on) apply to `'bp'` only and raise `ValueError` with the others.
 - `ImageFormer(ant, fmin, df, K, nx, ny, spx, spy, e1, e2, *, backend='auto', precision='float32', ...,
   aperture_weight=None, ref=None)`: plans and compiles once; `former(S)` forms each image. Arguments after `e2` are
@@ -58,7 +58,8 @@ the CPU), `'auto'`. Precision: `'float32'`, `'float16'` (CUDA, JAX),
 - `read_nisar(path, frequency=None, polarization=None, meta=False, height=None, band_margin=1.0, block=1024, range_delay=None, troposphere='model', orbit=None, reference_range=None)`: a
   NISAR L0B RRSD granule as `read_cphd` returns a CPHD (range compressed, frequency domain, a moving scene
   reference point at mid swath); `meta` adds `image_area` (the swath's corners). `read_collection(path, **kw)`
-  dispatches on the extension (`.h5`: NISAR). Needs h5py (`fastsar[raw]`).
+  dispatches on the path: `.h5` to NISAR, Sentinel-1 product names (`S1...`, raw or `.SAFE`) to `read_sentinel1`,
+  zips, directories and `IMG-`/`LED-` files to `read_palsar`, anything else to `read_cphd`. Needs h5py (`fastsar[raw]`).
 - `nisar_product(path)`: the orbit (time, position, velocity, epoch, type) and the common delays per frequency of an
   RSLC, GSLC or GCOV product, for `read_nisar(orbit=, range_delay=)`.
 - `read_palsar(path, polarization=None, meta=False, height=None, band_margin=1.0, block=512, troposphere='model', reference_range=None)`: an ALOS PALSAR

@@ -476,7 +476,7 @@ def form_image(S, ant, fmin, df, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
                backend='auto', precision='float32', window=True, T='auto', levels=None, pmax=0.4, pfa_guard=300.0, pfa_support='union', target_db=-40.0,
                ref=None, interp=None, upsample=None, center=None):
     """Form the complex image [nx, ny] (complex64). See the module docstring for the arguments. precision, T, levels,
-    pmax and target_db apply to factorized backprojection, pfa_guard to polar format, and interp ('cubic' or
+    pmax and target_db apply to factorized backprojection, pfa_guard and pfa_support to polar format, and interp ('cubic' or
     'linear'), upsample and center to exact backprojection (algorithm='bp'; see ExactFormer). For more than one
     image of the same geometry, build an ImageFormer (or ExactFormer) once and call it; this function sets one up
     on every call."""

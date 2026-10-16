@@ -362,8 +362,9 @@ def read_cphd(cphd, sicd=None, channel=0, meta=False, regrid_tol=1e-3, drop_flag
 
 
 def read_collection(path, **kw):
-    """read_cphd for a CPHD file, read_nisar for a NISAR L0B (HDF5, .h5) file, with the keyword arguments the
-    reader called accepts; the others are dropped, with a note in meta when they were set."""
+    """read_nisar for a NISAR L0B (HDF5, .h5) file, read_sentinel1 for a Sentinel-1 Level-0 product (a name starting
+    with s1 that is raw or .SAFE), read_palsar for a zip, a directory or an IMG-/LED- file, read_cphd otherwise; with
+    the keyword arguments the reader called accepts; the others are dropped, with a note in meta when they were set."""
     import inspect
     import os
     s = str(path).lower()

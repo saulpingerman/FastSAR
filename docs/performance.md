@@ -5,31 +5,35 @@
 Times run from the phase history in host memory to the image in host memory, transfers included, with a warm
 `ImageFormer` (planned and compiled beforehand). The other pages call this "host to host, warm former".
 `form_image` adds a few seconds of planning and compilation. The devices are a TPU v6e and a TPU v5e (one chip
-each), an Nvidia L4, and a c4d-highmem-16 CPU instance (AMD EPYC 9B45, 16 vCPUs on 8 cores).
+each), an Nvidia L4 (g2-standard-4), an A100 80GB (a2-ultragpu-1g), an H100 80GB (a3-highgpu-1g) and a
+c4d-highmem-16 CPU instance (AMD EPYC 9B45, 16 vCPUs on 8 cores).
 
 ## Time and cost per image
 
 The Umbra Panama image ([real-data.md](real-data.md#umbra-spotlight)) at float32-class accuracy (-57.8 to -60.0 dB,
 [precision.md](precision.md)), on-demand us-central1 prices of October 2026:
 
-| Device | Seconds per image | Dollars per 1000 images |
-|---|---|---|
-| TPU v6e (three-pass) | 3.1 | 1.58 |
-| TPU v5e (three-pass) | 5.2 | 1.32 |
-| L4 (float32) | 3.8 | 0.75 |
-| L4 (float16 storage, float32 accumulation) | 3.5 | 0.68 |
-| c4d-highmem-16 | 11.3 | 3.04 |
+| Device | Dollars per hour | Seconds per image | Dollars per 1000 images |
+|---|---|---|---|
+| TPU v6e (three-pass) | 2.70 | 2.9 | 1.55 |
+| TPU v5e (three-pass) | 1.20 | 5.0 | 1.31 |
+| L4 (float32) | 0.707 | 3.0 | 0.59 |
+| L4 (float16 storage, float32 accumulation) | 0.707 | 2.5 | 0.50 |
+| A100 (float32) | 5.02 | 1.1 | 1.50 |
+| H100 (float32) | 10.97 | 0.6 | 1.74 |
+| c4d-highmem-16 | 0.964 | 11.1 | 2.97 |
 
 Cost is the hourly price divided by the throughput of back-to-back images (on the TPUs the next history is staged
-while one forms). The v6e forms the image fastest; the L4, whose hourly price is about a quarter of the v6e's, has the lowest cost per image. The same ordering holds on the Melbourne and Iowa collections.
+while one forms). The H100 forms the image fastest; the L4, whose hourly price is about a quarter of the v6e's and
+a fifteenth of the H100's, has the lowest cost per image. The L4 has the lowest cost and the H100 the shortest time
+on the Melbourne and Iowa collections as well.
 
 ![Cost per 1000 Panama images against error for every FastSAR configuration and the open-source implementations](images/teaser.png)
 
-Single-pass on the TPUs takes 2.6 s (v6e) and 3.6 s (v5e) at -46.2 dB, $1.18 and $0.82 per 1000 images. Float16
-on the L4 and single-pass on the TPUs lower each device's cost by 9 to 38%. Polar format takes 3.0 s on the L4
-($0.61 per 1000) and 11.4 s on the c4d-highmem-16, at -32.1 dB. On the TPUs its resampling steps are gathers on the vector unit and take 103 s (v5e) and 110 s (v6e) per image. The L4 draws 0.07 kWh per 1000 float32 images (mean
-`nvidia-smi` power, host excluded). These are the release records of the study (FastSAR 0.1.0 release candidates,
-public API only).
+Single-pass on the TPUs takes 2.5 s (v6e) and 3.5 s (v5e) at -46.2 dB, $1.18 and $0.82 per 1000 images. Float16
+on the L4 and single-pass on the TPUs lower each device's cost by 14 to 37%. Polar format takes 3.0 s on the L4
+($0.59 per 1000) and 11.3 s on the c4d-highmem-16, at -32.1 dB. On the TPUs its resampling steps are gathers on the vector unit and take 103 s (v5e) and 110 s (v6e) per image. The L4 draws 0.06 kWh per 1000 float32 images (mean
+`nvidia-smi` power, host excluded). These are the release records of the study (FastSAR 0.1.4, public API only).
 
 ## Large collections
 
@@ -64,20 +68,21 @@ formation already uses every core; a GPU or TPU uses up to four, which would oth
 for host preparation. On a 2 by 4 patch Capella sub-mosaic on the c4d-highmem-16, one prefetch thread cuts the
 time per patch from 1.08 s to 0.91 s.
 
-## Release 0.1.3 on the GPUs
+## Tensor-core final stage on the GPUs
 
-The final stage runs on the tensor cores: float32 as three bfloat16 products (compute capability 8.0 and later), float16
-as one, both in a double-buffered kernel that builds the next pulses' tables while the current products run. With
-the transfers below and the mosaic changes in the changelog, the Panama image on the development instances
-(single warm image, host memory to host memory):
+Since 0.1.3 the final stage runs on the tensor cores: float32 as three bfloat16 products (compute capability 8.0 and
+later), float16 as one, both in a double-buffered kernel that builds the next pulses' tables while the current
+products run. With the transfers below and the mosaic changes in the changelog, the Panama image on the development
+instances at 0.1.3 (single warm image, host memory to host memory):
 
 | GPU | float32 | float16 | before (0.1.2, float32) |
 |---|---|---|---|
 | H100 80GB | 0.575 s | 0.524 s | 1.04 s |
 | L4 | 2.94 s | 2.52 s | 3.8 s |
 
-Errors are unchanged (-59.9 and -58.9 dB). The 84-patch 2021 Capella stripmap takes 5.0 s on the H100 (from 6.9 s)
-and 22.2 s on an L4 host with 4 vCPUs, where the mosaic is bound by the host.
+Errors are unchanged (-59.9 and -58.9 dB). In the 0.1.4 release records the 84-patch 2021 Capella stripmap takes
+5.7 s on the H100 and 9.6 s on an L4 with a 32-vCPU host (g2-standard-32); with 4 vCPUs the mosaic is bound by the
+host (22.2 s in development).
 
 ## Transfers on the cuda backend
 
@@ -101,9 +106,9 @@ When device or host memory is short, a former takes a slower path and issues a `
 At full speed the phase history stays on the device and the first level runs in groups of 8 children (4 on a TPU).
 On a v6e, groups of 4 and 8 formed the 2025 Capella spotlight equally fast, and groups of 2 took 1% longer. On the
 L4 the same spotlight took 17.9 s in groups of 8 in development. It took 2% longer in groups of 4 and 44% longer
-with the history streamed from host memory. Full speed for it needs 23.3 GB, just above the 22.9 GB free on the L4,
-so the release forms it in groups of 4 (17.9 s); the 74,203-pulse 2024 spotlight needs 33.8 GB and runs in groups
-of 2. The number of first-level children carried together through the later levels (up to half the free
+with the history streamed from host memory. Full speed for it needs 25.4 GB, above the 22.9 GB free on the L4,
+so the release forms it in groups of 4 (16.2 s in the 0.1.4 records); the 74,203-pulse 2024 spotlight needs 35.8 GB
+and runs in groups of 2. The number of first-level children carried together through the later levels (up to half the free
 memory) does not affect speed. Batches of 1, 2 and 4 formed that spotlight within 1% of each other, and a smaller batch is not reported as a fallback.
 
 The fallbacks are smaller groups or pulse blocks on the CPU, smaller groups on GPU and TPU, and streaming of the
@@ -151,7 +156,7 @@ tests only.
 
 ## Kernel times and stage profile
 
-On the c4d-highmem-16 the float32 Panama image takes 224 s as a single JAX program (`backend='jax'`) and 11.3 s
+On the c4d-highmem-16 the float32 Panama image takes 220 s as a single JAX program (`backend='jax'`) and 11.1 s
 with the C++ kernels. On the accelerators, in development and on the device, the JAX program took 4.6, 9.3 and
 13.7 s (v6e, v5e, L4) and the kernels 2.4, 4.6 and 3.5 s. In the profiled builds every kernel stage ran within 1.0
 to 2.5 times a lower bound set by its limiting hardware unit, measured by microbenchmarks on the same device.
@@ -181,7 +186,7 @@ The automatic tile choice takes 16 pixels on ARM. macOS builds the kernels with 
 
 On the Umbra Panama collection (15,186 pulses by 14,399 samples, 12,207 by 8,808 pixels) a c4a-highmem-16
 (Google Axion, Neoverse V2, 16 cores) forms the factorized float32 image in 20.3 s with these kernels, from 43.7 s
-with the 16-lane vectors of 0.1.1 (the c4d-highmem-16 of record: 11.4 s). Record: `results/fastsar/logs/arm2` in
+with the 16-lane vectors of 0.1.1 (the c4d-highmem-16 of record: 11.1 s). Record: `results/fastsar/logs/arm2` in
 sar-accel-study.
 
 ## Exact backprojection
@@ -191,21 +196,22 @@ warm former, against the float64 reference:
 
 | Device | Cubic, `upsample=8` (default) | Linear, `upsample=8` |
 |---|---|---|
-| L4 (g2-standard-4) | 24.1 s, -67.4 dB | 20.3 s, -56.9 dB |
-| c4d-highmem-16 | 433 s, -67.4 dB | 292 s, -56.9 dB |
+| L4 (g2-standard-4) | 23.9 s, -67.4 dB | 19.4 s, -56.9 dB |
+| c4d-highmem-16 | 374 s, -67.4 dB | 224 s, -56.9 dB |
 
 The cubic error is the reference's own: against a float64 backprojection oversampled 64 times, the reference is
 -67.3 to -68.8 dB on the lock, port and ship regions and the cubic image -77.5 to -81.7 dB (the float32 factorized
 images -57 to -63 dB). Cubic at 4 times, the default before 0.1.1, reaches -59.8 to -69.6 dB against that truth. The CUDA kernel runs at about 68
-billion pixel-pulse pairs per second on the L4 (cubic, 24.1 s); in development it ran at 86% of the L1 cache's throughput for its
+billion pixel-pulse pairs per second on the L4 (cubic, 23.9 s); in development it ran at 86% of the L1 cache's throughput for its
 data-dependent reads (Nsight Compute), and staging the profiles in shared memory or reading sample
-pairs as 16-byte words did not make it faster. The C++ kernel runs at about 4 billion per second on the
+pairs as 16-byte words did not make it faster. The C++ kernel runs at about 4.4 billion per second on the
 c4d-highmem-16, limited by its vector gathers.
 
 Exact backprojection costs pulses times pixels, factorized backprojection about pixels times the logarithm of the
 pulse count plus a fixed cost of reading the history. On square grids at the center of the Panama scene (all 15,186
-pulses, warm formers) on an L4 (g2-standard-4), exact backprojection with cubic interpolation at 8 times took 0.78, 1.29, 3.85
+pulses, warm formers; measured with a release candidate of 0.1.1) on an L4 (g2-standard-4), exact backprojection with cubic interpolation at 8 times took 0.78, 1.29, 3.85
 and 14.9 s at 1024, 2048, 4096 and 8192 pixels on a side, against 1.00, 0.96, 1.42 and 2.63 s for `ImageFormer`:
 the two meet between 1024 and 2048 pixels on a side. On the c4d-highmem-16 factorized backprojection was faster at every size (7.5 against
-2.6 s at 1024 pixels, 269 against 7.2 s at 8192). On the three Panama regions exact backprojection is 19 to 21 dB more
+2.6 s at 1024 pixels, 269 against 7.2 s at 8192; the CPU's exact kernel has since become faster, 433 s to 374 s on
+the full Panama image). On the three Panama regions exact backprojection is 19 to 21 dB more
 accurate against the 64 times truth. Records: `results/fastsar/crossover` in sar-accel-study.
