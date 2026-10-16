@@ -3,8 +3,8 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/saulpingerman/FastSAR/blob/main/LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://github.com/saulpingerman/FastSAR/blob/main/pyproject.toml)
 
-FastSAR forms synthetic aperture radar (SAR) images on x86 CPUs, Nvidia GPUs and Google Cloud TPUs from Python. It
-reads frequency-domain CPHD files, forms spotlight, stripmap and sliding spotlight images by factorized
+FastSAR forms synthetic aperture radar (SAR) images on x86 and ARM CPUs, Nvidia GPUs and Google Cloud TPUs from
+Python. It reads frequency-domain CPHD files, forms spotlight, stripmap and sliding spotlight images by factorized
 backprojection, and provides autofocus, interferometry, geolocation, map GeoTIFFs and SICD output.
 
 ![FastSAR image of the Panama Canal's Pacific entrance from an Umbra spotlight collection](https://raw.githubusercontent.com/saulpingerman/FastSAR/main/docs/images/hero_panama.jpg)
@@ -73,7 +73,7 @@ vendor grids.
 
 | | CPU (`cpu`) | Nvidia GPU (`cuda`) | Cloud TPU (`tpu`) | Any JAX device (`jax`) |
 |---|---|---|---|---|
-| Factorized backprojection | C++/OpenMP, AVX-512 or AVX2 | CUDA via CuPy | Pallas | reference program |
+| Factorized backprojection | C++/OpenMP: AVX-512 or AVX2 on x86-64, NEON or SVE on ARM | CUDA via CuPy | Pallas | reference program |
 | Precision | float32 | float32, float16 | three-pass (default), single-pass | float32, float16 |
 | Exact backprojection (`ExactFormer`) | C++/OpenMP, float32 with float64 tile centers | CUDA, the same | falls back to `jax` | float32, float64 block centers |
 

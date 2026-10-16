@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "fastsar"
 dynamic = ["version"]
-description = "Synthetic aperture radar image formation on x86 CPUs, Nvidia GPUs and Cloud TPUs"
+description = "Synthetic aperture radar image formation on x86 and ARM CPUs, Nvidia GPUs and Cloud TPUs"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
