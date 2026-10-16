@@ -249,3 +249,19 @@ def test_cupy_history(col20):
     f = fastsar.ExactFormer(col.ant, col.fmin, col.df, col.K, 32, 32, 0.5, 0.5, backend='cuda')
     assert np.array_equal(f(cp.asarray(S)), f(S))
     print('cuda: a CuPy history gives the image of the host one')
+
+
+@pytest.mark.cuda
+def test_cuda_releases_memory(col20):
+    """A call leaves no device memory in use: its FFT plans, whose work areas CuPy's plan cache would keep in the
+    memory pool, are freed with the call (a later former's allocation failed on an L4 after a wide-band exact image)."""
+    import cupy as cp
+    col = col20
+    S = sim.simulate_brute(col, np.array([[0.0, 0, 0]]), np.ones(1)).astype(np.complex64)
+    pool = cp.get_default_memory_pool()
+    f = fastsar.ExactFormer(col.ant, col.fmin, col.df, col.K, 64, 64, 0.5, 0.5, backend='cuda')
+    a = f(S)
+    held = pool.used_bytes() - sum(v.nbytes for v in f._d.values())
+    del a
+    assert held < 1 << 20, held
+    print(f'cuda: {held} bytes of device memory in use after a call, beyond the former\'s geometry')

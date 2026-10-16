@@ -498,6 +498,10 @@ class ExactFormer:
         win = cp.empty((ch, W), cp.complex64)
         chunks = [(p0, min(P, p0 + ch)) for p0 in range(0, P, ch)]
         used = [None, None]
+        # the FFT plans of this call, freed with it: CuPy's plan cache would keep their work areas (7 GB for a wide-band
+        # collection) in its memory pool after the call, where a later former's allocation fails
+        from cupyx.scipy.fftpack import get_fft_plan
+        plans = {}
         bad = cp.zeros((), cp.bool_)            # a non-finite sample seen (read once, at the end)
 
         def stage(i):        # host copy into a pinned buffer, then an asynchronous upload on the copy stream
@@ -527,7 +531,10 @@ class ExactFormer:
             used[b].record()
             if i + 1 < len(chunks):
                 up = stage(i + 1)            # overlaps the FFT and backprojection below
-            prof = cp.fft.ifft(pad[:n], axis=1)
+            if n not in plans:
+                plans[n] = get_fft_plan(pad[:n], axes=1, value_type='C2C')
+            with plans[n]:
+                prof = cp.fft.ifft(pad[:n], axis=1)
             self._k_crop((-(-n * W // 256),), (256,), (prof, d['blo'][p0:p1], np.int32(n), np.int32(nfft), np.int32(W), f32(nfft), win))
             del prof
             self._k_bp((self.ntx * self.nty,), (self._tb,),
