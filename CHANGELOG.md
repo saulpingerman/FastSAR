@@ -3,6 +3,15 @@
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The date of a version is the day it
 was published on PyPI.
 
+## [Unreleased]
+
+### Fixed
+
+- After a cuda `ExactFormer` image, CuPy's FFT plan cache kept the plan of its range compression, and with it a work
+  area in CuPy's memory pool (7 GB for an 8192 by 8192 image of a wide-band Umbra collection on an L4), so a
+  following float16 `ImageFormer` could fail with CuPy's `OutOfMemoryError`. The plans of a call are now freed with
+  it; the image and its time are unchanged.
+
 ## [0.1.4] - 2026-10-16
 
 ### Fixed
