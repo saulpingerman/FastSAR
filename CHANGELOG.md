@@ -11,6 +11,12 @@ was published on PyPI.
   area in CuPy's memory pool (7 GB for an 8192 by 8192 image of a wide-band Umbra collection on an L4), so a
   following float16 `ImageFormer` could fail with CuPy's `OutOfMemoryError`. The plans of a call are now freed with
   it; the image and its time are unchanged.
+- TPU: the host preparation of a large phase history uploaded each float32 plane in one transfer, which on a v6e
+  took 26 s for a 5 GB plane in every call of some processes and 1 s in others (the 2024 Capella spotlight, 10 GB:
+  images of 12 s took up to 149 s). The planes now go to the device in blocks of 4096 pulses, written into planes
+  allocated there. On a v6e the ten warm calls of that spotlight took 11.0 to 11.5 s (11.9 to 12.4 s in 0.1.4 in the
+  same process when no call stalled), the 2025 spotlight 9.6 s (9.9 s) and the 2021 stripmap 8.4 s (8.4 s), with
+  the same region errors.
 
 ## [0.1.4] - 2026-10-16
 
