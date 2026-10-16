@@ -25,6 +25,9 @@ was published on PyPI.
 - On a GPU whose memory is nearly filled by an earlier former (an 8192 by 8192 `ExactFormer` image of a wide-band
   Umbra collection on an L4), a following float16 `ImageFormer` can fail with CuPy's `OutOfMemoryError` instead of
   FastSAR's `MemoryError` or a slower path. Release 0.1.3 behaves the same way.
+- On a TPU v6e the host preparation of a 10 GB phase history (the 2024 Capella spotlight: scaling to float32 planes
+  and upload, `ffbp2.prepare`) takes 4 s in most calls but 23 to 96 s in some, at random within a process, so a
+  12 s image can take up to 104 s. Earlier releases behave the same way.
 
 ## [0.1.3] - 2026-10-15
 
