@@ -36,6 +36,12 @@ was published on PyPI.
   compile, so that collections with range lines of about 10,000 samples formed no image (a 0.8 GB Capella stripmap
   and two Umbra spotlights). `ImageFormer` now retries such a plan with smaller pulse blocks, halving them until the
   kernels compile, and keeps the setting for the plan; plans that compiled before run unchanged.
+- TPU: a collection whose decimated range line fits one output block of the level kernel but whose row is very long
+  (134,000 samples, an Umbra spotlight) made that block of the decimation matrix 137 MB in vector memory, beyond the
+  128 MB of a v6e, and no pulse block was small enough. Such rows are now cut into narrower output blocks; rows whose
+  block fits are unchanged.
+- TPU: a device buffer allocation that fails surfaced through a `ValueError` carrying XLA's text, which the upload's
+  conversion to `MemoryError` did not catch; every exception that reports the device out of memory is now converted.
 - TPU: the padding of the uploaded planes for the first-level kernel held both copies at once, so a 22 GB history
   needed 34 GB of temporaries on a 32 GB v6e. The blocks of a large history now go straight into the padded planes.
   A history that does not fit raises `MemoryError` with the memory it needs, as documented, not XLA's error.

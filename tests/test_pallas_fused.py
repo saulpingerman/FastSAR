@@ -112,6 +112,30 @@ def test_kernel2_multiblock(toy):
     assert e < -45, f'kernel2 multi-block: {e:.1f} dB (limit -45 dB)'
 
 
+def test_band_blocks2_window_limit(toy, monkeypatch):
+    """A row whose single block would exceed WIN_MAX samples (window by output block) is cut into narrower output
+    blocks by band_blocks2 itself, and the third kernel on those blocks matches the reference; rows within the limit
+    keep one block."""
+    import jax.numpy as jnp
+    from fastsar import pallas_ffbp
+    from fastsar.pallas_ffbp import band_blocks2, pad_columns, fused_rotate_dec_k3
+    one = band_blocks2(toy.Fk, D)
+    assert one['nb'] == 1
+    monkeypatch.setattr(pallas_ffbp, 'WIN_MAX', 1)
+    band = band_blocks2(toy.Fk, D)
+    print('window limit', {k: band[k] for k in ('kob', 'win', 'stride', 'nb', 'Kpad', 'chunk')})
+    assert band['nb'] > 1 and band['kob'] == 128 and band['win'] <= 2 * band['stride']
+    Sre = jnp.stack([pad_columns(jnp.asarray(s.real), band) for s in toy.Ss]); Sim = jnp.stack([pad_columns(jnp.asarray(s.imag), band) for s in toy.Ss])
+    yr, yi = fused_rotate_dec_k3(Sre, Sim, jnp.asarray(toy.c0s), jnp.asarray(toy.sls), band, kc, pb=32, passes=3, interpret=True)
+    num = den = 0.0
+    for (n, c), ref in child_refs(toy).items():
+        Y = np.asarray(yr)[n, c, :, :Ko] + 1j * np.asarray(yi)[n, c, :, :Ko]
+        num += np.sum(np.abs(Y - ref) ** 2); den += np.sum(np.abs(ref) ** 2)
+    e = err_db(num, den)
+    print(f'kernel3 on window-limited blocks: error {e:.1f} dB')
+    assert e < -55, e
+
+
 @pytest.mark.parametrize('passes, lim', [(1, -44), (3, -55)])
 @pytest.mark.parametrize('fused', [False, True])
 def test_kernel3(toy, band2, fused, passes, lim):

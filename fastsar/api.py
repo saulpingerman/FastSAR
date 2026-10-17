@@ -378,7 +378,9 @@ class ImageFormer:
         try:
             hre, him, scale = ffbp2.prepare(self._pol, S, getattr(self._fn, 'layout', None))
             hre, him = self._fn.pad(hre, him)
-        except _jax_runtime_error() as e:
+        except Exception as e:
+            # a device out of memory, whatever class the runtime raised it as (JaxRuntimeError for a failed
+            # computation; a buffer allocation that fails on a TPU has surfaced as a ValueError)
             if 'RESOURCE_EXHAUSTED' not in str(e):
                 raise
             raise MemoryError(f'{self.backend}: the phase history ({_mem._gb(8.0 * self.P * self.K)} as float32 planes, '
@@ -444,8 +446,8 @@ class ImageFormer:
                 # dispatch is asynchronous: a device that runs out of memory may say so only when the result is read
                 re, im = jax.block_until_ready(self._fn(hre, him, self._arrs))
                 break
-            except runtime_error as e:      # device memory: fewer first-level children per group, down to one
-                if 'RESOURCE_EXHAUSTED' not in str(e):
+            except Exception as e:          # device memory: fewer first-level children per group, down to one
+                if 'RESOURCE_EXHAUSTED' not in str(e) or not isinstance(e, (runtime_error, ValueError, RuntimeError)):
                     raise
                 if 'vmem' in str(e).lower():
                     # a kernel's on-chip scratch (VMEM) is sized at compile time and does not depend on the group

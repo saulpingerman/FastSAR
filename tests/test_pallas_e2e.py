@@ -123,3 +123,23 @@ def test_vmem_retry(scene, monkeypatch):
     e = 10 * np.log10(np.sum(np.abs(img - ref) ** 2) / np.sum(np.abs(ref) ** 2))
     print(f'  vmem retry: cap {32 * wmax} samples, image vs jax backend {e:.1f} dB')
     assert e < -80
+
+
+def test_upload_memory_error(scene, monkeypatch):
+    """A device out of memory during the upload raises MemoryError whatever class the runtime used (a TPU buffer
+    allocation that failed surfaced as a ValueError carrying RESOURCE_EXHAUSTED)."""
+    import fastsar
+    from fastsar import ffbp2 as f2, sim as fsim
+    col = fsim.make_collect(res=0.5, scene=60.0, r0=5e3)
+    S = scene[0]
+    f = fastsar.ImageFormer(col.ant, col.fmin, col.df, S.shape[1], 128, 128, 0.5, 0.5, backend='tpu')
+    for exc in (ValueError, RuntimeError):
+        def boom(*a, exc=exc, **k):
+            raise exc('RESOURCE_EXHAUSTED: E0100: RuntimeBufferAllocationFailure: Error allocating device buffer')
+        monkeypatch.setattr(f2, 'prepare', boom)
+        with pytest.raises(MemoryError, match='does not fit in device memory'):
+            f(S)
+    monkeypatch.setattr(f2, 'prepare', lambda *a, **k: (_ for _ in ()).throw(ValueError('something else')))
+    with pytest.raises(ValueError, match='something else'):
+        f(S)
+    print('  upload: RESOURCE_EXHAUSTED as ValueError and RuntimeError -> MemoryError; other errors pass through')

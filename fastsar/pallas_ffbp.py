@@ -23,6 +23,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 TWO_PI = 2.0 * math.pi
 LANE = 128
+WIN_MAX = 16 << 20       # band_blocks2: samples (window by output block) of one block of the decimation matrix held in VMEM
 
 
 def band_blocks(Fk, D, kob=256, lane=LANE, chunk_align=512):
@@ -180,6 +181,15 @@ def band_blocks2(Fk, D, kob=None, lane=LANE, chunk=128, kob_max=512):
         if kob > kob_max:
             kob = 256
     nb = -(-Ko // kob)
+    if nb == 1 and chunk * math.ceil((pl_pad + K) / chunk) * kob > WIN_MAX:
+        # one block would cover the whole row: a range line of 134,000 samples (an Umbra spotlight) makes it 137 MB in
+        # bfloat16, more than the v6e's 128 MB of vector memory; narrower output blocks bound the window to about two
+        # strides (rows that fit in one block are unchanged)
+        for kob in (256, lane):
+            nb = -(-Ko // kob)
+            if nb > 1 and chunk * math.ceil((D * kob + L + pl_pad) / chunk) * kob <= WIN_MAX:
+                break
+        nb = -(-Ko // kob)
     Ko_pad = nb * kob
     if nb == 1:
         win = int(chunk * math.ceil((pl_pad + K) / chunk))
