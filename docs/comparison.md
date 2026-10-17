@@ -1,8 +1,8 @@
 # Comparison with open-source implementations
 
-Five open-source backprojection codes were run on the Umbra Panama collection, on the c4d-highmem-16 or the L4 (the open-source GPU codes on a g2-standard-8 host;
-[performance.md](performance.md#timing-protocol-and-devices)), from the same Taylor-windowed phase history and
-antenna positions.
+Six open-source backprojection codes were run on the Umbra Panama collection, on the c4d-highmem-16 or the L4 (the open-source GPU codes on a g2-standard-8 host,
+MatX on the g2-standard-4 of FastSAR's records; [performance.md](performance.md#timing-protocol-and-devices)), from
+the same Taylor-windowed phase history and antenna positions.
 
 Errors are against the float64 reference (linear interpolation, 16 times oversampled) over the lock, port and ship
 regions of [precision.md](precision.md), worst to best. FastSAR's rows (truth) are against a float64
@@ -27,7 +27,10 @@ min against 374 s measured.
 | ISCE3 `backproject`, CUDA | -31.5 to -52.2 | 27 min (est.) |
 | torchbp, exact | no image | 16.0 s |
 | torchbp, factorized | out of memory | |
-| FastSAR, exact backprojection, cubic, 8x | -77.5 to -81.7 (truth) | 23.9 s |
+| MatX `sar_bp`, `taylor_fast`, as shipped, 8x | -37.7 to -43.2 | 12.5 s |
+| MatX `sar_bp`, `taylor_fast`, float64 pixel coordinates, 8x | -54.9 to -58.6 | 11.6 s |
+| FastSAR, exact backprojection, linear, 8x | -54.9 to -58.7 | 11.4 s |
+| FastSAR, exact backprojection, cubic, 8x | -77.5 to -81.7 (truth) | 16.4 s |
 | FastSAR, factorized, float32 | -57.1 to -62.6 (truth) | 3.0 s |
 | FastSAR, factorized, float16 throughout | -55.6 to -61.6 (truth) | 2.5 s |
 
@@ -40,10 +43,18 @@ min against 374 s measured.
 - torchbp computes distance in float32, whose spacing at 744 km is 6 cm, about two wavelengths.
 - GRDL's factorized backprojection, documented as a stripmap algorithm, formed no focused image with default
   parameters.
+- MatX (NVIDIA's C++ library, `examples/sarbp`, commit 3f3cc13, BSD-3): exact backprojection whose `taylor_fast`
+  kernel expands the range to second order within a tile of pixels, with linear interpolation of profiles oversampled
+  8 times. As shipped, the example builds the pixel coordinates with a float32 `linspace`; the rounding, about 0.12 mm
+  at 2.5 km from the scene center, is a phase error at X band that caps the whole-image error at -33.9 dB. The
+  example's own validation compares against its float64 mode, which shares the coordinates, so it does not see this.
+  With a float64 `linspace` (one line, `cloud/matx/dvox.patch` in the study repository) the errors are those of
+  linear interpolation at 8 times, within 0.1 dB of FastSAR's linear row, which uses the same scheme.
 
 With the algorithm held fixed, FastSAR's exact backprojection is 46 times faster than ISCE3's estimated time on the
-CPU and 67 times faster on the L4, with lower errors in every region. The factorized algorithm cuts the CPU time by a
-further factor of 34.
+CPU and, on the L4, level with MatX at matched accuracy (11.4 against 11.6 s with linear interpolation; 98 times
+faster than ISCE3's estimate), with lower errors in every region than every code but MatX's corrected form. The
+factorized algorithm is 3.8 times faster again on the L4 and 34 times on the CPU.
 
 On the same CPU, the AFRL toolbox's `pfa_mem` (Octave) forms a polar-format image in 44.5 s and GRDL's polar format in 24.5 s.
 Neither corrects the planar-wavefront displacement. Their log-amplitude correlations with the reference are 0.80 to
