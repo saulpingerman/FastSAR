@@ -122,6 +122,7 @@ def test_prepare_blocked(monkeypatch, policy):
     a = ffbp2.prepare(policy, S)
     monkeypatch.setattr(ffbp2, '_blocked_upload', lambda: True)
     monkeypatch.setattr(ffbp2, 'UPLOAD_ROWS', 128)
+    monkeypatch.setattr(ffbp2, 'UPLOAD_MIN_BYTES', 0)
     with warnings.catch_warnings():
         warnings.filterwarnings('ignore', message='Some donated buffers were not usable')
         b = ffbp2.prepare(policy, S)

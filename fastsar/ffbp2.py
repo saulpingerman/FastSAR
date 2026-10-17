@@ -380,6 +380,8 @@ def device_arrays(policy, plan, coll, static):
 
 
 UPLOAD_ROWS = 4096       # pulses per block when prepare uploads a host history to a TPU
+UPLOAD_MIN_BYTES = 1 << 30   # prepare uploads block-wise only above this many bytes per plane: the stall it avoids was
+                             # seen on 5 GB planes, and the blocks cost a stripmap mosaic of small patches 7 percent
 
 
 @functools.partial(jax.jit, donate_argnums=0)
@@ -404,7 +406,7 @@ def prepare(policy, S, layout=None):
     h = np.float64 if p['ew'] == 'float64' else np.float32
     scale = float(np.abs(S).max()) or 1.0          # an all-zero history: zero planes, not 0/0
     P = S.shape[0]
-    if not _blocked_upload() or P <= UPLOAD_ROWS:
+    if not _blocked_upload() or P <= UPLOAD_ROWS or S.shape[0] * S.shape[1] * np.dtype(h).itemsize < UPLOAD_MIN_BYTES:
         return (jnp.asarray((S.real / scale).astype(h)).astype(p['ew']), jnp.asarray((S.imag / scale).astype(h)).astype(p['ew']), scale)
     if layout is not None:
         shape, i0, j0 = (layout['Pp'], layout['Kpad']), layout['front'], layout['left']

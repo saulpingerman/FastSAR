@@ -78,6 +78,7 @@ def test_prepare_into_layout(scene, pol, monkeypatch):
     a = fn.pad(*ffbp2.prepare(pol, S)[:2])
     monkeypatch.setattr(ffbp2, '_blocked_upload', lambda: True)
     monkeypatch.setattr(ffbp2, 'UPLOAD_ROWS', 100)
+    monkeypatch.setattr(ffbp2, 'UPLOAD_MIN_BYTES', 0)
     with warnings.catch_warnings():
         warnings.filterwarnings('ignore', message='Some donated buffers were not usable')
         hre, him, _ = ffbp2.prepare(pol, S, fn.layout)
