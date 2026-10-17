@@ -520,10 +520,6 @@ class ExactFormer:
         win = cp.empty((ch, W), cp.complex64)
         chunks = [(p0, min(P, p0 + ch)) for p0 in range(0, P, ch)]
         used = [None, None]
-        # the FFT plans of this call, freed with it: CuPy's plan cache would keep their work areas (7 GB for a wide-band
-        # collection) in its memory pool after the call, where a later former's allocation fails
-        from cupyx.scipy.fftpack import get_fft_plan
-        plans = {}
         bad = cp.zeros((), cp.bool_)            # a non-finite sample seen (read once, at the end)
 
         def stage(i):        # host copy into a pinned buffer, then an asynchronous upload on the copy stream
@@ -565,10 +561,7 @@ class ExactFormer:
             used[b].record()
             if i + 1 < len(chunks):
                 up = stage(i + 1)            # overlaps the FFT and backprojection below
-            if n not in plans:
-                plans[n] = get_fft_plan(pad[:n], axes=1, value_type='C2C')
-            with plans[n]:
-                prof = cp.fft.ifft(pad[:n], axis=1)
+            prof = cp.fft.ifft(pad[:n], axis=1)      # CuPy's plan cache keeps the plan (memory.cuda_release frees it)
             self._k_crop((-(-n * W // 256),), (256,), (prof, d['blo'][p0:p1], np.int32(n), np.int32(nfft), np.int32(W), f32(nfft), win))
             del prof
             if pending is not None and pending[0][1].done and pending[1][1].done:     # the last pair's events
@@ -725,6 +718,7 @@ class ExactFormer:
                 except cp.cuda.memory.OutOfMemoryError:
                     if self.chunk <= 64:
                         raise
+                    _mem.cuda_release()     # cached blocks and FFT plans back to the device
                     self.chunk //= 2        # memory held elsewhere (another former, JAX): fewer pulses per chunk
                     _mem._warn(f'cuda: out of GPU memory; ExactFormer continues with {self.chunk} pulses per chunk '
                                f'({_mem._gb(_mem.cuda_free())} free)')

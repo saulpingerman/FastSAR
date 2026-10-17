@@ -442,7 +442,7 @@ def _children_split(kern, pre, pim, c0, sl, lv):
     except cp.cuda.memory.OutOfMemoryError:
         if Cn == 1:
             raise
-    cp.get_default_memory_pool().free_all_blocks()
+    memory.cuda_release()
     rows = lv['Po'] if lv['Dp'] > 1 else pre.shape[1]
     cols = lv['Ko'] if lv['Dk'] > 1 else pre.shape[2]
     zre = cp.empty((Np, Cn, rows, cols), kern['dtype'])
@@ -459,7 +459,7 @@ def _children_split(kern, pre, pim, c0, sl, lv):
                 raise
             failed = True
         if failed:                              # freed outside the handler, whose traceback holds the failed arrays
-            cp.get_default_memory_pool().free_all_blocks()
+            memory.cuda_release()
             step = max(1, step // 2)
             continue
         zre[:, j0:j1] = a.reshape(Np, j1 - j0, rows, cols)
@@ -913,7 +913,7 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
                     _out_of_memory(free + full.nbytes, kern['dtype'])
                 # the model sized the groups too large for this device: half the group, from this one on
                 del c0, sl
-                cp.get_default_memory_pool().free_all_blocks()
+                memory.cuda_release()
                 ng //= 2
                 memory._warn(f'cuda: out of GPU memory in the first level; FastSAR continues in groups of '
                              f'{memory._nchildren(ng)}, which is slower ({memory._gb(memory.cuda_free())} free)')
@@ -927,7 +927,7 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
                     re, im = tiles(A[k0:k0 + len(sub)], Bm[k0:k0 + len(sub)], sub)
                 except cp.cuda.memory.OutOfMemoryError:
                     if bt > 1:
-                        cp.get_default_memory_pool().free_all_blocks()
+                        memory.cuda_release()
                         bt //= 2
                         continue
                     if ng == 1:
@@ -940,7 +940,7 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
             del A, Bm
             g0 += k0                            # the children done; the rest of the group again, in smaller groups
             if k0 < len(gs):
-                cp.get_default_memory_pool().free_all_blocks()
+                memory.cuda_release()
                 ng = max(1, ng // 2)
                 memory._warn(f'cuda: out of GPU memory in the later levels; FastSAR continues in first-level groups of '
                              f'{memory._nchildren(ng)}, which is slower ({memory._gb(memory.cuda_free())} free)')
@@ -948,7 +948,7 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
         if scaled and not bool(cp.isfinite(img).all()):
             if _scale is None:
                 del img, full
-                cp.get_default_memory_pool().free_all_blocks()
+                memory.cuda_release()
                 peak = _host_peak(S) if isinstance(S, np.ndarray) else (float(cp.abs(S).max()) or 1.0)
                 if peak > scale:
                     return form(S, ng, batch, window, False, peak)

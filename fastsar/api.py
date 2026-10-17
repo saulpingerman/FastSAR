@@ -588,7 +588,7 @@ def _pfa(S, col, nx, ny, spx, spy, e1, e2, guard=300.0, window=True, support='un
             _PFA_PROGRAMS[key] = prog
     fn, (W, alpha, eps_r, shift, eps_a), prep = prog
     if 'cupy' in sys.modules and jax.default_backend() == 'gpu':
-        sys.modules['cupy'].get_default_memory_pool().free_all_blocks()     # blocks CuPy cached are not JAX's to use
+        _mem.cuda_release()                   # blocks and FFT plans CuPy cached are not JAX's to use
     re, im, scale = prep(jax.device_put(np.asarray(S, np.complex64)))
     out = fn(re, im, W, alpha, eps_r, shift, eps_a)
     return (np.asarray(out) * float(scale)).astype(np.complex64)

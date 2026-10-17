@@ -83,6 +83,18 @@ def host_available():
         return 64e9
 
 
+def cuda_release():
+    """Return CuPy's cached blocks to the device, and with them the work areas of cupy.fft's plan cache, which keeps a
+    plan and its work area for the process (7 GB after a wide-band ExactFormer call): called where an allocation on
+    the device has failed, before the retry."""
+    import cupy as cp
+    try:
+        cp.fft.config.get_plan_cache().clear()
+    except Exception:          # no cache on this CuPy
+        pass
+    cp.get_default_memory_pool().free_all_blocks()
+
+
 def cuda_free():
     """Free bytes on the current CUDA device, counting the blocks CuPy's memory pool holds cached but unused (an
     earlier call's arrays, freed to the pool and not to the driver)."""

@@ -37,8 +37,11 @@ was published on PyPI.
   `ValueError` that names float32 is raised if that overflows too.
 - After a cuda `ExactFormer` image, CuPy's FFT plan cache kept the plan of its range compression, and with it a work
   area in CuPy's memory pool (7 GB for an 8192 by 8192 image of a wide-band Umbra collection on an L4), so a
-  following float16 `ImageFormer` could fail with CuPy's `OutOfMemoryError`. The plans of a call are now freed with
-  it; the image and its time are unchanged.
+  following float16 `ImageFormer` could fail with CuPy's `OutOfMemoryError`. Every retry after an out-of-memory
+  error on the device (the fast and exact formers, a mosaic's gathers, JAX's turn on the GPU) now returns CuPy's
+  cached blocks and its FFT plans to the device before trying again (`memory.cuda_release`); between calls the plans
+  stay cached as in 0.1.4 (a candidate that made them per call ran a wide-band exact image 3 per cent slower on an
+  L4). The images are unchanged.
 - TPU: the host preparation of a large phase history uploaded each float32 plane in one transfer, which on a v6e
   took 26 s for a 5 GB plane in every call of some processes and 1 s in others (the 2024 Capella spotlight, 10 GB:
   images of 12 s took up to 149 s). Planes of 1 GB or more now go to the device in blocks of 4096 pulses, written

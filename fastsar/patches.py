@@ -753,7 +753,8 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
                 if backend != 'cuda' or type(e).__name__ != 'OutOfMemoryError' or attempt == 39:
                     raise
                 import cupy
-                cupy.get_default_memory_pool().free_all_blocks()
+                from .memory import cuda_release
+                cuda_release()
                 if attempt >= 3 and prof is not None and prof.get('win') is not None:
                     with prof['lock']:
                         prof['win'].update(buf=None, w0=0, w1=0)

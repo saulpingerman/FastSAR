@@ -253,18 +253,24 @@ def test_cupy_history(col20):
 
 @pytest.mark.cuda
 def test_cuda_releases_memory(col20):
-    """A call leaves no device memory in use: its FFT plans, whose work areas CuPy's plan cache would keep in the
-    memory pool, are freed with the call (a later former's allocation failed on an L4 after a wide-band exact image)."""
+    """memory.cuda_release, which every out-of-memory retry on the device calls before trying again, leaves no device
+    memory in use beyond a former's geometry: CuPy's FFT plan cache keeps the plan of the range compression and its
+    work area between calls (7 GB after a wide-band exact image on an L4, where a following float16 former's
+    allocation failed), and the release clears the cache with the pool."""
     import cupy as cp
+    from fastsar import memory
     col = col20
     S = sim.simulate_brute(col, np.array([[0.0, 0, 0]]), np.ones(1)).astype(np.complex64)
     pool = cp.get_default_memory_pool()
     f = fastsar.ExactFormer(col.ant, col.fmin, col.df, col.K, 64, 64, 0.5, 0.5, backend='cuda')
     a = f(S)
-    held = pool.used_bytes() - sum(v.nbytes for v in f._d.values())
     del a
+    cached = cp.fft.config.get_plan_cache().get_curr_size()
+    memory.cuda_release()
+    held = pool.used_bytes() - sum(v.nbytes for v in f._d.values())
     assert held < 1 << 20, held
-    print(f'cuda: {held} bytes of device memory in use after a call, beyond the former\'s geometry')
+    assert cp.fft.config.get_plan_cache().get_curr_size() == 0
+    print(f'cuda: {cached} cached FFT plan(s) after a call; {held} bytes in use after the release, beyond the geometry')
 
 
 @pytest.mark.cuda
