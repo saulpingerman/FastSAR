@@ -207,6 +207,39 @@ def test_profile_window(monkeypatch):
     assert not bad, 'FAILED: ' + '; '.join(bad)
 
 
+def test_gather_retry_drops_window(monkeypatch):
+    """A patch's gather that runs out of GPU memory on a prefetch thread is tried again; from the fourth attempt the
+    range-profile window on the device is given up (the retry loads it again), and the image is unchanged."""
+    import cupy as cp
+    from fastsar import stripmap as sm, patches as pt
+    p = sm.make_params(squint_deg=0.0)
+    r, x = sm.axes(p)
+    raw = sm.simulate(p, np.array([[x[len(x) // 2], r[len(r) // 2]]]))
+    rows = (len(x) // 2 - 140, len(x) // 2 + 140)
+    monkeypatch.setenv('FASTSAR_PROFILE_WINDOW_ROWS', '1200')
+    monkeypatch.setenv('FASTSAR_MOSAIC_PREFETCH', '2')
+    monkeypatch.setenv('FASTSAR_TIMING', '1')
+    pt._Timer.acc.clear()
+    img_res, _, _ = pt.form_stripmap(raw, p, rows=rows, backend='cuda', rwin='taylor', awin='taylor')
+    moves = pt._Timer.acc.get('form_mosaic: profile window moves (count)')
+    real, calls, fails = pt.patch_history, [], []
+
+    def failing(*a, **k):            # the third gather fails five times, then runs
+        calls.append(1)
+        if len(calls) >= 3 and len(fails) < 5:
+            fails.append(1)
+            raise cp.cuda.memory.OutOfMemoryError(1 << 40, 0)
+        return real(*a, **k)
+    monkeypatch.setattr(pt, 'patch_history', failing)
+    monkeypatch.setattr(pt.time, 'sleep', lambda s: None)
+    pt._Timer.acc.clear()
+    img_r, _, _ = pt.form_stripmap(raw, p, rows=rows, backend='cuda', rwin='taylor', awin='taylor')
+    moves_r = pt._Timer.acc.get('form_mosaic: profile window moves (count)')
+    print(f'gather retried after {len(fails)} failures: window loads {moves} without, {moves_r} with the retry; '
+          f'identical {np.array_equal(img_r, img_res)}')
+    assert len(fails) == 5 and np.array_equal(img_r, img_res) and moves == 1 and moves_r == 2
+
+
 def test_staging_reuse(monkeypatch):
     """A mosaic's page-locked staging buffers are reused: a smaller request takes a free buffer, a larger one replaces
     it (the count stays bounded), and the patches of a host-gathered mosaic make at most one per gather in flight."""

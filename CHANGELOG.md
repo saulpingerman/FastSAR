@@ -9,12 +9,13 @@ was published on PyPI.
 
 - cuda `ExactFormer`: the thread blocks take their tiles along one grid axis or the other, so that the blocks resident
   together read the same range bins from the L2 cache instead of the image's whole range window, and the image comes
-  back through pinned memory, as `ImageFormer`'s does. The order is timed: every 32 chunks of pulses two chunks run in
-  the two orders and the faster is kept from the next pair on, without waiting on the GPU (the line of sight turns
-  over a long aperture, and the axis closer to constant range at mid-aperture made a 212,858-pulse Capella spotlight
-  3 percent slower than 0.1.4 on an L4); a call of fewer than 34 chunks runs the mid-aperture guess. On an RTX PRO
-  6000 Blackwell Max-Q the 12,207 by 8,808 pixel, 15,186-pulse Panama image took 2.59 s with linear and 3.82 s with
-  cubic interpolation (4.54 and 5.84 s in 0.1.4); the images are bitwise the same.
+  back through pinned memory, as `ImageFormer`'s does. The order is timed: the second and third chunks of pulses run
+  in the two orders between events, the faster is kept from the first chunk at which the events have completed
+  (asked, never waited for), and every 32 chunks another pair checks the choice; the geometric guess was not reliable
+  (the axis closer to constant range at mid-aperture made a 212,858-pulse Capella spotlight 3 percent slower than
+  0.1.4 on an L4, and two short calls 2 to 3 percent slower), and a call of fewer than five chunks keeps 0.1.4's
+  order. On an RTX PRO 6000 Blackwell Max-Q the 12,207 by 8,808 pixel, 15,186-pulse Panama image took 2.59 s with
+  linear and 3.82 s with cubic interpolation (4.54 and 5.84 s in 0.1.4); the images are bitwise the same.
 
 ### Fixed
 
@@ -23,8 +24,12 @@ was published on PyPI.
   in the window multiply. Blocks are now at most 512 MB; the planes are the same.
 - cuda `form_cphd` on a mosaic (a sliding spotlight or stripmap): a patch's range profiles gathered on a prefetch
   thread while the former held its peak could fail with CuPy's `OutOfMemoryError` (a 29 GB Capella sliding
-  spotlight on an L4 with four prefetch workers, in three of four calls at 0.1.4 and this release's candidate). The
-  gather now returns the pool's free blocks to the device and tries again, waiting up to 20 s for the former.
+  spotlight on an L4 with four prefetch workers, in three of four calls at 0.1.4 and this release's candidate; a
+  14 GB one in one of four calls at 0.1.4 and three at the candidate). The gather holds one whole-gate array past
+  each step instead of six (the ramp and taper are applied in place; the values are the same), and after an
+  out-of-memory it returns the pool's free blocks to the device and tries again for up to 20 s, from the fourth
+  attempt giving up the range-profile window on the device as well, since the former cannot release memory while it
+  waits for this patch.
 - cuda `ImageFormer` with `precision='float16'`: a history that streams from host memory (larger than the GPU's free
   memory) was scaled by the peak of its first 4096 pulses without the fallback the uploaded path has, so a later,
   stronger block overflowed the half range and the image came out non-finite (a 21.8 GB Capella spotlight on an L4).

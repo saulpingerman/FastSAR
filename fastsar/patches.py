@@ -438,15 +438,23 @@ def patch_history(fx, ant, center, pts, lo, hi, margin=None, guard=None, prof=No
                 cols = (cp.asarray(j)[None, :] - md[:, None]) % K2
                 u = Q[cp.arange(lo_q, lo_q + hi - lo)[:, None], cols]
             tm('gather')
-            U = cp.fft.fft(u, axis=1)[:, k0:k1]
+            # the gated spectrum alone is kept past each step, and the ramp and taper are applied in place: with the
+            # window and the other workers' prepared histories on the device, the six whole-gate temporaries of the
+            # expression U * ramp * (cph * T) left a 14 GB sliding spotlight's patch out of memory on a 24 GB L4
+            Uf = cp.fft.fft(u, axis=1)
+            u = None
+            U = cp.ascontiguousarray(Uf[:, k0:k1])
+            Uf = None
             tm('fft')
             kk = cp.arange(k0, k1, dtype=cp.float32)
             dd = cp.asarray((sft - m).astype(np.float32))
             cph = cp.asarray((np.exp(-4j * np.pi * f0 * shift / C) * (K2 / N)).astype(np.complex64))
-            ramp = cp.exp((-2j * np.pi / N) * dd[:, None] * kk[None, :]).astype(cp.complex64)
-            out = U * ramp * (cph[:, None] * cp.asarray(T[k0:k1].astype(np.float32))[None, :])
+            ramp = cp.exp((-2j * np.pi / N) * dd[:, None] * kk[None, :]).astype(cp.complex64, copy=False)
+            U *= ramp
+            ramp = None
+            U *= cph[:, None] * cp.asarray(T[k0:k1].astype(np.float32))[None, :]
             tm('ramp')
-            return out.astype(cp.complex64), a - center, float(f2[k0]), float(df2)
+            return U, a - center, float(f2[k0]), float(df2)
 
     if gate and prof is not None:
         # exp(-j 4 pi f shift / c) with f = f0 + k df is a delay of s = 2 df K2 shift / c bins of the profile times the
@@ -738,11 +746,18 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
             except Exception as e:
                 # a CUDA gather on a prefetch thread while the former holds its peak, or CuPy's pool is fragmented
                 # across threads (a 29 GB sliding spotlight on an L4 with four prefetch workers): return the pool's
-                # free blocks to the device and try again, waiting for the former's memory for up to 20 s
+                # free blocks to the device and try again, waiting for the former's memory for up to 20 s. Waiting
+                # frees nothing when this patch is the one the former waits for (the other workers' histories are
+                # held until it forms), so from the fourth attempt the profile window on the device is given up too
+                # (a quarter of the memory free at the start; the next patch that needs it loads it again)
                 if backend != 'cuda' or type(e).__name__ != 'OutOfMemoryError' or attempt == 39:
                     raise
                 import cupy
                 cupy.get_default_memory_pool().free_all_blocks()
+                if attempt >= 3 and prof is not None and prof.get('win') is not None:
+                    with prof['lock']:
+                        prof['win'].update(buf=None, w0=0, w1=0)
+                        cupy.get_default_memory_pool().free_all_blocks()
                 if attempt:
                     time.sleep(0.5)
         tm('patch history')

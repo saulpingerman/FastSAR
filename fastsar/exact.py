@@ -531,14 +531,17 @@ class ExactFormer:
             return e
 
         f32 = np.float32
-        # tile order: the mid-aperture guess first; then every PROBE chunks, two full chunks in a row run in the two
-        # orders between events, and when the next pair comes round (the events long complete, so no wait) the faster
-        # order of the last pair is kept. Both orders give the same image bit for bit (each pixel's sum runs in one
-        # thread in pulse order); the line of sight turns over a long aperture and the faster order is not always the
-        # guessed one (a 212,858-pulse Capella spotlight on an L4 took 3 percent longer in the guessed order than in
-        # 0.1.4's). No pair is timed unless PROBE chunks follow it, so a short call runs the guess without a probe
-        # (synchronizing on the probe's events cost small images 1 to 2 percent).
-        along1, probe, pending = self._along1, {}, None
+        # tile order: the second and third chunks run in the two orders between events, and from the first chunk at
+        # which both pairs of events have completed (asked, never waited for: the host stays a chunk or two ahead of
+        # the device, so usually the fifth or sixth) the faster order is kept; every PROBE chunks another pair, its
+        # orders alternated, checks the choice. Both orders give the same image bit for bit (each pixel's sum runs in
+        # one thread in pulse order). The mid-aperture guess serves until the first choice; a call of fewer than five
+        # chunks, which no choice can reach, keeps 0.1.4's order. The guess alone was not reliable (a 212,858-pulse
+        # Capella spotlight on an L4 ran 3 percent slower in the guessed order than in 0.1.4's, and two short calls
+        # 2 to 3 percent slower), and applying a choice only when the next pair came round left most of a 50-chunk
+        # call in the wrong order; a host wait on the events cost small images 1 to 2 percent.
+        along1 = self._along1 if len(chunks) >= 5 else 0
+        probe, pending, nprobe, first = {}, None, 0, None
         self.probe_ms = []
         up = stage(0)
         for i, (p0, p1) in enumerate(chunks):
@@ -559,14 +562,17 @@ class ExactFormer:
                 prof = cp.fft.ifft(pad[:n], axis=1)
             self._k_crop((-(-n * W // 256),), (256,), (prof, d['blo'][p0:p1], np.int32(n), np.int32(nfft), np.int32(W), f32(nfft), win))
             del prof
-            j = i % PROBE
-            if j == 1 and pending is not None:              # the last pair's events: complete PROBE - 2 chunks ago
+            if pending is not None and pending[0][1].done and pending[1][1].done:     # the last pair's events
                 t0, t1 = (cp.cuda.get_elapsed_time(*pending[k]) for k in (0, 1))
                 self.probe_ms.append((pending[2], round(t0, 3), round(t1, 3)))
                 along1, pending = int(t1 < t0), None
-            timed = j in (1, 2) and n == ch and i - j + 2 + PROBE <= len(chunks)
+            j = i % PROBE
+            # a pair is timed when it is whole (both chunks full), no pair is still pending, and at least two chunks
+            # follow it; the second chunk only with the first
+            timed = (j == 1 and n == ch and pending is None and i + 4 <= len(chunks)) or (j == 2 and first == i - 1)
             if timed:
-                order = j - 1
+                first = i if j == 1 else first
+                order = (j - 1) ^ (nprobe & 1)
                 probe[order] = (cp.cuda.Event(), cp.cuda.Event())
                 probe[order][0].record()
             else:
@@ -578,13 +584,17 @@ class ExactFormer:
                         np.float64(self.inv_dr), np.float64(self.kcyc), np.int32(order), out))
             if timed:
                 probe[order][1].record()
-                if order == 1:
-                    pending = (probe[0], probe[1], i - 1)
+                if j == 2:
+                    pending, probe, first, nprobe = (probe[0], probe[1], i - 1), {}, None, nprobe + 1
         if check and bool(bad):
             from .api import _check_history
             _check_history(S if isinstance(S, np.ndarray) else cp.asnumpy(S))       # raises, naming the first pulse
         from .api import _to_host
-        return _to_host(out)                 # through pinned memory, as ImageFormer returns its image
+        img = _to_host(out)                  # through pinned memory, as ImageFormer returns its image
+        if pending is not None:              # a pair the call ended on, complete with the copy: for the diagnostics
+            t0, t1 = (cp.cuda.get_elapsed_time(*pending[k]) for k in (0, 1))
+            self.probe_ms.append((pending[2], round(t0, 3), round(t1, 3)))
+        return img
 
     # ---------------------------------------------------------------- CPU
     def _form_cpu(self, S):

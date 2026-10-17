@@ -285,16 +285,20 @@ def test_cuda_block_order(ranges, axes):
 
 @pytest.mark.cuda
 def test_cuda_order_probe(ranges, monkeypatch):
-    """The timed choice of the tile order (two chunks in the two orders every PROBE chunks) records its timings, and
-    the image does not depend on the orders it chose."""
+    """The timed choice of the tile order (the second and third chunks in the two orders, then a pair every PROBE
+    chunks) records its timings, a call of fewer than five chunks times none, and the image does not depend on the
+    orders chosen."""
     from fastsar import exact
     c = ranges[600e3]
     monkeypatch.setattr(exact, 'PROBE', 4)
     f = fastsar.ExactFormer(c.col.ant, c.col.fmin, c.col.df, c.S.shape[1], 100, 120, 0.5, 0.5, backend='cuda', chunk=16)
     a = f(c.S).copy()
     probes = list(f.probe_ms)
-    assert len(probes) >= 2 and all(t0 > 0 and t1 > 0 for _, t0, t1 in probes), probes
-    monkeypatch.setattr(exact, 'PROBE', 10 ** 9)          # no pair is timed when fewer than PROBE chunks follow it
+    assert len(probes) >= 2 and probes[0][0] == 1 and all(t0 > 0 and t1 > 0 for _, t0, t1 in probes), probes
+    monkeypatch.setattr(exact, 'PROBE', 10 ** 9)          # the first pair alone
     b = f(c.S)
-    assert np.array_equal(a, b) and f.probe_ms == []
-    print(f"cuda: order probes at chunks {[p[0] for p in probes]}, the image of the unprobed call bit for bit")
+    assert np.array_equal(a, b) and [p[0] for p in f.probe_ms] == [1], f.probe_ms
+    g = fastsar.ExactFormer(c.col.ant, c.col.fmin, c.col.df, c.S.shape[1], 100, 120, 0.5, 0.5, backend='cuda',
+                            chunk=-(-c.S.shape[0] // 4))          # four chunks: no pair is timed
+    assert rel_db(g(c.S), a) < -60 and g.probe_ms == []     # a chunk length is not a bitwise invariant (the FFT batch)
+    print(f"cuda: order probes at chunks {[p[0] for p in probes]}, the images of the once- and never-probed calls bit for bit")
