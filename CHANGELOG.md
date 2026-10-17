@@ -11,9 +11,9 @@ was published on PyPI.
   together read the same range bins from the L2 cache instead of the image's whole range window, and the image comes
   back through pinned memory, as `ImageFormer`'s does. The order is timed: every 32 chunks of pulses two chunks run in
   the two orders and the faster is kept (the line of sight turns over a long aperture, and the axis closer to constant
-  range at mid-aperture made a 212,858-pulse Capella spotlight 3 percent slower than 0.1.4 on an L4). On an RTX PRO 6000 Blackwell Max-Q the 12,207
-  by 8,808 pixel, 15,186-pulse Panama image took 2.59 s with linear and 3.82 s with cubic interpolation (4.54 and
-  5.84 s in 0.1.4); the images are bitwise the same.
+  range at mid-aperture made a 212,858-pulse Capella spotlight 3 percent slower than 0.1.4 on an L4). On an RTX PRO
+  6000 Blackwell Max-Q the 12,207 by 8,808 pixel, 15,186-pulse Panama image took 2.59 s with linear and 3.82 s with
+  cubic interpolation (4.54 and 5.84 s in 0.1.4); the images are bitwise the same.
 
 ### Fixed
 
@@ -40,7 +40,9 @@ was published on PyPI.
   (134,000 samples, an Umbra spotlight; 36,600 for another) made that block of the decimation matrix up to 137 MB in
   vector memory, beyond the 128 MB of a v6e, and no pulse block was small enough. Rows longer than 32,768 samples are
   now rotated and multiplied in segments whose products accumulate in the output block, and a row whose decimated
-  length allows it is cut into narrower output blocks; rows that compiled before run the same program.
+  length allows it is cut into narrower output blocks; rows that compiled before run the same program. With this and
+  the two entries above, the v6e forms 1024 by 1024 pixel images of ten held-out Capella and Umbra collections (0.8
+  to 22 GB) on which 0.1.4 compiled no grid up to 8192 by 8192, with warm calls of 0.9 to 11.8 s.
 - TPU: a device buffer allocation that fails surfaced through a `ValueError` carrying XLA's text, which the upload's
   conversion to `MemoryError` did not catch; every exception that reports the device out of memory is now converted.
 - TPU: the padding of the uploaded planes for the first-level kernel held both copies at once, so a 22 GB history
