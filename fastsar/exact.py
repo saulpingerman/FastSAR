@@ -60,7 +60,7 @@ _CUDA_SRC = r'''
 extern "C" __global__ void bp_tiles(const float2* rc, int P, int W, const int* lo, const double* ant, const double* ref,
                                     const double* cen, int nty, int nx, int ny, float sx, float sy,
                                     float e1x, float e1y, float e1z, float e2x, float e2y, float e2z,
-                                    double inv_dr, double kcyc, int along1, float2* out) {
+                                    double inv_dr, double kcyc, float2* out) {
   // one thread block per tile of TX x TY pixels, PX pixels per thread; the tile center's terms for TB pulses at a
   // time are computed in float64 by the block's threads and shared
   __shared__ float s_ux[TB], s_uy[TB], s_uz[TB], s_ir[TB], s_i2[TB], s_tf[TB], s_ph[TB];
@@ -68,9 +68,15 @@ extern "C" __global__ void bp_tiles(const float2* rc, int P, int W, const int* l
   // consecutive blocks along the grid axis closer to constant range (along1: e1), so that the blocks resident together
   // lie at nearly one range and read the same profile bins from the L2 cache: 1.3 times faster on the Panama image
   // than blocks along range, whose resident blocks spanned the image's whole range window
+  // (ALONG1 is a compile-time choice: a run-time flag here cost the kernel 3 per cent on an L4)
+#if ALONG1
   const int j = threadIdx.x, ntx = gridDim.x / nty;
-  const int bx = along1 ? blockIdx.x % ntx : blockIdx.x / nty, by = along1 ? blockIdx.x / ntx : blockIdx.x % nty;
+  const int bx = blockIdx.x % ntx, by = blockIdx.x / ntx;
   const int b = bx * nty + by;
+#else
+  const int b = blockIdx.x, j = threadIdx.x;
+  const int bx = b / nty, by = b % nty;
+#endif
   const double cx = cen[3*b], cy = cen[3*b+1], cz = cen[3*b+2];
   float dx[PX], dy[PX], dz[PX], dd[PX], are[PX], aim[PX];
   int ix[PX], iy[PX];
@@ -485,8 +491,11 @@ class ExactFormer:
         import cupy as cp
         self._tb, px = CUDA_BLOCKS[self.tile]
         opts = ('-use_fast_math', f'-DPX={px}', f'-DTB={self._tb}', f'-DTX={self.tx}') + (('-DCUBIC',) if self.cubic else ())
-        m = cp.RawModule(code=_CUDA_SRC, options=opts)
-        self._k_bp, self._k_pad, self._k_crop = m.get_function('bp_tiles'), m.get_function('pad_window'), m.get_function('crop')
+        m = cp.RawModule(code=_CUDA_SRC, options=opts + ('-DALONG1=0',))
+        m1 = cp.RawModule(code=_CUDA_SRC, options=opts + ('-DALONG1=1',))
+        # the backprojection kernel in each tile order (ALONG1 compiled in: a run-time flag cost 3 per cent on an L4)
+        self._k_bp = (m.get_function('bp_tiles'), m1.get_function('bp_tiles'))
+        self._k_pad, self._k_crop = m.get_function('pad_window'), m.get_function('crop')
         self._d = dict(cen=cp.asarray(self.cen), blo=cp.asarray(self.blo), lo=cp.asarray(self.lo), ant=cp.asarray(self.ant),
                        ref=cp.asarray(self.ref), wp=cp.asarray(self.wp, cp.float32), wk=cp.asarray(self.wk, cp.float32))
         ch = min(self.chunk, self.P)
@@ -577,11 +586,11 @@ class ExactFormer:
                 probe[order][0].record()
             else:
                 order = along1
-            self._k_bp((self.ntx * self.nty,), (self._tb,),
+            self._k_bp[order]((self.ntx * self.nty,), (self._tb,),
                        (win, np.int32(n), np.int32(W), d['lo'][p0:p1], d['ant'][p0:p1], d['ref'][p0:p1], d['cen'],
                         np.int32(self.nty), np.int32(self.nx), np.int32(self.ny), f32(self.spx), f32(self.spy),
                         f32(self.e1[0]), f32(self.e1[1]), f32(self.e1[2]), f32(self.e2[0]), f32(self.e2[1]), f32(self.e2[2]),
-                        np.float64(self.inv_dr), np.float64(self.kcyc), np.int32(order), out))
+                        np.float64(self.inv_dr), np.float64(self.kcyc), out))
             if timed:
                 probe[order][1].record()
                 if j == 2:

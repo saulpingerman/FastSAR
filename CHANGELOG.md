@@ -14,7 +14,7 @@ was published on PyPI.
   (asked, never waited for), and every 32 chunks another pair checks the choice; the geometric guess was not reliable
   (the axis closer to constant range at mid-aperture made a 212,858-pulse Capella spotlight 3 percent slower than
   0.1.4 on an L4, and two short calls 2 to 3 percent slower), and a call of fewer than five chunks keeps 0.1.4's
-  order. On an RTX PRO 6000 Blackwell Max-Q the 12,207 by 8,808 pixel, 15,186-pulse Panama image took 2.59 s with
+  order (compiled into the kernel, two builds, since a run-time flag cost it 3 per cent on an L4). On an RTX PRO 6000 Blackwell Max-Q the 12,207 by 8,808 pixel, 15,186-pulse Panama image took 2.59 s with
   linear and 3.82 s with cubic interpolation (4.54 and 5.84 s in 0.1.4); the images are bitwise the same.
 
 ### Fixed
