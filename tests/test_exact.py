@@ -283,6 +283,7 @@ def test_cuda_block_order(ranges, axes):
     print(f'cuda: {axes}, blocks along e{2 - chosen} chosen, the other order gives the same image')
 
 
+@pytest.mark.cuda
 def test_cuda_order_probe(ranges, monkeypatch):
     """The timed choice of the tile order (two chunks in the two orders every PROBE chunks) records its timings, and
     the image does not depend on the orders it chose."""
