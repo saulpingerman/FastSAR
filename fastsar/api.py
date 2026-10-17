@@ -81,6 +81,7 @@ def available_backends():
 
 _JAX_PROGRAMS = {}         # compiled JAX/TPU programs by plan signature (ImageFormer)
 _JAX_LOCK = threading.Lock()   # mosaic workers build formers concurrently: one build per signature, no torn eviction
+_WIN_CAPS = {}             # TPU level-kernel pulse-block caps by plan signature, found when a kernel ran out of vector memory
 
 BACKENDS = ('auto', 'tpu', 'cuda', 'cpu', 'jax', 'metal')     # the values form_image, ImageFormer, ExactFormer and form_cphd accept
 
@@ -367,9 +368,24 @@ class ImageFormer:
             return S
         from . import ffbp2
         S = self._host(S)
-        hre, him, scale = ffbp2.prepare(self._pol, S)
-        hre, him = self._fn.pad(hre, him)
+        hre, him, scale = self._upload(S)
         return _Staged(S, hre, him, scale, self._fn)
+
+    def _upload(self, S):
+        """The host history scaled, uploaded and padded for this former's program: (hre, him, scale). A history whose
+        planes do not fit in device memory raises MemoryError."""
+        from . import ffbp2
+        try:
+            hre, him, scale = ffbp2.prepare(self._pol, S, getattr(self._fn, 'layout', None))
+            hre, him = self._fn.pad(hre, him)
+        except _jax_runtime_error() as e:
+            if 'RESOURCE_EXHAUSTED' not in str(e):
+                raise
+            raise MemoryError(f'{self.backend}: the phase history ({_mem._gb(8.0 * self.P * self.K)} as float32 planes, '
+                              f'more once padded for the first-level kernel) does not fit in device memory '
+                              f'({_mem._gb(_mem.tpu_capacity())}). Use the cuda or cpu backend (both stream or read the '
+                              'history in place), a device with more memory, or fewer pulses.') from e
+        return hre, him, scale
 
     def _host(self, S):
         if not (self.backend == 'cuda' and type(S).__module__.startswith('cupy')):
@@ -423,16 +439,26 @@ class ImageFormer:
                 staged = None
             else:
                 staged = None
-                hre, him, scale = ffbp2.prepare(self._pol, S)
-                hre, him = self._fn.pad(hre, him)
+                hre, him, scale = self._upload(S)
             try:
                 # dispatch is asynchronous: a device that runs out of memory may say so only when the result is read
                 re, im = jax.block_until_ready(self._fn(hre, him, self._arrs))
                 break
             except runtime_error as e:      # device memory: fewer first-level children per group, down to one
-                # a kernel's on-chip scratch (VMEM) is sized at compile time and does not depend on the group size
-                if 'RESOURCE_EXHAUSTED' not in str(e) or 'vmem' in str(e).lower():
+                if 'RESOURCE_EXHAUSTED' not in str(e):
                     raise
+                if 'vmem' in str(e).lower():
+                    # a kernel's on-chip scratch (VMEM) is sized at compile time and does not depend on the group
+                    # size: smaller pulse blocks in the level kernels (long range lines), until the smallest
+                    cap = self._next_win_cap()
+                    if cap is None:
+                        raise
+                    del hre, him
+                    _WIN_CAPS[ffbp2.plan_signature(self._plan)] = cap
+                    self._fn = self._program(self._fn.stages['ng'])[0]
+                    _mem._warn(f'{self.backend}: a level kernel ran out of vector memory; retrying with pulse blocks of '
+                               f'at most {cap} samples')
+                    continue
                 ng = self._fn.stages['ng']          # the group the program runs (a divisor of the children)
                 if ng <= 1:
                     need = _mem.tpu_history_bytes(self._plan, self.K) + _mem.child_bytes(self._plan, 'tpu')
@@ -455,16 +481,28 @@ class ImageFormer:
         avail = _mem.device_available(self.backend)
         return dict(backend=self.backend, needed=need, available=avail, full_speed=need <= avail, parts=parts)
 
+    def _next_win_cap(self):
+        """The next, halved cap on the samples in a level kernel's pulse block (pulses by band window), starting from
+        256 pulses of the widest window; None when blocks of 8 pulses are already reached."""
+        bands = self._fn.stages.get('bands') or {}
+        if self._filt != 'pallas2' or not bands:
+            return None
+        wmax = max(b['win'] for b in bands.values())
+        cap = (self._fn.stages.get('win_cap') or 256 * wmax) // 2
+        return cap if cap >= 8 * wmax else None
+
     def _program(self, ng):
         """The compiled JAX/TPU program for ng first-level children per group, with the plan's device arrays: one per
         plan signature, so that patches of a mosaic with equal shapes and filters share it."""
         from . import ffbp2
-        key = (self._pol, self._filt, ng, ffbp2.plan_signature(self._plan))
+        sig = ffbp2.plan_signature(self._plan)
+        cap = _WIN_CAPS.get(sig)
+        key = (self._pol, self._filt, ng, sig, cap)
         with _JAX_LOCK:
             hit = _JAX_PROGRAMS.get(key)
             if hit is None:
                 hit = (ffbp2.make_ffbp(self._pol, self._plan, self._filt, 1 << 26, 'direct', pallas_pb=256, pallas_nc=8,
-                                       pallas_ng=ng, pallas_final=2, pallas_gen=3),
+                                       pallas_ng=ng, pallas_final=2, pallas_gen=3, pallas_win_cap=cap),
                        ffbp2.static_arrays(self._pol, self._plan, self._filt))
                 if len(_JAX_PROGRAMS) >= 32:
                     _JAX_PROGRAMS.pop(next(iter(_JAX_PROGRAMS)))

@@ -25,6 +25,13 @@ was published on PyPI.
   allocated there. On a v6e the ten warm calls of that spotlight took 11.0 to 11.5 s (11.9 to 12.4 s in 0.1.4 in the
   same process when no call stalled), the 2025 spotlight 9.6 s (9.9 s) and the 2021 stripmap 8.4 s (8.4 s), with
   the same region errors.
+- TPU: a first-level kernel whose pulse blocks by range window exceeded the v6e's 128 MB of vector memory failed to
+  compile, so that collections with range lines of about 10,000 samples formed no image (a 0.8 GB Capella stripmap
+  and two Umbra spotlights). `ImageFormer` now retries such a plan with smaller pulse blocks, halving them until the
+  kernels compile, and keeps the setting for the plan; plans that compiled before run unchanged.
+- TPU: the padding of the uploaded planes for the first-level kernel held both copies at once, so a 22 GB history
+  needed 34 GB of temporaries on a 32 GB v6e. The blocks of a large history now go straight into the padded planes.
+  A history that does not fit raises `MemoryError` with the memory it needs, as documented, not XLA's error.
 
 ## [0.1.4] - 2026-10-16
 

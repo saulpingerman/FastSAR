@@ -383,31 +383,42 @@ UPLOAD_ROWS = 4096       # pulses per block when prepare uploads a host history 
 
 
 @functools.partial(jax.jit, donate_argnums=0)
-def _put_rows(dst, blk, i):
-    return lax.dynamic_update_slice(dst, blk, (i, 0))
+def _put_rows(dst, blk, i, j=0):
+    return lax.dynamic_update_slice(dst, blk.astype(dst.dtype), (i, j))
 
 
 def _blocked_upload():
     return jax.devices()[0].platform == 'tpu'
 
 
-def prepare(policy, S):
+def prepare(policy, S, layout=None):
     """Phase history [P, K] -> real and imaginary planes in the element-wise type, scaled to unit peak, and the scale.
 
     On a TPU the planes are uploaded in blocks of UPLOAD_ROWS pulses into planes allocated on the device: the upload of
     a whole 5 GB plane took 26 s in every call of a process on a v6e (1 s for a block-wise one; the 2024 Capella
-    spotlight), against 0.9 s for the same upload from an array allocated once. The planes are the same either way."""
+    spotlight), against 0.9 s for the same upload from an array allocated once. The planes are the same either way.
+    With layout (form.layout: front, Pp, left, Kpad) the blocks go straight into the float32 planes padded for the
+    first-level kernel, which form.pad then passes unchanged: padding uploaded planes held both copies at once, 1.5
+    times the history (34 GB for a 22 GB Capella spotlight on a 32 GB v6e). The padded planes are those of form.pad."""
     p = POLICIES[policy]
     h = np.float64 if p['ew'] == 'float64' else np.float32
     scale = float(np.abs(S).max()) or 1.0          # an all-zero history: zero planes, not 0/0
     P = S.shape[0]
     if not _blocked_upload() or P <= UPLOAD_ROWS:
         return (jnp.asarray((S.real / scale).astype(h)).astype(p['ew']), jnp.asarray((S.imag / scale).astype(h)).astype(p['ew']), scale)
-    hre, him = jnp.zeros(S.shape, h), jnp.zeros(S.shape, h)
+    if layout is not None:
+        shape, i0, j0 = (layout['Pp'], layout['Kpad']), layout['front'], layout['left']
+        hre, him = jnp.zeros(shape, jnp.float32), jnp.zeros(shape, jnp.float32)
+        ew = jnp.dtype(p['ew'])
+        cast = (lambda x: x) if ew == jnp.float32 else (lambda x: jnp.asarray(x).astype(ew))   # the values form.pad gets
+    else:
+        hre, him, i0, j0, cast = jnp.zeros(S.shape, h), jnp.zeros(S.shape, h), 0, 0, (lambda x: x)
     for i in range(0, P, UPLOAD_ROWS):
         b = S[i:i + UPLOAD_ROWS]
-        hre = _put_rows(hre, (b.real / scale).astype(h), i)
-        him = _put_rows(him, (b.imag / scale).astype(h), i)
+        hre = _put_rows(hre, cast((b.real / scale).astype(h)), i0 + i, j0)
+        him = _put_rows(him, cast((b.imag / scale).astype(h)), i0 + i, j0)
+    if layout is not None:
+        return hre, him, scale
     return hre.astype(p['ew']), him.astype(p['ew']), scale
 
 
@@ -421,13 +432,15 @@ def _pulse_block(P, pb_max):
     return min(cands, key=lambda pb: -(-P // pb) * pb)
 
 
-def make_ffbp(policy, plan, filt='dense', budget=1 << 26, trig='split', pallas_pb=128, pallas_chunk=512, pallas_nc=8, pallas_ng=8, pallas_final=2, pallas_gen=3):
+def make_ffbp(policy, plan, filt='dense', budget=1 << 26, trig='split', pallas_pb=128, pallas_chunk=512, pallas_nc=8, pallas_ng=8, pallas_final=2, pallas_gen=3, pallas_win_cap=None):
     """Build form(hre, him, arrays) -> (re, im), each [nx, ny] float32 (float64 for the fp64 policy).
 
     filt: 'dense' (matrix product with the decimation matrix), 'conv' (strided convolution with its kernel),
     or 'taps' (sum over kernel taps of strided slices).
     trig: 'direct' evaluates one sine and cosine per sample of a phase ramp; 'split' builds the ramp as the
     product of a coarse and a fine table, which needs about 2 sqrt(n) of them per ramp of n samples.
+    pallas_win_cap: None, or the most samples (pulses by band window) in a pulse block of the TPU level kernel; the
+    pulse block is halved until it holds no more (ImageFormer sets it when a kernel runs out of vector memory).
     """
     p = POLICIES[policy]
     ew, mm, prec = jnp.dtype(p['ew']), jnp.dtype(p['mm']), p['prec']
@@ -580,6 +593,8 @@ def make_ffbp(policy, plan, filt='dense', budget=1 << 26, trig='split', pallas_p
             nc = min(pallas_nc, Cn)
             if fuse_p_for(lv, band, nc):
                 pb = 128 * -(-pb // 128)
+            if on_tpu:
+                pb = capped(pb, band)
             # the first level on a TPU with a banded pulse filter: lv['front'] zero rows before the pulses and lv['Pp']
             # rows in all (form.pad), so that the kernel's output is the filter's padded input
             front = lv.get('front', 0)
@@ -662,6 +677,14 @@ def make_ffbp(policy, plan, filt='dense', budget=1 << 26, trig='split', pallas_p
         return (on_tpu and pallas_gen >= 3 and lv['Dp'] > 1 and Po_pad * band['kob'] * nc * 16 <= 40 << 20
                 and dense_pulse_filter(lv))
 
+    def capped(pb, band):
+        """The TPU level kernel's pulse block halved, down to 8 pulses, until a block of pulses by the band window
+        holds at most pallas_win_cap samples: the kernel holds several such blocks in vector memory, and a range
+        line of about 10,000 samples in blocks of 256 pulses exceeds the v6e's 128 MB."""
+        while pallas_win_cap and pb > 8 and pb * band['win'] > pallas_win_cap:
+            pb //= 2
+        return pb
+
     def level_kernel(pre_p, pim_p, c0g, slg, band, K, P, Ko, Po, pb, la, lv):
         """pre_p, pim_p [Np, Pp, Kpad]; c0g, slg [Np, nc, Pp] -> (re, im) [Np, 2 nc .. ] pulse-decimated children
         [Np, nc, Po, Ko] each, through the level kernel of the selected generation (fusing the pulse decimation when
@@ -707,6 +730,8 @@ def make_ffbp(policy, plan, filt='dense', budget=1 << 26, trig='split', pallas_p
         nc = Cn if Cn <= 64 else pallas_nc
         if fuse_p_for(lv, band, nc):
             pb = 128 * -(-pb // 128)
+        if on_tpu:
+            pb = capped(pb, band)
         Pp = -(-P // pb) * pb
         Cp = -(-Cn // nc) * nc
         pre_p = pad_columns(jnp.pad(pre.astype(jnp.float32), ((0, 0), (0, Pp - P), (0, 0))), band)
@@ -930,6 +955,7 @@ def make_ffbp(policy, plan, filt='dense', budget=1 << 26, trig='split', pallas_p
         pb0 = _pulse_block(lv0['P'], pallas_pb)
         if fuse_p_for(lv0, band0, min(pallas_nc, ng if ng > 1 else 1)):
             pb0 = 128 * -(-pb0 // 128)
+        pb0 = capped(pb0, band0)
         Pp0 = -(-lv0['P'] // pb0) * pb0
         if lv0['Dp'] > 1 and not dense_pulse_filter(lv0) and not fuse_p_for(lv0, band0, min(pallas_nc, ng if ng > 1 else 1)):
             # banded pulse filter: the filter's leading zeros go in front of the pulses and its blocks fit the rows
@@ -946,12 +972,17 @@ def make_ffbp(policy, plan, filt='dense', budget=1 << 26, trig='split', pallas_p
         def pad(hre, him):
             """The phase history planes padded once for the first-level kernel, which then reads them in place
             instead of padding a copy for every group of children (two planes of temporaries on the device). The
-            caller drops its unpadded planes."""
+            caller drops its unpadded planes. Planes that prepare uploaded into this layout pass unchanged."""
+            if hre.shape == (Pp0, band0['Kpad']) and hre.dtype == jnp.float32:
+                return hre, him
             return pad1(hre), pad1(him)
+        layout = dict(front=front0, Pp=Pp0, left=band0['pl_pad'], Kpad=band0['Kpad'])
     else:
         def pad(hre, him):
             return hre, him
+        layout = None
     form.pad = pad
+    form.layout = layout          # the first-level kernel's padded planes (prepare uploads into them on a TPU)
     # the stages of one_tile, exposed for per-stage profiling (profile_level0.py)
-    form.stages = dict(children=children, final=final, device_phases=device_phases, levels=levels, G=G, host_levels=HOST_LEVELS, one_group=one_group, one_tile=one_tile, ng=ng, bands=bands)
+    form.stages = dict(win_cap=pallas_win_cap, children=children, final=final, device_phases=device_phases, levels=levels, G=G, host_levels=HOST_LEVELS, one_group=one_group, one_tile=one_tile, ng=ng, bands=bands)
     return form

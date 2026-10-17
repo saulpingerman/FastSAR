@@ -45,7 +45,8 @@ def test_tpu_kernels_vs_dense(scene, pol, monkeypatch):
     dense_rule, tqp = ffbp2.dense_pulse_filter, ffbp2.FINAL_VMEM_TQP
     for key, filt, kw in (('dense', 'dense', {}), ('pallas2', 'pallas2', dict(pallas_pb=128, pallas_nc=4, pallas_ng=2)),
                           ('banded', 'pallas2', dict(pallas_pb=128, pallas_nc=4, pallas_ng=2)),
-                          ('qchunks', 'pallas2', dict(pallas_pb=128, pallas_nc=4, pallas_ng=2))):
+                          ('qchunks', 'pallas2', dict(pallas_pb=128, pallas_nc=4, pallas_ng=2)),
+                          ('capped', 'pallas2', dict(pallas_pb=128, pallas_nc=4, pallas_ng=2, pallas_win_cap=1))):
         with monkeypatch.context() as mp:
             mp.setattr(ffbp2, 'dense_pulse_filter', (lambda lv: False) if key == 'banded' else dense_rule)   # banded: the long-aperture form
             mp.setattr(ffbp2, 'FINAL_VMEM_TQP', 8 * 16 * 128 if key == 'qchunks' else tqp)                   # final stage in chunks of 8 rows
@@ -56,7 +57,7 @@ def test_tpu_kernels_vs_dense(scene, pol, monkeypatch):
         out[key] = np.asarray(re) + 1j * np.asarray(im)
         if key == 'banded':
             assert any('Wp' in la for la in arrs['levels']), 'the banded pulse filter was not used'
-    for key in ('pallas2', 'banded', 'qchunks'):
+    for key in ('pallas2', 'banded', 'qchunks', 'capped'):
         d = out[key] - out['dense']
         e = 10 * np.log10(np.sum(np.abs(d) ** 2) / np.sum(np.abs(out['dense']) ** 2))
         lim = -40 if pol == 'fp32_fast' else -90
@@ -64,3 +65,61 @@ def test_tpu_kernels_vs_dense(scene, pol, monkeypatch):
             bad.append(f'{pol} {key}: {e:.1f} dB (limit {lim} dB)')
         print(pol, '%s (tpu kernels, interpret) vs dense: %.1f dB' % (key, e))
     assert not bad, 'FAILED: ' + '; '.join(bad)
+
+
+@pytest.mark.parametrize('pol', ['fp32_high', 'bf16'])
+def test_prepare_into_layout(scene, pol, monkeypatch):
+    """prepare's block-wise upload into the first-level kernel's padded planes (form.layout) gives the planes that
+    form.pad makes from the unpadded ones, and form.pad passes them unchanged."""
+    import warnings
+    S, plan, coll = scene
+    fn = ffbp2.make_ffbp(pol, plan, 'pallas2', 1 << 24, 'direct', pallas_pb=128, pallas_nc=4, pallas_ng=2)
+    assert fn.layout is not None
+    a = fn.pad(*ffbp2.prepare(pol, S)[:2])
+    monkeypatch.setattr(ffbp2, '_blocked_upload', lambda: True)
+    monkeypatch.setattr(ffbp2, 'UPLOAD_ROWS', 100)
+    with warnings.catch_warnings():
+        warnings.filterwarnings('ignore', message='Some donated buffers were not usable')
+        hre, him, _ = ffbp2.prepare(pol, S, fn.layout)
+    b = fn.pad(hre, him)
+    assert b[0] is hre and b[1] is him
+    for x, y in zip(a, b):
+        assert x.shape == y.shape and x.dtype == y.dtype and np.array_equal(np.asarray(x), np.asarray(y))
+    print(f'  prepare {pol}: planes uploaded into the padded layout equal form.pad\'s')
+
+
+def test_vmem_retry(scene, monkeypatch):
+    """ImageFormer(backend='tpu') whose level kernel runs out of vector memory (simulated for pulse blocks of more than
+    a quarter of the first cap) retries with smaller pulse blocks, remembers the cap for the plan, and forms the image
+    of the jax backend."""
+    import jax
+    import fastsar
+    from fastsar import api, sim as fsim
+    col = fsim.make_collect(res=0.5, scene=60.0, r0=5e3)
+    S = scene[0]
+    seen = []
+    k3 = pallas_ffbp.fused_rotate_dec_k3
+
+    def tight(*a, **k):
+        pb, win = k['pb'], a[4]['win']
+        seen.append(pb * win)
+        if pb * win > lim[0]:
+            seen.append('raised')
+            raise jax.errors.JaxRuntimeError('RESOURCE_EXHAUSTED: XLA:TPU compile permanent error. Ran out of memory in memory space vmem.')
+        return k3(*a, **k)
+
+    lim = [None]
+    monkeypatch.setattr(pallas_ffbp, 'fused_rotate_dec_k3', tight)
+    monkeypatch.setattr(api, '_WIN_CAPS', {})
+    f = fastsar.ImageFormer(col.ant, col.fmin, col.df, S.shape[1], 128, 128, 0.5, 0.5, backend='tpu')
+    wmax = max(b['win'] for b in f._fn.stages['bands'].values())
+    lim[0] = 32 * wmax                       # the third cap (128, 64, 32 times the widest window) fits
+    with pytest.warns(UserWarning, match='vector memory'):
+        img = f(S)
+    assert list(api._WIN_CAPS.values()) == [32 * wmax] and f._fn.stages['win_cap'] == 32 * wmax
+    last = seen[len(seen) - seen[::-1].index('raised'):]                 # the kernel calls of the attempt that formed
+    assert last and max(last) <= 32 * wmax
+    ref = fastsar.ImageFormer(col.ant, col.fmin, col.df, S.shape[1], 128, 128, 0.5, 0.5, backend='jax')(S)
+    e = 10 * np.log10(np.sum(np.abs(img - ref) ** 2) / np.sum(np.abs(ref) ** 2))
+    print(f'  vmem retry: cap {32 * wmax} samples, image vs jax backend {e:.1f} dB')
+    assert e < -80
