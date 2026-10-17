@@ -51,10 +51,10 @@ min against 374 s measured.
   With a float64 `linspace` (one line, `cloud/matx/dvox.patch` in the study repository) the errors are those of
   linear interpolation at 8 times, within 0.1 dB of FastSAR's linear row, which uses the same scheme.
 
-With the algorithm held fixed, FastSAR's exact backprojection is 46 times faster than ISCE3's estimated time on the
-CPU and, on the L4, level with MatX at matched accuracy (11.4 against 11.6 s with linear interpolation; 98 times
-faster than ISCE3's estimate), with lower errors in every region than every code but MatX's corrected form. The
-factorized algorithm is 3.8 times faster again on the L4 and 34 times on the CPU.
+With the algorithm held fixed, FastSAR's exact backprojection (cubic) is 46 times faster than ISCE3's estimated time
+on the CPU and 98 times on the L4, with lower errors in every region; with linear interpolation it is level with
+MatX's corrected form at matched accuracy (11.4 against 11.6 s). The factorized algorithm cuts the time by a further
+factor of 5.5 on the L4 and 34 on the CPU.
 
 On the same CPU, the AFRL toolbox's `pfa_mem` (Octave) forms a polar-format image in 44.5 s and GRDL's polar format in 24.5 s.
 Neither corrects the planar-wavefront displacement. Their log-amplitude correlations with the reference are 0.80 to
