@@ -820,14 +820,17 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
             del pre, pim, y
         return zre, zim
 
-    def form(S, ng=None, batch=None, window=None, check=False):
+    def form(S, ng=None, batch=None, window=None, check=False, _scale=None):
         """S [P, K] complex64 (host or device, already windowed) -> complex64 image [nx, ny] on the device.
         window: None, or (wp [P], wk [K]) applied here, on the device for a history that is uploaded and on the host
         for one that streams; check: refuse non-finite samples here (ValueError). A host
         history whose device planes exceed memory.STREAM_FRACTION of the free device memory is streamed through the
         first level in pulse blocks (FASTSAR_CUDA_STREAM=1 forces it); a smaller one is uploaded once. ng: first-level
         children per group (default: up to 8, within the memory left after the image and the upload; FASTSAR_CUDA_GROUP
-        sets it). batch: first-level children carried through the later levels together (default: as many as fit)."""
+        sets it). batch: first-level children carried through the later levels together (default: as many as fit).
+        float16 storage scales the history by its first block's peak; an image that comes out non-finite from a
+        finite history (a later block, or the sums of the levels, beyond the half range) is formed again with the
+        whole history's peak (_scale), and a ValueError names float32 if that overflows too."""
         lv0, la0 = levels[0], dev[0]
         isz = 2 * np.dtype(kern['dtype']).itemsize
         planes = isz * S.shape[0] * S.shape[1]                # the history as device planes
@@ -855,17 +858,19 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
             pre = cp.empty((1,) + S.shape, kern['dtype'])
             pim = cp.empty((1,) + S.shape, kern['dtype'])
             if isinstance(S, np.ndarray):
-                scale = _upload_planes(S, pre[0], pim[0], None if window is None else (wpd, wkd), check, scaled)
+                scale = _upload_planes(S, pre[0], pim[0], None if window is None else (wpd, wkd), check, scaled, _scale)
             else:                                    # a device history: blocks in place
                 if scaled:                           # the first block's peak, or the whole history's if it is zero
-                    scale = float(cp.abs(block(0)).max()) or float(cp.abs(S).max()) or 1.0
+                    scale = _scale or float(cp.abs(block(0)).max()) or float(cp.abs(S).max()) or 1.0
                 for i in range(0, S.shape[0], 4096):
                     b = block(i)
                     pre[0, i:i + 4096] = (b.real / scale).astype(kern['dtype'])
                     pim[0, i:i + 4096] = (b.imag / scale).astype(kern['dtype'])
                     del b
+        elif scaled and _scale:
+            scale = _scale
         elif scaled:                                 # streamed: the first block's peak, on the device
-            b0 = cp.asarray(S[:4096])                # (only a host history streams)
+            b0 = cp.asarray(S[:memory.STREAM_PULSES])     # (only a host history streams)
             scale = float(cp.abs(b0).max()) or _host_peak(S)
             del b0
         forced = ng is not None or bool(os.environ.get('FASTSAR_CUDA_GROUP'))
@@ -928,7 +933,17 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
                 ng = max(1, ng // 2)
                 memory._warn(f'cuda: out of GPU memory in the later levels; FastSAR continues in first-level groups of '
                              f'{memory._nchildren(ng)}, which is slower ({memory._gb(memory.cuda_free())} free)')
-        return full[ox:ox + nx, oy:oy + ny] if scale == 1.0 else full[ox:ox + nx, oy:oy + ny] * np.float32(scale)
+        img = full[ox:ox + nx, oy:oy + ny] if scale == 1.0 else full[ox:ox + nx, oy:oy + ny] * np.float32(scale)
+        if scaled and not bool(cp.isfinite(img).all()):
+            if _scale is None:
+                del img, full
+                cp.get_default_memory_pool().free_all_blocks()
+                peak = _host_peak(S) if isinstance(S, np.ndarray) else (float(cp.abs(S).max()) or 1.0)
+                if peak > scale:
+                    return form(S, ng, batch, window, False, peak)
+            raise ValueError('cuda: the float16 image overflowed the half range (non-finite pixels) with the history scaled '
+                             "to its peak; use precision='float32'")
+        return img
 
     return form
 

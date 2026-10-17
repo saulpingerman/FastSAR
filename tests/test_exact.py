@@ -281,3 +281,19 @@ def test_cuda_block_order(ranges, axes):
     b = f(c.S)
     assert np.array_equal(a, b), axes
     print(f'cuda: {axes}, blocks along e{2 - chosen} chosen, the other order gives the same image')
+
+
+def test_cuda_order_probe(ranges, monkeypatch):
+    """The timed choice of the tile order (two chunks in the two orders every PROBE chunks) records its timings, and
+    the image does not depend on the orders it chose."""
+    from fastsar import exact
+    c = ranges[600e3]
+    monkeypatch.setattr(exact, 'PROBE', 4)
+    f = fastsar.ExactFormer(c.col.ant, c.col.fmin, c.col.df, c.S.shape[1], 100, 120, 0.5, 0.5, backend='cuda', chunk=16)
+    a = f(c.S).copy()
+    probes = list(f.probe_ms)
+    assert len(probes) >= 2 and all(t0 > 0 and t1 > 0 for _, t0, t1 in probes), probes
+    monkeypatch.setattr(exact, 'PROBE', 10 ** 9)          # one probe pair (chunks 1 and 2), then one order throughout
+    b = f(c.S)
+    assert np.array_equal(a, b) and len(f.probe_ms) == 1
+    print(f"cuda: order probes at chunks {[p[0] for p in probes]}, the image of one probe pair bit for bit")

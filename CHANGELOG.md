@@ -7,14 +7,21 @@ was published on PyPI.
 
 ### Changed
 
-- cuda `ExactFormer`: the thread blocks take their tiles along the grid axis closer to constant range, so that the
-  blocks resident together read the same range bins from the L2 cache instead of the image's whole range window, and
-  the image comes back through pinned memory, as `ImageFormer`'s does. On an RTX PRO 6000 Blackwell Max-Q the 12,207
+- cuda `ExactFormer`: the thread blocks take their tiles along one grid axis or the other, so that the blocks resident
+  together read the same range bins from the L2 cache instead of the image's whole range window, and the image comes
+  back through pinned memory, as `ImageFormer`'s does. The order is timed: every 32 chunks of pulses two chunks run in
+  the two orders and the faster is kept (the line of sight turns over a long aperture, and the axis closer to constant
+  range at mid-aperture made a 212,858-pulse Capella spotlight 3 percent slower than 0.1.4 on an L4). On an RTX PRO 6000 Blackwell Max-Q the 12,207
   by 8,808 pixel, 15,186-pulse Panama image took 2.59 s with linear and 3.82 s with cubic interpolation (4.54 and
   5.84 s in 0.1.4); the images are bitwise the same.
 
 ### Fixed
 
+- cuda `ImageFormer` with `precision='float16'`: a history that streams from host memory (larger than the GPU's free
+  memory) was scaled by the peak of its first 4096 pulses without the fallback the uploaded path has, so a later,
+  stronger block overflowed the half range and the image came out non-finite (a 21.8 GB Capella spotlight on an L4).
+  A non-finite float16 image from a finite history is now formed again with the whole history's peak, and a
+  `ValueError` that names float32 is raised if that overflows too.
 - After a cuda `ExactFormer` image, CuPy's FFT plan cache kept the plan of its range compression, and with it a work
   area in CuPy's memory pool (7 GB for an 8192 by 8192 image of a wide-band Umbra collection on an L4), so a
   following float16 `ImageFormer` could fail with CuPy's `OutOfMemoryError`. The plans of a call are now freed with

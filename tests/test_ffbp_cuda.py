@@ -294,6 +294,27 @@ def test_float16_zero_first_block(scene, monkeypatch):
     assert e < -40, e
 
 
+@pytest.mark.parametrize('stream', ['0', '1'])
+def test_float16_weak_first_block(scene, stream, monkeypatch):
+    """float16 storage scaled by a first block a million times weaker than the rest (beyond the half range): the
+    uploaded planes and the streamed first level both fall back to the whole history's peak and form the float32
+    image within float16's error (the streamed path returned a non-finite image in 0.1.4)."""
+    import cupy as cp
+    from fastsar import ffbp_cuda
+    col, S = scene
+    plan, coll = _plan(col, 2, T=32)
+    monkeypatch.setattr(memory, 'STREAM_PULSES', 32)
+    monkeypatch.setenv('FASTSAR_CUDA_STREAM', stream)
+    S0 = S.copy()
+    S0[:32] *= 1e-6
+    f32 = cp.asnumpy(ffbp_cuda.make_ffbp_cuda(plan, coll)(S0))
+    f16 = cp.asnumpy(ffbp_cuda.make_ffbp_cuda(plan, coll, final_mode='f16tc', store='f16')(S0))
+    e = 10 * np.log10(np.sum(np.abs(f16 - f32) ** 2) / np.sum(np.abs(f32) ** 2))
+    print(f'float16 with a weak first block (stream {stream}) vs float32: {e:.1f} dB, finite {np.isfinite(f16).all()}')
+    assert np.isfinite(f16).all()
+    assert e < -40, e
+
+
 def test_env_validation(scene, monkeypatch):
     """The CUDA settings with fixed choices reject other values, naming the variable."""
     from fastsar import ffbp_cuda

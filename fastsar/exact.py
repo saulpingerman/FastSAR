@@ -350,6 +350,9 @@ def _distance_to_rectangle(ant, x0, e1, e2, a0, a1, b0, b1):
 
 # ---------------------------------------------------------------------------------------------------- former
 
+PROBE = 32               # cuda ExactFormer: chunks between two timings of the tile orders
+
+
 class ExactFormer:
     """Exact backprojection onto the grid of form_image, set up once for a collection geometry. former(S) ->
     complex64 image [nx, ny]. ant [P, 3] antenna phase centers (monostatic), fmin, df, K the frequency samples,
@@ -490,9 +493,11 @@ class ExactFormer:
         self._pin = [cp.cuda.alloc_pinned_memory(ch * self.K * 8) for _ in range(2)]
         self._hbuf = [np.frombuffer(b, np.complex64, ch * self.K).reshape(ch, self.K) for b in self._pin]
         self._stream = cp.cuda.Stream(non_blocking=True)
-        # the grid axis closer to constant range: the one less aligned with the line of sight at mid-aperture
+        # the first guess of the tile order: the grid axis closer to constant range, the one less aligned with the line
+        # of sight at mid-aperture; _form_cuda then times both orders (PROBE)
         los = self.ant[self.P // 2] - self.center
         self._along1 = int(abs(los @ self.e1) <= abs(los @ self.e2))
+        self.probe_ms = []                   # (chunk, ms in order 0, ms in order 1) of each probe, for diagnostics
 
     def _form_cuda(self, S, check=False):
         import cupy as cp
@@ -526,6 +531,13 @@ class ExactFormer:
             return e
 
         f32 = np.float32
+        # tile order: the mid-aperture guess for the first chunk; then every PROBE chunks, two full chunks in a row run
+        # in the two orders, timed, and the faster one is kept until the next pair. Both orders give the same image bit
+        # for bit (each pixel's sum runs in one thread in pulse order); the line of sight turns over a long aperture and
+        # the faster order is not always the guessed one (a 212,858-pulse Capella spotlight on an L4 took 3 percent
+        # longer in the guessed order than in 0.1.4's)
+        along1, probe = self._along1, {}
+        self.probe_ms = []
         up = stage(0)
         for i, (p0, p1) in enumerate(chunks):
             n, b = p1 - p0, i % 2
@@ -545,11 +557,26 @@ class ExactFormer:
                 prof = cp.fft.ifft(pad[:n], axis=1)
             self._k_crop((-(-n * W // 256),), (256,), (prof, d['blo'][p0:p1], np.int32(n), np.int32(nfft), np.int32(W), f32(nfft), win))
             del prof
+            j = i % PROBE
+            timed = j in (1, 2) and n == ch and i - j + 2 < len(chunks)
+            if timed:
+                order = j - 1
+                probe[order] = (cp.cuda.Event(), cp.cuda.Event())
+                probe[order][0].record()
+            else:
+                order = along1
             self._k_bp((self.ntx * self.nty,), (self._tb,),
                        (win, np.int32(n), np.int32(W), d['lo'][p0:p1], d['ant'][p0:p1], d['ref'][p0:p1], d['cen'],
                         np.int32(self.nty), np.int32(self.nx), np.int32(self.ny), f32(self.spx), f32(self.spy),
                         f32(self.e1[0]), f32(self.e1[1]), f32(self.e1[2]), f32(self.e2[0]), f32(self.e2[1]), f32(self.e2[2]),
-                        np.float64(self.inv_dr), np.float64(self.kcyc), np.int32(self._along1), out))
+                        np.float64(self.inv_dr), np.float64(self.kcyc), np.int32(order), out))
+            if timed:
+                probe[order][1].record()
+                if order == 1:
+                    probe[1][1].synchronize()
+                    t0, t1 = (cp.cuda.get_elapsed_time(*probe[k]) for k in (0, 1))
+                    self.probe_ms.append((i - 1, round(t0, 3), round(t1, 3)))
+                    along1 = int(t1 < t0)
         if check and bool(bad):
             from .api import _check_history
             _check_history(S if isinstance(S, np.ndarray) else cp.asnumpy(S))       # raises, naming the first pulse
