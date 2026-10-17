@@ -83,6 +83,17 @@ def test_batched_children(three):
     assert not eb > -100, f'batched children: {eb:.1f} dB'
 
 
+def test_group_bitwise(three):
+    """The image does not depend on the first-level group or on the batch of children through the later levels: every
+    child is rotated from the raw window (0.1.4 rotated one window on from child to child, so a child's rounding
+    depended on the children launched with it, which the free memory set)."""
+    import cupy as cp
+    ref = cp.asnumpy(three.form(three.S, ng=1, batch=1))
+    for kw in (dict(ng=2), dict(ng=3), dict(ng=3, batch=1), dict(ng=three.plan['levels'][0]['C'])):
+        img = cp.asnumpy(three.form(three.S, **kw))
+        assert img.shape == ref.shape and np.array_equal(img.view(np.uint8), ref.view(np.uint8)), f'{kw}: not bitwise the one-child image'
+
+
 def test_group_env(three, monkeypatch):
     """FASTSAR_CUDA_GROUP with a partial last group (3 does not divide the first level's children), no warning."""
     import cupy as cp

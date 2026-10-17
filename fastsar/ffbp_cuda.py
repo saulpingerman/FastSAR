@@ -57,7 +57,17 @@ void rot_fir_k(const sample_t* __restrict__ sre, const sample_t* __restrict__ si
     const int WS = W | 1;                               // odd row stride
     const int kstart = D * j0 - pl;
     extern __shared__ float sm[];
+#if RAWREG
+    // the raw window stays in registers, this thread's samples of it (RAWMAX at most: the caller's choice of the
+    // variant); the shared window is the copy rotated by the current child's ramp
+    float rawr[RAWMAX], rawi[RAWMAX];
     float* zr = sm; float* zi = sm + PB * WS; float* tp = sm + 2 * PB * WS;
+    float* rr = zr; float* ri = zi;
+#else
+    float* rr = sm; float* ri = sm + PB * WS;                  // the raw window
+    float* zr = ri + PB * WS; float* zi = zr + PB * WS;        // the window rotated by the current child's ramp
+    float* tp = zi + PB * WS;
+#endif
     float* otr = tp + L; float* oti = otr + PB * 2 * JT;   // output tile [PB][2 JT], written out row-contiguous
     for (int r = tid; r < L; r += PB * JT) tp[r] = taps[r];
     const int p = p0 + pp;
@@ -67,21 +77,28 @@ void rot_fir_k(const sample_t* __restrict__ sre, const sample_t* __restrict__ si
     for (int idx = tid; idx < PB * W; idx += PB * JT) {
         const int row = idx / W, i = idx % W, k = kstart + i, pr = p0 + row;
         const bool ok = (pr < P) && (k >= 0) && (k < K);
-        zr[row * WS + i] = ok ? LD(sre[((size_t)n * P + pr) * K + k]) : 0.f;
-        zi[row * WS + i] = ok ? LD(sim[((size_t)n * P + pr) * K + k]) : 0.f;
+        rr[row * WS + i] = ok ? LD(sre[((size_t)n * P + pr) * K + k]) : 0.f;
+        ri[row * WS + i] = ok ? LD(sim[((size_t)n * P + pr) * K + k]) : 0.f;
     }
     __syncthreads();
-    float prev_cc = 0.f, prev_ss = 0.f;
+#if RAWREG
+    #pragma unroll
+    for (int m = 0; m < RAWMAX; ++m) {                  // this thread's samples (it alone rotates them, below)
+        const int i = jt + m * JT;
+        rawr[m] = i < W ? zr[pp * WS + i] : 0.f;
+        rawi[m] = i < W ? zi[pp * WS + i] : 0.f;
+    }
+#endif
     for (int c = 0; c < C_; ++c) {
-        // rotate the window in place by the ramp of child c relative to child c - 1 (one sine and cosine per sample
-        // and child, as before, but no second copy of the window); threads along columns, so the rows differ per
-        // warp only through the ramp coefficients
-        const float cc = pok ? c0[((size_t)n * C_ + c) * P + p] : 0.f;
-        const float ss = pok ? sl[((size_t)n * C_ + c) * P + p] : 0.f;
+        // the raw window rotated by the child's own ramp into the working copy; threads along columns, so the rows
+        // differ per warp only through the ramp coefficients. (0.1.4 rotated one copy on from the previous child's
+        // ramp, which made a child's rounding depend on the children launched before it, that is on the group size
+        // and so on the memory free at the call.)
+        const float dcc = pok ? c0[((size_t)n * C_ + c) * P + p] : 0.f;
+        const float dss = pok ? sl[((size_t)n * C_ + c) * P + p] : 0.f;
         {
             // this thread's samples are JT columns apart, so their phase steps are constant: one sine and cosine for
             // the first sample and one for the step, then a complex multiplication per sample (a geometric sequence)
-            const float dcc = cc - prev_cc, dss = ss - prev_ss;
             float cyc = dcc + ((float)(kstart + jt) - kc) * dss;
             cyc -= rintf(cyc);
             float st = (float)JT * dss;
@@ -89,14 +106,27 @@ void rot_fir_k(const sample_t* __restrict__ sre, const sample_t* __restrict__ si
             float wi_, wr_, si_, sr_;
             sincospif(2.0f * cyc, &wi_, &wr_);
             sincospif(2.0f * st, &si_, &sr_);
+#if RAWREG
+            #pragma unroll
+            for (int m = 0; m < RAWMAX; ++m) {
+                const int i = jt + m * JT;
+                if (i < W) {
+                    const float vr = rawr[m], vi = rawi[m];
+                    zr[pp * WS + i] = vr * wr_ - vi * wi_;
+                    zi[pp * WS + i] = vr * wi_ + vi * wr_;
+                    const float nr = wr_ * sr_ - wi_ * si_;
+                    wi_ = wr_ * si_ + wi_ * sr_; wr_ = nr;
+                }
+            }
+#else
             for (int i = jt; i < W; i += JT) {
-                const float vr = zr[pp * WS + i], vi = zi[pp * WS + i];
+                const float vr = rr[pp * WS + i], vi = ri[pp * WS + i];
                 zr[pp * WS + i] = vr * wr_ - vi * wi_;
                 zi[pp * WS + i] = vr * wi_ + vi * wr_;
                 const float nr = wr_ * sr_ - wi_ * si_;
                 wi_ = wr_ * si_ + wi_ * sr_; wr_ = nr;
             }
-            prev_cc = cc; prev_ss = ss;
+#endif
         }
         __syncthreads();
         {
@@ -329,13 +359,17 @@ _mods = {}
 _PB_CHOICES = (32, 16, 8)        # pulses per block tried in order by the level kernel (tests may narrow this)
 
 
-def _kernels(store='fp32', pb=32):
+_RAWREG = (16, 32, 48)           # rot_fir_k keeps the raw window in registers, this many samples per thread at most (0: in shared memory)
+
+
+def _kernels(store='fp32', pb=32, rawreg=16):
     bits = 16 if store == 'f16' else 32
     jt = memory._env_number('FASTSAR_CUDA_JT', 1) or 8                 # threads per pulse in rot_fir_k (testing)
     colb = int(memory._env_choice('FASTSAR_FINAL_COLB', '1', {'0', '1'}))     # final_tile's table build by columns (testing)
-    key = (bits, pb, jt, colb)
+    key = (bits, pb, jt, colb, rawreg)
     if key not in _mods:
-        _mods[key] = cp.RawModule(code=_SRC, options=('--std=c++14', '--use_fast_math', f'-DSTORE={bits}', f'-DPB={pb}', f'-DJT={jt}', f'-DCOLB={colb}'))
+        _mods[key] = cp.RawModule(code=_SRC, options=('--std=c++14', '--use_fast_math', f'-DSTORE={bits}', f'-DPB={pb}', f'-DJT={jt}', f'-DCOLB={colb}',
+                                                      f'-DRAWREG={int(rawreg > 0)}', f'-DRAWMAX={max(rawreg, 1)}'))
     out = {k: _mods[key].get_function(k) for k in ('rot_fir_k', 'fir_p', 'fir_p_g', 'final_tile')}
     # opt in once to the device's largest shared memory per block: the limit belongs to the kernel, which every former
     # shares, so a former must never lower it (a former built on another thread while one runs would break its launch)
@@ -379,15 +413,24 @@ def _children(kern, pre, pim, c0, sl, lv):
         W = cols * Dk + L
         smem_max = int(cp.cuda.Device().attributes.get('MaxSharedMemoryPerBlockOptin', 48 * 1024))
         pb_env = memory._env_number('FASTSAR_CUDA_PB', 1) or 0          # testing: force the pulses per block
+        # the raw window in registers (this thread's samples) and its rotated copy in shared memory, or, for a wider
+        # window, both in shared memory; a child's samples are rotated from the raw window by the child's own ramp
+        # either way, so that the image does not depend on how many children a launch holds (the group size, which
+        # the free device memory sets): 0.1.4 rotated one copy on from child to child
+        rawreg = next((r for r in _RAWREG if -(-W // jt) <= r), 0)
+        if os.environ.get('FASTSAR_CUDA_RAWREG'):
+            rawreg = int(os.environ['FASTSAR_CUDA_RAWREG'])             # testing: a tier, or 0 for shared memory
         for pb in ((pb_env,) if pb_env else _PB_CHOICES):   # pulses per block: the largest whose window fits the device
-            smem = (2 * pb * (W | 1) + L + 2 * pb * cols) * 4
+            smem = ((2 if rawreg else 4) * pb * (W | 1) + L + 2 * pb * cols) * 4
             if smem <= smem_max:
                 break
+        if os.environ.get('FASTSAR_CUDA_DEBUG'):                            # testing: the kernel's configuration
+            print(f'rot_fir_k W {W} jt {jt} per-thread {-(-W // jt)} rawreg {rawreg} pb {pb} smem {smem}', flush=True)
         if smem > smem_max:
             raise ValueError(f"the cuda backend's first-level window ({smem // 1024} KB: range decimation {Dk} with a "
                              f"{L}-tap filter, a small image from a wide-band collection) exceeds the GPU's shared memory "
                              f"({smem_max // 1024} KB): use backend='cpu' or 'jax', or a larger image")
-        kl = kern['rot_fir_k'] if pb == 32 else _kernels(kern['store'], pb)['rot_fir_k']
+        kl = kern['rot_fir_k'] if pb == 32 and rawreg == _RAWREG[0] else _kernels(kern['store'], pb, rawreg)['rot_fir_k']
         kl(((Ko + cols - 1) // cols, (P + pb - 1) // pb, Np), (pb * jt,),
                           (pre, pim, c0, sl, taps, yre, yim, np.int32(Cn), np.int32(P), np.int32(K), np.int32(Ko), np.int32(Dk),
                            np.int32(L), np.int32(pl), np.float32(kc)), shared_mem=smem)
@@ -676,6 +719,16 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
     e1d, e2d, end = cp.asarray(e1), cp.asarray(e2), cp.asarray(en)
     sx0, sy0 = levels[0]['sx'], levels[0]['sy']
     G = sx0 * sy0
+    wthr = None
+    if wfd is not None and wfd.ndim == 3:
+        # the near-zero test of a tile's centre weight (tiles, below) is relative to the largest centre weight among the
+        # children formed together; it is taken over the aligned groups of CUDA_GROUP children that a device with ample
+        # memory forms, whatever this device's groups and batches, so that the image does not depend on the memory free
+        # at the call
+        gm = min(memory.CUDA_GROUP, G)
+        w0g = cp.abs(wfd[0].reshape(G, -1))
+        wthr = cp.concatenate([(1e-6 * cp.maximum(w0g[q:q + gm].max(), 1e-30)).reshape(1) for q in range(0, G, gm)])
+        wthr = cp.repeat(wthr, gm)[:G]
     mx, my = plan['Nx'] // sx0, plan['Ny'] // sy0
     shape_g = [s for lv in levels[1:] for s in (lv['sx'], lv['sy'])] + [T, T]
     perm_g = [2 * i for i in range(L - 1)] + [2 * (L - 1)] + [2 * i + 1 for i in range(L - 1)] + [2 * (L - 1) + 1]
@@ -768,7 +821,7 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
         if wfd is not None and wfd.ndim == 3 and (final_mode != 'f16tc' or tc_ver == 2):     # weights in the final kernel
             w = wfd.reshape(3, G, -1, Pf)[:, gi].reshape(3, -1, Pf)
             w0 = w[0]
-            big = cp.abs(w0) > 1e-6 * cp.maximum(cp.abs(w0).max(), 1e-30)    # on the device: no wait for the host
+            big = cp.abs(w0) > cp.repeat(wthr[gi], w0.shape[0] // n)[:, None]    # on the device: no wait for the host
             gyr = cp.where(big, w[2] / cp.where(w0 == 0, 1, w0), 0.0)
             re, im = final(a, b, cen, (w0, w[1], gyr))
         elif wfd is not None and wfd.ndim == 3:

@@ -19,6 +19,16 @@ was published on PyPI.
 
 ### Fixed
 
+- cuda `ImageFormer` and `form_cphd`: the image depended on the GPU memory free at the call. The first-level kernel
+  loaded a window of the history into shared memory once per launch and rotated it in place from one child to the
+  next, so a child's rounding carried every rotation before it in the same launch, and the children a launch holds
+  are the group (sized from the free memory, halved after an out-of-memory) at the first level and the level's
+  children or their halves at the later ones. Two calls on a 24 GB L4 could give images -107 dB of the peak apart
+  (-84 dB in RMS) for a 9 GB Capella spotlight, and group sizes of one and eight on a 96 GB card -118 dB apart for an
+  Umbra spotlight; the same at 0.1.4. Every child is now rotated from the raw window (this thread's samples kept in
+  registers, or a second copy in shared memory for a window of more than 48 samples per thread), and the image is
+  the same whatever the group, the batch or the splitting. The images differ from 0.1.4's at that rounding level and
+  from nothing else; the CPU and TPU formers are unchanged.
 - cuda: the blocks in which a host phase history is moved to the device were 4096 pulses whatever the row length,
   so a collection with 134,400 samples per pulse (an Umbra spotlight) made 4.4 GB blocks and ran out of GPU memory
   in the window multiply. Blocks are now at most 512 MB; the planes are the same.
