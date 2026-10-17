@@ -351,6 +351,10 @@ def _distance_to_rectangle(ant, x0, e1, e2, a0, a1, b0, b1):
 # ---------------------------------------------------------------------------------------------------- former
 
 PROBE = 32               # cuda ExactFormer: chunks between two timings of the tile orders
+import os as _os
+_FORCE = _os.environ.get('FASTSAR_EXACT_ORDER')          # bisect: '0' or '1' fixes the tile order, no probes
+_NOPLAN = _os.environ.get('FASTSAR_EXACT_NO_PLAN') == '1'   # bisect: CuPy's plan cache instead of per-call plans
+_ASNUMPY = _os.environ.get('FASTSAR_EXACT_ASNUMPY') == '1'  # bisect: cp.asnumpy instead of the pinned return
 
 
 class ExactFormer:
@@ -540,7 +544,7 @@ class ExactFormer:
         # Capella spotlight on an L4 ran 3 percent slower in the guessed order than in 0.1.4's, and two short calls
         # 2 to 3 percent slower), and applying a choice only when the next pair came round left most of a 50-chunk
         # call in the wrong order; a host wait on the events cost small images 1 to 2 percent.
-        along1 = self._along1 if len(chunks) >= 5 else 0
+        along1 = int(_FORCE) if _FORCE is not None else (self._along1 if len(chunks) >= 5 else 0)
         probe, pending, nprobe, first = {}, None, 0, None
         self.probe_ms = []
         up = stage(0)
@@ -558,8 +562,11 @@ class ExactFormer:
                 up = stage(i + 1)            # overlaps the FFT and backprojection below
             if n not in plans:
                 plans[n] = get_fft_plan(pad[:n], axes=1, value_type='C2C')
-            with plans[n]:
+            if _NOPLAN:
                 prof = cp.fft.ifft(pad[:n], axis=1)
+            else:
+                with plans[n]:
+                    prof = cp.fft.ifft(pad[:n], axis=1)
             self._k_crop((-(-n * W // 256),), (256,), (prof, d['blo'][p0:p1], np.int32(n), np.int32(nfft), np.int32(W), f32(nfft), win))
             del prof
             if pending is not None and pending[0][1].done and pending[1][1].done:     # the last pair's events
@@ -569,7 +576,7 @@ class ExactFormer:
             j = i % PROBE
             # a pair is timed when it is whole (both chunks full), no pair is still pending, and at least two chunks
             # follow it; the second chunk only with the first
-            timed = (j == 1 and n == ch and pending is None and i + 4 <= len(chunks)) or (j == 2 and first == i - 1)
+            timed = _FORCE is None and ((j == 1 and n == ch and pending is None and i + 4 <= len(chunks)) or (j == 2 and first == i - 1))
             if timed:
                 first = i if j == 1 else first
                 order = (j - 1) ^ (nprobe & 1)
@@ -590,7 +597,7 @@ class ExactFormer:
             from .api import _check_history
             _check_history(S if isinstance(S, np.ndarray) else cp.asnumpy(S))       # raises, naming the first pulse
         from .api import _to_host
-        img = _to_host(out)                  # through pinned memory, as ImageFormer returns its image
+        img = cp.asnumpy(out) if _ASNUMPY else _to_host(out)
         if pending is not None:              # a pair the call ended on, complete with the copy: for the diagnostics
             t0, t1 = (cp.cuda.get_elapsed_time(*pending[k]) for k in (0, 1))
             self.probe_ms.append((pending[2], round(t0, 3), round(t1, 3)))
