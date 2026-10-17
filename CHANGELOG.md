@@ -27,8 +27,9 @@ was published on PyPI.
   (-84 dB in RMS) for a 9 GB Capella spotlight, and group sizes of one and eight on a 96 GB card -118 dB apart for an
   Umbra spotlight; the same at 0.1.4. Every child is now rotated from the raw window (this thread's samples kept in
   registers, or a second copy in shared memory for a window of more than 48 samples per thread), and the image is
-  the same whatever the group, the batch or the splitting. The images differ from 0.1.4's at that rounding level and
-  from nothing else; the CPU and TPU formers are unchanged.
+  the same whatever the group, the batch or the splitting; the kernel's variants are compiled from their own source,
+  so a first call does not rebuild the other kernels for each. The images differ from 0.1.4's at that rounding level
+  and from nothing else; the CPU and TPU formers are unchanged.
 - cuda: the blocks in which a host phase history is moved to the device were 4096 pulses whatever the row length,
   so a collection with 134,400 samples per pulse (an Umbra spotlight) made 4.4 GB blocks and ran out of GPU memory
   in the window multiply. Blocks are now at most 512 MB; the planes are the same.

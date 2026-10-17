@@ -23,7 +23,7 @@ from . import memory
 from .ffbp import C, _positions
 from .ffbp2 import HOST_LEVELS, make_plan, collection_arrays  # noqa: F401  (re-exported for callers)
 
-_SRC = r'''
+_SRC_PRE = r'''
 #include <cuda_fp16.h>
 #if STORE == 16
   typedef __half sample_t;           /* phase history, intermediates and outputs in memory */
@@ -43,6 +43,9 @@ _SRC = r'''
 #ifndef JT
 #define JT 8           /* threads per pulse, each two consecutive outputs: 2 JT columns per block */
 #endif
+'''
+
+_SRC_ROT = r'''
 extern "C" __global__
 void rot_fir_k(const sample_t* __restrict__ sre, const sample_t* __restrict__ sim, const float* __restrict__ c0, const float* __restrict__ sl,
                const float* __restrict__ taps, sample_t* __restrict__ yre, sample_t* __restrict__ yim,
@@ -163,6 +166,9 @@ void rot_fir_k(const sample_t* __restrict__ sre, const sample_t* __restrict__ si
     }
 }
 
+'''
+
+_SRC_REST = r'''
 #define FP_COLS 64     /* columns per block in fir_p */
 extern "C" __global__
 void fir_p(const sample_t* __restrict__ yre, const sample_t* __restrict__ yim, const float* __restrict__ taps,
@@ -354,6 +360,7 @@ void final_tile(const sample_t* __restrict__ dre, const sample_t* __restrict__ d
     }
 }
 '''
+_SRC = _SRC_PRE + _SRC_ROT + _SRC_REST          # the first-level kernel and the rest compiled apart (below)
 
 _mods = {}
 _PB_CHOICES = (32, 16, 8)        # pulses per block tried in order by the level kernel (tests may narrow this)
@@ -366,11 +373,17 @@ def _kernels(store='fp32', pb=32, rawreg=16):
     bits = 16 if store == 'f16' else 32
     jt = memory._env_number('FASTSAR_CUDA_JT', 1) or 8                 # threads per pulse in rot_fir_k (testing)
     colb = int(memory._env_choice('FASTSAR_FINAL_COLB', '1', {'0', '1'}))     # final_tile's table build by columns (testing)
-    key = (bits, pb, jt, colb, rawreg)
+    # the first-level kernel is built per pulses-per-block and raw-window variant from its own source, the other
+    # kernels once per storage (a variant otherwise recompiled them all, 4 s of a process's first call on an L4)
+    key = ('rest', bits, jt, colb)
     if key not in _mods:
-        _mods[key] = cp.RawModule(code=_SRC, options=('--std=c++14', '--use_fast_math', f'-DSTORE={bits}', f'-DPB={pb}', f'-DJT={jt}', f'-DCOLB={colb}',
-                                                      f'-DRAWREG={int(rawreg > 0)}', f'-DRAWMAX={max(rawreg, 1)}'))
-    out = {k: _mods[key].get_function(k) for k in ('rot_fir_k', 'fir_p', 'fir_p_g', 'final_tile')}
+        _mods[key] = cp.RawModule(code=_SRC_PRE + _SRC_REST, options=('--std=c++14', '--use_fast_math', f'-DSTORE={bits}', f'-DJT={jt}', f'-DCOLB={colb}'))
+    out = {k: _mods[key].get_function(k) for k in ('fir_p', 'fir_p_g', 'final_tile')}
+    key = ('rot', bits, pb, jt, rawreg)
+    if key not in _mods:
+        _mods[key] = cp.RawModule(code=_SRC_PRE + _SRC_ROT, options=('--std=c++14', '--use_fast_math', f'-DSTORE={bits}', f'-DPB={pb}', f'-DJT={jt}',
+                                                                     f'-DRAWREG={int(rawreg > 0)}', f'-DRAWMAX={max(rawreg, 1)}'))
+    out['rot_fir_k'] = _mods[key].get_function('rot_fir_k')
     # opt in once to the device's largest shared memory per block: the limit belongs to the kernel, which every former
     # shares, so a former must never lower it (a former built on another thread while one runs would break its launch)
     smax = int(cp.cuda.Device().attributes.get('MaxSharedMemoryPerBlockOptin', 96 * 1024))
