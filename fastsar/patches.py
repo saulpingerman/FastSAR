@@ -49,6 +49,7 @@ so where T = 16 misses target_db the patch is formed on a grid finer by 2 in one
 halves the final tiles; the JAX program also takes T = 8.
 """
 import os
+import time
 import sys
 import threading
 
@@ -729,8 +730,21 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
         if beam is not None and awin is not None and not in_kernel:
             wt = weight_terms(wa(np.clip(beam(slice(lo, hi), pts) / umax, -1, 1)), wtol_db)
         tm('beam span')
-        S, a, f0, df = patch_history(fx, ant, c, pts, lo, hi, margin, guard, prof,
-                                     gate_len=padded_gate if backend in ('jax', 'tpu') and not exact else None)
+        for attempt in range(40):
+            try:
+                S, a, f0, df = patch_history(fx, ant, c, pts, lo, hi, margin, guard, prof,
+                                             gate_len=padded_gate if backend in ('jax', 'tpu') and not exact else None)
+                break
+            except Exception as e:
+                # a CUDA gather on a prefetch thread while the former holds its peak, or CuPy's pool is fragmented
+                # across threads (a 29 GB sliding spotlight on an L4 with four prefetch workers): return the pool's
+                # free blocks to the device and try again, waiting for the former's memory for up to 20 s
+                if backend != 'cuda' or type(e).__name__ != 'OutOfMemoryError' or attempt == 39:
+                    raise
+                import cupy
+                cupy.get_default_memory_pool().free_all_blocks()
+                if attempt:
+                    time.sleep(0.5)
         tm('patch history')
         if exact:
             from .bp import backproject as bpx, plane_points

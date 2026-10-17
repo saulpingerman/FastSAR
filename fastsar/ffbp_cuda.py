@@ -557,6 +557,15 @@ def _host_peak(S):
     return max(peaks, default=0.0) or 1.0
 
 
+def _block_rows(K):
+    """Pulses per block of a history moved to the device: memory.STREAM_PULSES, fewer when a row is so long that the
+    block and its windowed temporaries would take more than BLOCK_BYTES each (134,400 samples: 4096 rows are 4.4 GB)."""
+    return max(1, min(memory.STREAM_PULSES, BLOCK_BYTES // (int(K) * 8)))
+
+
+BLOCK_BYTES = 512 << 20
+
+
 def _upload_planes(S, pre, pim, win, check, scaled, scale=None):
     """Host S [P, K] complex -> float planes pre, pim [P, K] on the device, in row blocks through two pinned staging
     buffers: the threads copying the next block into its buffer overlap the transfer of the current one, and the
@@ -566,7 +575,7 @@ def _upload_planes(S, pre, pim, win, check, scaled, scale=None):
     block is zero, or a later block overflows the half range, the whole history's peak (scale: given, testing).
     Returns the scale."""
     P, K = S.shape
-    nb = memory.STREAM_PULSES
+    nb = _block_rows(K)
     rows = min(nb, P)
     bufs = [memory._pinned(rows * K * 8) for _ in range(2)]                       # pooled: reused by later calls
     stg = [np.frombuffer(b, np.complex64, rows * K).reshape(rows, K) for b in bufs]
@@ -796,7 +805,7 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
         L, pl = fp['L'], fp['pl']
         zre = cp.empty((ngc, Po, Ko), kern['dtype'])
         zim = cp.empty((ngc, Po, Ko), kern['dtype'])
-        nb = max(1, (memory.STREAM_PULSES - L) // Dp + 1)                    # output rows per block
+        nb = max(1, (_block_rows(K_) - L) // Dp + 1)                        # output rows per block
         for i0 in range(0, Po, nb):
             i1 = min(Po, i0 + nb)
             p0, p1 = Dp * i0 - pl, Dp * (i1 - 1) - pl + L               # input pulses read by these outputs
@@ -844,10 +853,12 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
         if window is not None:
             wpd, wkd = cp.asarray(window[0], cp.float32)[:, None], cp.asarray(window[1], cp.float32)[None, :]
 
-        def block(i):           # rows i .. i + 4096 of S on the device, windowed and checked
-            b = cp.asarray(S[i:i + 4096])
+        br = _block_rows(S.shape[1])
+
+        def block(i):           # rows i .. i + br of S on the device, windowed and checked
+            b = cp.asarray(S[i:i + br])
             if window is not None:
-                b = b * wpd[i:i + 4096] * wkd
+                b = b * wpd[i:i + br] * wkd
             if check:
                 _finite(b, cp, i)
             return b
@@ -862,15 +873,15 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
             else:                                    # a device history: blocks in place
                 if scaled:                           # the first block's peak, or the whole history's if it is zero
                     scale = _scale or float(cp.abs(block(0)).max()) or float(cp.abs(S).max()) or 1.0
-                for i in range(0, S.shape[0], 4096):
+                for i in range(0, S.shape[0], br):
                     b = block(i)
-                    pre[0, i:i + 4096] = (b.real / scale).astype(kern['dtype'])
-                    pim[0, i:i + 4096] = (b.imag / scale).astype(kern['dtype'])
+                    pre[0, i:i + br] = (b.real / scale).astype(kern['dtype'])
+                    pim[0, i:i + br] = (b.imag / scale).astype(kern['dtype'])
                     del b
         elif scaled and _scale:
             scale = _scale
         elif scaled:                                 # streamed: the first block's peak, on the device
-            b0 = cp.asarray(S[:memory.STREAM_PULSES])     # (only a host history streams)
+            b0 = cp.asarray(S[:br])                  # (only a host history streams)
             scale = float(cp.abs(b0).max()) or _host_peak(S)
             del b0
         forced = ng is not None or bool(os.environ.get('FASTSAR_CUDA_GROUP'))

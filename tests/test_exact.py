@@ -294,7 +294,7 @@ def test_cuda_order_probe(ranges, monkeypatch):
     a = f(c.S).copy()
     probes = list(f.probe_ms)
     assert len(probes) >= 2 and all(t0 > 0 and t1 > 0 for _, t0, t1 in probes), probes
-    monkeypatch.setattr(exact, 'PROBE', 10 ** 9)          # one probe pair (chunks 1 and 2), then one order throughout
+    monkeypatch.setattr(exact, 'PROBE', 10 ** 9)          # no pair is timed when fewer than PROBE chunks follow it
     b = f(c.S)
-    assert np.array_equal(a, b) and len(f.probe_ms) == 1
-    print(f"cuda: order probes at chunks {[p[0] for p in probes]}, the image of one probe pair bit for bit")
+    assert np.array_equal(a, b) and f.probe_ms == []
+    print(f"cuda: order probes at chunks {[p[0] for p in probes]}, the image of the unprobed call bit for bit")

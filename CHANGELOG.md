@@ -10,13 +10,21 @@ was published on PyPI.
 - cuda `ExactFormer`: the thread blocks take their tiles along one grid axis or the other, so that the blocks resident
   together read the same range bins from the L2 cache instead of the image's whole range window, and the image comes
   back through pinned memory, as `ImageFormer`'s does. The order is timed: every 32 chunks of pulses two chunks run in
-  the two orders and the faster is kept (the line of sight turns over a long aperture, and the axis closer to constant
-  range at mid-aperture made a 212,858-pulse Capella spotlight 3 percent slower than 0.1.4 on an L4). On an RTX PRO
+  the two orders and the faster is kept from the next pair on, without waiting on the GPU (the line of sight turns
+  over a long aperture, and the axis closer to constant range at mid-aperture made a 212,858-pulse Capella spotlight
+  3 percent slower than 0.1.4 on an L4); a call of fewer than 34 chunks runs the mid-aperture guess. On an RTX PRO
   6000 Blackwell Max-Q the 12,207 by 8,808 pixel, 15,186-pulse Panama image took 2.59 s with linear and 3.82 s with
   cubic interpolation (4.54 and 5.84 s in 0.1.4); the images are bitwise the same.
 
 ### Fixed
 
+- cuda: the blocks in which a host phase history is moved to the device were 4096 pulses whatever the row length,
+  so a collection with 134,400 samples per pulse (an Umbra spotlight) made 4.4 GB blocks and ran out of GPU memory
+  in the window multiply. Blocks are now at most 512 MB; the planes are the same.
+- cuda `form_cphd` on a mosaic (a sliding spotlight or stripmap): a patch's range profiles gathered on a prefetch
+  thread while the former held its peak could fail with CuPy's `OutOfMemoryError` (a 29 GB Capella sliding
+  spotlight on an L4 with four prefetch workers, in three of four calls at 0.1.4 and this release's candidate). The
+  gather now returns the pool's free blocks to the device and tries again, waiting up to 20 s for the former.
 - cuda `ImageFormer` with `precision='float16'`: a history that streams from host memory (larger than the GPU's free
   memory) was scaled by the peak of its first 4096 pulses without the fallback the uploaded path has, so a later,
   stronger block overflowed the half range and the image came out non-finite (a 21.8 GB Capella spotlight on an L4).
