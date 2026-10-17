@@ -24,6 +24,8 @@ from jax.experimental.pallas import tpu as pltpu
 TWO_PI = 2.0 * math.pi
 LANE = 128
 WIN_MAX = 16 << 20       # band_blocks2: samples (window by output block) of one block of the decimation matrix held in VMEM
+SEG_MAX = 32768          # band_blocks2: samples of a row that one grid step of the level kernel rotates and multiplies; a longer
+                         # row (134,000 samples, an Umbra spotlight) is cut into segments whose products accumulate in the output
 
 
 def band_blocks(Fk, D, kob=256, lane=LANE, chunk_align=512):
@@ -191,8 +193,12 @@ def band_blocks2(Fk, D, kob=None, lane=LANE, chunk=128, kob_max=512):
                 break
         nb = -(-Ko // kob)
     Ko_pad = nb * kob
+    ns = 1
     if nb == 1:
         win = int(chunk * math.ceil((pl_pad + K) / chunk))
+        ns = max(1, -(-win // SEG_MAX))
+        seg = int(chunk * math.ceil(win / ns / chunk))
+        win = ns * seg
         stride = win
         Kpad = win
     else:
@@ -214,7 +220,7 @@ def band_blocks2(Fk, D, kob=None, lane=LANE, chunk=128, kob_max=512):
         rows = np.nonzero(np.abs(cols).sum(1))[0]
         assert rows.size == 0 or (rows.min() >= r0 and rows.max() < r0 + win), (b, rows.min(), rows.max(), r0, win)
     return dict(blocks=jnp.asarray(blocks), Kpad=Kpad, pl_pad=pl_pad, Ko_pad=Ko_pad, kob=kob, win=win, stride=stride, nb=nb,
-                Ko=Ko, K=K, chunk=chunk)
+                Ko=Ko, K=K, chunk=chunk, ns=ns, seg=win // ns)
 
 
 def fused_rotate_dec_k2(S_re, S_im, c0, slope, band, kc, pb=256, passes=1, interpret=False, vmem_limit=100 << 20):
@@ -459,6 +465,8 @@ def fused_rotate_dec_k3(S_re, S_im, c0, slope, band, kc, pb=256, passes=1, FpT=N
     """S_re, S_im [N, P, Kpad] float32; c0, slope [N, nc, P] float32; band from band_blocks2; kc the ramp center.
     FpT: None, or the transposed pulse decimation matrix [Po, P] (float32); when given the kernel returns the pulse-
     decimated children (y_re, y_im) [N, nc, Po_pad, Ko_pad], otherwise [N, nc, P, Ko_pad] as fused_rotate_dec_k2."""
+    if band.get('ns', 1) > 1:
+        return _fused_rotate_dec_k3_seg(S_re, S_im, c0, slope, band, kc, pb, passes, FpT, interpret, vmem_limit)
     N, P, Kpad = S_re.shape
     nc = c0.shape[1]
     nb, win, kob, stride, pl_pad, chunk = band['nb'], band['win'], band['kob'], band['stride'], band['pl_pad'], band['chunk']
@@ -577,6 +585,124 @@ def fused_rotate_dec_k3(S_re, S_im, c0, slope, band, kc, pb=256, passes=1, FpT=N
         out_shape = [jax.ShapeDtypeStruct((N, nc, P, Ko_pad), jnp.float32)] * 2
     call = pl.pallas_call(kernel, grid=grid, in_specs=in_specs, out_specs=out_specs, out_shape=out_shape,
                           scratch_shapes=[pltpu.VMEM((pb, win), jnp.float32)] * 2,
+                          compiler_params=None if interpret else pltpu.CompilerParams(vmem_limit_bytes=vmem_limit, dimension_semantics=('arbitrary', 'arbitrary', 'arbitrary')),
+                          interpret=interpret)
+    return call(*args)
+
+
+def _fused_rotate_dec_k3_seg(S_re, S_im, c0, slope, band, kc, pb, passes, FpT, interpret, vmem_limit):
+    """fused_rotate_dec_k3 for a row cut into band['ns'] segments of band['seg'] samples (one output block, nb == 1):
+    the grid runs over the segments innermost, each step rotates one segment of the pulse block and multiplies it by
+    the segment's rows of the decimation matrix, and the products accumulate in the output block, which stays
+    resident across the segments (and across the pulse blocks when the pulse decimation is fused)."""
+    N, P, Kpad = S_re.shape
+    nc = c0.shape[1]
+    kob, pl_pad, chunk, ns, seg = band['kob'], band['pl_pad'], band['chunk'], band['ns'], band['seg']
+    Ko_pad = band['Ko_pad']
+    assert band['nb'] == 1 and Kpad == band['Kpad'] == ns * seg and P % pb == 0 and seg % chunk == 0, (S_re.shape, band['nb'], ns, seg)
+    nch = seg // chunk
+    nchl = LANE * -(-nch // LANE)
+    blocks = band['blocks'].reshape(ns, seg, kob)
+    kk0 = jnp.arange(ns, dtype=jnp.float32)[:, None] * seg - pl_pad - kc                     # [ns, 1]
+    moff = jnp.pad(jnp.arange(nch, dtype=jnp.float32) * chunk, (0, nchl - nch))            # [nchl]
+    ccyc = c0[:, None, :, :, None] + slope[:, None, :, :, None] * (kk0[None, :, None, None, :] + moff[None, None, None, None, :])   # [N, ns, nc, P, nchl]
+    cang = (ccyc - jnp.floor(ccyc + 0.5)) * TWO_PI
+    ccos, csin = jnp.cos(cang), jnp.sin(cang)
+    fcyc = slope[..., None] * jnp.arange(chunk, dtype=jnp.float32)
+    fang = (fcyc - jnp.floor(fcyc + 0.5)) * TWO_PI
+    fcos, fsin = jnp.cos(fang), jnp.sin(fang)
+    if passes == 3:
+        fb_hi, fb_lo = _split_bf16(blocks)
+    else:
+        fb = blocks.astype(jnp.bfloat16)
+    fuse_p = FpT is not None
+    if fuse_p:
+        Po = FpT.shape[0]
+        Po_pad = 8 * -(-Po // 8)
+        FpT_p = jnp.pad(FpT.astype(jnp.float32), ((0, Po_pad - Po), (0, 0)))
+        if passes == 3:
+            fp_hi, fp_lo = _split_bf16(FpT_p)
+        else:
+            fp = FpT_p.astype(jnp.bfloat16)
+
+    def mm(a, b):
+        if passes == 3:
+            a_hi, a_lo = a if isinstance(a, tuple) else _split_bf16(a)
+            b_hi, b_lo = b if isinstance(b, tuple) else _split_bf16(b)
+            return (jnp.dot(a_hi, b_hi, preferred_element_type=jnp.float32) + jnp.dot(a_hi, b_lo, preferred_element_type=jnp.float32)
+                    + jnp.dot(a_lo, b_hi, preferred_element_type=jnp.float32))
+        a = a if a.dtype == jnp.bfloat16 else a.astype(jnp.bfloat16)
+        b = b if b.dtype == jnp.bfloat16 else b.astype(jnp.bfloat16)
+        return jnp.dot(a, b, preferred_element_type=jnp.float32)
+
+    def kernel(sa_ref, ta_ref, cc_ref, cs_ref, fc_ref, fs_ref, *rest):
+        rest = list(rest)
+        if passes == 3:
+            F = (rest.pop(0)[...], rest.pop(0)[...])
+        else:
+            F = rest.pop(0)[...]
+        if fuse_p:
+            if passes == 3:
+                Fp = (rest.pop(0)[...], rest.pop(0)[...])
+            else:
+                Fp = rest.pop(0)[...]
+        ore_ref, oim_ref, zre, zim = rest
+        i, s = pl.program_id(1), pl.program_id(2)
+        first = (s == 0) & (i == 0) if fuse_p else (s == 0)
+
+        @pl.when(first)
+        def _():
+            ore_ref[...] = jnp.zeros_like(ore_ref)
+            oim_ref[...] = jnp.zeros_like(oim_ref)
+
+        def one_child(c, carry):
+            fcos, fsin = fc_ref[c], fs_ref[c]
+            ccos_all, csin_all = cc_ref[c], cs_ref[c]
+            for m in range(nch):
+                ccos, csin = ccos_all[:, m:m + 1], csin_all[:, m:m + 1]
+                cs = ccos * fcos - csin * fsin
+                sn = csin * fcos + ccos * fsin
+                lo = m * chunk
+                sr, si = sa_ref[:, lo:lo + chunk], ta_ref[:, lo:lo + chunk]
+                zre[:, lo:lo + chunk] = sr * cs - si * sn
+                zim[:, lo:lo + chunk] = sr * sn + si * cs
+            yr = mm(zre[...], F)
+            yi = mm(zim[...], F)
+            if fuse_p:
+                ore_ref[c] += mm(Fp, yr)
+                oim_ref[c] += mm(Fp, yi)
+            else:
+                ore_ref[c] += yr
+                oim_ref[c] += yi
+            return carry
+
+        lax.fori_loop(0, nc, one_child, 0)
+
+    grid = (N, P // pb, ns)
+    in_specs = [pl.BlockSpec((None, pb, seg), lambda n, i, s: (n, i, s)), pl.BlockSpec((None, pb, seg), lambda n, i, s: (n, i, s)),
+                pl.BlockSpec((None, None, nc, pb, nchl), lambda n, i, s: (n, s, 0, i, 0)), pl.BlockSpec((None, None, nc, pb, nchl), lambda n, i, s: (n, s, 0, i, 0)),
+                pl.BlockSpec((None, nc, pb, chunk), lambda n, i, s: (n, 0, i, 0)), pl.BlockSpec((None, nc, pb, chunk), lambda n, i, s: (n, 0, i, 0))]
+    args = [S_re, S_im, ccos, csin, fcos, fsin]
+    if passes == 3:
+        in_specs += [pl.BlockSpec((None, seg, kob), lambda n, i, s: (s, 0, 0))] * 2
+        args += [fb_hi, fb_lo]
+    else:
+        in_specs += [pl.BlockSpec((None, seg, kob), lambda n, i, s: (s, 0, 0))]
+        args += [fb]
+    if fuse_p:
+        if passes == 3:
+            in_specs += [pl.BlockSpec((Po_pad, pb), lambda n, i, s: (0, i))] * 2
+            args += [fp_hi, fp_lo]
+        else:
+            in_specs += [pl.BlockSpec((Po_pad, pb), lambda n, i, s: (0, i))]
+            args += [fp]
+        out_specs = [pl.BlockSpec((None, nc, Po_pad, kob), lambda n, i, s: (n, 0, 0, 0))] * 2
+        out_shape = [jax.ShapeDtypeStruct((N, nc, Po_pad, Ko_pad), jnp.float32)] * 2
+    else:
+        out_specs = [pl.BlockSpec((None, nc, pb, kob), lambda n, i, s: (n, 0, i, 0))] * 2
+        out_shape = [jax.ShapeDtypeStruct((N, nc, P, Ko_pad), jnp.float32)] * 2
+    call = pl.pallas_call(kernel, grid=grid, in_specs=in_specs, out_specs=out_specs, out_shape=out_shape,
+                          scratch_shapes=[pltpu.VMEM((pb, seg), jnp.float32)] * 2,
                           compiler_params=None if interpret else pltpu.CompilerParams(vmem_limit_bytes=vmem_limit, dimension_semantics=('arbitrary', 'arbitrary', 'arbitrary')),
                           interpret=interpret)
     return call(*args)

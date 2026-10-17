@@ -489,7 +489,7 @@ class ImageFormer:
         bands = self._fn.stages.get('bands') or {}
         if self._filt != 'pallas2' or not bands:
             return None
-        wmax = max(b['win'] for b in bands.values())
+        wmax = max(b.get('seg', b['win']) for b in bands.values())
         cap = (self._fn.stages.get('win_cap') or 256 * wmax) // 2
         return cap if cap >= 8 * wmax else None
 

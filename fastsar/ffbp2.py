@@ -681,7 +681,7 @@ def make_ffbp(policy, plan, filt='dense', budget=1 << 26, trig='split', pallas_p
         """The TPU level kernel's pulse block halved, down to 8 pulses, until a block of pulses by the band window
         holds at most pallas_win_cap samples: the kernel holds several such blocks in vector memory, and a range
         line of about 10,000 samples in blocks of 256 pulses exceeds the v6e's 128 MB."""
-        while pallas_win_cap and pb > 8 and pb * band['win'] > pallas_win_cap:
+        while pallas_win_cap and pb > 8 and pb * band.get('seg', band['win']) > pallas_win_cap:
             pb //= 2
         return pb
 

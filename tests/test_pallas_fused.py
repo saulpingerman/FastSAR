@@ -136,6 +136,47 @@ def test_band_blocks2_window_limit(toy, monkeypatch):
     assert e < -55, e
 
 
+@pytest.mark.parametrize('fused', [False, True])
+def test_kernel3_segmented(toy, fused, monkeypatch):
+    """A row longer than SEG_MAX is cut into segments whose products accumulate in the output block: band_blocks2
+    reports ns > 1 and the third kernel, with and without the fused pulse decimation, matches the reference and the
+    unsegmented kernel's output."""
+    import jax.numpy as jnp
+    from fastsar import pallas_ffbp
+    from fastsar.pallas_ffbp import band_blocks2, pad_columns, fused_rotate_dec_k3
+    one = band_blocks2(toy.Fk, D)
+    assert one['nb'] == 1 and one['ns'] == 1
+    monkeypatch.setattr(pallas_ffbp, 'SEG_MAX', 512)
+    band = band_blocks2(toy.Fk, D)
+    print('segmented', {k: band[k] for k in ('kob', 'win', 'seg', 'ns', 'nb', 'Kpad', 'chunk')})
+    assert band['nb'] == 1 and band['ns'] > 1 and band['ns'] * band['seg'] == band['Kpad']
+    Dp, Po = 2, 40
+    tp_ = np.kaiser(16, 8.0) * np.sinc((np.arange(16) - 7.5) / Dp) / Dp
+    Fp = np.zeros((P, Po))
+    for j in range(Po):
+        for r in range(16):
+            i = Dp * j + r - 6
+            if 0 <= i < P:
+                Fp[i, j] = tp_[r]
+    FpT = jnp.asarray(Fp.T, jnp.float32) if fused else None
+    outs = {}
+    for name, b in (('one', one), ('seg', band)):
+        Sre = jnp.stack([pad_columns(jnp.asarray(s.real), b) for s in toy.Ss]); Sim = jnp.stack([pad_columns(jnp.asarray(s.imag), b) for s in toy.Ss])
+        yr, yi = fused_rotate_dec_k3(Sre, Sim, jnp.asarray(toy.c0s), jnp.asarray(toy.sls), b, kc, pb=32, passes=3, FpT=FpT, interpret=True)
+        outs[name] = np.asarray(yr) + 1j * np.asarray(yi)
+    num = den = 0.0
+    for (n, c), ref in child_refs(toy).items():
+        if fused:
+            ref = Fp.T @ ref
+        Y = outs['seg'][n, c, :ref.shape[0], :Ko]
+        num += np.sum(np.abs(Y - ref) ** 2); den += np.sum(np.abs(ref) ** 2)
+    e = err_db(num, den)
+    d = outs['seg'] - outs['one']
+    e2 = err_db(np.sum(np.abs(d) ** 2), np.sum(np.abs(outs['one']) ** 2))
+    print(f'kernel3 segmented (fused {fused}): error {e:.1f} dB vs reference, {e2:.1f} dB vs the unsegmented kernel')
+    assert e < -55 and e2 < -60, (e, e2)
+
+
 @pytest.mark.parametrize('passes, lim', [(1, -44), (3, -55)])
 @pytest.mark.parametrize('fused', [False, True])
 def test_kernel3(toy, band2, fused, passes, lim):
