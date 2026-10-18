@@ -63,7 +63,10 @@ backprojection sees, with zeros where a pulse has no sample; `'inscribed'` keeps
 a clean window at the cost of the bandwidth outside it (about half the range bandwidth in the ground plane of a
 squinted orbital spotlight, little in the slant plane).
 `pfa_guard` (default 300 m, for orbital scenes) is the margin kept free of wrap-around; small simulated scenes need
-less. The planar-wavefront assumption displaces scatterers away from the center: on Panama by up to 18 pixels in
+less. The polar raster is taken about the grid's range axis `e2`, which must point along the mid-aperture line of
+sight in the image plane (the vendors' image grids do, whatever the squint of the collection); a grid rotated from it
+degrades quickly (15 degrees on a squinted Umbra spotlight gave -5 dB against backprojection where the aligned grid
+gave -27 dB) and FastSAR warns beyond 2 degrees. Backprojection takes any grid. The planar-wavefront assumption displaces scatterers away from the center: on Panama by up to 18 pixels in
 azimuth and 12 in range at the corners. FastSAR removes the displacement predicted from the geometry by a final
 resampling. The error is then -32.1 dB on Panama (Melbourne -33.5 dB, Iowa -35.4 dB). It grows by about 10 dB from
 the inner to the outer ring around the scene center; the factorized image's error stays level:

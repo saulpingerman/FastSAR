@@ -19,10 +19,16 @@ was published on PyPI.
   the aperture or the bandwidth supports) is cropped to the raster with a warning; before, the padding to the raster
   failed with a negative width. The CPU polar format uploads nothing; on a GPU the history goes up in pinned row
   blocks, so no second host copy of it is made.
-- `ExactFormer` on cuda with `interp='linear'` keeps the cropped range profiles in float16 (`profiles='auto'`;
-  `'float32'`, `'float16'` and `'float16-pair'` select explicitly), scaled per chunk on the device: the Panama image
-  in 10.7 s against 11.7 s with float32 profiles on an L4 in development, at the same -56.9 dB. Cubic interpolation
-  keeps float32 profiles (float16 would cost 0.5 dB at -67 dB).
+- Polar format warns when the grid's range axis `e2` is more than 2 degrees from the mid-aperture line of sight in
+  the image plane, the orientation its polar raster assumes (a grid rotated 15 degrees on a squinted Umbra spotlight
+  gave -5 dB against backprojection where the aligned grid gave -27 dB; found by the release gate, present in 0.1.6).
+- `ExactFormer` on cuda with `interp='linear'` keeps the cropped range profiles in float16 on grids of 2^25 pixels
+  or more (`profiles='auto'`; `'float32'`, `'float16'` and `'float16-pair'` select explicitly), scaled per chunk on
+  the device: the Panama image in 10.7 s against 11.7 s with float32 profiles on an L4 in development, at the same
+  -56.9 dB. The saving is in the pixel gather, so on twelve held-out collections it was 4 to 6 per cent on 8192 by
+  8192 grids and a cost of up to 3 per cent on 4096 by 4096 grids, where the per-chunk scaling is the larger term;
+  below the threshold the former reads float32 profiles as before. Cubic interpolation keeps float32 profiles
+  (float16 would cost 0.5 dB at -67 dB).
 
 ## [0.1.6.post1] - 2026-10-18
 

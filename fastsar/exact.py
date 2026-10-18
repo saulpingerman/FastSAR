@@ -421,10 +421,13 @@ class ExactFormer:
             raise ValueError(f"profiles must be 'auto', 'float32', 'float16' or 'float16-pair', got {profiles!r}")
         if profiles == 'float16-pair' and interp != 'linear':
             raise ValueError("profiles='float16-pair' applies to interp='linear'")
-        # cuda keeps the cropped range profiles in float16 for linear interpolation (the rounding, -70 dB and
-        # below per sample, is far under the linear kernel's error; 7 per cent faster on an L4) and in float32 for
-        # cubic, whose -67 dB images would lose 0.5 dB; the CPU and Metal kernels read float32 profiles
-        self.profiles = ('float16' if interp == 'linear' else 'float32') if profiles == 'auto' else profiles
+        # cuda keeps the cropped range profiles in float16 for linear interpolation on large grids (the rounding,
+        # -70 dB and below per sample, is far under the linear kernel's error): the saving is in the pixel gather,
+        # so it pays where the gather dominates the call, 4 to 6 per cent on 8192 by 8192 grids and 9 per cent on
+        # the 12,207 by 8,808 Panama image on an L4, and it costs up to 3 per cent on 4096 by 4096 grids, where the
+        # per-chunk scaling of the profiles is the larger term (twelve held-out collections, release 0.1.7). Cubic
+        # interpolation keeps float32, whose -67 dB images would lose 0.5 dB; the CPU and Metal kernels read float32.
+        self.profiles = ('float16' if interp == 'linear' and nx * ny >= 1 << 25 else 'float32') if profiles == 'auto' else profiles
         self.ant = _check_positions(ant)
         self.P = len(self.ant)
         self.K = _integer(K, 'K (frequency samples per pulse)', 2)

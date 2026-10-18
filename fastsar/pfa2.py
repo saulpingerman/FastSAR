@@ -294,6 +294,16 @@ def geometry(col, nx, ny, spx, spy, taps=16, e1=(1.0, 0.0, 0.0), e2=(0.0, 1.0, 0
     ur = -(u @ e2)                                  # range component toward the radar in the image plane (positive)
     t = (u @ e1) / ur                               # tangent of the look angle in the image plane
     P, K = col.Np, col.K
+    # the polar raster is taken about e2: a grid whose range axis is rotated from the mid-aperture line of sight
+    # degrades fast (a 15 degree rotation on a squinted Umbra spotlight gave -5 dB against backprojection where the
+    # aligned grid gave -27 dB, release 0.1.7); the vendors' image grids are aligned, other callers are warned
+    tmid = float(t[P // 2])
+    if abs(tmid) > np.tan(np.radians(2.0)):
+        import warnings
+        warnings.warn(f"polar format: the grid's range axis e2 is {abs(np.degrees(np.arctan(tmid))):.1f} degrees from the "
+                      f"mid-aperture line of sight in the image plane; the polar raster is taken about e2 and the image degrades "
+                      f"quickly with this angle. Rotate the grid so that e2 points along the line of sight (the vendors' image "
+                      f"grids do), or use algorithm='ffbp' or 'bp'", UserWarning, stacklevel=3)
     p = np.arange(P)
     m = taps // 2
     rev = t[-1] < t[0]                              # pulses are taken in the order of increasing t

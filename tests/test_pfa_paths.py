@@ -84,6 +84,20 @@ def test_exact_profiles_validation(scene):
         fastsar.ExactFormer(col.ant, col.fmin, col.df, S.shape[1], **GRID, backend='cpu', profiles='float16-pair')
 
 
+def test_grid_rotated_from_line_of_sight_warns(scene):
+    """The polar raster is taken about e2: a grid whose range axis is rotated from the mid-aperture line of sight
+    gets a warning (2 degrees and beyond); the aligned grid does not."""
+    import warnings
+    col, S = scene
+    th = np.radians(10.0)
+    rot = dict(GRID, e1=(-np.sin(th), np.cos(th), 0.0), e2=(np.cos(th), np.sin(th), 0.0))
+    with pytest.warns(UserWarning, match='line of sight'):
+        fastsar.form_image(S, col.ant, col.fmin, col.df, **rot, algorithm='pfa', pfa_guard=10.0)
+    with warnings.catch_warnings():
+        warnings.simplefilter('error', UserWarning)
+        fastsar.form_image(S, col.ant, col.fmin, col.df, **GRID, algorithm='pfa', pfa_guard=10.0)
+
+
 def test_band_wider_than_grid():
     """A grid coarser than the aperture's azimuth resolution: the spectrum is cropped to the raster with a warning,
     and the image still forms (before 0.1.7 the padding to the raster failed with a negative width)."""
