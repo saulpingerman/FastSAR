@@ -413,15 +413,18 @@ class ExactFormer:
     two threads at once (the cuda backend reuses its pinned upload buffers)."""
 
     def __init__(self, ant, fmin, df, K, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 1.0, 0.0), *, backend='auto',
-                 window=True, interp='cubic', upsample=None, ref=None, center=None, chunk=1024, profiles='float32'):
+                 window=True, interp='cubic', upsample=None, ref=None, center=None, chunk=1024, profiles='auto'):
         from .api import _backend, _check_positions, _check_grid, _window
         if interp not in ('cubic', 'linear'):
             raise ValueError(f"interp must be 'cubic' or 'linear', got {interp!r}")
-        if profiles not in ('float32', 'float16', 'float16-pair'):
-            raise ValueError(f"profiles must be 'float32', 'float16' or 'float16-pair', got {profiles!r}")
+        if profiles not in ('auto', 'float32', 'float16', 'float16-pair'):
+            raise ValueError(f"profiles must be 'auto', 'float32', 'float16' or 'float16-pair', got {profiles!r}")
         if profiles == 'float16-pair' and interp != 'linear':
             raise ValueError("profiles='float16-pair' applies to interp='linear'")
-        self.profiles = profiles
+        # cuda keeps the cropped range profiles in float16 for linear interpolation (the rounding, -70 dB and
+        # below per sample, is far under the linear kernel's error; 7 per cent faster on an L4) and in float32 for
+        # cubic, whose -67 dB images would lose 0.5 dB; the CPU and Metal kernels read float32 profiles
+        self.profiles = ('float16' if interp == 'linear' else 'float32') if profiles == 'auto' else profiles
         self.ant = _check_positions(ant)
         self.P = len(self.ant)
         self.K = _integer(K, 'K (frequency samples per pulse)', 2)

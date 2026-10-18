@@ -182,9 +182,10 @@ def _resample_kernels(taps):
 
 
 def _direct_resampling():
-    """FASTSAR_PFA_CZT=0 replaces the two chirp-z transforms by direct Kaiser-sinc resampling (CUDA or C++ kernels)."""
+    """On a GPU or the CPU the two chirp-z transforms are replaced by direct Kaiser-sinc resampling (CUDA or C++
+    kernels) of the windowed profiles; FASTSAR_PFA_CZT=1 keeps the chirp-z transforms (the TPU always uses them)."""
     import os
-    return os.environ.get('FASTSAR_PFA_CZT', '1') == '0'
+    return os.environ.get('FASTSAR_PFA_CZT', '0') != '1'
 
 
 def _gather_kernel(taps, npow, deg):
