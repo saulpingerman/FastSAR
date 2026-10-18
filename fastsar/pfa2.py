@@ -96,6 +96,96 @@ extern "C" __global__ void pfa_gather(const float2* base, int span, int Nx2, int
 """
 _GATHER = {}
 
+_RESAMPLE_SRC = r"""
+#ifndef TAPS
+#define TAPS 16
+#endif
+#define HALF_T (TAPS / 2)
+// Kaiser-windowed sinc of TAPS taps (the kernel of pfa2._kernel): I0 by its series, 1 / I0(beta) given
+__device__ __forceinline__ float kaiser_sinc(float d, float beta, float inv_i0) {
+  const float x = fminf(fmaxf(d / HALF_T, -1.f), 1.f);
+  const float a = 0.5f * beta * sqrtf(fmaxf(0.f, 1.f - x * x));
+  float term = 1.f, sum = 1.f;
+  #pragma unroll
+  for (int k = 1; k <= 12; ++k) { term *= (a / k) * (a / k); sum += term; }
+  const float win = sum * inv_i0;
+  float sc;
+  if (fabsf(d) < 1e-6f) sc = 1.f; else { const float pd = 3.14159265358979f * d; sc = sinf(pd) / pd; }
+  return fabsf(d) < HALF_T ? sc * win : 0.f;
+}
+// rows: out[r, j] = row r of (re, im) [R, n] interpolated at index pos0[r] + j * step[r], j < n_out; outputs
+// whose index lies outside (-0.5, n - 0.5) are zero (as the chirp-z transform zeroes them); weights normalised
+extern "C" __global__ void resample_rows(const float2* x, int R, int n, const float* pos0, const float* step,
+                                         int n_out, float beta, float inv_i0, float2* out) {
+  const int j = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y;
+  if (j >= n_out || r >= R) return;
+  const float pos = pos0[r] + j * step[r];
+  float2 acc = make_float2(0.f, 0.f);
+  if (pos > -0.5f && pos < n - 0.5f) {
+    const int i0 = (int)floorf(pos) - HALF_T + 1;
+    const float2* rr = x + (long)r * n;
+    float w[TAPS], tot = 0.f;
+    #pragma unroll
+    for (int t = 0; t < TAPS; ++t) {
+      const int i = i0 + t;
+      w[t] = (i >= 0 && i < n) ? kaiser_sinc(pos - i, beta, inv_i0) : 0.f;
+      tot += w[t];
+    }
+    const float inv = 1.f / fmaxf(tot, 1e-12f);
+    #pragma unroll
+    for (int t = 0; t < TAPS; ++t) {
+      const int i = min(max(i0 + t, 0), n - 1);
+      const float2 v = rr[i];
+      acc.x = fmaf(w[t] * inv, v.x, acc.x); acc.y = fmaf(w[t] * inv, v.y, acc.y);
+    }
+  }
+  out[(long)r * n_out + j] = acc;
+}
+// columns: out[m, j] = column m of A [R, M] (complex) interpolated along the rows at index pos0[m] + j * step[m];
+// threads along m read consecutive addresses
+extern "C" __global__ void resample_cols(const float2* A, int R, int M, const float* pos0, const float* step,
+                                         int n_out, float beta, float inv_i0, float2* out) {
+  const int m = blockIdx.x * blockDim.x + threadIdx.x, j = blockIdx.y;
+  if (m >= M || j >= n_out) return;
+  const float pos = pos0[m] + j * step[m];
+  float2 acc = make_float2(0.f, 0.f);
+  if (pos > -0.5f && pos < R - 0.5f) {
+    const int i0 = (int)floorf(pos) - HALF_T + 1;
+    float w[TAPS], tot = 0.f;
+    #pragma unroll
+    for (int t = 0; t < TAPS; ++t) {
+      const int i = i0 + t;
+      w[t] = (i >= 0 && i < R) ? kaiser_sinc(pos - i, beta, inv_i0) : 0.f;
+      tot += w[t];
+    }
+    const float inv = 1.f / fmaxf(tot, 1e-12f);
+    #pragma unroll
+    for (int t = 0; t < TAPS; ++t) {
+      const int i = min(max(i0 + t, 0), R - 1);
+      const float2 v = A[(long)i * M + m];
+      acc.x = fmaf(w[t] * inv, v.x, acc.x); acc.y = fmaf(w[t] * inv, v.y, acc.y);
+    }
+  }
+  out[(long)m * n_out + j] = acc;
+}
+"""
+_RESAMPLE = {}
+
+
+def _resample_kernels(taps):
+    """The CUDA direct-resampling kernels (rows and columns), compiled once per tap count."""
+    import cupy as cp
+    if taps not in _RESAMPLE:
+        m = cp.RawModule(code=_RESAMPLE_SRC, options=(f'-DTAPS={taps}',))
+        _RESAMPLE[taps] = (m.get_function('resample_rows'), m.get_function('resample_cols'))
+    return _RESAMPLE[taps]
+
+
+def _direct_resampling():
+    """FASTSAR_PFA_CZT=0 replaces the two chirp-z transforms by direct Kaiser-sinc resampling on a GPU."""
+    import os
+    return os.environ.get('FASTSAR_PFA_CZT', '1') == '0'
+
 
 def _gather_kernel(taps, npow, deg):
     """The CUDA gather kernel of the final resampling (compiled once per taps, polynomial length and degree)."""
@@ -419,6 +509,50 @@ def make_pfa(geo, nx, ny, spx, spy, resample='dense', mm_dtype=None, precision=N
 
     def spectrum(S_re, S_im, W, alpha, eps_r, shift, eps_a):
         return stage2(stage1(S_re, S_im, W, alpha, eps_r), shift, eps_a)
+
+    if _cuda_gather_available() and _direct_resampling():
+        # the two chirp-z transforms as direct resampling by the pulse-resampling kernel (Kaiser-windowed sinc of
+        # geo['taps'] taps): a row kernel over the frequency samples of each resampled pulse and a column kernel
+        # over the pulses of each wavenumber row, CUDA kernels on CuPy arrays
+        import cupy as cp
+        k_rows, k_cols = _resample_kernels(geo['taps'])
+        inv_i0 = float(1.0 / np.i0(geo['kaiser']))
+        kb = np.float32(geo['kaiser'])
+
+        # the window of the chirp-z transforms (taper: one over the scene, a raised cosine to zero over the guard,
+        # zero beyond) is applied in the profile domain by an unpadded transform pair before each resampling, so
+        # that returns from beyond the guard do not wrap into the smaller period of the resampled grid
+        @jax.jit
+        def pulses_windowed(S_re, S_im, W, ext):
+            x = cx(*resample_pulses(S_re, S_im, W))                                             # [Pp, K]
+            g = jnp.fft.fftshift(jnp.fft.ifft(x, axis=1), axes=1) * taper(x.shape[1], ext, edge_y)
+            return jnp.fft.fft(jnp.fft.ifftshift(g, axes=1), axis=1)
+
+        @jax.jit
+        def columns_windowed(A, ext):
+            g = jnp.fft.fftshift(jnp.fft.ifft(A, axis=0), axes=0) * taper(A.shape[0], ext, edge_x).T
+            return jnp.fft.fft(jnp.fft.ifftshift(g, axes=0), axis=0)                             # [Pp, nkr]
+
+        def spectrum(S_re, S_im, W, alpha, eps_r, shift, eps_a):
+            x = pulses_windowed(S_re, S_im, W, ext_r)
+            x.block_until_ready()
+            cxp = cp.from_dlpack(x)
+            Pp, K = cxp.shape
+            st_r = cp.from_dlpack(1.0 + eps_r); a0 = cp.from_dlpack(alpha)
+            A = cp.empty((Pp, nkr), cp.complex64)
+            k_rows((-(-nkr // 128), Pp), (128,), (cxp, np.int32(Pp), np.int32(K), a0, st_r, np.int32(nkr), kb, np.float32(inv_i0), A))
+            cp.cuda.get_current_stream().synchronize()
+            del cxp, x
+            Aw = columns_windowed(jax.dlpack.from_dlpack(A), ext_a)
+            Aw.block_until_ready()
+            del A
+            cA = cp.from_dlpack(Aw)
+            st_a = cp.from_dlpack(1.0 + eps_a); s0 = cp.from_dlpack(shift)
+            B = cp.empty((nkr, nka), cp.complex64)
+            k_cols((-(-nkr // 128), nka), (128,), (cA, np.int32(Pp), np.int32(nkr), s0, st_a, np.int32(nka), kb, np.float32(inv_i0), B))
+            cp.cuda.get_current_stream().synchronize()
+            del cA, Aw
+            return jax.dlpack.from_dlpack(B)                                                    # [nkr, nka]
 
     @jax.jit
     def image(b):
