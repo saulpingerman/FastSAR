@@ -46,16 +46,8 @@ _SRC_PRE = r'''
 '''
 
 _SRC_ROT = r'''
-#ifndef LB
-#define LB 0           /* minimum blocks per multiprocessor asked of the compiler for rot_fir_k (0: none; testing) */
-#endif
-#if LB > 0
-#define LBATTR __launch_bounds__(PB * JT, LB)
-#else
-#define LBATTR
-#endif
 extern "C" __global__
-void LBATTR rot_fir_k(const sample_t* __restrict__ sre, const sample_t* __restrict__ sim, const float* __restrict__ c0, const float* __restrict__ sl,
+void rot_fir_k(const sample_t* __restrict__ sre, const sample_t* __restrict__ sim, const float* __restrict__ c0, const float* __restrict__ sl,
                const float* __restrict__ taps, sample_t* __restrict__ yre, sample_t* __restrict__ yim,
                int C_, int P, int K, int Ko, int D, int L, int pl, float kc)
 {
@@ -74,10 +66,9 @@ void LBATTR rot_fir_k(const sample_t* __restrict__ sre, const sample_t* __restri
     float rawr[RAWMAX], rawi[RAWMAX];
     float* zr = sm; float* zi = sm + PB * WS; float* tp = sm + 2 * PB * WS;
     float* rr = zr; float* ri = zi;
-#elif RAWLOAD || ROTFLY
-    // one shared window: (RAWLOAD) loaded again from global memory (the L2 cache after the first child) for every
-    // child and rotated in place by the child's ramp, or (ROTFLY) the raw window, rotated on the fly as the filter
-    // reads it
+#elif RAWLOAD
+    // one shared window, loaded again from global memory (the L2 cache after the first child) for every child and
+    // rotated in place by the child's ramp
     float* zr = sm; float* zi = sm + PB * WS; float* tp = sm + 2 * PB * WS;
     float* rr = zr; float* ri = zi;
 #else
@@ -125,38 +116,12 @@ void LBATTR rot_fir_k(const sample_t* __restrict__ sre, const sample_t* __restri
         // and so on the memory free at the call.)
         const float dcc = pok ? c0[((size_t)n * C_ + c) * P + p] : 0.f;
         const float dss = pok ? sl[((size_t)n * C_ + c) * P + p] : 0.f;
-#if ROTFLY
-        {
-            // the filter reads the raw window and rotates each sample as it goes: the phase is linear in the sample,
-            // so one sine and cosine for the window's first sample and one for the step, then a complex multiplication
-            // per sample read (a geometric sequence along the window); no rotated copy is written
-            const int i0 = 2 * jt * D;
-            float cyc = dcc + ((float)(kstart + i0) - kc) * dss;
-            cyc -= rintf(cyc);
-            float st = dss;
-            st -= rintf(st);
-            float wi_, wr_, si_, sr_;
-            sincospif(2.0f * cyc, &wi_, &wr_);
-            sincospif(2.0f * st, &si_, &sr_);
-            float a0r = 0.f, a0i = 0.f, a1r = 0.f, a1i = 0.f;
-            const float* row_r = zr + pp * WS + i0;
-            const float* row_i = zi + pp * WS + i0;
-            for (int r = 0; r < L + D; ++r) {
-                const float xr = row_r[r], xi = row_i[r];
-                const float vr = xr * wr_ - xi * wi_, vi = xr * wi_ + xi * wr_;
-                if (r < L) { const float t = tp[r]; a0r = fmaf(t, vr, a0r); a0i = fmaf(t, vi, a0i); }
-                if (r >= D) { const float t = tp[r - D]; a1r = fmaf(t, vr, a1r); a1i = fmaf(t, vi, a1i); }
-                const float nr = wr_ * sr_ - wi_ * si_;
-                wi_ = wr_ * si_ + wi_ * sr_; wr_ = nr;
-            }
-            otr[pp * (2 * JT) + 2 * jt] = a0r; oti[pp * (2 * JT) + 2 * jt] = a0i;
-            otr[pp * (2 * JT) + 2 * jt + 1] = a1r; oti[pp * (2 * JT) + 2 * jt + 1] = a1i;
-        }
-#else
         {
             // this thread's samples are JT columns apart, so their phase steps are constant: one sine and cosine for
             // the first sample and one for the step, then a complex multiplication per sample (a geometric sequence)
-            float cyc = dcc + ((float)(kstart + jt) - kc) * dss;
+            // the arithmetic is written out in fused multiply-adds so that every variant of the window's storage
+            // rounds alike (left to the compiler, the contraction differed between variants on the H100 and A100)
+            float cyc = fmaf((float)(kstart + jt) - kc, dss, dcc);
             cyc -= rintf(cyc);
             float st = (float)JT * dss;
             st -= rintf(st);
@@ -169,19 +134,19 @@ void LBATTR rot_fir_k(const sample_t* __restrict__ sre, const sample_t* __restri
                 const int i = jt + m * JT;
                 if (i < W) {
                     const float vr = rawr[m], vi = rawi[m];
-                    zr[pp * WS + i] = vr * wr_ - vi * wi_;
-                    zi[pp * WS + i] = vr * wi_ + vi * wr_;
-                    const float nr = wr_ * sr_ - wi_ * si_;
-                    wi_ = wr_ * si_ + wi_ * sr_; wr_ = nr;
+                    zr[pp * WS + i] = fmaf(vr, wr_, -(vi * wi_));
+                    zi[pp * WS + i] = fmaf(vr, wi_, vi * wr_);
+                    const float nr = fmaf(wr_, sr_, -(wi_ * si_));
+                    wi_ = fmaf(wr_, si_, wi_ * sr_); wr_ = nr;
                 }
             }
 #else
             for (int i = jt; i < W; i += JT) {
                 const float vr = rr[pp * WS + i], vi = ri[pp * WS + i];
-                zr[pp * WS + i] = vr * wr_ - vi * wi_;
-                zi[pp * WS + i] = vr * wi_ + vi * wr_;
-                const float nr = wr_ * sr_ - wi_ * si_;
-                wi_ = wr_ * si_ + wi_ * sr_; wr_ = nr;
+                zr[pp * WS + i] = fmaf(vr, wr_, -(vi * wi_));
+                zi[pp * WS + i] = fmaf(vr, wi_, vi * wr_);
+                const float nr = fmaf(wr_, sr_, -(wi_ * si_));
+                wi_ = fmaf(wr_, si_, wi_ * sr_); wr_ = nr;
             }
 #endif
         }
@@ -207,7 +172,6 @@ void LBATTR rot_fir_k(const sample_t* __restrict__ sre, const sample_t* __restri
             otr[pp * (2 * JT) + 2 * jt] = a0r; oti[pp * (2 * JT) + 2 * jt] = a0i;
             otr[pp * (2 * JT) + 2 * jt + 1] = a1r; oti[pp * (2 * JT) + 2 * jt + 1] = a1i;
         }
-#endif
         __syncthreads();
         // coalesced store: consecutive threads write consecutive columns of one pulse's row
         for (int idx = tid; idx < PB * 2 * JT; idx += PB * JT) {
@@ -422,9 +386,10 @@ _PB_CHOICES = (32, 16, 8)        # pulses per block tried in order by the level 
 
 
 _RAWREG = (16, 32, 48)           # rot_fir_k keeps the raw window in registers, this many samples per thread at most (0: a second
-                                 # copy in shared memory; -1: reloaded from global memory for every child; these three give the same
-                                 # bits; -2: rotated on the fly as the filter reads it, which rounds differently but is as independent
-                                 # of the launch)
+                                 # copy in shared memory; -1: reloaded from global memory for every child); the three give the same bits
+_SMEM_BIG = 200 * 1024           # shared memory per multiprocessor from which the shared-memory copy is the faster variant (the
+                                 # H100's 228 KB: 0.600 against 0.649 s on the Panama record; the A100's 164 KB and the L4's 100 KB
+                                 # prefer the registers, 1.17 against 1.25 s and 2.81 against 2.94 s)
 
 
 _KERN = {}
@@ -434,8 +399,7 @@ def _kernels(store='fp32', pb=32, rawreg=16):
     bits = 16 if store == 'f16' else 32
     jt = memory._env_number('FASTSAR_CUDA_JT', 1) or 8                 # threads per pulse in rot_fir_k (testing)
     colb = int(memory._env_choice('FASTSAR_FINAL_COLB', '1', {'0', '1'}))     # final_tile's table build by columns (testing)
-    lb = memory._env_number('FASTSAR_CUDA_LB', 1) or 0                 # launch bounds (testing)
-    ckey = (store, pb, rawreg, jt, colb, lb, cp.cuda.Device().id)
+    ckey = (store, pb, rawreg, jt, colb, cp.cuda.Device().id)
     if ckey in _KERN:                   # the dict itself, once per configuration: a level that uses a variant asked for
         return _KERN[ckey]              # it per launch, and the function look-ups and attribute calls cost 2 to 5 per cent
     # the first-level kernel is built per pulses-per-block and raw-window variant from its own source, the other
@@ -444,11 +408,10 @@ def _kernels(store='fp32', pb=32, rawreg=16):
     if key not in _mods:
         _mods[key] = cp.RawModule(code=_SRC_PRE + _SRC_REST, options=('--std=c++14', '--use_fast_math', f'-DSTORE={bits}', f'-DJT={jt}', f'-DCOLB={colb}'))
     out = {k: _mods[key].get_function(k) for k in ('fir_p', 'fir_p_g', 'final_tile')}
-    key = ('rot', bits, pb, jt, rawreg, lb)
+    key = ('rot', bits, pb, jt, rawreg)
     if key not in _mods:
         _mods[key] = cp.RawModule(code=_SRC_PRE + _SRC_ROT, options=('--std=c++14', '--use_fast_math', f'-DSTORE={bits}', f'-DPB={pb}', f'-DJT={jt}',
-                                                                     f'-DRAWREG={int(rawreg > 0)}', f'-DRAWMAX={max(rawreg, 1)}', f'-DRAWLOAD={int(rawreg == -1)}',
-                                                                     f'-DROTFLY={int(rawreg == -2)}', f'-DLB={lb}'))
+                                                                     f'-DRAWREG={int(rawreg > 0)}', f'-DRAWMAX={max(rawreg, 1)}', f'-DRAWLOAD={int(rawreg == -1)}'))
     out['rot_fir_k'] = _mods[key].get_function('rot_fir_k')
     # opt in once to the device's largest shared memory per block: the limit belongs to the kernel, which every former
     # shares, so a former must never lower it (a former built on another thread while one runs would break its launch)
@@ -497,9 +460,12 @@ def _children(kern, pre, pim, c0, sl, lv):
         # window, both in shared memory; a child's samples are rotated from the raw window by the child's own ramp
         # either way, so that the image does not depend on how many children a launch holds (the group size, which
         # the free device memory sets): 0.1.4 rotated one copy on from child to child
-        rawreg = next((r for r in _RAWREG if -(-W // jt) <= r), 0)
+        if int(cp.cuda.Device().attributes.get('MaxSharedMemoryPerMultiprocessor', 0)) >= _SMEM_BIG:
+            rawreg = 0
+        else:
+            rawreg = next((r for r in _RAWREG if -(-W // jt) <= r), 0)
         if os.environ.get('FASTSAR_CUDA_RAWREG'):
-            rawreg = int(os.environ['FASTSAR_CUDA_RAWREG'])             # testing: a tier, or 0 for shared memory
+            rawreg = int(os.environ['FASTSAR_CUDA_RAWREG'])             # testing: a tier, 0 for shared memory, -1 for reloads
         for pb in ((pb_env,) if pb_env else _PB_CHOICES):   # pulses per block: the largest whose window fits the device
             smem = ((4 if rawreg == 0 else 2) * pb * (W | 1) + L + 2 * pb * cols) * 4
             if smem <= smem_max:
@@ -510,7 +476,7 @@ def _children(kern, pre, pim, c0, sl, lv):
             raise ValueError(f"the cuda backend's first-level window ({smem // 1024} KB: range decimation {Dk} with a "
                              f"{L}-tap filter, a small image from a wide-band collection) exceeds the GPU's shared memory "
                              f"({smem_max // 1024} KB): use backend='cpu' or 'jax', or a larger image")
-        kl = kern['rot_fir_k'] if pb == 32 and rawreg == _RAWREG[0] and not os.environ.get('FASTSAR_CUDA_LB') else _kernels(kern['store'], pb, rawreg)['rot_fir_k']
+        kl = kern['rot_fir_k'] if pb == 32 and rawreg == _RAWREG[0] else _kernels(kern['store'], pb, rawreg)['rot_fir_k']
         kl(((Ko + cols - 1) // cols, (P + pb - 1) // pb, Np), (pb * jt,),
                           (pre, pim, c0, sl, taps, yre, yim, np.int32(Cn), np.int32(P), np.int32(K), np.int32(Ko), np.int32(Dk),
                            np.int32(L), np.int32(pl), np.float32(kc)), shared_mem=smem)

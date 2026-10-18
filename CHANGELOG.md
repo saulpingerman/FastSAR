@@ -3,6 +3,20 @@
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The date of a version is the day it
 was published on PyPI.
 
+## [0.1.6] - unreleased
+
+### Changed
+
+- cuda `ImageFormer` and `form_cphd`: the first-level kernel's raw window is kept in registers on most devices and in
+  a second shared-memory copy on devices with 200 KB or more of shared memory per multiprocessor (the H100), whichever
+  the paper's record measured faster; 0.1.5 kept it in registers everywhere, which cost the H100 14 per cent of the
+  fast former's time against 0.1.4 and the A100 8 per cent (the L4 gained 3 to 6 per cent). With the choice the H100
+  is 6 per cent slower than 0.1.4 on the Panama record (0.600 against 0.568 s), the A100 8 per cent (1.17 against
+  1.08 s) and the L4 3 to 6 per cent faster: the price of an image that does not depend on the memory free at the
+  call, which the 0.1.5 release fixed. The rotation's arithmetic is written in explicit fused multiply-adds, so the
+  variants give the same bits (left to the compiler they differed in the last bit on the H100 and A100); the images
+  differ from 0.1.5's at that rounding level.
+
 ## [0.1.5] - 2026-10-18
 
 ### Changed
