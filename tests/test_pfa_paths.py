@@ -82,3 +82,19 @@ def test_exact_profiles_validation(scene):
         fastsar.ExactFormer(col.ant, col.fmin, col.df, S.shape[1], **GRID, backend='cpu', profiles='float8')
     with pytest.raises(ValueError, match='float16-pair'):
         fastsar.ExactFormer(col.ant, col.fmin, col.df, S.shape[1], **GRID, backend='cpu', profiles='float16-pair')
+
+
+def test_band_wider_than_grid():
+    """A grid coarser than the aperture's azimuth resolution: the spectrum is cropped to the raster with a warning,
+    and the image still forms (before 0.1.7 the padding to the raster failed with a negative width)."""
+    import warnings
+    rng = np.random.default_rng(3)
+    col = sim.make_collect(res=0.5, scene=70.0, r0=20e3)
+    tg = np.stack([rng.uniform(-20, 20, 10), rng.uniform(-20, 20, 10), np.zeros(10)], 1)
+    S = sim.simulate_brute(col, tg, rng.standard_normal(10) + 1j * rng.standard_normal(10)).astype(np.complex64)
+    grid = dict(nx=48, ny=48, spx=1.5, spy=1.5, e1=(0.0, 1.0, 0.0), e2=(1.0, 0.0, 0.0))
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter('always')
+        img = fastsar.form_image(S, col.ant, col.fmin, col.df, **grid, algorithm='pfa', pfa_guard=10.0)
+    assert img.shape == (48, 48) and np.isfinite(img).all()
+    assert any('band' in str(x.message) for x in w), [str(x.message) for x in w]

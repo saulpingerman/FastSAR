@@ -335,11 +335,25 @@ def geometry(col, nx, ny, spx, spy, taps=16, e1=(1.0, 0.0, 0.0), e2=(0.0, 1.0, 0
     else:
         raise ValueError(f"support must be 'union' or 'inscribed', not {support!r}")
     nkr = int((kr_max - kr_min) / dkr) + 1
+    if nkr > nfy:                                             # a band wider than the grid resolves: its center is kept
+        import warnings
+        warnings.warn(f'polar format: the range band ({nkr} samples) exceeds the {nfy}-sample raster of the grid; the central '
+                      f'{nfy} are kept, so the range resolution is limited by the pixel spacing', UserWarning, stacklevel=3)
+        kr_min += ((nkr - nfy) // 2) * dkr
+        nkr = nfy
+        kr_max = kr_min + (nkr - 1) * dkr
     kr = kr_min + dkr * np.arange(nkr)
     ta, tb = t0 + m * dt, t1 - m * dt
     kref = kr_min if support == 'inscribed' else kr_max      # the azimuth band common to the rows, or the widest row's
     ka_lo, ka_hi = kref * ta, kref * tb
     nka = int((ka_hi - ka_lo) / dka) + 1
+    if nka > nfx:                                             # the aperture's azimuth band wider than the grid resolves
+        import warnings
+        warnings.warn(f'polar format: the azimuth band of the aperture ({nka} samples) exceeds the {nfx}-sample raster of '
+                      f'the grid; the central {nfx} are kept, so the azimuth resolution is limited by the pixel spacing '
+                      '(a finer spacing or a shorter aperture keeps the whole band)', UserWarning, stacklevel=3)
+        ka_lo += ((nka - nfx) // 2) * dka
+        nka = nfx
     scale = C / (4.0 * math.pi * ur_r * col.df)
     extent_r = C / (2.0 * col.df)                            # period of a range profile (m)
     extent_a = 2.0 * math.pi / (kr * dt)                     # period of the azimuth profile of each kr row (m)
@@ -575,34 +589,44 @@ def make_pfa(geo, nx, ny, spx, spy, resample='dense', mm_dtype=None, precision=N
         # that returns from beyond the guard do not wrap into the smaller period of the resampled grid
         @jax.jit
         def pulses_windowed(S_re, S_im, W, ext):
-            x = cx(*resample_pulses(S_re, S_im, W))                                             # [Pp, K]
+            x = cx(*resample_pulses(S_re, S_im, W))                                             # [rows, K]
             g = jnp.fft.fftshift(jnp.fft.ifft(x, axis=1), axes=1) * taper(x.shape[1], ext, edge_y)
             return jnp.fft.fft(jnp.fft.ifftshift(g, axes=1), axis=1)
 
         @jax.jit
         def columns_windowed(A, ext):
             g = jnp.fft.fftshift(jnp.fft.ifft(A, axis=0), axes=0) * taper(A.shape[0], ext, edge_x).T
-            return jnp.fft.fft(jnp.fft.ifftshift(g, axes=0), axis=0)                             # [Pp, nkr]
+            return jnp.fft.fft(jnp.fft.ifftshift(g, axes=0), axis=0)                             # [Pp, cols]
 
         def spectrum(S_re, S_im, W, alpha, eps_r, shift, eps_a):
-            x = pulses_windowed(S_re, S_im, W, ext_r)
-            x.block_until_ready()
-            cxp = cp.from_dlpack(x)
-            Pp, K = cxp.shape
+            # blocks of pulses, then blocks of wavenumber columns, so that the temporaries of one block are freed
+            # before the next (the whole array at once needed 40 GB on a 213,000-pulse spotlight)
+            Pp = alpha.shape[0]
             st_r = cp.from_dlpack(1.0 + eps_r); a0 = cp.from_dlpack(alpha)
             A = cp.empty((Pp, nkr), cp.complex64)
-            k_rows((-(-nkr // 128), Pp), (128,), (cxp, np.int32(Pp), np.int32(K), a0, st_r, np.int32(nkr), d_tab, A))
-            cp.cuda.get_current_stream().synchronize()
-            del cxp, x
-            Aw = columns_windowed(jax.dlpack.from_dlpack(A), ext_a)
-            Aw.block_until_ready()
-            del A
-            cA = cp.from_dlpack(Aw)
+            for r in range(0, Pp, rows):
+                Wb = W[r:r + rows] if resample == 'dense' else (W[0][r:r + rows], W[1][r:r + rows])
+                x = pulses_windowed(S_re, S_im, Wb, ext_r[r:r + rows])
+                x.block_until_ready()
+                cxp = cp.from_dlpack(x)
+                nb, K = cxp.shape
+                k_rows((-(-nkr // 128), nb), (128,), (cxp, np.int32(nb), np.int32(K), a0[r:r + rows], st_r[r:r + rows], np.int32(nkr), d_tab, A[r:r + rows]))
+                cp.cuda.get_current_stream().synchronize()
+                del cxp, x
             st_a = cp.from_dlpack(1.0 + eps_a); s0 = cp.from_dlpack(shift)
             B = cp.empty((nkr, nka), cp.complex64)
-            k_cols((-(-nkr // 128), nka), (128,), (cA, np.int32(Pp), np.int32(nkr), s0, st_a, np.int32(nka), d_tab, B))
-            cp.cuda.get_current_stream().synchronize()
-            del cA, Aw
+            cols = 1024
+            for c in range(0, nkr, cols):
+                Ab = cp.ascontiguousarray(A[:, c:c + cols])
+                Aw = columns_windowed(jax.dlpack.from_dlpack(Ab), ext_a[c:c + cols])
+                Aw.block_until_ready()
+                del Ab
+                cA = cp.from_dlpack(Aw)
+                nc = cA.shape[1]
+                k_cols((-(-nc // 128), nka), (128,), (cA, np.int32(Pp), np.int32(nc), s0[c:c + cols], st_a[c:c + cols], np.int32(nka), d_tab, B[c:c + cols]))
+                cp.cuda.get_current_stream().synchronize()
+                del cA, Aw
+            del A
             return jax.dlpack.from_dlpack(B)                                                    # [nkr, nka]
 
     @jax.jit

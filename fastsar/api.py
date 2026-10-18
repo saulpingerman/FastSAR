@@ -592,12 +592,23 @@ def _pfa(S, col, nx, ny, spx, spy, e1, e2, guard=300.0, window=True, support='un
         _mem.cuda_release()                   # blocks and FFT plans CuPy cached are not JAX's to use
     S = np.asarray(S, np.complex64)
     if jax.default_backend() == 'gpu':
-        import cupy as cp                                                # upload through pinned memory (several times
-        mem = _mem._pinned(S.nbytes)                                     # faster than JAX's copy from pageable memory)
-        hb = np.frombuffer(mem, np.complex64, S.size).reshape(S.shape)
-        np.copyto(hb, S)
-        Sd = jax.dlpack.from_dlpack(cp.asarray(hb))
-        del hb
+        import cupy as cp                                                # upload in row blocks through two pinned
+        dev = cp.empty(S.shape, cp.complex64)                            # staging buffers (several times faster than
+        rows = max(1, (256 << 20) // max(S.shape[1] * 8, 1))             # JAX's copy from pageable memory, and
+        bufs = [_mem._pinned(rows * S.shape[1] * 8) for _ in range(2)]   # without a second host copy of the history)
+        stream = cp.cuda.Stream(non_blocking=True)
+        events = [None, None]
+        for i, p0 in enumerate(range(0, S.shape[0], rows)):
+            p1 = min(S.shape[0], p0 + rows); b = i % 2
+            if events[b] is not None:
+                events[b].synchronize()
+            hb = np.frombuffer(bufs[b], np.complex64, rows * S.shape[1]).reshape(rows, S.shape[1])[:p1 - p0]
+            np.copyto(hb, S[p0:p1])
+            dev[p0:p1].set(hb, stream=stream)
+            events[b] = cp.cuda.Event(); events[b].record(stream)
+        stream.synchronize()
+        del bufs
+        Sd = jax.dlpack.from_dlpack(dev)
     else:
         Sd = jax.device_put(S)
     re, im, scale = prep(Sd)
