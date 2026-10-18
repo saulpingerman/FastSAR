@@ -15,6 +15,10 @@ was published on PyPI.
   memory and the history is uploaded through pinned memory. The Panama image in development: 3.0 s at 0.1.6 and
   1.45 s now on an L4, 11.2 and 8.9 s on the c4d-highmem-16, the same -32.1 dB; the direct resampling agrees with
   the transforms to -61 dB.
+- Polar format: a range or azimuth band wider than the grid's raster (a pixel spacing coarser than the resolution
+  the aperture or the bandwidth supports) is cropped to the raster with a warning; before, the padding to the raster
+  failed with a negative width. The CPU polar format uploads nothing; on a GPU the history goes up in pinned row
+  blocks, so no second host copy of it is made.
 - `ExactFormer` on cuda with `interp='linear'` keeps the cropped range profiles in float16 (`profiles='auto'`;
   `'float32'`, `'float16'` and `'float16-pair'` select explicitly), scaled per chunk on the device: the Panama image
   in 10.7 s against 11.7 s with float32 profiles on an L4 in development, at the same -56.9 dB. Cubic interpolation
