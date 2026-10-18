@@ -47,6 +47,17 @@ C = 299792458.0
 # ---------------------------------------------------------------------------------------------------- CUDA
 
 _CUDA_SRC = r'''
+#include <cuda_fp16.h>
+#if defined(HALFPAIR)
+typedef uint2 prof_t;         // position i holds the float16 samples i and i + 1 (8 bytes, one load)
+#define HALF 1
+#elif defined(HALF)
+typedef __half2 prof_t;      // the cropped profiles in float16 pairs, scaled per chunk (see to_half)
+#define LOAD(a) __half22float2(a)
+#else
+typedef float2 prof_t;
+#define LOAD(a) (a)
+#endif
 #ifndef PX
 #define PX 8
 #endif
@@ -57,10 +68,10 @@ _CUDA_SRC = r'''
 #define TX 32
 #endif
 #define TY ((TB * PX) / TX)
-extern "C" __global__ void bp_tiles(const float2* rc, int P, int W, const int* lo, const double* ant, const double* ref,
+extern "C" __global__ void bp_tiles(const prof_t* rc, int P, int W, const int* lo, const double* ant, const double* ref,
                                     const double* cen, int nty, int nx, int ny, float sx, float sy,
                                     float e1x, float e1y, float e1z, float e2x, float e2y, float e2z,
-                                    double inv_dr, double kcyc, float2* out) {
+                                    double inv_dr, double kcyc, const float* unscale, float2* out) {
   // one thread block per tile of TX x TY pixels, PX pixels per thread; the tile center's terms for TB pulses at a
   // time are computed in float64 by the block's threads and shared
   __shared__ float s_ux[TB], s_uy[TB], s_uz[TB], s_ir[TB], s_i2[TB], s_tf[TB], s_ph[TB];
@@ -105,7 +116,7 @@ extern "C" __global__ void bp_tiles(const float2* rc, int P, int W, const int* l
     const int np = min(TB, P - p0);
     for (int k = 0; k < np; ++k) {
       const float ux = s_ux[k], uy = s_uy[k], uz = s_uz[k], hir = s_ir[k], hi2 = s_i2[k], tfk = s_tf[k], phk = s_ph[k];
-      const float2* row = rc + (long)(p0 + k) * W + s_ti[k];
+      const prof_t* row = rc + (long)(p0 + k) * W + s_ti[k];
       #pragma unroll
       for (int m = 0; m < PX; ++m) {
         const float du = dx[m]*ux + dy[m]*uy + dz[m]*uz;
@@ -114,13 +125,17 @@ extern "C" __global__ void bp_tiles(const float2* rc, int P, int W, const int* l
         const float t = tfk + del * fdr, fl = floorf(t), w = t - fl;
         const int i = (int)fl;
 #ifdef CUBIC
-        const float2 a0 = row[i - 1], a1 = row[i], a2 = row[i + 1], a3 = row[i + 2];
+        const float2 a0 = LOAD(row[i - 1]), a1 = LOAD(row[i]), a2 = LOAD(row[i + 1]), a3 = LOAD(row[i + 2]);
         const float wm1 = w - 1.f, wm2 = w - 2.f, wp1 = w + 1.f;
         const float c0 = -w * wm1 * wm2 * (1.f / 6.f), c1 = wp1 * wm1 * wm2 * 0.5f;
         const float c2 = -wp1 * w * wm2 * 0.5f, c3 = wp1 * w * wm1 * (1.f / 6.f);
         const float vre = c0*a0.x + c1*a1.x + c2*a2.x + c3*a3.x, vim = c0*a0.y + c1*a1.y + c2*a2.y + c3*a3.y;
+#elif defined(HALFPAIR)
+        const uint2 pr = row[i];
+        const float2 r0 = __half22float2(*reinterpret_cast<const __half2*>(&pr.x)), r1 = __half22float2(*reinterpret_cast<const __half2*>(&pr.y));
+        const float vre = fmaf(w, r1.x - r0.x, r0.x), vim = fmaf(w, r1.y - r0.y, r0.y);
 #else
-        const float2 r0 = row[i], r1 = row[i + 1];
+        const float2 r0 = LOAD(row[i]), r1 = LOAD(row[i + 1]);
         const float vre = fmaf(w, r1.x - r0.x, r0.x), vim = fmaf(w, r1.y - r0.y, r0.y);
 #endif
         float ph = fmaf(fk, del, phk);
@@ -133,12 +148,39 @@ extern "C" __global__ void bp_tiles(const float2* rc, int P, int W, const int* l
     }
     __syncthreads();
   }
+#ifdef HALF
+  const float us = *unscale;          // the chunk's profile scale, undone once per pixel
+#else
+  const float us = 1.f;
+#endif
   #pragma unroll
   for (int m = 0; m < PX; ++m)
     if (ix[m] < nx && iy[m] < ny) {
       const long o = (long)ix[m] * ny + iy[m];
-      out[o] = make_float2(out[o].x + are[m], out[o].y + aim[m]);
+      out[o] = make_float2(fmaf(are[m], us, out[o].x), fmaf(aim[m], us, out[o].y));
     }
+}
+
+// float16 profiles: the chunk's cropped profiles scaled so that their largest magnitude is 2048 (inside the
+// float16 range with a margin for the interpolation), the scale and its inverse kept on the device (no host sync)
+extern "C" __global__ void half_scale(const float* smax, float* sc) {
+  const float m = fmaxf(*smax, 1e-30f);
+  sc[0] = 2048.f / m; sc[1] = m / 2048.f;
+}
+extern "C" __global__ void to_half(const float2* win, const float* sc, long n, __half2* out) {
+  const long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= n) return;
+  const float2 v = win[idx];
+  out[idx] = __floats2half2_rn(v.x * sc[0], v.y * sc[0]);
+}
+// float16 pairs: word i of each profile row holds samples i and i + 1 (the last word repeats the last sample)
+extern "C" __global__ void to_half_pair(const float2* win, const float* sc, long n, int W, uint2* out) {
+  const long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= n) return;
+  const int m = idx % W;
+  const float2 v = win[idx], u = win[idx + (m + 1 < W ? 1 : 0)];
+  const __half2 a = __floats2half2_rn(v.x * sc[0], v.y * sc[0]), b = __floats2half2_rn(u.x * sc[0], u.y * sc[0]);
+  out[idx] = make_uint2(*reinterpret_cast<const unsigned int*>(&a), *reinterpret_cast<const unsigned int*>(&b));
 }
 
 // the windowed history of one block of pulses, centered and zero padded to nfft (the bins between stay zero)
@@ -371,10 +413,15 @@ class ExactFormer:
     two threads at once (the cuda backend reuses its pinned upload buffers)."""
 
     def __init__(self, ant, fmin, df, K, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 1.0, 0.0), *, backend='auto',
-                 window=True, interp='cubic', upsample=None, ref=None, center=None, chunk=1024):
+                 window=True, interp='cubic', upsample=None, ref=None, center=None, chunk=1024, profiles='float32'):
         from .api import _backend, _check_positions, _check_grid, _window
         if interp not in ('cubic', 'linear'):
             raise ValueError(f"interp must be 'cubic' or 'linear', got {interp!r}")
+        if profiles not in ('float32', 'float16', 'float16-pair'):
+            raise ValueError(f"profiles must be 'float32', 'float16' or 'float16-pair', got {profiles!r}")
+        if profiles == 'float16-pair' and interp != 'linear':
+            raise ValueError("profiles='float16-pair' applies to interp='linear'")
+        self.profiles = profiles
         self.ant = _check_positions(ant)
         self.P = len(self.ant)
         self.K = _integer(K, 'K (frequency samples per pulse)', 2)
@@ -490,14 +537,16 @@ class ExactFormer:
     def _setup_cuda(self):
         import cupy as cp
         self._tb, px = CUDA_BLOCKS[self.tile]
-        opts = ('-use_fast_math', f'-DPX={px}', f'-DTB={self._tb}', f'-DTX={self.tx}') + (('-DCUBIC',) if self.cubic else ())
+        opts = ('-use_fast_math', f'-DPX={px}', f'-DTB={self._tb}', f'-DTX={self.tx}') + (('-DCUBIC',) if self.cubic else ()) + {'float32': (), 'float16': ('-DHALF',), 'float16-pair': ('-DHALFPAIR',)}[self.profiles]
         m = cp.RawModule(code=_CUDA_SRC, options=opts + ('-DALONG1=0',))
         m1 = cp.RawModule(code=_CUDA_SRC, options=opts + ('-DALONG1=1',))
         # the backprojection kernel in each tile order (ALONG1 compiled in: a run-time flag cost 3 per cent on an L4)
         self._k_bp = (m.get_function('bp_tiles'), m1.get_function('bp_tiles'))
         self._k_pad, self._k_crop = m.get_function('pad_window'), m.get_function('crop')
+        self._k_half = None if self.profiles == 'float32' else (m.get_function('half_scale'), m.get_function('to_half' if self.profiles == 'float16' else 'to_half_pair'))
         self._d = dict(cen=cp.asarray(self.cen), blo=cp.asarray(self.blo), lo=cp.asarray(self.lo), ant=cp.asarray(self.ant),
-                       ref=cp.asarray(self.ref), wp=cp.asarray(self.wp, cp.float32), wk=cp.asarray(self.wk, cp.float32))
+                       ref=cp.asarray(self.ref), wp=cp.asarray(self.wp, cp.float32), wk=cp.asarray(self.wk, cp.float32),
+                       sc=cp.ones(2, cp.float32))         # float16 profiles: the chunk's scale and its inverse
         ch = min(self.chunk, self.P)
         self._pin = [cp.cuda.alloc_pinned_memory(ch * self.K * 8) for _ in range(2)]
         self._hbuf = [np.frombuffer(b, np.complex64, ch * self.K).reshape(ch, self.K) for b in self._pin]
@@ -518,6 +567,10 @@ class ExactFormer:
         dev = [] if on_device else [cp.empty((ch, K), cp.complex64) for _ in range(2)]
         pad = cp.zeros((ch, nfft), cp.complex64)
         win = cp.empty((ch, W), cp.complex64)
+        half = self._k_half is not None
+        if half:                                 # float16 pairs (or pairs of pairs), stored in the bits of a float32 (float64) array
+            winh = cp.empty((ch, W), cp.float32 if self.profiles == 'float16' else cp.float64)
+            mag, smax = cp.empty((ch, W), cp.float32), cp.empty((), cp.float32)
         chunks = [(p0, min(P, p0 + ch)) for p0 in range(0, P, ch)]
         used = [None, None]
         bad = cp.zeros((), cp.bool_)            # a non-finite sample seen (read once, at the end)
@@ -564,6 +617,15 @@ class ExactFormer:
             prof = cp.fft.ifft(pad[:n], axis=1)      # CuPy's plan cache keeps the plan (memory.cuda_release frees it)
             self._k_crop((-(-n * W // 256),), (256,), (prof, d['blo'][p0:p1], np.int32(n), np.int32(nfft), np.int32(W), f32(nfft), win))
             del prof
+            if half:
+                cp.abs(win[:n], out=mag[:n])
+                cp.amax(mag[:n], out=smax)
+                self._k_half[0]((1,), (1,), (smax, d['sc']))
+                if self.profiles == 'float16':
+                    self._k_half[1]((-(-n * W // 256),), (256,), (win, d['sc'], np.int64(n * W), winh))
+                else:
+                    self._k_half[1]((-(-n * W // 256),), (256,), (win, d['sc'], np.int64(n * W), np.int32(W), winh))
+            rc = winh if half else win
             if pending is not None and pending[0][1].done and pending[1][1].done:     # the last pair's events
                 t0, t1 = (cp.cuda.get_elapsed_time(*pending[k]) for k in (0, 1))
                 self.probe_ms.append((pending[2], round(t0, 3), round(t1, 3)))
@@ -580,10 +642,10 @@ class ExactFormer:
             else:
                 order = along1
             self._k_bp[order]((self.ntx * self.nty,), (self._tb,),
-                       (win, np.int32(n), np.int32(W), d['lo'][p0:p1], d['ant'][p0:p1], d['ref'][p0:p1], d['cen'],
+                       (rc, np.int32(n), np.int32(W), d['lo'][p0:p1], d['ant'][p0:p1], d['ref'][p0:p1], d['cen'],
                         np.int32(self.nty), np.int32(self.nx), np.int32(self.ny), f32(self.spx), f32(self.spy),
                         f32(self.e1[0]), f32(self.e1[1]), f32(self.e1[2]), f32(self.e2[0]), f32(self.e2[1]), f32(self.e2[2]),
-                        np.float64(self.inv_dr), np.float64(self.kcyc), out))
+                        np.float64(self.inv_dr), np.float64(self.kcyc), d['sc'][1:], out))
             if timed:
                 probe[order][1].record()
                 if j == 2:
@@ -684,7 +746,7 @@ class ExactFormer:
             geo = self.cen.nbytes + self.P * (3 * 8 + 8 + 8 + 4 + 8)
             if self.backend == 'cuda':
                 parts = dict(histories=2 * ch * self.K * 8, padded=ch * self.nfft * 8,
-                             fft=2 * ch * self.nfft * 8, window=ch * self.W * 8, image=npix * 8, geometry=geo)
+                             fft=2 * ch * self.nfft * 8, window=ch * self.W * {'float32': 8, 'float16': 16, 'float16-pair': 20}[self.profiles], image=npix * 8, geometry=geo)
             else:
                 parts = dict(history=ch * self.K * 8 * 2, padded=ch * self.nfft * 8, fft=ch * self.nfft * 8,
                              window=ch * self.W * (8 + 8 + 8 + 8), image=npix * 4 * 2 + npix * 8 * 2, geometry=geo)

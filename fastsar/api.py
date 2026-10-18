@@ -581,14 +581,21 @@ def _pfa(S, col, nx, ny, spx, spy, e1, e2, guard=300.0, window=True, support='un
             scale = jnp.max(jnp.abs(x))
             scale = jnp.where(scale > 0, scale, 1.0)          # an all-zero history gives a zero image, not 0/0
             return jnp.real(x) / scale, jnp.imag(x) / scale, scale
-        prog = (fn, arrs, prep)
+
+        @jax.jit
+        def finish(out, scale):
+            return (out * scale).astype(jnp.complex64)
+        prog = (fn, arrs, prep, finish)
         with _PFA_LOCK:
             if len(_PFA_PROGRAMS) >= 4:
                 _PFA_PROGRAMS.pop(next(iter(_PFA_PROGRAMS)))
             _PFA_PROGRAMS[key] = prog
-    fn, (W, alpha, eps_r, shift, eps_a), prep = prog
+    fn, (W, alpha, eps_r, shift, eps_a), prep, finish = prog
     if 'cupy' in sys.modules and jax.default_backend() == 'gpu':
         _mem.cuda_release()                   # blocks and FFT plans CuPy cached are not JAX's to use
     re, im, scale = prep(jax.device_put(np.asarray(S, np.complex64)))
-    out = fn(re, im, W, alpha, eps_r, shift, eps_a)
-    return (np.asarray(out) * float(scale)).astype(np.complex64)
+    out = finish(fn(re, im, W, alpha, eps_r, shift, eps_a), scale)       # scaled on the device
+    if jax.default_backend() == 'gpu':
+        import cupy as cp
+        return _to_host(cp.from_dlpack(out))                             # through pinned memory, as ImageFormer returns
+    return np.asarray(out)
