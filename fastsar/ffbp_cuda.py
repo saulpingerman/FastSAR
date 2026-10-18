@@ -427,17 +427,23 @@ _RAWREG = (16, 32, 48)           # rot_fir_k keeps the raw window in registers, 
                                  # of the launch)
 
 
+_KERN = {}
+
+
 def _kernels(store='fp32', pb=32, rawreg=16):
     bits = 16 if store == 'f16' else 32
     jt = memory._env_number('FASTSAR_CUDA_JT', 1) or 8                 # threads per pulse in rot_fir_k (testing)
     colb = int(memory._env_choice('FASTSAR_FINAL_COLB', '1', {'0', '1'}))     # final_tile's table build by columns (testing)
+    lb = memory._env_number('FASTSAR_CUDA_LB', 1) or 0                 # launch bounds (testing)
+    ckey = (store, pb, rawreg, jt, colb, lb, cp.cuda.Device().id)
+    if ckey in _KERN:                   # the dict itself, once per configuration: a level that uses a variant asked for
+        return _KERN[ckey]              # it per launch, and the function look-ups and attribute calls cost 2 to 5 per cent
     # the first-level kernel is built per pulses-per-block and raw-window variant from its own source, the other
     # kernels once per storage (a variant otherwise recompiled them all, 4 s of a process's first call on an L4)
     key = ('rest', bits, jt, colb)
     if key not in _mods:
         _mods[key] = cp.RawModule(code=_SRC_PRE + _SRC_REST, options=('--std=c++14', '--use_fast_math', f'-DSTORE={bits}', f'-DJT={jt}', f'-DCOLB={colb}'))
     out = {k: _mods[key].get_function(k) for k in ('fir_p', 'fir_p_g', 'final_tile')}
-    lb = memory._env_number('FASTSAR_CUDA_LB', 1) or 0                 # launch bounds (testing)
     key = ('rot', bits, pb, jt, rawreg, lb)
     if key not in _mods:
         _mods[key] = cp.RawModule(code=_SRC_PRE + _SRC_ROT, options=('--std=c++14', '--use_fast_math', f'-DSTORE={bits}', f'-DPB={pb}', f'-DJT={jt}',
@@ -452,6 +458,7 @@ def _kernels(store='fp32', pb=32, rawreg=16):
     out['dtype'] = cp.float16 if bits == 16 else cp.float32
     out['store'] = store
     out['jt'] = jt
+    _KERN[ckey] = out
     return out
 
 
