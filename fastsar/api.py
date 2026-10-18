@@ -590,7 +590,17 @@ def _pfa(S, col, nx, ny, spx, spy, e1, e2, guard=300.0, window=True, support='un
     fn, (W, alpha, eps_r, shift, eps_a), prep = prog
     if 'cupy' in sys.modules and jax.default_backend() == 'gpu':
         _mem.cuda_release()                   # blocks and FFT plans CuPy cached are not JAX's to use
-    re, im, scale = prep(jax.device_put(np.asarray(S, np.complex64)))
+    S = np.asarray(S, np.complex64)
+    if jax.default_backend() == 'gpu':
+        import cupy as cp                                                # upload through pinned memory (several times
+        mem = _mem._pinned(S.nbytes)                                     # faster than JAX's copy from pageable memory)
+        hb = np.frombuffer(mem, np.complex64, S.size).reshape(S.shape)
+        np.copyto(hb, S)
+        Sd = jax.dlpack.from_dlpack(cp.asarray(hb))
+        del hb
+    else:
+        Sd = jax.device_put(S)
+    re, im, scale = prep(Sd)
     out = fn(re, im, W, alpha, eps_r, shift, eps_a, scale)               # scaled on the device
     if type(out).__module__.startswith('cupy'):                          # the CUDA gather wrote a CuPy image
         return _to_host(out)                                             # through pinned memory, as ImageFormer returns

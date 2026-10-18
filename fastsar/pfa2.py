@@ -106,6 +106,37 @@ def _gather_kernel(taps, npow, deg):
     return _GATHER[key]
 
 
+_CPU_LIB = None
+
+
+def _cpu_gather_lib():
+    """The C++ gather of the final resampling (pfa_cpu.cpp), compiled on first use as the other CPU kernels."""
+    global _CPU_LIB
+    if _CPU_LIB is None:
+        import ctypes, os
+        from ._build import shared_object, default_flags
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pfa_cpu.cpp')) as fh:
+            src = fh.read()
+        L = ctypes.CDLL(shared_object('pfa_cpu', src, default_flags() + ['-std=c++17']))
+        f32 = np.ctypeslib.ndpointer(np.float32, flags='C_CONTIGUOUS')
+        f64 = np.ctypeslib.ndpointer(np.float64, flags='C_CONTIGUOUS')
+        i32 = np.ctypeslib.ndpointer(np.int32, flags='C_CONTIGUOUS')
+        i, d, fl = ctypes.c_int, ctypes.c_double, ctypes.c_float
+        L.pfa_gather.argtypes = [f32, i, i, i, i, i, i, i, i, i, i, d, d, d, d, d, d, d, f64, f64, i32, i, i, d, d, i, i, fl, fl, i,
+                                 ctypes.c_void_p, ctypes.c_long]
+        _CPU_LIB = L
+    return _CPU_LIB
+
+
+def _cpu_gather_available():
+    """True when JAX runs on the CPU and the C++ gather is not switched off (FASTSAR_PFA_GATHER=0)."""
+    import os
+    if os.environ.get('FASTSAR_PFA_GATHER', '1') == '0':
+        return False
+    import jax
+    return jax.default_backend() == 'cpu'
+
+
 def _cuda_gather_available():
     """True when JAX runs on a GPU and CuPy can run the gather kernel on it (FASTSAR_PFA_GATHER=0 keeps the JAX gather)."""
     import os
@@ -469,6 +500,7 @@ def make_pfa(geo, nx, ny, spx, spy, resample='dense', mm_dtype=None, precision=N
         return out * carr * norm
 
     cuda = _cuda_gather_available()
+    cpu = (not cuda) and _cpu_gather_available()
 
     def block_start(jb):
         """The base row start of a block from the apparent positions on a coarse grid (with margin), as
@@ -479,7 +511,7 @@ def make_pfa(geo, nx, ny, spx, spy, resample='dense', mm_dtype=None, precision=N
         fy_idx = (Y + Bp @ dist['cy']) / (spy / ov) + Ny2 / 2.0
         return int(np.clip(np.floor(fy_idx.min()) - half - 6, 0, Ny2 - span)), len(ys)
 
-    if cuda:
+    if cuda or cpu:
         blocks = [(block_start(jb), jb) for jb in range(j0, j0 + w, bw)]
 
         @jax.jit
@@ -488,6 +520,29 @@ def make_pfa(geo, nx, ny, spx, spy, resample='dense', mm_dtype=None, precision=N
             G = jnp.roll(jnp.pad(rows_, ((0, 0), (0, Nx2 - nka))), -(nka // 2), axis=1)
             return jnp.fft.fftshift(t_x(G, axis=1), axes=1)                                     # [span, Nx2]
 
+    if cpu:
+        lib = _cpu_gather_lib()
+        c_cx, c_cy = np.ascontiguousarray(dist['cx'], np.float64), np.ascontiguousarray(dist['cy'], np.float64)
+        c_pw = np.ascontiguousarray(np.asarray(dist['powers'], np.int32).ravel())
+        deg = max(a + b for a, b in dist['powers'])
+
+        def pfa_corrected(S_re, S_im, W, alpha, eps_r, shift, eps_a, scale=None):
+            b = spectrum_jit(S_re, S_im, W, alpha, eps_r, shift, eps_a)                         # [nkr, nka]
+            F1 = range_stage(b)
+            del b
+            sc = 1.0 if scale is None else float(scale)
+            out = np.empty((h, w), np.complex64)
+            for (rb0, n), jb in blocks:
+                base = np.ascontiguousarray(np.asarray(azimuth_base(F1, rb0)), np.complex64)
+                lib.pfa_gather(base.view(np.float32).reshape(span, 2 * Nx2), span, Nx2, Ny2, rb0, h, n, i0, jb, nx, ny,
+                               float(spx), float(spy), float(offset[0]), float(offset[1]), float(ov), float(dist['sx']), float(dist['sy']),
+                               c_cx, c_cy, c_pw, len(c_cx), deg, float(kr_c), float(ka_c), int(sy), int(sx), float(norm), sc, int(taps),
+                               out.ctypes.data + (jb - j0) * 8, w)
+            return out                                                                          # numpy [h, w], scaled
+
+        return pfa_corrected
+
+    if cuda:
         import cupy as cp
         kern = _gather_kernel(taps, len(dist['powers']), max(a + b for a, b in dist['powers']))
         d_cx, d_cy = cp.asarray(np.asarray(dist['cx'], np.float64)), cp.asarray(np.asarray(dist['cy'], np.float64))
