@@ -383,7 +383,7 @@ _mods = {}
 _PB_CHOICES = (32, 16, 8)        # pulses per block tried in order by the level kernel (tests may narrow this)
 
 
-_RAWREG = (16, 32, 48)           # rot_fir_k keeps the raw window in registers, this many samples per thread at most (0: a second
+_RAWREG = (-1,)                  # rot_fir_k keeps the raw window in registers, this many samples per thread at most (0: a second
                                  # copy in shared memory; -1: reloaded from global memory for every child); all three give the same bits
 
 
