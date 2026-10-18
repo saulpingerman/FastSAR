@@ -437,7 +437,7 @@ def _kernels(store='fp32', pb=32, rawreg=16):
     if key not in _mods:
         _mods[key] = cp.RawModule(code=_SRC_PRE + _SRC_REST, options=('--std=c++14', '--use_fast_math', f'-DSTORE={bits}', f'-DJT={jt}', f'-DCOLB={colb}'))
     out = {k: _mods[key].get_function(k) for k in ('fir_p', 'fir_p_g', 'final_tile')}
-    lb = memory._env_number('FASTSAR_CUDA_LB', 1) or 0                 # launch bounds (testing)
+    lb = memory._env_number('FASTSAR_CUDA_LB', 1) or 4                 # launch bounds (testing)
     key = ('rot', bits, pb, jt, rawreg, lb)
     if key not in _mods:
         _mods[key] = cp.RawModule(code=_SRC_PRE + _SRC_ROT, options=('--std=c++14', '--use_fast_math', f'-DSTORE={bits}', f'-DPB={pb}', f'-DJT={jt}',
