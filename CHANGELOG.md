@@ -3,6 +3,24 @@
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The date of a version is the day it
 was published on PyPI.
 
+## [0.1.7] - unreleased
+
+### Changed
+
+- Polar format on GPUs: the final resampling (the planar-wavefront displacement removed) is a CUDA kernel that
+  computes each pixel's apparent position and carrier itself; the two chirp-z transforms are replaced by direct
+  Kaiser-windowed-sinc resampling of the windowed profiles (`FASTSAR_PFA_CZT=1` keeps the transforms); the image
+  is scaled on the device and returned through pinned memory, and the history is uploaded through pinned memory.
+  The Panama image on an L4 in development: 3.0 s at 0.1.6, 1.5 s now, the same -32.1 dB; the direct resampling
+  agrees with the transforms to -61 dB.
+- Polar format on the CPU: the final resampling is a C++ kernel (11.2 s to 10.2 s on the Panama image on the
+  c4d-highmem-16 in development); `FASTSAR_PFA_GATHER=0` keeps the JAX gather. The chirp-z transforms stay on the
+  CPU and the TPU.
+- `ExactFormer` on cuda with `interp='linear'` keeps the cropped range profiles in float16 (`profiles='auto'`;
+  `'float32'`, `'float16'` and `'float16-pair'` select explicitly), scaled per chunk on the device: the Panama image
+  in 10.8 s against 11.6 s with float32 profiles on an L4 in development, at the same -56.9 dB. Cubic interpolation
+  keeps float32 profiles (float16 would cost 0.5 dB at -67 dB).
+
 ## [0.1.6.post1] - 2026-10-18
 
 ### Changed
