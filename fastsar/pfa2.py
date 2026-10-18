@@ -362,7 +362,7 @@ def geometry(col, nx, ny, spx, spy, taps=16, e1=(1.0, 0.0, 0.0), e2=(0.0, 1.0, 0
         raise ValueError(f'polar format: the scene ({nx * spx:.1f} by {ny * spy:.1f} m) plus pfa_guard={guard:g} m on each '
                          f'side exceeds the unambiguous extent ({extent_a.min():.1f} m in azimuth, {extent_r:.1f} m in '
                          'range); use a smaller pfa_guard or grid')
-    return dict(pidx=pidx, taps=taps, kaiser=kaiser, Pp=Pp, K=K, extent_r=extent_r, extent_a=extent_a, edge=edge, guard=guard,
+    return dict(pidx=pidx, taps=taps, kaiser=kaiser, Pp=Pp, K=K, extent_r=extent_r, extent_a=extent_a, edge=edge, guard=guard, ur_r=ur_r,
                 alpha=kr_min * scale - col.fmin / col.df,        # [Pp] frequency index at kr_min
                 beta=dkr * scale,                                # [Pp] frequency index step per kr sample
                 gam=dka / (dt * kr),                             # [nkr] pulse index step per ka sample
@@ -467,12 +467,16 @@ def make_pfa(geo, nx, ny, spx, spy, resample='dense', mm_dtype=None, precision=N
         extra = eps[:, None] * (i2.astype(f) / (2 * n))
         return cis(sign * (base[None, :] + extra))
 
-    def taper(n, extent, edge):
+    def taper(n, extent, edge, gd=None):
         """Window over a profile of n samples whose period is `extent` meters (per row, [R]): one inside
-        `edge` meters of the center, a raised cosine to zero over the next `guard` meters."""
+        `edge` meters of the center, a raised cosine to zero over the next `gd` meters (default the guard). edge
+        and gd may be per row ([R]): the range profiles are in slant range, so the scene's edge and the guard,
+        given in the image plane, are projected onto the line of sight of each pulse (times ur)."""
         d = jnp.abs(jnp.arange(n, dtype=jnp.int32) - n // 2).astype(f)[None, :] * (extent[:, None] / n)
-        gd = geo['guard']
-        return jnp.where(d <= edge, 1.0, jnp.where(d >= edge + gd, 0.0, 0.5 + 0.5 * jnp.cos((d - edge) * (math.pi / gd)))).astype(f)
+        e = jnp.asarray(edge, f); g_ = jnp.asarray(geo['guard'] if gd is None else gd, f)
+        e = e[:, None] if e.ndim == 1 else e
+        g_ = g_[:, None] if g_.ndim == 1 else g_
+        return jnp.where(d <= e, 1.0, jnp.where(d >= e + g_, 0.0, 0.5 + 0.5 * jnp.cos((d - e) * (math.pi / g_)))).astype(f)
 
     def czt(x, shift, eps, n_out, j0, extent, edge):
         """The chirp-z transforms in blocks of rows, which bounds the working memory."""
@@ -481,13 +485,13 @@ def make_pfa(geo, nx, ny, spx, spy, resample='dense', mm_dtype=None, precision=N
             return czt_block(x, shift, eps, n_out, j0, extent, edge)
         return jnp.concatenate([czt_block(x[r:r + rows], shift[r:r + rows], eps[r:r + rows], n_out, j0, extent[r:r + rows], edge) for r in range(0, R, rows)], axis=0)
 
-    def czt_block(x, shift, eps, n_out, j0, extent, edge):
+    def czt_block(x, shift, eps, n_out, j0, extent, edge, gd=None):
         """Rows of x [R, n] are spectra; their trigonometric interpolation at index shift + (j0 + j)(1 + eps).
         Outputs whose index falls outside the row (where the periodic interpolation would wrap) are zero."""
         n = x.shape[1]
         L = _next_pow2(n + n_out)
         r = jnp.arange(n, dtype=jnp.int32) - n // 2
-        g = jnp.fft.fftshift(jnp.fft.ifft(x, axis=1), axes=1) * taper(n, extent, edge)
+        g = jnp.fft.fftshift(jnp.fft.ifft(x, axis=1), axes=1) * taper(n, extent, edge, gd)
         pre = g * cis(-(shift[:, None] * r.astype(f)[None, :]) / n) * chirp(r, eps, n, -1.0)
         xin = jnp.concatenate([pre[:, n // 2:], jnp.zeros((x.shape[0], L - n), pre.dtype), pre[:, :n // 2]], axis=1)
         hi = j0 + n_out - 1 + n // 2
@@ -514,6 +518,9 @@ def make_pfa(geo, nx, ny, spx, spy, resample='dense', mm_dtype=None, precision=N
     shy, shx = jnp.asarray(shift_y), jnp.asarray(shift_x)
 
     ext_r = jnp.full((geo['Pp'],), geo['extent_r'], f)
+    # the range profiles are in slant range: the scene edge and the guard projected onto each pulse's line of sight
+    edge_r = jnp.asarray((geo['edge'][0] * geo['ur_r']).astype(np.float32))
+    guard_r = jnp.asarray((geo['guard'] * geo['ur_r']).astype(np.float32))
     ext_a = jnp.asarray(geo['extent_a'].astype(np.float32))
     edge_y, edge_x = geo['edge']
 
@@ -524,9 +531,9 @@ def make_pfa(geo, nx, ny, spx, spy, resample='dense', mm_dtype=None, precision=N
     czt_a = jax.jit(lambda x, sh, ep, ex: czt_block(x, sh, ep, nka, 0, ex, edge_x))
 
     @jax.jit
-    def stage1_block(S_re, S_im, Wb, sh, ep, ex):
+    def stage1_block(S_re, S_im, Wb, sh, ep, ex, ey, gy):
         """Resampling and range chirp-z of one block of pulses; the block is the unit of working memory."""
-        return czt_block(cx(*resample_pulses(S_re, S_im, Wb)), sh, ep, nkr, 0, ex, edge_y)
+        return czt_block(cx(*resample_pulses(S_re, S_im, Wb)), sh, ep, nkr, 0, ex, ey, gy)
 
     def czt_calls(fn, x, shift, eps, extent):
         R = x.shape[0]
@@ -537,7 +544,7 @@ def make_pfa(geo, nx, ny, spx, spy, resample='dense', mm_dtype=None, precision=N
         parts = []
         for r in range(0, Pp, rows):
             Wb = W[r:r + rows] if resample == 'dense' else (W[0][r:r + rows], W[1][r:r + rows])
-            parts.append(stage1_block(S_re, S_im, Wb, alpha[r:r + rows], eps_r[r:r + rows], ext_r[r:r + rows]))
+            parts.append(stage1_block(S_re, S_im, Wb, alpha[r:r + rows], eps_r[r:r + rows], ext_r[r:r + rows], edge_r[r:r + rows], guard_r[r:r + rows]))
         return jnp.concatenate(parts, axis=0).T                                               # [nkr, Pp]
 
     def stage2(aT, shift, eps_a):
@@ -552,9 +559,9 @@ def make_pfa(geo, nx, ny, spx, spy, resample='dense', mm_dtype=None, precision=N
         tab = kernel_table(taps_p, geo['kaiser'])
 
         @jax.jit
-        def pulses_windowed(S_re, S_im, W, ext):
+        def pulses_windowed(S_re, S_im, W, ext, ey, gy):
             x = cx(*resample_pulses(S_re, S_im, W))                                             # [Pp, K]
-            g = jnp.fft.fftshift(jnp.fft.ifft(x, axis=1), axes=1) * taper(x.shape[1], ext, edge_y)
+            g = jnp.fft.fftshift(jnp.fft.ifft(x, axis=1), axes=1) * taper(x.shape[1], ext, ey, gy)
             return jnp.fft.fft(jnp.fft.ifftshift(g, axes=1), axis=1)
 
         @jax.jit
@@ -563,7 +570,7 @@ def make_pfa(geo, nx, ny, spx, spy, resample='dense', mm_dtype=None, precision=N
             return jnp.fft.fft(jnp.fft.ifftshift(g, axes=0), axis=0)                             # [Pp, nkr]
 
         def spectrum(S_re, S_im, W, alpha, eps_r, shift, eps_a):
-            x = np.ascontiguousarray(np.asarray(pulses_windowed(S_re, S_im, W, ext_r)), np.complex64)
+            x = np.ascontiguousarray(np.asarray(pulses_windowed(S_re, S_im, W, ext_r, edge_r, guard_r)), np.complex64)
             Pp, K = x.shape
             A = np.empty((Pp, nkr), np.complex64)
             lib.pfa_resample_rows(x.view(np.float32).reshape(Pp, 2 * K), Pp, K, np.ascontiguousarray(np.asarray(alpha), np.float32),
@@ -588,9 +595,9 @@ def make_pfa(geo, nx, ny, spx, spy, resample='dense', mm_dtype=None, precision=N
         # zero beyond) is applied in the profile domain by an unpadded transform pair before each resampling, so
         # that returns from beyond the guard do not wrap into the smaller period of the resampled grid
         @jax.jit
-        def pulses_windowed(S_re, S_im, W, ext):
+        def pulses_windowed(S_re, S_im, W, ext, ey, gy):
             x = cx(*resample_pulses(S_re, S_im, W))                                             # [rows, K]
-            g = jnp.fft.fftshift(jnp.fft.ifft(x, axis=1), axes=1) * taper(x.shape[1], ext, edge_y)
+            g = jnp.fft.fftshift(jnp.fft.ifft(x, axis=1), axes=1) * taper(x.shape[1], ext, ey, gy)
             return jnp.fft.fft(jnp.fft.ifftshift(g, axes=1), axis=1)
 
         @jax.jit
@@ -606,7 +613,7 @@ def make_pfa(geo, nx, ny, spx, spy, resample='dense', mm_dtype=None, precision=N
             A = cp.empty((Pp, nkr), cp.complex64)
             for r in range(0, Pp, rows):
                 Wb = W[r:r + rows] if resample == 'dense' else (W[0][r:r + rows], W[1][r:r + rows])
-                x = pulses_windowed(S_re, S_im, Wb, ext_r[r:r + rows])
+                x = pulses_windowed(S_re, S_im, Wb, ext_r[r:r + rows], edge_r[r:r + rows], guard_r[r:r + rows])
                 x.block_until_ready()
                 cxp = cp.from_dlpack(x)
                 nb, K = cxp.shape
