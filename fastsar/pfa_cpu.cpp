@@ -67,19 +67,18 @@ extern "C" void pfa_gather(const float* base, int span, int Nx2, int Ny2, int rb
 
 // Direct resampling in place of the chirp-z transforms (the CUDA kernels resample_rows / resample_cols of pfa2.py):
 // Kaiser-windowed sinc of `taps` taps, weights normalised, outputs whose index lies outside (-0.5, n - 0.5) zero.
-static inline float kaiser_sinc(float d, int taps, float beta, float inv_i0) {
-  const float half = taps * 0.5f;
-  const float x = std::min(std::max(d / half, -1.f), 1.f);
-  const float a = 0.5f * beta * std::sqrt(std::max(0.f, 1.f - x * x));
-  float term = 1.f, sum = 1.f;
-  for (int k = 1; k <= 12; ++k) { term *= (a / k) * (a / k); sum += term; }
-  const float sc = sincf_(d);
-  return std::fabs(d) < half ? sc * sum * inv_i0 : 0.f;
+// the kernel from a table of its values at tabn points per unit offset over [0, taps / 2] (pfa2.kernel_table)
+static inline float kaiser_sinc(float d, int taps, const float* tab, int tabn) {
+  const float ad = std::fabs(d);
+  if (ad >= taps * 0.5f) return 0.f;
+  const float u = ad * tabn;
+  const int k = (int)u;
+  return tab[k] + (tab[k + 1] - tab[k]) * (u - k);
 }
 
 // out[r, j] = row r of x [R, n] (complex) at index pos0[r] + j * step[r], j < n_out
 extern "C" void pfa_resample_rows(const float* x, int R, int n, const float* pos0, const float* step, int n_out,
-                                  int taps, float beta, float inv_i0, float* out) {
+                                  int taps, const float* tab, int tabn, float* out) {
   const int half = taps / 2;
   par::for_dynamic(R, 4, [&](long r) {
     const float* xr = x + 2 * ((long)r * n);
@@ -91,7 +90,7 @@ extern "C" void pfa_resample_rows(const float* x, int R, int n, const float* pos
       if (pos > -0.5f && pos < n - 0.5f) {
         const int i0 = (int)std::floor(pos) - half + 1;
         float tot = 0.f;
-        for (int t = 0; t < taps; ++t) { const int i = i0 + t; w[t] = (i >= 0 && i < n) ? kaiser_sinc(pos - i, taps, beta, inv_i0) : 0.f; tot += w[t]; }
+        for (int t = 0; t < taps; ++t) { const int i = i0 + t; w[t] = (i >= 0 && i < n) ? kaiser_sinc(pos - i, taps, tab, tabn) : 0.f; tot += w[t]; }
         const float inv = 1.f / std::max(tot, 1e-12f);
         for (int t = 0; t < taps; ++t) { const int i = std::min(std::max(i0 + t, 0), n - 1); ar += w[t] * inv * xr[2 * i]; ai += w[t] * inv * xr[2 * i + 1]; }
       }
@@ -103,7 +102,7 @@ extern "C" void pfa_resample_rows(const float* x, int R, int n, const float* pos
 // out[m, j] = column m of A [R, M] (complex) at row index pos0[m] + j * step[m], j < n_out; blocks of columns so
 // that the rows read stay in cache
 extern "C" void pfa_resample_cols(const float* A, int R, int M, const float* pos0, const float* step, int n_out,
-                                  int taps, float beta, float inv_i0, float* out) {
+                                  int taps, const float* tab, int tabn, float* out) {
   const int half = taps / 2, MB = 64;
   par::for_dynamic((M + MB - 1) / MB, 1, [&](long mb) {
     const int m0 = (int)mb * MB, m1 = std::min(M, m0 + MB);
@@ -115,7 +114,7 @@ extern "C" void pfa_resample_cols(const float* A, int R, int M, const float* pos
         if (pos > -0.5f && pos < R - 0.5f) {
           const int i0 = (int)std::floor(pos) - half + 1;
           float tot = 0.f;
-          for (int t = 0; t < taps; ++t) { const int i = i0 + t; w[t] = (i >= 0 && i < R) ? kaiser_sinc(pos - i, taps, beta, inv_i0) : 0.f; tot += w[t]; }
+          for (int t = 0; t < taps; ++t) { const int i = i0 + t; w[t] = (i >= 0 && i < R) ? kaiser_sinc(pos - i, taps, tab, tabn) : 0.f; tot += w[t]; }
           const float inv = 1.f / std::max(tot, 1e-12f);
           for (int t = 0; t < taps; ++t) { const int i = std::min(std::max(i0 + t, 0), R - 1); const float* v = A + 2 * ((long)i * M + m); ar += w[t] * inv * v[0]; ai += w[t] * inv * v[1]; }
         }

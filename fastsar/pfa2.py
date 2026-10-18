@@ -101,22 +101,22 @@ _RESAMPLE_SRC = r"""
 #define TAPS 16
 #endif
 #define HALF_T (TAPS / 2)
-// Kaiser-windowed sinc of TAPS taps (the kernel of pfa2._kernel): I0 by its series, 1 / I0(beta) given
-__device__ __forceinline__ float kaiser_sinc(float d, float beta, float inv_i0) {
-  const float x = fminf(fmaxf(d / HALF_T, -1.f), 1.f);
-  const float a = 0.5f * beta * sqrtf(fmaxf(0.f, 1.f - x * x));
-  float term = 1.f, sum = 1.f;
-  #pragma unroll
-  for (int k = 1; k <= 12; ++k) { term *= (a / k) * (a / k); sum += term; }
-  const float win = sum * inv_i0;
-  float sc;
-  if (fabsf(d) < 1e-6f) sc = 1.f; else { const float pd = 3.14159265358979f * d; sc = sinf(pd) / pd; }
-  return fabsf(d) < HALF_T ? sc * win : 0.f;
+#ifndef TABN
+#define TABN 1024
+#endif
+// Kaiser-windowed sinc of TAPS taps (the kernel of pfa2._kernel) from a table of its values at TABN points per
+// unit offset over [0, HALF_T], linearly interpolated (symmetric in d)
+__device__ __forceinline__ float kaiser_sinc(float d, const float* tab) {
+  const float ad = fabsf(d);
+  if (ad >= HALF_T) return 0.f;
+  const float u = ad * TABN;
+  const int k = (int)u;
+  return fmaf(tab[k + 1] - tab[k], u - k, tab[k]);
 }
 // rows: out[r, j] = row r of (re, im) [R, n] interpolated at index pos0[r] + j * step[r], j < n_out; outputs
 // whose index lies outside (-0.5, n - 0.5) are zero (as the chirp-z transform zeroes them); weights normalised
 extern "C" __global__ void resample_rows(const float2* x, int R, int n, const float* pos0, const float* step,
-                                         int n_out, float beta, float inv_i0, float2* out) {
+                                         int n_out, const float* tab, float2* out) {
   const int j = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y;
   if (j >= n_out || r >= R) return;
   const float pos = pos0[r] + j * step[r];
@@ -128,7 +128,7 @@ extern "C" __global__ void resample_rows(const float2* x, int R, int n, const fl
     #pragma unroll
     for (int t = 0; t < TAPS; ++t) {
       const int i = i0 + t;
-      w[t] = (i >= 0 && i < n) ? kaiser_sinc(pos - i, beta, inv_i0) : 0.f;
+      w[t] = (i >= 0 && i < n) ? kaiser_sinc(pos - i, tab) : 0.f;
       tot += w[t];
     }
     const float inv = 1.f / fmaxf(tot, 1e-12f);
@@ -144,7 +144,7 @@ extern "C" __global__ void resample_rows(const float2* x, int R, int n, const fl
 // columns: out[m, j] = column m of A [R, M] (complex) interpolated along the rows at index pos0[m] + j * step[m];
 // threads along m read consecutive addresses
 extern "C" __global__ void resample_cols(const float2* A, int R, int M, const float* pos0, const float* step,
-                                         int n_out, float beta, float inv_i0, float2* out) {
+                                         int n_out, const float* tab, float2* out) {
   const int m = blockIdx.x * blockDim.x + threadIdx.x, j = blockIdx.y;
   if (m >= M || j >= n_out) return;
   const float pos = pos0[m] + j * step[m];
@@ -155,7 +155,7 @@ extern "C" __global__ void resample_cols(const float2* A, int R, int M, const fl
     #pragma unroll
     for (int t = 0; t < TAPS; ++t) {
       const int i = i0 + t;
-      w[t] = (i >= 0 && i < R) ? kaiser_sinc(pos - i, beta, inv_i0) : 0.f;
+      w[t] = (i >= 0 && i < R) ? kaiser_sinc(pos - i, tab) : 0.f;
       tot += w[t];
     }
     const float inv = 1.f / fmaxf(tot, 1e-12f);
@@ -172,11 +172,20 @@ extern "C" __global__ void resample_cols(const float2* A, int R, int M, const fl
 _RESAMPLE = {}
 
 
+TABN = 1024          # table points per unit offset of the resampling kernel
+
+
+def kernel_table(taps, beta):
+    """The Kaiser-windowed sinc (_kernel) at TABN points per unit offset over [0, taps / 2], plus one guard point."""
+    d = np.arange(TABN * (taps // 2) + 2) / TABN
+    return _kernel(d, taps, beta).astype(np.float32)
+
+
 def _resample_kernels(taps):
     """The CUDA direct-resampling kernels (rows and columns), compiled once per tap count."""
     import cupy as cp
     if taps not in _RESAMPLE:
-        m = cp.RawModule(code=_RESAMPLE_SRC, options=(f'-DTAPS={taps}',))
+        m = cp.RawModule(code=_RESAMPLE_SRC, options=(f'-DTAPS={taps}', f'-DTABN={TABN}'))
         _RESAMPLE[taps] = (m.get_function('resample_rows'), m.get_function('resample_cols'))
     return _RESAMPLE[taps]
 
@@ -218,8 +227,8 @@ def _cpu_gather_lib():
         i, d, fl = ctypes.c_int, ctypes.c_double, ctypes.c_float
         L.pfa_gather.argtypes = [f32, i, i, i, i, i, i, i, i, i, i, d, d, d, d, d, d, d, f64, f64, i32, i, i, d, d, i, i, fl, fl, i,
                                  ctypes.c_void_p, ctypes.c_long]
-        L.pfa_resample_rows.argtypes = [f32, i, i, f32, f32, i, i, fl, fl, f32]
-        L.pfa_resample_cols.argtypes = [f32, i, i, f32, f32, i, i, fl, fl, f32]
+        L.pfa_resample_rows.argtypes = [f32, i, i, f32, f32, i, i, f32, i, f32]
+        L.pfa_resample_cols.argtypes = [f32, i, i, f32, f32, i, i, f32, i, f32]
         _CPU_LIB = L
     return _CPU_LIB
 
@@ -526,8 +535,8 @@ def make_pfa(geo, nx, ny, spx, spy, resample='dense', mm_dtype=None, precision=N
 
     if _cpu_kernels_available() and _direct_resampling(False):
         lib = _cpu_gather_lib()
-        inv_i0 = float(1.0 / np.i0(geo['kaiser']))
-        kb, taps_p = float(geo['kaiser']), int(geo['taps'])
+        taps_p = int(geo['taps'])
+        tab = kernel_table(taps_p, geo['kaiser'])
 
         @jax.jit
         def pulses_windowed(S_re, S_im, W, ext):
@@ -545,13 +554,13 @@ def make_pfa(geo, nx, ny, spx, spy, resample='dense', mm_dtype=None, precision=N
             Pp, K = x.shape
             A = np.empty((Pp, nkr), np.complex64)
             lib.pfa_resample_rows(x.view(np.float32).reshape(Pp, 2 * K), Pp, K, np.ascontiguousarray(np.asarray(alpha), np.float32),
-                                  np.ascontiguousarray(1.0 + np.asarray(eps_r), np.float32), nkr, taps_p, kb, inv_i0, A.view(np.float32).reshape(Pp, 2 * nkr))
+                                  np.ascontiguousarray(1.0 + np.asarray(eps_r), np.float32), nkr, taps_p, tab, TABN, A.view(np.float32).reshape(Pp, 2 * nkr))
             del x
             Aw = np.ascontiguousarray(np.asarray(columns_windowed(A, ext_a)), np.complex64)
             del A
             B = np.empty((nkr, nka), np.complex64)
             lib.pfa_resample_cols(Aw.view(np.float32).reshape(Pp, 2 * nkr), Pp, nkr, np.ascontiguousarray(np.asarray(shift), np.float32),
-                                  np.ascontiguousarray(1.0 + np.asarray(eps_a), np.float32), nka, taps_p, kb, inv_i0, B.view(np.float32).reshape(nkr, 2 * nka))
+                                  np.ascontiguousarray(1.0 + np.asarray(eps_a), np.float32), nka, taps_p, tab, TABN, B.view(np.float32).reshape(nkr, 2 * nka))
             return jnp.asarray(B)                                                               # [nkr, nka]
 
     if _cuda_kernels_available() and _direct_resampling(True):
@@ -560,8 +569,7 @@ def make_pfa(geo, nx, ny, spx, spy, resample='dense', mm_dtype=None, precision=N
         # over the pulses of each wavenumber row, CUDA kernels on CuPy arrays
         import cupy as cp
         k_rows, k_cols = _resample_kernels(geo['taps'])
-        inv_i0 = float(1.0 / np.i0(geo['kaiser']))
-        kb = np.float32(geo['kaiser'])
+        d_tab = cp.asarray(kernel_table(geo['taps'], geo['kaiser']))
 
         # the window of the chirp-z transforms (taper: one over the scene, a raised cosine to zero over the guard,
         # zero beyond) is applied in the profile domain by an unpadded transform pair before each resampling, so
@@ -584,7 +592,7 @@ def make_pfa(geo, nx, ny, spx, spy, resample='dense', mm_dtype=None, precision=N
             Pp, K = cxp.shape
             st_r = cp.from_dlpack(1.0 + eps_r); a0 = cp.from_dlpack(alpha)
             A = cp.empty((Pp, nkr), cp.complex64)
-            k_rows((-(-nkr // 128), Pp), (128,), (cxp, np.int32(Pp), np.int32(K), a0, st_r, np.int32(nkr), kb, np.float32(inv_i0), A))
+            k_rows((-(-nkr // 128), Pp), (128,), (cxp, np.int32(Pp), np.int32(K), a0, st_r, np.int32(nkr), d_tab, A))
             cp.cuda.get_current_stream().synchronize()
             del cxp, x
             Aw = columns_windowed(jax.dlpack.from_dlpack(A), ext_a)
@@ -593,7 +601,7 @@ def make_pfa(geo, nx, ny, spx, spy, resample='dense', mm_dtype=None, precision=N
             cA = cp.from_dlpack(Aw)
             st_a = cp.from_dlpack(1.0 + eps_a); s0 = cp.from_dlpack(shift)
             B = cp.empty((nkr, nka), cp.complex64)
-            k_cols((-(-nkr // 128), nka), (128,), (cA, np.int32(Pp), np.int32(nkr), s0, st_a, np.int32(nka), kb, np.float32(inv_i0), B))
+            k_cols((-(-nkr // 128), nka), (128,), (cA, np.int32(Pp), np.int32(nkr), s0, st_a, np.int32(nka), d_tab, B))
             cp.cuda.get_current_stream().synchronize()
             del cA, Aw
             return jax.dlpack.from_dlpack(B)                                                    # [nkr, nka]
