@@ -181,11 +181,14 @@ def _resample_kernels(taps):
     return _RESAMPLE[taps]
 
 
-def _direct_resampling():
-    """On a GPU or the CPU the two chirp-z transforms are replaced by direct Kaiser-sinc resampling (CUDA or C++
-    kernels) of the windowed profiles; FASTSAR_PFA_CZT=1 keeps the chirp-z transforms (the TPU always uses them)."""
+def _direct_resampling(default):
+    """Whether the two chirp-z transforms are replaced by direct Kaiser-sinc resampling of the windowed profiles:
+    the default on a GPU (CUDA kernels; 20 per cent faster on an L4) and not on the CPU, where the C++ kernels were
+    slower than the transforms (13.5 against 10.2 s on the Panama image); FASTSAR_PFA_CZT=0 or 1 overrides. The
+    TPU always uses the transforms."""
     import os
-    return os.environ.get('FASTSAR_PFA_CZT', '0') != '1'
+    v = os.environ.get('FASTSAR_PFA_CZT')
+    return default if v not in ('0', '1') else v == '0'
 
 
 def _gather_kernel(taps, npow, deg):
@@ -521,7 +524,7 @@ def make_pfa(geo, nx, ny, spx, spy, resample='dense', mm_dtype=None, precision=N
     def spectrum(S_re, S_im, W, alpha, eps_r, shift, eps_a):
         return stage2(stage1(S_re, S_im, W, alpha, eps_r), shift, eps_a)
 
-    if _cpu_kernels_available() and _direct_resampling():
+    if _cpu_kernels_available() and _direct_resampling(False):
         lib = _cpu_gather_lib()
         inv_i0 = float(1.0 / np.i0(geo['kaiser']))
         kb, taps_p = float(geo['kaiser']), int(geo['taps'])
@@ -551,7 +554,7 @@ def make_pfa(geo, nx, ny, spx, spy, resample='dense', mm_dtype=None, precision=N
                                   np.ascontiguousarray(1.0 + np.asarray(eps_a), np.float32), nka, taps_p, kb, inv_i0, B.view(np.float32).reshape(nkr, 2 * nka))
             return jnp.asarray(B)                                                               # [nkr, nka]
 
-    if _cuda_kernels_available() and _direct_resampling():
+    if _cuda_kernels_available() and _direct_resampling(True):
         # the two chirp-z transforms as direct resampling by the pulse-resampling kernel (Kaiser-windowed sinc of
         # geo['taps'] taps): a row kernel over the frequency samples of each resampled pulse and a column kernel
         # over the pulses of each wavenumber row, CUDA kernels on CuPy arrays
