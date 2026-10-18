@@ -182,7 +182,7 @@ def _resample_kernels(taps):
 
 
 def _direct_resampling():
-    """FASTSAR_PFA_CZT=0 replaces the two chirp-z transforms by direct Kaiser-sinc resampling on a GPU."""
+    """FASTSAR_PFA_CZT=0 replaces the two chirp-z transforms by direct Kaiser-sinc resampling (CUDA or C++ kernels)."""
     import os
     return os.environ.get('FASTSAR_PFA_CZT', '1') == '0'
 
@@ -214,6 +214,8 @@ def _cpu_gather_lib():
         i, d, fl = ctypes.c_int, ctypes.c_double, ctypes.c_float
         L.pfa_gather.argtypes = [f32, i, i, i, i, i, i, i, i, i, i, d, d, d, d, d, d, d, f64, f64, i32, i, i, d, d, i, i, fl, fl, i,
                                  ctypes.c_void_p, ctypes.c_long]
+        L.pfa_resample_rows.argtypes = [f32, i, i, f32, f32, i, i, fl, fl, f32]
+        L.pfa_resample_cols.argtypes = [f32, i, i, f32, f32, i, i, fl, fl, f32]
         _CPU_LIB = L
     return _CPU_LIB
 
@@ -509,6 +511,36 @@ def make_pfa(geo, nx, ny, spx, spy, resample='dense', mm_dtype=None, precision=N
 
     def spectrum(S_re, S_im, W, alpha, eps_r, shift, eps_a):
         return stage2(stage1(S_re, S_im, W, alpha, eps_r), shift, eps_a)
+
+    if _cpu_gather_available() and _direct_resampling():
+        lib = _cpu_gather_lib()
+        inv_i0 = float(1.0 / np.i0(geo['kaiser']))
+        kb, taps_p = float(geo['kaiser']), int(geo['taps'])
+
+        @jax.jit
+        def pulses_windowed(S_re, S_im, W, ext):
+            x = cx(*resample_pulses(S_re, S_im, W))                                             # [Pp, K]
+            g = jnp.fft.fftshift(jnp.fft.ifft(x, axis=1), axes=1) * taper(x.shape[1], ext, edge_y)
+            return jnp.fft.fft(jnp.fft.ifftshift(g, axes=1), axis=1)
+
+        @jax.jit
+        def columns_windowed(A, ext):
+            g = jnp.fft.fftshift(jnp.fft.ifft(A, axis=0), axes=0) * taper(A.shape[0], ext, edge_x).T
+            return jnp.fft.fft(jnp.fft.ifftshift(g, axes=0), axis=0)                             # [Pp, nkr]
+
+        def spectrum(S_re, S_im, W, alpha, eps_r, shift, eps_a):
+            x = np.ascontiguousarray(np.asarray(pulses_windowed(S_re, S_im, W, ext_r)), np.complex64)
+            Pp, K = x.shape
+            A = np.empty((Pp, nkr), np.complex64)
+            lib.pfa_resample_rows(x.view(np.float32).reshape(Pp, 2 * K), Pp, K, np.ascontiguousarray(np.asarray(alpha), np.float32),
+                                  np.ascontiguousarray(1.0 + np.asarray(eps_r), np.float32), nkr, taps_p, kb, inv_i0, A.view(np.float32).reshape(Pp, 2 * nkr))
+            del x
+            Aw = np.ascontiguousarray(np.asarray(columns_windowed(A, ext_a)), np.complex64)
+            del A
+            B = np.empty((nkr, nka), np.complex64)
+            lib.pfa_resample_cols(Aw.view(np.float32).reshape(Pp, 2 * nkr), Pp, nkr, np.ascontiguousarray(np.asarray(shift), np.float32),
+                                  np.ascontiguousarray(1.0 + np.asarray(eps_a), np.float32), nka, taps_p, kb, inv_i0, B.view(np.float32).reshape(nkr, 2 * nka))
+            return jnp.asarray(B)                                                               # [nkr, nka]
 
     if _cuda_gather_available() and _direct_resampling():
         # the two chirp-z transforms as direct resampling by the pulse-resampling kernel (Kaiser-windowed sinc of
