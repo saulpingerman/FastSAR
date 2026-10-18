@@ -3,6 +3,13 @@
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The date of a version is the day it
 was published on PyPI.
 
+## [0.1.6.post1] - 2026-10-18
+
+### Changed
+
+- README, `docs/performance.md` and `docs/comparison.md` carry the 0.1.6 release records (the PyPI page shows the
+  README of the upload, so the text is republished); no code change.
+
 ## [0.1.6] - 2026-10-18
 
 ### Changed

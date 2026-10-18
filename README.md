@@ -10,12 +10,12 @@ geolocation, map GeoTIFFs and SICD output.
 
 ![FastSAR image of the Panama Canal's Pacific entrance from an Umbra spotlight collection](https://raw.githubusercontent.com/saulpingerman/FastSAR/main/docs/images/hero_panama.jpg)
 
-*Panama Canal, Pacific entrance (Umbra open data, 2023-07-18): 12,207 by 8,808 pixels in 3.0 s on an Nvidia L4
+*Panama Canal, Pacific entrance (Umbra open data, 2023-07-18): 12,207 by 8,808 pixels in 2.8 s on an Nvidia L4
 (warm former, transfers included; float32, -59.9 dB against the float64 reference of
 [precision.md](https://github.com/saulpingerman/FastSAR/blob/main/docs/precision.md)), downsampled. A
-c4d-highmem-16 CPU instance (16 vCPUs, 8 cores) takes 11.1 s. The fastest open-source exact backprojection that forms this
+c4d-highmem-16 CPU instance (16 vCPUs, 8 cores) takes 11.2 s. The fastest open-source exact backprojection that forms this
 collection, the `sar_bp` example of NVIDIA's MatX, takes 12.5 s on the L4 as shipped and 11.6 s with float64 pixel
-coordinates, against 11.4 s for FastSAR's exact backprojection at the same accuracy; on the CPU, ISCE3 would take an
+coordinates, against 12.1 s for FastSAR's exact backprojection at the same accuracy; on the CPU, ISCE3 would take an
 estimated 4.8 h.*
 
 ![Cost per 1000 images against error for FastSAR and six open-source implementations](https://raw.githubusercontent.com/saulpingerman/FastSAR/main/docs/images/teaser.png)
