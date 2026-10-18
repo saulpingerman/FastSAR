@@ -24,6 +24,101 @@ import jax.numpy as jnp
 C = 299792458.0
 
 
+_GATHER_SRC = r"""
+#include <cuda_fp16.h>
+#ifndef TAPS
+#define TAPS 6
+#endif
+#ifndef NPOW
+#define NPOW 10
+#endif
+#ifndef DEG
+#define DEG 3
+#endif
+#define HALF_T (TAPS / 2)
+__device__ __forceinline__ float sincf_(float d) {
+  if (fabsf(d) < 1e-6f) return 1.f;
+  const float a = 3.14159265358979f * d;
+  return sinf(a) / a;
+}
+// one thread per output pixel (i along e1 / azimuth, fastest; c along e2 / range): the apparent position from the
+// distortion polynomial in float64, the Lanczos weights in float32, TAPS x TAPS reads of the baseband block
+extern "C" __global__ void pfa_gather(const float2* base, int span, int Nx2, int Ny2, int rb0,
+                                      int h, int n, int i0, int jb, int nx, int ny, double spx, double spy, double ox, double oy,
+                                      double ov, double dsx, double dsy, const double* cx, const double* cy, const int* pw,
+                                      double kr_c, double ka_c, int sy_, int sx_, float norm, const float* scale,
+                                      float2* out, long ostride) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x, c = blockIdx.y;
+  if (i >= h || c >= n) return;
+  const double x = (i0 + i - nx / 2.0) * spx + ox, y = (jb + c - ny / 2.0) * spy + oy;
+  const double xn = x / dsx, yn = y / dsy;
+  double Xa = x, Ya = y, px[DEG + 1], py[DEG + 1];
+  px[0] = 1.0; py[0] = 1.0;
+  #pragma unroll
+  for (int k = 1; k <= DEG; ++k) { px[k] = px[k-1] * xn; py[k] = py[k-1] * yn; }
+  #pragma unroll
+  for (int k = 0; k < NPOW; ++k) {
+    const double t = px[pw[2*k]] * py[pw[2*k+1]];
+    Xa += cx[k] * t; Ya += cy[k] * t;
+  }
+  const double fx = Xa / (spx / ov) + Nx2 / 2.0, fy = Ya / (spy / ov) + Ny2 / 2.0;
+  const double fix = floor(fx), fiy = floor(fy);
+  const int ix = (int)fix, iyl = (int)fiy - rb0;
+  const float tx = (float)(fx - fix), ty = (float)(fy - fiy);
+  float wx[TAPS], wy[TAPS];
+  float sx = 0.f, sy = 0.f;
+  #pragma unroll
+  for (int a = 0; a < TAPS; ++a) {
+    const float o = (float)(a - HALF_T + 1);
+    const float dx = tx - o, dy = ty - o;
+    wx[a] = sincf_(dx) * sincf_(dx / HALF_T); wy[a] = sincf_(dy) * sincf_(dy / HALF_T);
+    sx += wx[a]; sy += wy[a];
+  }
+  float2 acc = make_float2(0.f, 0.f);
+  #pragma unroll
+  for (int a = 0; a < TAPS; ++a) {
+    const int yy = min(max(iyl + a - HALF_T + 1, 0), span - 1);
+    const float2* row = base + (long)yy * Nx2;
+    const float wya = wy[a] / sy;
+    #pragma unroll
+    for (int b = 0; b < TAPS; ++b) {
+      const int xx = min(max(ix + b - HALF_T + 1, 0), Nx2 - 1);
+      const float2 v = row[xx];
+      const float wgt = wya * (wx[b] / sx);
+      acc.x = fmaf(wgt, v.x, acc.x); acc.y = fmaf(wgt, v.y, acc.y);
+    }
+  }
+  double sn, cs;
+  sincos(sy_ * kr_c * Ya + sx_ * ka_c * Xa, &sn, &cs);
+  const float cr = (float)cs, ci = (float)sn, g = norm * scale[0];
+  out[(long)i * ostride + c] = make_float2(g * (acc.x * cr - acc.y * ci), g * (acc.x * ci + acc.y * cr));
+}
+"""
+_GATHER = {}
+
+
+def _gather_kernel(taps, npow, deg):
+    """The CUDA gather kernel of the final resampling (compiled once per taps, polynomial length and degree)."""
+    import cupy as cp
+    key = (taps, npow, deg)
+    if key not in _GATHER:
+        _GATHER[key] = cp.RawModule(code=_GATHER_SRC, options=(f'-DTAPS={taps}', f'-DNPOW={npow}', f'-DDEG={deg}')).get_function('pfa_gather')
+    return _GATHER[key]
+
+
+def _cuda_gather_available():
+    """True when JAX runs on a GPU and CuPy can run the gather kernel on it (FASTSAR_PFA_GATHER=0 keeps the JAX gather)."""
+    import os
+    if os.environ.get('FASTSAR_PFA_GATHER', '1') == '0':
+        return False
+    try:
+        import cupy  # noqa: F401
+        import jax
+        return jax.default_backend() == 'gpu'
+    except Exception:
+        return False
+
+
 def _next_pow2(n):
     return 1 << int(np.ceil(np.log2(n)))
 
@@ -373,16 +468,64 @@ def make_pfa(geo, nx, ny, spx, spy, resample='dense', mm_dtype=None, precision=N
                 out = out + (wy[a] * wx[b_]) * jnp.take(base, yy * Nx2 + xx)
         return out * carr * norm
 
+    cuda = _cuda_gather_available()
+
+    def block_start(jb):
+        """The base row start of a block from the apparent positions on a coarse grid (with margin), as
+        block_tables computes it from every pixel."""
+        ys = (np.arange(jb, min(jb + bw, j0 + w)) - ny / 2.0) * spy + offset[1]
+        X, Y = np.meshgrid(xs[::max(1, len(xs) // 64)], ys[::max(1, len(ys) // 64)], indexing='ij')
+        Bp = np.stack([(X / dist['sx']) ** a * (Y / dist['sy']) ** b for a, b in dist['powers']], -1)
+        fy_idx = (Y + Bp @ dist['cy']) / (spy / ov) + Ny2 / 2.0
+        return int(np.clip(np.floor(fy_idx.min()) - half - 6, 0, Ny2 - span)), len(ys)
+
+    if cuda:
+        blocks = [(block_start(jb), jb) for jb in range(j0, j0 + w, bw)]
+
+        @jax.jit
+        def azimuth_base(F1, rb0):
+            rows_ = jax.lax.dynamic_slice_in_dim(F1, rb0, span, axis=0)                          # [span, nka]
+            G = jnp.roll(jnp.pad(rows_, ((0, 0), (0, Nx2 - nka))), -(nka // 2), axis=1)
+            return jnp.fft.fftshift(t_x(G, axis=1), axes=1)                                     # [span, Nx2]
+
+        import cupy as cp
+        kern = _gather_kernel(taps, len(dist['powers']), max(a + b for a, b in dist['powers']))
+        d_cx, d_cy = cp.asarray(np.asarray(dist['cx'], np.float64)), cp.asarray(np.asarray(dist['cy'], np.float64))
+        d_pw = cp.asarray(np.asarray(dist['powers'], np.int32).ravel())
+        f64 = np.float64
+
+        def pfa_corrected(S_re, S_im, W, alpha, eps_r, shift, eps_a, scale=None):
+            b = spectrum_jit(S_re, S_im, W, alpha, eps_r, shift, eps_a)                         # [nkr, nka]
+            F1 = range_stage(b)
+            del b
+            sc = cp.ones((1,), cp.float32) if scale is None else cp.from_dlpack(jnp.reshape(scale, (1,)).astype(jnp.float32))
+            out = cp.empty((h, w), cp.complex64)
+            for (rb0, n), jb in blocks:
+                base = azimuth_base(F1, rb0)
+                base.block_until_ready()
+                bd = cp.from_dlpack(base)
+                kern((-(-h // 128), n), (128,),
+                     (bd, np.int32(span), np.int32(Nx2), np.int32(Ny2), np.int32(rb0), np.int32(h), np.int32(n), np.int32(i0), np.int32(jb),
+                      np.int32(nx), np.int32(ny), f64(spx), f64(spy), f64(offset[0]), f64(offset[1]), f64(ov), f64(dist['sx']), f64(dist['sy']),
+                      d_cx, d_cy, d_pw, f64(kr_c), f64(ka_c), np.int32(sy), np.int32(sx), np.float32(norm), sc,
+                      out[:, jb - j0:], np.int64(w)))
+                cp.cuda.get_current_stream().synchronize()           # the kernel reads JAX's block until it is done
+                del bd, base
+            return out                                                                          # cupy [h, w], scaled
+
+        return pfa_corrected
+
     tables = [block_tables(jb) for jb in range(j0, j0 + w, bw)]
 
-    def pfa_corrected(S_re, S_im, W, alpha, eps_r, shift, eps_a):
+    def pfa_corrected(S_re, S_im, W, alpha, eps_r, shift, eps_a, scale=None):
         b = spectrum_jit(S_re, S_im, W, alpha, eps_r, shift, eps_a)                             # [nkr, nka]
         F1 = range_stage(b)
         del b
         parts = []
         for rb0, arrs, n in tables:
             parts.append(azimuth_warp(F1, rb0, *arrs)[:, :n])
-        return jnp.concatenate(parts, axis=1)                                                 # [h, w] = [azimuth, range]
+        out = jnp.concatenate(parts, axis=1)                                                  # [h, w] = [azimuth, range]
+        return out if scale is None else (out * scale).astype(jnp.complex64)
 
     return pfa_corrected
 
