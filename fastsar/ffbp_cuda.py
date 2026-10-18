@@ -66,6 +66,11 @@ void rot_fir_k(const sample_t* __restrict__ sre, const sample_t* __restrict__ si
     float rawr[RAWMAX], rawi[RAWMAX];
     float* zr = sm; float* zi = sm + PB * WS; float* tp = sm + 2 * PB * WS;
     float* rr = zr; float* ri = zi;
+#elif RAWLOAD
+    // one shared window, loaded again from global memory (the L2 cache after the first child) for every child and
+    // rotated in place by the child's ramp
+    float* zr = sm; float* zi = sm + PB * WS; float* tp = sm + 2 * PB * WS;
+    float* rr = zr; float* ri = zi;
 #else
     float* rr = sm; float* ri = sm + PB * WS;                  // the raw window
     float* zr = ri + PB * WS; float* zi = zr + PB * WS;        // the window rotated by the current child's ramp
@@ -76,7 +81,9 @@ void rot_fir_k(const sample_t* __restrict__ sre, const sample_t* __restrict__ si
     const int p = p0 + pp;
     const bool pok = p < P;
     const int j = j0 + 2 * jt;
-    // the raw window, loaded once with consecutive threads on consecutive columns (coalesced)
+    // the raw window, loaded with consecutive threads on consecutive columns (coalesced): once, or (RAWLOAD) for
+    // every child
+#if !RAWLOAD
     for (int idx = tid; idx < PB * W; idx += PB * JT) {
         const int row = idx / W, i = idx % W, k = kstart + i, pr = p0 + row;
         const bool ok = (pr < P) && (k >= 0) && (k < K);
@@ -84,6 +91,7 @@ void rot_fir_k(const sample_t* __restrict__ sre, const sample_t* __restrict__ si
         ri[row * WS + i] = ok ? LD(sim[((size_t)n * P + pr) * K + k]) : 0.f;
     }
     __syncthreads();
+#endif
 #if RAWREG
     #pragma unroll
     for (int m = 0; m < RAWMAX; ++m) {                  // this thread's samples (it alone rotates them, below)
@@ -93,6 +101,15 @@ void rot_fir_k(const sample_t* __restrict__ sre, const sample_t* __restrict__ si
     }
 #endif
     for (int c = 0; c < C_; ++c) {
+#if RAWLOAD
+        for (int idx = tid; idx < PB * W; idx += PB * JT) {
+            const int row = idx / W, i = idx % W, k = kstart + i, pr = p0 + row;
+            const bool ok = (pr < P) && (k >= 0) && (k < K);
+            zr[row * WS + i] = ok ? LD(sre[((size_t)n * P + pr) * K + k]) : 0.f;
+            zi[row * WS + i] = ok ? LD(sim[((size_t)n * P + pr) * K + k]) : 0.f;
+        }
+        __syncthreads();
+#endif
         // the raw window rotated by the child's own ramp into the working copy; threads along columns, so the rows
         // differ per warp only through the ramp coefficients. (0.1.4 rotated one copy on from the previous child's
         // ramp, which made a child's rounding depend on the children launched before it, that is on the group size
@@ -366,7 +383,8 @@ _mods = {}
 _PB_CHOICES = (32, 16, 8)        # pulses per block tried in order by the level kernel (tests may narrow this)
 
 
-_RAWREG = (16, 32, 48)           # rot_fir_k keeps the raw window in registers, this many samples per thread at most (0: in shared memory)
+_RAWREG = (16, 32, 48)           # rot_fir_k keeps the raw window in registers, this many samples per thread at most (0: a second
+                                 # copy in shared memory; -1: reloaded from global memory for every child); all three give the same bits
 
 
 def _kernels(store='fp32', pb=32, rawreg=16):
@@ -382,7 +400,7 @@ def _kernels(store='fp32', pb=32, rawreg=16):
     key = ('rot', bits, pb, jt, rawreg)
     if key not in _mods:
         _mods[key] = cp.RawModule(code=_SRC_PRE + _SRC_ROT, options=('--std=c++14', '--use_fast_math', f'-DSTORE={bits}', f'-DPB={pb}', f'-DJT={jt}',
-                                                                     f'-DRAWREG={int(rawreg > 0)}', f'-DRAWMAX={max(rawreg, 1)}'))
+                                                                     f'-DRAWREG={int(rawreg > 0)}', f'-DRAWMAX={max(rawreg, 1)}', f'-DRAWLOAD={int(rawreg < 0)}'))
     out['rot_fir_k'] = _mods[key].get_function('rot_fir_k')
     # opt in once to the device's largest shared memory per block: the limit belongs to the kernel, which every former
     # shares, so a former must never lower it (a former built on another thread while one runs would break its launch)
@@ -434,7 +452,7 @@ def _children(kern, pre, pim, c0, sl, lv):
         if os.environ.get('FASTSAR_CUDA_RAWREG'):
             rawreg = int(os.environ['FASTSAR_CUDA_RAWREG'])             # testing: a tier, or 0 for shared memory
         for pb in ((pb_env,) if pb_env else _PB_CHOICES):   # pulses per block: the largest whose window fits the device
-            smem = ((2 if rawreg else 4) * pb * (W | 1) + L + 2 * pb * cols) * 4
+            smem = ((4 if rawreg == 0 else 2) * pb * (W | 1) + L + 2 * pb * cols) * 4
             if smem <= smem_max:
                 break
         if os.environ.get('FASTSAR_CUDA_DEBUG'):                            # testing: the kernel's configuration
