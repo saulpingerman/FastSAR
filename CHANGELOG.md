@@ -17,7 +17,7 @@ was published on PyPI.
   the transforms to -61 dB.
 - `ExactFormer` on cuda with `interp='linear'` keeps the cropped range profiles in float16 (`profiles='auto'`;
   `'float32'`, `'float16'` and `'float16-pair'` select explicitly), scaled per chunk on the device: the Panama image
-  in 10.8 s against 11.6 s with float32 profiles on an L4 in development, at the same -56.9 dB. Cubic interpolation
+  in 10.7 s against 11.7 s with float32 profiles on an L4 in development, at the same -56.9 dB. Cubic interpolation
   keeps float32 profiles (float16 would cost 0.5 dB at -67 dB).
 
 ## [0.1.6.post1] - 2026-10-18
