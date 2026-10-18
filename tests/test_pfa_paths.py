@@ -45,8 +45,8 @@ def _pfa(scene, **env):
 
 def test_kernel_gather_matches_jax(scene):
     """The C++ or CUDA gather (whichever the default backend uses) against the JAX gather: the same arithmetic."""
-    a = _pfa(scene, FASTSAR_PFA_GATHER='1')
-    b = _pfa(scene, FASTSAR_PFA_GATHER='0')
+    a = _pfa(scene, FASTSAR_PFA_GATHER='1', FASTSAR_PFA_CZT='1')
+    b = _pfa(scene, FASTSAR_PFA_GATHER='0', FASTSAR_PFA_CZT='1')
     e = rel_db(a, b)
     print(f'kernel gather vs jax gather: {e:.1f} dB')
     assert e < -100, e
@@ -54,8 +54,8 @@ def test_kernel_gather_matches_jax(scene):
 
 def test_direct_resampling_matches_czt(scene):
     """Direct resampling against the chirp-z transforms: a band-limited interpolation of the same spectra."""
-    a = _pfa(scene, FASTSAR_PFA_CZT='0')
-    b = _pfa(scene, FASTSAR_PFA_CZT='1')
+    a = _pfa(scene, FASTSAR_PFA_CZT='0', FASTSAR_PFA_GATHER='1')
+    b = _pfa(scene, FASTSAR_PFA_CZT='1', FASTSAR_PFA_GATHER='1')
     e = rel_db(a, b)
     print(f'direct resampling vs chirp-z: {e:.1f} dB')
     assert e < -40, e

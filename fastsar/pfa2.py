@@ -221,26 +221,34 @@ def _cpu_gather_lib():
     return _CPU_LIB
 
 
-def _cpu_gather_available():
-    """True when JAX runs on the CPU and the C++ gather is not switched off (FASTSAR_PFA_GATHER=0)."""
+def _gather_kernels_on():
+    """FASTSAR_PFA_GATHER=0 keeps the JAX gather of the final resampling in place of the C++ or CUDA kernel."""
     import os
-    if os.environ.get('FASTSAR_PFA_GATHER', '1') == '0':
-        return False
+    return os.environ.get('FASTSAR_PFA_GATHER', '1') != '0'
+
+
+def _cpu_kernels_available():
+    """True when JAX runs on the CPU (the C++ kernels then apply)."""
     import jax
     return jax.default_backend() == 'cpu'
 
 
-def _cuda_gather_available():
-    """True when JAX runs on a GPU and CuPy can run the gather kernel on it (FASTSAR_PFA_GATHER=0 keeps the JAX gather)."""
-    import os
-    if os.environ.get('FASTSAR_PFA_GATHER', '1') == '0':
-        return False
+def _cuda_kernels_available():
+    """True when JAX runs on a GPU and CuPy can run kernels on it."""
     try:
         import cupy  # noqa: F401
         import jax
         return jax.default_backend() == 'gpu'
     except Exception:
         return False
+
+
+def _cpu_gather_available():
+    return _gather_kernels_on() and _cpu_kernels_available()
+
+
+def _cuda_gather_available():
+    return _gather_kernels_on() and _cuda_kernels_available()
 
 
 def _next_pow2(n):
@@ -513,7 +521,7 @@ def make_pfa(geo, nx, ny, spx, spy, resample='dense', mm_dtype=None, precision=N
     def spectrum(S_re, S_im, W, alpha, eps_r, shift, eps_a):
         return stage2(stage1(S_re, S_im, W, alpha, eps_r), shift, eps_a)
 
-    if _cpu_gather_available() and _direct_resampling():
+    if _cpu_kernels_available() and _direct_resampling():
         lib = _cpu_gather_lib()
         inv_i0 = float(1.0 / np.i0(geo['kaiser']))
         kb, taps_p = float(geo['kaiser']), int(geo['taps'])
@@ -543,7 +551,7 @@ def make_pfa(geo, nx, ny, spx, spy, resample='dense', mm_dtype=None, precision=N
                                   np.ascontiguousarray(1.0 + np.asarray(eps_a), np.float32), nka, taps_p, kb, inv_i0, B.view(np.float32).reshape(nkr, 2 * nka))
             return jnp.asarray(B)                                                               # [nkr, nka]
 
-    if _cuda_gather_available() and _direct_resampling():
+    if _cuda_kernels_available() and _direct_resampling():
         # the two chirp-z transforms as direct resampling by the pulse-resampling kernel (Kaiser-windowed sinc of
         # geo['taps'] taps): a row kernel over the frequency samples of each resampled pulse and a column kernel
         # over the pulses of each wavenumber row, CUDA kernels on CuPy arrays
