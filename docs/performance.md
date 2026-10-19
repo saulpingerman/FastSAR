@@ -17,7 +17,7 @@ The Umbra Panama image ([real-data.md](real-data.md#umbra-spotlight)) at float32
 |---|---|---|---|
 | TPU v6e (three-pass) | 2.70 | 2.9 | 1.55 |
 | TPU v5e (three-pass) | 1.20 | 5.0 | 1.31 |
-| L4 (float32) | 0.707 | 2.8 | 0.57 |
+| L4 (float32) | 0.707 | 3.0 | 0.59 |
 | L4 (float16 throughout, float32 accumulation) | 0.707 | 2.5 | 0.50 |
 | A100 (float32) | 5.02 | 1.2 | 1.63 |
 | H100 (float32) | 10.97 | 0.6 | 1.84 |
@@ -30,12 +30,13 @@ on the Melbourne and Iowa collections as well.
 
 ![Cost per 1000 Panama images against error for every FastSAR configuration and the open-source implementations](images/teaser.png)
 
-Single-pass on the TPUs takes 2.5 s (v6e) and 3.6 s (v5e) at -46.2 dB, $1.18 and $0.82 per 1000 images. Float16
-on the L4 and single-pass on the TPUs lower each device's cost by 12 to 37%. Polar format takes 3.0 s on the L4
-($0.60 per 1000) and 11.2 s on the c4d-highmem-16, at -32.1 dB. On the TPUs its resampling steps are gathers on the vector unit and take 103 s (v5e) and 110 s (v6e) per image. The L4 draws 0.05 kWh per 1000 float32 images (mean
-`nvidia-smi` power, host excluded). These are the release records of the study (FastSAR 0.1.6, public API only;
-the L4 record is the second of two fresh instances, which agreed within 2% on every configuration but the Panama
-float32 single call, 3.06 against 2.85 s).
+Single-pass on the TPUs takes 2.5 s (v6e) and 3.5 s (v5e) at -46.2 dB, $1.19 and $0.82 per 1000 images. Float16
+on the L4 and single-pass on the TPUs lower each device's cost by 15 to 37%. Polar format takes 1.4 s on the L4
+($0.28 per 1000, the lowest cost of any configuration) and 9.0 s on the c4d-highmem-16, at -32.1 dB. On the TPUs its resampling steps are gathers on the vector unit and take 103 s (v5e) and 110 s (v6e) per image. The L4 draws 0.05 kWh per 1000 float32 images (mean
+`nvidia-smi` power, host excluded). These are the release records of the study (FastSAR 0.1.7, public API only;
+the L4 record is the first of two fresh instances, which agreed within 1% on every configuration with bitwise
+identical images; both put the Panama float32 single call at 2.93 to 3.00 s where the faster of the two 0.1.6
+instances had 2.85 s with the same kernel, the largest instance-to-instance difference seen).
 
 ## Large collections
 
@@ -82,8 +83,8 @@ instances at 0.1.3 (single warm image, host memory to host memory):
 | H100 80GB | 0.575 s | 0.524 s | 1.04 s |
 | L4 | 2.94 s | 2.52 s | 3.8 s |
 
-Errors are unchanged (-59.9 and -58.9 dB). In the 0.1.6 release records the 84-patch 2021 Capella stripmap takes
-5.5 s on the H100 and 9.8 s on an L4 with a 32-vCPU host (g2-standard-32); with 4 vCPUs the mosaic is bound by the
+Errors are unchanged (-59.9 and -58.9 dB). In the 0.1.7 release records the 84-patch 2021 Capella stripmap takes
+5.6 s on the H100 and 9.5 s on an L4 with a 32-vCPU host (g2-standard-32); with 4 vCPUs the mosaic is bound by the
 host (22.2 s in development).
 
 ## Transfers on the cuda backend
@@ -109,7 +110,7 @@ At full speed the phase history stays on the device and the first level runs in 
 On a v6e, groups of 4 and 8 formed the 2025 Capella spotlight equally fast, and groups of 2 took 1% longer. On the
 L4 the same spotlight took 17.9 s in groups of 8 in development. It took 2% longer in groups of 4 and 44% longer
 with the history streamed from host memory. Full speed for it needs 25.4 GB, above the 22.9 GB free on the L4,
-so the release forms it in groups of 4 (16.5 s in the 0.1.6 records); the 74,203-pulse 2024 spotlight needs 35.8 GB
+so the release forms it in groups of 4 (16.3 s in the 0.1.7 records); the 74,203-pulse 2024 spotlight needs 35.8 GB
 and runs in groups of 2. The number of first-level children carried together through the later levels (up to half the free
 memory) does not affect speed. Batches of 1, 2 and 4 formed that spotlight within 1% of each other, and a smaller batch is not reported as a fallback.
 
@@ -194,22 +195,25 @@ sar-accel-study.
 ## Exact backprojection
 
 `ExactFormer` on the Umbra Panama collection (12,207 by 8,808 pixels, 15,186 pulses), host memory to host memory,
-warm former, against the float64 reference (release 0.1.6 records; 0.1.4's GPU times in brackets):
+warm former, against the float64 reference (release 0.1.7 records; 0.1.4's GPU times in brackets):
 
 | Device | Cubic, `upsample=8` (default) | Linear, `upsample=8` |
 |---|---|---|
-| L4 (g2-standard-4) | 16.8 s (23.9 s), -67.4 dB | 12.1 s (19.4 s), -56.9 dB |
-| A100 80GB (a2-ultragpu-1g) | 8.28 s (9.3 s), -67.4 dB | 5.71 s (6.9 s), -56.9 dB |
-| H100 80GB (a3-highgpu-1g) | 4.50 s (5.3 s), -67.4 dB | 3.05 s (4.2 s), -56.9 dB |
-| c4d-highmem-16 | 366 s, -67.4 dB | 225 s, -56.9 dB |
+| L4 (g2-standard-4) | 16.8 s (23.9 s), -67.4 dB | 10.9 s (19.4 s), -56.8 dB |
+| A100 80GB (a2-ultragpu-1g) | 8.31 s (9.3 s), -67.4 dB | 5.18 s (6.9 s), -56.8 dB |
+| H100 80GB (a3-highgpu-1g) | 4.53 s (5.3 s), -67.4 dB | 2.91 s (4.2 s), -56.8 dB |
+| c4d-highmem-16 | 372 s, -67.4 dB | 225 s, -56.9 dB |
 
-The exact kernels did not change between 0.1.5 and 0.1.6; the two L4 instances of the 0.1.6 records ran them 3 to
-6% slower than the 0.1.5 record instance (16.3 s cubic, 11.7 s linear). The 0.1.5 images are bitwise those of 0.1.4
+At 0.1.7 the cuda former keeps its cropped range profiles in float16 for linear interpolation on grids of 2^25
+pixels or more (`profiles='auto'`; float32 below, and for cubic), which took the L4's linear time from 12.1 to 10.9 s
+at -56.8 against -56.9 dB; the cubic path is unchanged. The exact kernels did not change between 0.1.5 and 0.1.6;
+the two L4 instances of the 0.1.6 records ran them 3 to 6% slower than the 0.1.5 record instance (16.3 s cubic,
+11.7 s linear). The 0.1.5 images are bitwise those of 0.1.4
 on all three GPUs and the three Umbra scenes. Two changes made the
 difference: the CUDA kernel's thread blocks take their tiles along the grid axis closer to constant range, so that
 the blocks resident together read the same range bins from the L2 cache instead of the image's whole range window,
 and the image comes back through pinned memory (0.25 s or more for the 860 MB image through pageable memory).
-Records: the bucket prefix `v9` of sar-accel-study (`cloud/r013/queue_gpu_v016_part.sh`).
+Records: the bucket prefix `v10` of sar-accel-study (`cloud/r013/queue_gpu_v017_part.sh`).
 
 The cubic error is the reference's own: against a float64 backprojection oversampled 64 times, the reference is
 -67.3 to -68.8 dB on the lock, port and ship regions and the cubic image -77.5 to -81.7 dB (the float32 factorized
