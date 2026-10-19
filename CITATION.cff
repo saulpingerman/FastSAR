@@ -7,7 +7,7 @@ authors:
     given-names: Paul
     affiliation: Penn State University
 version: 0.1.6
-date-released: 2026-10-18
+date-released: 2026-10-19
 repository-code: https://github.com/saulpingerman/FastSAR
 url: https://pypi.org/project/fastsar/
 license: MIT
