@@ -107,6 +107,38 @@ def _mode_type(r, m, notes):
     return None
 
 
+def _cphd03_channel(r, m, arrays, channel):
+    """CPHD 0.3 per-vector parameters and samples of one channel, read at the offsets the 0.3 layout gives:
+    channel c's vector block starts NumBytesVBP times the vectors of the channels before it into the vector-based
+    block, and its samples after those channels' samples. (sarpy's 0.3 reader offsets channel c's vector block by c
+    vectors only, so for any channel but the first it returns the first channel's parameters shifted by c pulses, and
+    scales the samples with them.) -> (pv(name) -> float64 array or None, read_rows(p0, p1) -> complex64 [rows, K])."""
+    h = r.cphd_header
+    fname = r.cphd_details.file_name
+    dt = m.VectorParameters.get_vector_dtype()
+    nv = [int(a.NumVectors) for a in arrays]
+    P, K = nv[channel], int(arrays[channel].NumSamples)
+    vb = np.memmap(fname, dtype=dt, mode='r', offset=int(h.VB_BYTE_OFFSET) + int(m.Data.NumBytesVBP) * sum(nv[:channel]),
+                   shape=(P,))
+    raw = {'RE32F_IM32F': '>f4', 'RE16I_IM16I': '>i2', 'RE08I_IM08I': '>i1'}[m.Data.SampleType]
+    isz = np.dtype(raw).itemsize
+    off = int(h.CPHD_BYTE_OFFSET) + sum(int(a.NumVectors) * int(a.NumSamples) * 2 * isz for a in arrays[:channel])
+    sig = np.memmap(fname, dtype=raw, mode='r', offset=off, shape=(P, K, 2))
+    amp = np.asarray(vb['AmpSF'], np.float64) if 'AmpSF' in dt.names else None
+
+    def pv(name):
+        return np.array(vb[name], np.float64) if name in dt.names else None
+
+    def read_rows(p0, p1):
+        b = sig[p0:p1]
+        out = np.empty((p1 - p0, K), np.complex64)
+        out.real, out.imag = b[..., 0], b[..., 1]
+        if amp is not None:
+            out *= amp[p0:p1, None].astype(np.float32)
+        return out
+    return pv, read_rows
+
+
 def _phase_rows(S, f, coef, sign):
     """In place, in row blocks on all cores: S[p, k] *= exp(sign 2j pi f[p, k] coef[p]) with f(slice, out) writing the
     frequencies (Hz) of a row slice into out [rows, K] (no full-size temporary). The phase is formed in float64 and its
@@ -253,11 +285,14 @@ def read_cphd(cphd, sicd=None, channel=0, meta=False, regrid_tol=1e-3, drop_flag
     if v03:
         arrays = list(m.Data.ArraySize)
         ids = [str(i) for i in range(len(arrays))]
+        # 0.3 does not tie RadarCollection's receive channels to its arrays, so they are taken as one per array, in
+        # order, only when the counts agree; otherwise the polarizations are left unknown
         rcvch = list(_opt(m, 'RadarCollection.RcvChannels') or [])
         pols = [None] * len(arrays)
-        for i, c in enumerate(rcvch[:len(arrays)]):
-            tr = getattr(c, 'TxRcvPolarization', None)
-            pols[i] = None if tr is None or ':' not in str(tr) else str(tr).replace(':', '')
+        if len(rcvch) == len(arrays):
+            for i, c in enumerate(rcvch):
+                tr = getattr(c, 'TxRcvPolarization', None)
+                pols[i] = None if tr is None or ':' not in str(tr) else str(tr).replace(':', '')
     else:
         arrays = list(m.Data.Channels)
         ids = [c.Identifier for c in arrays]
@@ -276,7 +311,14 @@ def read_cphd(cphd, sicd=None, channel=0, meta=False, regrid_tol=1e-3, drop_flag
     P, K = ch.NumVectors, ch.NumSamples
     if m.Global.DomainType != 'FX':
         raise ValueError('needs a frequency-domain (FX) CPHD; time-of-arrival (TOA) CPHD is not supported')
-    pv = lambda n: r.read_pvp_variable(n, channel)
+    if v03:
+        if troposphere is True:
+            raise ValueError("troposphere=True: CPHD 0.3's TropoSRP does not define its units, so it cannot be applied; "
+                             "use troposphere='model' or None")
+        pv, read_rows = _cphd03_channel(r, m, arrays, channel)
+    else:
+        pv = lambda n: r.read_pvp_variable(n, channel)
+        read_rows = lambda p0, p1: r.read_chip((p0, p1), (0, K), index=channel)
     tx, rcv, srp = pv('TxPos'), pv('RcvPos'), pv('SRPPos')
     if v03:
         if int(getattr(m.Global, 'RefFreqIndex', 0) or 0):
@@ -290,7 +332,7 @@ def read_cphd(cphd, sicd=None, channel=0, meta=False, regrid_tol=1e-3, drop_flag
     S = np.empty((P, K), np.complex64)
     for p0 in range(0, P, 2048):
         p1 = min(P, p0 + 2048)
-        S[p0:p1] = r.read_chip((p0, p1), (0, K), index=channel)
+        S[p0:p1] = read_rows(p0, p1)
     notes = ['CPHD 0.3 file'] if v03 else []
     coll = m.CollectionInfo if v03 else m.CollectionID
     sgn = phase_sign

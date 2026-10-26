@@ -13,7 +13,14 @@ was published on PyPI.
   corners. A 0.3 file whose frequencies are offsets from an unstated reference frequency (`RefFreqIndex` set) is
   refused, and 0.3's `TropoSRP`, whose units the format does not define, is reported but not applied. `meta`
   carries the file's `cphd_version`. On a simulated collection written as both 1.0.1 and 0.3, the two read
-  identically and form images within -123 dB of each other.
+  identically and form images within -123 dB of each other. FastSAR reads each 0.3 channel's vector parameters and
+  samples at the offsets the 0.3 layout gives: sarpy's 0.3 reader places channel c's vector block c vectors into the
+  file instead of after the earlier channels' vectors, which gives every channel but the first the first channel's
+  positions and frequencies, shifted by c pulses, and scales its samples with them.
+
+### Changed
+
+- The README, `docs/comparison.md` and `docs/performance.md` give the 0.1.7 release records.
 
 ## [0.1.7] - 2026-10-19
 

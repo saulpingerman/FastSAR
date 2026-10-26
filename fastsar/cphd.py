@@ -12,7 +12,7 @@ range-gated patches (patches.form_mosaic), each pixel weighted by a Hann window 
 illuminates around it (the beam center of each pulse is its own SRP).
 
 Grid. A ground-plane grid (axes along track and across track, horizontal at the scene) covering the vendor image's
-footprint when a SICD is given, else the CPHD's image area (SceneCoordinates.ImageArea). Pixel spacing: the SICD's,
+footprint when a SICD is given, else the CPHD's image area (SceneCoordinates.ImageArea; for CPHD 0.3, the corners of Global.ImageArea). Pixel spacing: the SICD's,
 widened to 0.8 of its impulse response width, or 0.8 of the resolution the data support (range: c / 2B over the
 cosine of the grazing angle; azimuth: lambda / 2 over the angular span of the aperture, or of the processed band).
 

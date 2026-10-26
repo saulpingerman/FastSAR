@@ -18,11 +18,14 @@ lat0, lon0, h0, heading = 40.7934, -77.8600, 351.0, 30.0
 TERM = b'\f\n'
 
 
-def write_cphd03(path, v1path, ref_freq_index=0, tropo=None, pol='V:V'):
+def write_cphd03(path, v1path, ref_freq_index=0, tropo=None, pols=('V:V',), sgn=None, nchan=1):
     """A CPHD 0.3 file holding the collection of the CPHD 1.x file v1path: per-vector parameters TxTime, TxPos,
-    RcvTime, RcvPos, SRPPos (and TropoSRP when given) with the frequency grid as Fx0, Fx_SS, Fx1, Fx2, big-endian
-    as 0.3 stores them; the samples as big-endian float32 pairs (RE32F_IM32F); the image area as the 1.x file's
-    corner points at the reference point's height; the polarization in RadarCollection.RcvChannels."""
+    RcvTime, RcvPos, SRPPos, AmpSF (and TropoSRP when given) with the frequency grid as Fx0, Fx_SS, Fx1, Fx2 (Fx1 and
+    Fx2 the band edges, distinct from Fx0), big-endian as 0.3 stores them; the samples as big-endian float32 pairs
+    (RE32F_IM32F); the image area as the 1.x file's corner points at the reference point's height; pols in
+    RadarCollection.RcvChannels. nchan channels hold the same collection, channel c with its samples divided by
+    c + 1 and AmpSF = c + 1 (so every channel reads the same). sgn: the PhaseSGN written (the samples conjugated
+    when it differs from the 1.x file's)."""
     from sarpy.io.phase_history.converter import open_phase_history
     r = open_phase_history(v1path)
     m = r.cphd_meta
@@ -32,45 +35,52 @@ def write_cphd03(path, v1path, ref_freq_index=0, tropo=None, pol='V:V'):
     sc = m.SceneCoordinates
     hae = float(sc.IARP.LLH.HAE)
     g = lambda x: repr(float(x))
-    corners = ''.join(f'<ACP index="{k + 1}:{tag}"><Lat>{g(c.Lat)}</Lat><Lon>{g(c.Lon)}</Lon><HAE>{g(hae)}</HAE></ACP>'
-                      for k, (c, tag) in enumerate(zip(sc.ImageAreaCornerPoints, ('FRFC', 'FRLC', 'LRLC', 'LRFC'))))
-    names = [('TxTime', 8), ('TxPos', 24), ('RcvTime', 8), ('RcvPos', 24), ('SRPPos', 24)] + ([('TropoSRP', 8)] if tropo is not None else [])
-    fx = (pv('SC0'), pv('SCSS'), pv('FX1'), pv('FX2'))
+    corners = ''.join(f'<ACP index="{k + 1}"><Lat>{g(c.Lat)}</Lat><Lon>{g(c.Lon)}</Lon><HAE>{g(hae)}</HAE></ACP>'
+                      for k, c in enumerate(sc.ImageAreaCornerPoints))
+    names = [('TxTime', 8), ('TxPos', 24), ('RcvTime', 8), ('RcvPos', 24), ('SRPPos', 24), ('AmpSF', 8)] + ([('TropoSRP', 8)] if tropo is not None else [])
+    sgn1 = int(m.Global.SGN)
+    sgn = sgn1 if sgn is None else sgn
+    if sgn != sgn1:
+        S = np.conj(S)
+    fx = (pv('SC0'), pv('SCSS'), pv('SC0') - 0.25 * pv('SCSS'), pv('SC0') + (K - 0.75) * pv('SCSS'))
     nbytes = sum(b for _, b in names) + 32
     xml = f"""<CPHD xmlns="urn:CPHD:0.3">
 <CollectionInfo><CollectorName>FastSAR simulator</CollectorName><CoreName>SIMULATED03</CoreName><CollectType>MONOSTATIC</CollectType>
 <RadarMode><ModeType>SPOTLIGHT</ModeType></RadarMode><Classification>UNCLASSIFIED</Classification></CollectionInfo>
-<Data><SampleType>RE32F_IM32F</SampleType><NumCPHDChannels>1</NumCPHDChannels><NumBytesVBP>{nbytes}</NumBytesVBP>
-<ArraySize><NumVectors>{P}</NumVectors><NumSamples>{K}</NumSamples></ArraySize></Data>
-<Global><DomainType>FX</DomainType><PhaseSGN>{int(m.Global.SGN)}</PhaseSGN><RefFreqIndex>{ref_freq_index}</RefFreqIndex>
+<Data><SampleType>RE32F_IM32F</SampleType><NumCPHDChannels>{nchan}</NumCPHDChannels><NumBytesVBP>{nbytes}</NumBytesVBP>
+{f'<ArraySize><NumVectors>{P}</NumVectors><NumSamples>{K}</NumSamples></ArraySize>' * nchan}</Data>
+<Global><DomainType>FX</DomainType><PhaseSGN>{sgn}</PhaseSGN><RefFreqIndex>{ref_freq_index}</RefFreqIndex>
 <CollectStart>2026-01-01T00:00:00.000000Z</CollectStart><CollectDuration>{g(pv('TxTime')[-1] - pv('TxTime')[0])}</CollectDuration>
 <TxTime1>{g(pv('TxTime')[0])}</TxTime1><TxTime2>{g(pv('TxTime')[-1])}</TxTime2><ImageArea><Corner>{corners}</Corner></ImageArea></Global>
-<Channel><Parameters><SRP_Index>0</SRP_Index><NomTOARateSF>1.0</NomTOARateSF><FxCtrNom>{g(0.5 * (fx[2][0] + fx[3][0]))}</FxCtrNom>
-<BWSavedNom>{g(fx[3][0] - fx[2][0])}</BWSavedNom><TOASavedNom>{g(0.9 / fx[1][0])}</TOASavedNom></Parameters></Channel>
+<Channel>{f'<Parameters><SRP_Index>0</SRP_Index><NomTOARateSF>1.0</NomTOARateSF><FxCtrNom>{g(0.5 * (fx[2][0] + fx[3][0]))}</FxCtrNom><BWSavedNom>{g(fx[3][0] - fx[2][0])}</BWSavedNom><TOASavedNom>{g(0.9 / fx[1][0])}</TOASavedNom></Parameters>' * nchan}</Channel>
 <SRP><SRPType>STEPPED</SRPType><NumSRPs>1</NumSRPs></SRP>
-<RadarCollection><TxFrequency><Min>{g(fx[2][0])}</Min><Max>{g(fx[3][0])}</Max></TxFrequency><TxPolarization>{pol.split(':')[0]}</TxPolarization>
-<RcvChannels size="1"><ChanParameters index="1"><TxRcvPolarization>{pol}</TxRcvPolarization></ChanParameters></RcvChannels></RadarCollection>
+<RadarCollection><TxFrequency><Min>{g(fx[2][0])}</Min><Max>{g(fx[3][0])}</Max></TxFrequency><TxPolarization>{pols[0].split(':')[0]}</TxPolarization>
+<RcvChannels size="{len(pols)}">{''.join(f'<ChanParameters index="{i + 1}"><TxRcvPolarization>{q}</TxRcvPolarization></ChanParameters>' for i, q in enumerate(pols))}</RcvChannels></RadarCollection>
 <VectorParameters>{''.join(f'<{n}>{b}</{n}>' for n, b in names)}<FxParameters><Fx0>8</Fx0><Fx_SS>8</Fx_SS><Fx1>8</Fx1><Fx2>8</Fx2></FxParameters></VectorParameters>
 </CPHD>""".encode()
     dt = np.dtype([(n, '>f8') if b == 8 else (n, '>f8', (3,)) for n, b in names] + [(n, '>f8') for n in ('Fx0', 'Fx_SS', 'Fx1', 'Fx2')])
-    vb = np.zeros(P, dt)
-    for n, _ in names:
-        vb[n] = tropo if n == 'TropoSRP' else pv(n)
-    for n, a in zip(('Fx0', 'Fx_SS', 'Fx1', 'Fx2'), fx):
-        vb[n] = a
-    sig = np.empty((P, K, 2), '>f4')
-    sig[..., 0], sig[..., 1] = S.real, S.imag
+    vbs, sigs = [], []
+    for c in range(nchan):
+        vb = np.zeros(P, dt)
+        for n, _ in names:
+            vb[n] = tropo if n == 'TropoSRP' else (c + 1.0 if n == 'AmpSF' else pv(n))
+        for n, a in zip(('Fx0', 'Fx_SS', 'Fx1', 'Fx2'), fx):
+            vb[n] = a
+        sig = np.empty((P, K, 2), '>f4')
+        sig[..., 0], sig[..., 1] = S.real / (c + 1.0), S.imag / (c + 1.0)
+        vbs.append(vb); sigs.append(sig)
+    vball, sigall = b''.join(v.tobytes() for v in vbs), b''.join(x.tobytes() for x in sigs)
 
     def header(xo, vo, co):
-        return (b'CPHD/0.3\n' + f'XML_DATA_SIZE := {len(xml)}\nXML_BYTE_OFFSET := {xo}\nVB_DATA_SIZE := {vb.nbytes}\n'
-                f'VB_BYTE_OFFSET := {vo}\nCPHD_DATA_SIZE := {sig.nbytes}\nCPHD_BYTE_OFFSET := {co}\n'
+        return (b'CPHD/0.3\n' + f'XML_DATA_SIZE := {len(xml)}\nXML_BYTE_OFFSET := {xo}\nVB_DATA_SIZE := {len(vball)}\n'
+                f'VB_BYTE_OFFSET := {vo}\nCPHD_DATA_SIZE := {len(sigall)}\nCPHD_BYTE_OFFSET := {co}\n'
                 'CLASSIFICATION := UNCLASSIFIED\nRELEASE_INFO := UNRESTRICTED\n'.encode() + TERM)
     xo = len(header(10 ** 9, 10 ** 9, 10 ** 9)) + 16           # room for the offsets' digits, padded below
     vo = xo + len(xml) + len(TERM)
-    co = vo + vb.nbytes
+    co = vo + len(vball)
     h = header(xo, vo, co)
     with open(path, 'wb') as f:
-        f.write(h + b'\0' * (xo - len(h)) + xml + TERM + vb.tobytes() + sig.tobytes())
+        f.write(h + b'\0' * (xo - len(h)) + xml + TERM + vball + sigall)
 
 
 @pytest.fixture(scope='module')
@@ -98,6 +108,10 @@ def test_reads_like_1x(files):
     np.testing.assert_allclose(m3['ref'], m1['ref'], rtol=0, atol=1e-6)
     assert m3['polarization'] == 'VV' and m3['channel'] == '0'
     assert m3['mode'] == 'SPOTLIGHT' and m3['core_name'] == 'SIMULATED03'
+    assert m3['collector'] == m1['collector'] and str(m3['start']).startswith('2026-01-01')
+    np.testing.assert_array_equal(m3['tx_time'], m1['tx_time'])
+    np.testing.assert_array_equal(m3['rcv_time'], m1['rcv_time'])
+    assert m3['pulses'] == m1['pulses']
 
 
 def test_forms_like_1x(files):
@@ -135,3 +149,41 @@ def test_tropo_reported_not_applied(files):
     c0 = io.read_cphd(p3)
     np.testing.assert_array_equal(c['S'], c0['S'])
     assert any('TropoSRP' in n and 'not applied' in n for n in m['notes'])
+
+
+def test_second_channel(files):
+    """Channel 1 of a two-channel 0.3 file (samples halved, AmpSF 2) reads like channel 0, positions included; sarpy's
+    own 0.3 reader would give channel 1 the first channel's parameters shifted by one pulse."""
+    tmp, p1, _ = files
+    p = os.path.join(tmp, 'sim_03_2ch.cphd')
+    write_cphd03(p, p1, nchan=2, pols=('V:V', 'V:H'))
+    c0, m0 = io.read_cphd(p, channel=0, meta=True)
+    c1, m1 = io.read_cphd(p, channel='VH', meta=True)
+    assert m1['channel_index'] == 1 and m1['polarization'] == 'VH' and m0['polarization'] == 'VV'
+    np.testing.assert_array_equal(c1['ant'], c0['ant'])
+    np.testing.assert_array_equal(m1['tx_time'], m0['tx_time'])
+    np.testing.assert_allclose(c1['S'], c0['S'], rtol=1e-6, atol=0)
+    assert c1['fmin'] == c0['fmin'] and c1['df'] == c0['df']
+
+
+def test_phase_sign_plus(files):
+    """PhaseSGN = +1 with conjugated samples reads like the original."""
+    tmp, p1, p3 = files
+    p = os.path.join(tmp, 'sim_03_sgn.cphd')
+    write_cphd03(p, p1, sgn=+1)
+    np.testing.assert_array_equal(io.read_cphd(p)['S'], io.read_cphd(p3)['S'])
+
+
+def test_polarization_counts_disagree(files):
+    """Two receive channels listed for one array: the polarization is left unknown rather than guessed."""
+    tmp, p1, _ = files
+    p = os.path.join(tmp, 'sim_03_pols.cphd')
+    write_cphd03(p, p1, pols=('V:V', 'V:H'))
+    _, m = io.read_cphd(p, meta=True)
+    assert m['polarization'] is None
+
+
+def test_troposphere_true_refused(files):
+    _, _, p3 = files
+    with pytest.raises(ValueError, match='TropoSRP'):
+        io.read_cphd(p3, troposphere=True)
