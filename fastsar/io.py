@@ -293,6 +293,14 @@ def read_cphd(cphd, sicd=None, channel=0, meta=False, regrid_tol=1e-3, drop_flag
             for i, c in enumerate(rcvch):
                 tr = getattr(c, 'TxRcvPolarization', None)
                 pols[i] = None if tr is None or ':' not in str(tr) else str(tr).replace(':', '')
+        elif len(arrays) == 1:
+            # some producers (SARCASTIC) give a single channel's polarization only as a CollectionInfo parameter
+            prm = _opt(m, 'CollectionInfo.Parameters')
+            for key in ('Polarization', 'Polarisation', 'TxRcvPolarization'):
+                v = prm.get(key) if prm is not None and hasattr(prm, 'get') else None
+                if v and len(str(v).replace(':', '')) == 2 and set(str(v).replace(':', '').upper()) <= set('HVRLX'):
+                    pols[0] = str(v).replace(':', '').upper()
+                    break
     else:
         arrays = list(m.Data.Channels)
         ids = [c.Identifier for c in arrays]

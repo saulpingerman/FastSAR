@@ -16,7 +16,10 @@ was published on PyPI.
   identically and form images within -123 dB of each other. FastSAR reads each 0.3 channel's vector parameters and
   samples at the offsets the 0.3 layout gives: sarpy's 0.3 reader places channel c's vector block c vectors into the
   file instead of after the earlier channels' vectors, which gives every channel but the first the first channel's
-  positions and frequencies, shifted by c pulses, and scales its samples with them.
+  positions and frequencies, shifted by c pulses, and scales its samples with them. A single channel's
+  polarization is also taken from a `Polarization` or `Polarisation` parameter of `CollectionInfo` (as the SARCASTIC
+  simulator writes it), and image-area corners that coincide (SARCASTIC writes all four at 0, 0, 0) count as no
+  image area. All 168 files of a SARCASTIC v2.0 T-72 data dome (CPHD 0.3, doi 10.5522/04/c.5892392) read and form.
 
 ### Changed
 

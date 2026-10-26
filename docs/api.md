@@ -55,7 +55,8 @@ the CPU), `'auto'`. Precision: `'float32'`, `'float16'` (CUDA, JAX),
   phase_sign=None)`: one channel as `dict(S, ant, fmin, df)`, plus `nx, ny, spx, spy, e1, e2` with a SICD.
   Reads CPHD 1.0.x, 1.1.0 and 0.3 in the frequency domain. `channel`: index, identifier or polarization (0.3 files
   have no channel identifiers, so their channels are identified by the index as a string, `'0'`, `'1'`, ...; their
-  polarizations are taken from `RadarCollection.RcvChannels` only when it lists one per channel). `meta=True` also returns `tx`, `rcv`, `ref`, `R`, `origin`, `srp`, `tx_time`,
+  polarizations are taken from `RadarCollection.RcvChannels` only when it lists one per channel, or for a single
+  channel from a `Polarization` or `Polarisation` parameter of `CollectionInfo`). `meta=True` also returns `tx`, `rcv`, `ref`, `R`, `origin`, `srp`, `tx_time`,
   `rcv_time`, `pulses`, `polarization`, `channel`, `mode`, `start`, `collector`, `core_name`, `cphd_version`,
   `notes` (which for a 0.3 file begin with `'CPHD 0.3 file'`). In a 0.3 file the TropoSRP field, whose units 0.3
   does not define, is reported in `notes` and not applied (`troposphere='model'` applies the modeled delay, and

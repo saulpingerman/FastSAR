@@ -65,6 +65,8 @@ def _image_area(cphd, meta):
         if corners is None or len(corners) != 4:
             return None, ref
         ecf = np.array([np.ravel(io.geodetic_to_ecf(float(c.Lat), float(c.Lon), float(c.HAE))) for c in corners], np.float64)
+        if np.ptp(ecf, axis=0).max() < 1.0:        # placeholder corners (SARCASTIC writes all four at 0, 0, 0)
+            return None, ref
         return io.ecf_to_local(ecf, meta), ref
     ia, iarp = sc.ImageArea, sc.IARP
     ref = None if iarp is None else io.ecf_to_local(np.array(iarp.ECF.get_array(), np.float64)[None], meta)[0]

@@ -18,14 +18,15 @@ lat0, lon0, h0, heading = 40.7934, -77.8600, 351.0, 30.0
 TERM = b'\f\n'
 
 
-def write_cphd03(path, v1path, ref_freq_index=0, tropo=None, pols=('V:V',), sgn=None, nchan=1):
+def write_cphd03(path, v1path, ref_freq_index=0, tropo=None, pols=('V:V',), sgn=None, nchan=1, sarcastic=False):
     """A CPHD 0.3 file holding the collection of the CPHD 1.x file v1path: per-vector parameters TxTime, TxPos,
     RcvTime, RcvPos, SRPPos, AmpSF (and TropoSRP when given) with the frequency grid as Fx0, Fx_SS, Fx1, Fx2 (Fx1 and
     Fx2 the band edges, distinct from Fx0), big-endian as 0.3 stores them; the samples as big-endian float32 pairs
     (RE32F_IM32F); the image area as the 1.x file's corner points at the reference point's height; pols in
     RadarCollection.RcvChannels. nchan channels hold the same collection, channel c with its samples divided by
     c + 1 and AmpSF = c + 1 (so every channel reads the same). sgn: the PhaseSGN written (the samples conjugated
-    when it differs from the 1.x file's)."""
+    when it differs from the 1.x file's). sarcastic: as the SARCASTIC simulator writes 0.3, the polarization only as a
+    CollectionInfo parameter (no RadarCollection) and the image-area corners all at latitude, longitude, height 0."""
     from sarpy.io.phase_history.converter import open_phase_history
     r = open_phase_history(v1path)
     m = r.cphd_meta
@@ -35,8 +36,8 @@ def write_cphd03(path, v1path, ref_freq_index=0, tropo=None, pols=('V:V',), sgn=
     sc = m.SceneCoordinates
     hae = float(sc.IARP.LLH.HAE)
     g = lambda x: repr(float(x))
-    corners = ''.join(f'<ACP index="{k + 1}"><Lat>{g(c.Lat)}</Lat><Lon>{g(c.Lon)}</Lon><HAE>{g(hae)}</HAE></ACP>'
-                      for k, c in enumerate(sc.ImageAreaCornerPoints))
+    corners = ''.join(f'<ACP index="{k + 1}"><Lat>{g(0 if sarcastic else c.Lat)}</Lat><Lon>{g(0 if sarcastic else c.Lon)}</Lon>'
+                      f'<HAE>{g(0 if sarcastic else hae)}</HAE></ACP>' for k, c in enumerate(sc.ImageAreaCornerPoints))
     names = [('TxTime', 8), ('TxPos', 24), ('RcvTime', 8), ('RcvPos', 24), ('SRPPos', 24), ('AmpSF', 8)] + ([('TropoSRP', 8)] if tropo is not None else [])
     sgn1 = int(m.Global.SGN)
     sgn = sgn1 if sgn is None else sgn
@@ -46,7 +47,7 @@ def write_cphd03(path, v1path, ref_freq_index=0, tropo=None, pols=('V:V',), sgn=
     nbytes = sum(b for _, b in names) + 32
     xml = f"""<CPHD xmlns="urn:CPHD:0.3">
 <CollectionInfo><CollectorName>FastSAR simulator</CollectorName><CoreName>SIMULATED03</CoreName><CollectType>MONOSTATIC</CollectType>
-<RadarMode><ModeType>SPOTLIGHT</ModeType></RadarMode><Classification>UNCLASSIFIED</Classification></CollectionInfo>
+<RadarMode><ModeType>SPOTLIGHT</ModeType></RadarMode><Classification>UNCLASSIFIED</Classification>{'<Parameter name="Polarisation">VV</Parameter>' if sarcastic else ''}</CollectionInfo>
 <Data><SampleType>RE32F_IM32F</SampleType><NumCPHDChannels>{nchan}</NumCPHDChannels><NumBytesVBP>{nbytes}</NumBytesVBP>
 {f'<ArraySize><NumVectors>{P}</NumVectors><NumSamples>{K}</NumSamples></ArraySize>' * nchan}</Data>
 <Global><DomainType>FX</DomainType><PhaseSGN>{sgn}</PhaseSGN><RefFreqIndex>{ref_freq_index}</RefFreqIndex>
@@ -54,8 +55,8 @@ def write_cphd03(path, v1path, ref_freq_index=0, tropo=None, pols=('V:V',), sgn=
 <TxTime1>{g(pv('TxTime')[0])}</TxTime1><TxTime2>{g(pv('TxTime')[-1])}</TxTime2><ImageArea><Corner>{corners}</Corner></ImageArea></Global>
 <Channel>{f'<Parameters><SRP_Index>0</SRP_Index><NomTOARateSF>1.0</NomTOARateSF><FxCtrNom>{g(0.5 * (fx[2][0] + fx[3][0]))}</FxCtrNom><BWSavedNom>{g(fx[3][0] - fx[2][0])}</BWSavedNom><TOASavedNom>{g(0.9 / fx[1][0])}</TOASavedNom></Parameters>' * nchan}</Channel>
 <SRP><SRPType>STEPPED</SRPType><NumSRPs>1</NumSRPs></SRP>
-<RadarCollection><TxFrequency><Min>{g(fx[2][0])}</Min><Max>{g(fx[3][0])}</Max></TxFrequency><TxPolarization>{pols[0].split(':')[0]}</TxPolarization>
-<RcvChannels size="{len(pols)}">{''.join(f'<ChanParameters index="{i + 1}"><TxRcvPolarization>{q}</TxRcvPolarization></ChanParameters>' for i, q in enumerate(pols))}</RcvChannels></RadarCollection>
+{'' if sarcastic else '<RadarCollection>'}{'' if sarcastic else '<TxFrequency>'}<Min>{g(fx[2][0])}</Min><Max>{g(fx[3][0])}</Max>{'' if sarcastic else '</TxFrequency>'}{'' if sarcastic else f'<TxPolarization>{pols[0].split(":")[0]}</TxPolarization>'}
+{'' if sarcastic else f'<RcvChannels size="{len(pols)}">' + ''.join(f'<ChanParameters index="{i + 1}"><TxRcvPolarization>{q}</TxRcvPolarization></ChanParameters>' for i, q in enumerate(pols)) + '</RcvChannels></RadarCollection>'}
 <VectorParameters>{''.join(f'<{n}>{b}</{n}>' for n, b in names)}<FxParameters><Fx0>8</Fx0><Fx_SS>8</Fx_SS><Fx1>8</Fx1><Fx2>8</Fx2></FxParameters></VectorParameters>
 </CPHD>""".encode()
     dt = np.dtype([(n, '>f8') if b == 8 else (n, '>f8', (3,)) for n, b in names] + [(n, '>f8') for n in ('Fx0', 'Fx_SS', 'Fx1', 'Fx2')])
@@ -187,3 +188,30 @@ def test_troposphere_true_refused(files):
     _, _, p3 = files
     with pytest.raises(ValueError, match='TropoSRP'):
         io.read_cphd(p3, troposphere=True)
+
+
+def test_sarcastic_style(files):
+    """The polarization from a CollectionInfo parameter when there is no RadarCollection; placeholder corners (all at
+    0, 0, 0) treated as no image area, so form_cphd asks for an extent and forms with one."""
+    tmp, p1, p3 = files
+    p = os.path.join(tmp, 'sim_03_sarcastic.cphd')
+    write_cphd03(p, p1, sarcastic=True)
+    c, m = io.read_cphd(p, meta=True)
+    assert m['polarization'] == 'VV'
+    np.testing.assert_array_equal(c['S'], io.read_cphd(p3)['S'])
+    with pytest.raises(ValueError, match='no planar image area'):
+        fastsar.form_cphd(p, backend='cpu')
+    o = fastsar.form_cphd(p, backend='cpu', extent=(30.0, 30.0), height=h0)
+    assert np.isfinite(o['image']).all()
+
+
+@pytest.mark.skipif(not os.environ.get('FASTSAR_CPHD03_FILE'), reason='FASTSAR_CPHD03_FILE (a real CPHD 0.3 file) not set')
+def test_real_file():
+    """A real CPHD 0.3 file, for example one of the SARCASTIC v2.0 T-72 data domes (doi 10.5522/04/c.5892392, CC BY
+    4.0): it reads, and forms a finite image with a strong target over a 12 m extent."""
+    f = os.environ['FASTSAR_CPHD03_FILE']
+    c, m = io.read_cphd(f, meta=True)
+    assert m['cphd_version'].startswith('0.3') and c['S'].size and np.isfinite(c['S']).all()
+    o = fastsar.form_cphd(f, backend='cpu', extent=(12.0, 12.0))
+    a = np.abs(o['image'])
+    assert np.isfinite(a).all() and 20 * np.log10(a.max() / np.median(a)) > 30
