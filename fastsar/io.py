@@ -89,7 +89,8 @@ def troposphere_delay(tx, rcv, srp):
 def _mode_type(r, m, notes):
     """CollectionID/RadarMode/ModeType: sarpy's value, or the XML's own text when the value is outside the CPHD
     enumeration (sarpy then reports None; ICEYE's CPHD 1.1.0 files write EXPERIMENTAL)."""
-    mode = getattr(getattr(m.CollectionID, 'RadarMode', None), 'ModeType', None)
+    coll = getattr(m, 'CollectionID', None) or getattr(m, 'CollectionInfo', None)       # 1.x, 0.3
+    mode = getattr(getattr(coll, 'RadarMode', None), 'ModeType', None)
     if mode is not None:
         return mode
     try:
@@ -238,42 +239,64 @@ def read_cphd(cphd, sicd=None, channel=0, meta=False, regrid_tol=1e-3, drop_flag
     scene reference point, local frame, positions interpolated where the file lacks them), tx_time and rcv_time
     [P] (s), pulses (the (first, last + 1) kept of the file's), channel_index, sicd_transpose (with a SICD: whether
     its rows run along range), the channel's polarization and identifier, the collector, core name and radar mode,
-    and notes on what was done to the data."""
+    the file's CPHD version, and notes on what was done to the data. Reads CPHD 1.0.x, 1.1.0 and 0.3 (frequency
+    domain); a 0.3 file's channels are identified by index or polarization, and its TropoSRP field, whose units 0.3
+    does not define, is reported but not applied."""
     _deps.require('sarpy')
     from sarpy.io.phase_history.converter import open_phase_history
     r = open_phase_history(cphd)
     m = r.cphd_meta
-    if isinstance(channel, str):
-        ids = [c.Identifier for c in m.Data.Channels]
+    # CPHD 0.3 (the pre-standard NGA format) keeps the per-vector positions and times under the 1.x names but sizes
+    # its channels in Data.ArraySize, gives the frequency grid as Fx0 and Fx_SS, the phase sign as Global.PhaseSGN and
+    # the collection and polarization in SICD-style CollectionInfo and RadarCollection blocks
+    v03 = str(getattr(r, 'cphd_version', '') or '').startswith('0.3')
+    if v03:
+        arrays = list(m.Data.ArraySize)
+        ids = [str(i) for i in range(len(arrays))]
+        rcvch = list(_opt(m, 'RadarCollection.RcvChannels') or [])
+        pols = [None] * len(arrays)
+        for i, c in enumerate(rcvch[:len(arrays)]):
+            tr = getattr(c, 'TxRcvPolarization', None)
+            pols[i] = None if tr is None or ':' not in str(tr) else str(tr).replace(':', '')
+    else:
+        arrays = list(m.Data.Channels)
+        ids = [c.Identifier for c in arrays]
         pols = [f'{p.Polarization.TxPol}{p.Polarization.RcvPol}' if getattr(p, 'Polarization', None) is not None else None
                 for p in m.Channel.Parameters]
+    if isinstance(channel, str):
         if channel in ids:
             channel = ids.index(channel)
         elif channel.upper() in pols:
             channel = pols.index(channel.upper())
         else:
             raise ValueError(f'channel {channel!r} not among identifiers {ids} or polarizations {pols}')
-    if not 0 <= channel < len(m.Data.Channels):
-        raise ValueError(f'channel {channel} out of range: the file has {len(m.Data.Channels)} channels')
-    ch = m.Data.Channels[channel]
-    par = m.Channel.Parameters[channel]
+    if not 0 <= channel < len(arrays):
+        raise ValueError(f'channel {channel} out of range: the file has {len(arrays)} channels')
+    ch = arrays[channel]
     P, K = ch.NumVectors, ch.NumSamples
     if m.Global.DomainType != 'FX':
         raise ValueError('needs a frequency-domain (FX) CPHD; time-of-arrival (TOA) CPHD is not supported')
     pv = lambda n: r.read_pvp_variable(n, channel)
     tx, rcv, srp = pv('TxPos'), pv('RcvPos'), pv('SRPPos')
-    sc0, scss = pv('SC0'), pv('SCSS')
+    if v03:
+        if int(getattr(m.Global, 'RefFreqIndex', 0) or 0):
+            raise ValueError('CPHD 0.3 file with RefFreqIndex set: its frequencies are offsets from a reference '
+                             'frequency the file does not give, so the absolute grid is unknown')
+        sc0, scss = pv('Fx0'), pv('Fx_SS')
+    else:
+        sc0, scss = pv('SC0'), pv('SCSS')
     # read in pulse blocks into one complex64 array; every later step works in place on blocks of rows, so the
     # reader needs about the history's complex64 size (a 16.5 GB ICEYE file needed over 128 GB with whole-array steps)
     S = np.empty((P, K), np.complex64)
     for p0 in range(0, P, 2048):
         p1 = min(P, p0 + 2048)
         S[p0:p1] = r.read_chip((p0, p1), (0, K), index=channel)
-    notes = []
+    notes = ['CPHD 0.3 file'] if v03 else []
+    coll = m.CollectionInfo if v03 else m.CollectionID
     sgn = phase_sign
     if sgn is None:
-        sgn = int(m.Global.SGN)
-        collector = str(getattr(m.CollectionID, 'CollectorName', '') or '')
+        sgn = int(m.Global.PhaseSGN if v03 else m.Global.SGN)
+        collector = str(getattr(coll, 'CollectorName', '') or '')
         if collector.lower().startswith('capella') and sgn > 0:
             # Capella's open-data CPHDs declare SGN = +1, but their phase follows -1: a 2021 stripmap and a 2024 spotlight
             # collection focus and match the vendor's SICD (amplitude correlation 0.96 and 0.78) only without conjugation
@@ -314,8 +337,15 @@ def read_cphd(cphd, sicd=None, channel=0, meta=False, regrid_tol=1e-3, drop_flag
         notes.append(f'{int(flagged.sum())} pulses flagged SIGNAL=0 (not normal): ' + ('zeroed' if drop_flagged else 'kept'))
     if troposphere not in (None, True, False, 'model'):
         raise ValueError(f"troposphere must be None, True, False or 'model', not {troposphere!r}")
-    td = pv('TDTropoSRP') if troposphere is not False else None
+    td = pv('TDTropoSRP') if troposphere is not False and not v03 else None
     td = None if td is None else np.asarray(td, np.float64)[lo:hi]
+    if v03 and troposphere is not False:
+        # 0.3's TropoSRP has no published definition of its units or of one-way against two-way, so it is not applied
+        t3 = pv('TropoSRP')
+        if t3 is not None and np.any(np.asarray(t3)[lo:hi]):
+            t3 = np.asarray(t3, np.float64)[lo:hi]
+            notes.append(f'the file gives TropoSRP (mean {t3.mean():.4g}, units not defined by CPHD 0.3): not applied; '
+                         "troposphere='model' applies the modeled delay")
     if troposphere == 'model':
         if td is not None and np.any(td):
             notes.append(f'the file gives a troposphere delay (mean {td.mean() * 1e9:.2f} ns); the modeled delay is applied '
@@ -353,11 +383,12 @@ def read_cphd(cphd, sicd=None, channel=0, meta=False, regrid_tol=1e-3, drop_flag
     if shift > regrid_tol:
         _sinc_regrid(S, lambda sl: (f0 + np.arange(K)[None, :] * df - sc0[sl, None]) / scss[sl, None], out=S)
         notes.append(f'resampled per-pulse frequency grids (largest offset {shift:.3g} samples)')
-    pol = getattr(par, 'Polarization', None)
+    cpath = 'CollectionInfo' if v03 else 'CollectionID'
     info = dict(tx_time=pv('TxTime')[lo:hi], rcv_time=pv('RcvTime')[lo:hi], pulses=(lo, hi),
-                polarization=None if pol is None else f'{pol.TxPol}{pol.RcvPol}', channel=ch.Identifier, channel_index=channel,
-                mode=_mode_type(r, m, notes), start=_opt(m, 'Global.Timeline.CollectionStart', str),
-                collector=_opt(m, 'CollectionID.CollectorName'), core_name=_opt(m, 'CollectionID.CoreName'))
+                polarization=pols[channel], channel=ids[channel], channel_index=channel,
+                mode=_mode_type(r, m, notes), cphd_version=str(getattr(r, 'cphd_version', '') or '') or None,
+                start=_opt(m, 'Global.CollectStart' if v03 else 'Global.Timeline.CollectionStart', str),
+                collector=_opt(m, f'{cpath}.CollectorName'), core_name=_opt(m, f'{cpath}.CoreName'))
     return _assemble(S, tx, rcv, srp, f0, df, notes, sicd, meta, info)
 
 

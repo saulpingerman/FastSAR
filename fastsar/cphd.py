@@ -55,7 +55,17 @@ def _image_area(cphd, meta):
         return meta['image_area'], meta.get('refpt')
     _deps.require('sarpy')
     from sarpy.io.phase_history.converter import open_phase_history
-    sc = open_phase_history(cphd).cphd_meta.SceneCoordinates
+    m = open_phase_history(cphd).cphd_meta
+    sc = getattr(m, 'SceneCoordinates', None)
+    if sc is None:                                 # CPHD 0.3: the image area is four corners (latitude, longitude, height)
+        ia3 = getattr(getattr(m, 'Global', None), 'ImageArea', None)
+        corners = getattr(ia3, 'Corner', None)
+        rp = getattr(getattr(getattr(ia3, 'Plane', None), 'RefPt', None), 'ECF', None)
+        ref = None if rp is None else io.ecf_to_local(np.array(rp.get_array(), np.float64)[None], meta)[0]
+        if corners is None or len(corners) != 4:
+            return None, ref
+        ecf = np.array([np.ravel(io.geodetic_to_ecf(float(c.Lat), float(c.Lon), float(c.HAE))) for c in corners], np.float64)
+        return io.ecf_to_local(ecf, meta), ref
     ia, iarp = sc.ImageArea, sc.IARP
     ref = None if iarp is None else io.ecf_to_local(np.array(iarp.ECF.get_array(), np.float64)[None], meta)[0]
     if ia is None or iarp is None or sc.ReferenceSurface is None or sc.ReferenceSurface.Planar is None:

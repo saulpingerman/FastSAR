@@ -3,6 +3,18 @@
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The date of a version is the day it
 was published on PyPI.
 
+## [0.1.8] - unreleased
+
+### Added
+
+- `read_cphd` and `form_cphd` read CPHD 0.3, the pre-standard NGA format, in the frequency domain: the frequency
+  grid from `Fx0` and `Fx_SS`, the phase sign from `PhaseSGN`, the channels from `Data.ArraySize` (selected by index
+  or polarization), the collection details from `CollectionInfo` and the image area from `Global.ImageArea`'s
+  corners. A 0.3 file whose frequencies are offsets from an unstated reference frequency (`RefFreqIndex` set) is
+  refused, and 0.3's `TropoSRP`, whose units the format does not define, is reported but not applied. `meta`
+  carries the file's `cphd_version`. On a simulated collection written as both 1.0.1 and 0.3, the two read
+  identically and form images within -123 dB of each other.
+
 ## [0.1.7] - 2026-10-19
 
 ### Changed

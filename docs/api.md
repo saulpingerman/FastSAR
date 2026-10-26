@@ -53,8 +53,12 @@ the CPU), `'auto'`. Precision: `'float32'`, `'float16'` (CUDA, JAX),
 
 - `read_cphd(cphd, sicd=None, channel=0, meta=False, regrid_tol=1e-3, drop_flagged=False, troposphere=None,
   phase_sign=None)`: one channel as `dict(S, ant, fmin, df)`, plus `nx, ny, spx, spy, e1, e2` with a SICD.
-  `channel`: index, identifier or polarization. `meta=True` also returns `tx`, `rcv`, `ref`, `R`, `origin`, `srp`,
-  `tx_time`, `rcv_time`, `pulses`, `polarization`, `channel`, `mode`, `start`, `collector`, `core_name`, `notes`.
+  Reads CPHD 1.0.x, 1.1.0 and 0.3 in the frequency domain. `channel`: index, identifier or polarization (0.3 files
+  have no channel identifiers). `meta=True` also returns `tx`, `rcv`, `ref`, `R`, `origin`, `srp`, `tx_time`,
+  `rcv_time`, `pulses`, `polarization`, `channel`, `mode`, `start`, `collector`, `core_name`, `cphd_version`,
+  `notes`. In a 0.3 file the TropoSRP field, whose units 0.3 does not define, is reported in `notes` and not applied
+  (`troposphere='model'` applies the modeled delay); a 0.3 file whose frequencies are offsets from a reference
+  frequency it does not give (`RefFreqIndex` set) is refused.
 - `read_nisar(path, frequency=None, polarization=None, meta=False, height=None, band_margin=1.0, block=1024, range_delay=None, troposphere='model', orbit=None, reference_range=None)`: a
   NISAR L0B RRSD granule as `read_cphd` returns a CPHD (range compressed, frequency domain, a moving scene
   reference point at mid swath); `meta` adds `image_area` (the swath's corners). `read_collection(path, **kw)`

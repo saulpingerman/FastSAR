@@ -4,7 +4,7 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://github.com/saulpingerman/FastSAR/blob/main/pyproject.toml)
 
 FastSAR forms synthetic aperture radar (SAR) images on x86 and ARM CPUs, Nvidia GPUs and Google Cloud TPUs from
-Python. It reads frequency-domain CPHD files and NISAR, Sentinel-1 and ALOS PALSAR raw data, forms spotlight,
+Python. It reads frequency-domain CPHD files (versions 1.0, 1.1 and 0.3) and NISAR, Sentinel-1 and ALOS PALSAR raw data, forms spotlight,
 stripmap and sliding spotlight images by factorized backprojection, and provides autofocus, interferometry,
 geolocation, map GeoTIFFs and SICD output.
 
