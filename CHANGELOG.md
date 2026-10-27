@@ -23,7 +23,18 @@ was published on PyPI.
 
 ### Changed
 
-- The README, `docs/comparison.md` and `docs/performance.md` give the 0.1.7 release records.
+- The README, `docs/comparison.md` and `docs/performance.md` give the 0.1.7 release records. 0.1.8 changes only
+  the CPHD readers: on the 14 Capella and Umbra collections of the release check it forms images bitwise identical
+  to 0.1.7's, at 0.98 to 1.01 times 0.1.7's time, so those records stand for 0.1.8.
+
+### Known issues
+
+- On one 2026 Capella spotlight collection from the open-data archive
+  (`CAPELLA_C13_SP_CPHD_HH_20260105024946_20260105024955`), factorized backprojection on an 8192 by 8192 grid
+  differs from exact backprojection by -42.6 dB, where the other collections checked give -60 to -62 dB, and the
+  polar format differs by -17.4 dB. 0.1.7 gives the same images. The collection has 3047 pulses without samples
+  inside its aperture, more than any collection checked before; whether these cause the error is not yet
+  established. The fix is planned for 0.1.9.
 
 ## [0.1.7] - 2026-10-19
 

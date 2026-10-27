@@ -6,7 +6,7 @@ authors:
   - family-names: Singerman
     given-names: Paul
     affiliation: Penn State University
-version: 0.1.6
+version: 0.1.8
 date-released: 2026-10-19
 repository-code: https://github.com/saulpingerman/FastSAR
 url: https://pypi.org/project/fastsar/

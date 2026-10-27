@@ -33,7 +33,7 @@ on the Melbourne and Iowa collections as well.
 Single-pass on the TPUs takes 2.5 s (v6e) and 3.5 s (v5e) at -46.2 dB, $1.19 and $0.82 per 1000 images. Float16
 on the L4 and single-pass on the TPUs lower each device's cost by 15 to 37%. Polar format takes 1.4 s on the L4
 ($0.28 per 1000, the lowest cost of any configuration) and 9.0 s on the c4d-highmem-16, at -32.1 dB. On the TPUs its resampling steps are gathers on the vector unit and take 103 s (v5e) and 110 s (v6e) per image. The L4 draws 0.05 kWh per 1000 float32 images (mean
-`nvidia-smi` power, host excluded). These are the release records of the study (FastSAR 0.1.7, public API only;
+`nvidia-smi` power, host excluded). These are the release records of the study (FastSAR 0.1.7, which 0.1.8 matches image for image; public API only;
 the L4 record is the first of two fresh instances, which agreed within 1% on every configuration with bitwise
 identical images; both put the Panama float32 single call at 2.93 to 3.00 s where the faster of the two 0.1.6
 instances had 2.85 s with the same kernel, the largest instance-to-instance difference seen).
