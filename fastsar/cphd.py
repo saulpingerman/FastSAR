@@ -112,7 +112,8 @@ def form_cphd(cphd, sicd=None, *, mode='auto', backend='auto', window=True, spac
     collection's readers remove the standard atmosphere's by default, None keeps it);
         'model' removes a standard-atmosphere delay instead, for files that give none (ICEYE).
     reader_options: a dict of further keyword arguments for the reader of this file type (io.read_collection), such as
-        pulses=(first, last) or polarization for the raw-data readers.
+        pulses=(first, last) or polarization for the raw-data readers, or ref_freq for a CPHD 0.3 file with
+        RefFreqIndex set (io.read_cphd).
     -> dict(image [nx, ny] complex64, origin [3] (local, pixel (0, 0)), e1, e2 (unit axes, local), spx, spy, mode,
     band (first and last frequency, Hz), bandwidth (spatial frequency support along e1 and e2, cycles/m), window,
     phase_error (autofocus: per pulse, rad, else None), meta (read_cphd's), notes). Pixel (i, j) lies at

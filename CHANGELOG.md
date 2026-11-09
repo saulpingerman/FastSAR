@@ -3,6 +3,15 @@
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The date of a version is the day it
 was published on PyPI.
 
+## [Unreleased]
+
+### Added
+
+- `read_cphd(..., ref_freq=)` for CPHD 0.3 files with `RefFreqIndex` set: the reference frequency the file omits is
+  added to `Fx0`, and `ref_freq=0.0` asserts that the producer wrote absolute frequencies despite the flag. Such files
+  are still refused without it, and the refusal now reports the file's `Fx0` range. From `form_cphd`, pass
+  `reader_options=dict(ref_freq=0.0)`.
+
 ## [0.1.8] - 2026-10-27
 
 ### Added

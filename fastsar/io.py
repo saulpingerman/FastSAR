@@ -263,7 +263,8 @@ def _assemble(S, tx, rcv, srp, f0, df, notes, sicd, meta, info):
     return out, info
 
 
-def read_cphd(cphd, sicd=None, channel=0, meta=False, regrid_tol=1e-3, drop_flagged=False, troposphere=None, phase_sign=None):
+def read_cphd(cphd, sicd=None, channel=0, meta=False, regrid_tol=1e-3, drop_flagged=False, troposphere=None, phase_sign=None,
+              ref_freq=None):
     """-> dict(S, ant, fmin, df[, nx, ny, spx, spy, e1, e2]) ready for form_image(**d), and with meta=True also a
     dict: tx, rcv [P, 3] (local frame, m), ref [P] (the one-way range each pulse is compensated to after this
     function's corrections, m), fixed_ref (False when the scene reference point moves and the image needs
@@ -273,7 +274,9 @@ def read_cphd(cphd, sicd=None, channel=0, meta=False, regrid_tol=1e-3, drop_flag
     its rows run along range), the channel's polarization and identifier, the collector, core name and radar mode,
     the file's CPHD version, and notes on what was done to the data. Reads CPHD 1.0.x, 1.1.0 and 0.3 (frequency
     domain); a 0.3 file's channels are identified by index or polarization, and its TropoSRP field, whose units 0.3
-    does not define, is reported but not applied."""
+    does not define, is reported but not applied. A 0.3 file with RefFreqIndex set declares its frequencies to be
+    offsets from a reference frequency it does not contain, and is refused unless ref_freq gives that reference in
+    Hz; ref_freq=0.0 asserts that the file's frequencies are absolute despite the flag."""
     _deps.require('sarpy')
     from sarpy.io.phase_history.converter import open_phase_history
     r = open_phase_history(cphd)
@@ -328,11 +331,17 @@ def read_cphd(cphd, sicd=None, channel=0, meta=False, regrid_tol=1e-3, drop_flag
         pv = lambda n: r.read_pvp_variable(n, channel)
         read_rows = lambda p0, p1: r.read_chip((p0, p1), (0, K), index=channel)
     tx, rcv, srp = pv('TxPos'), pv('RcvPos'), pv('SRPPos')
+    ref_note = []
     if v03:
-        if int(getattr(m.Global, 'RefFreqIndex', 0) or 0):
-            raise ValueError('CPHD 0.3 file with RefFreqIndex set: its frequencies are offsets from a reference '
-                             'frequency the file does not give, so the absolute grid is unknown')
         sc0, scss = pv('Fx0'), pv('Fx_SS')
+        if int(getattr(m.Global, 'RefFreqIndex', 0) or 0):
+            if ref_freq is None:
+                raise ValueError('CPHD 0.3 file with RefFreqIndex set: by the format its frequencies are offsets from a '
+                                 'reference frequency the file does not give, so the absolute grid is unknown '
+                                 f'(Fx0 runs {sc0.min():.6g} to {sc0.max():.6g} Hz). Pass ref_freq (Hz) to add the reference '
+                                 'frequency, or ref_freq=0.0 if the producer wrote absolute frequencies despite the flag')
+            sc0 = sc0 + float(ref_freq)
+            ref_note = [f'RefFreqIndex set; {float(ref_freq):.6g} Hz added to Fx0 (ref_freq)']
     else:
         sc0, scss = pv('SC0'), pv('SCSS')
     # read in pulse blocks into one complex64 array; every later step works in place on blocks of rows, so the
@@ -341,7 +350,7 @@ def read_cphd(cphd, sicd=None, channel=0, meta=False, regrid_tol=1e-3, drop_flag
     for p0 in range(0, P, 2048):
         p1 = min(P, p0 + 2048)
         S[p0:p1] = read_rows(p0, p1)
-    notes = ['CPHD 0.3 file'] if v03 else []
+    notes = (['CPHD 0.3 file'] if v03 else []) + ref_note
     coll = m.CollectionInfo if v03 else m.CollectionID
     sgn = phase_sign
     if sgn is None:

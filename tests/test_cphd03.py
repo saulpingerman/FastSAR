@@ -142,6 +142,18 @@ def test_ref_freq_index_refused(files):
         io.read_cphd(p)
 
 
+def test_ref_freq_override(files):
+    tmp, p1, _ = files
+    p = os.path.join(tmp, 'sim_03_reffreq.cphd')
+    write_cphd03(p, p1, ref_freq_index=1)
+    c1 = io.read_cphd(p1)
+    c0, m0 = io.read_cphd(p, ref_freq=0.0, meta=True)        # the producer wrote absolute frequencies
+    assert c0['fmin'] == pytest.approx(c1['fmin'], rel=1e-12) and c0['df'] == pytest.approx(c1['df'], rel=1e-12)
+    assert any('ref_freq' in n for n in m0['notes'])
+    cr = io.read_cphd(p, ref_freq=2.5e6)                      # a known reference frequency is added
+    assert cr['fmin'] - c0['fmin'] == pytest.approx(2.5e6, rel=1e-9)
+
+
 def test_tropo_reported_not_applied(files):
     tmp, p1, p3 = files
     p = os.path.join(tmp, 'sim_03_tropo.cphd')
