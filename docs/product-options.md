@@ -56,6 +56,26 @@ two collections, from the CPHD file on disk (in the page cache) to the product f
 apodization, detection and the projection to the ground; the SIDD's write includes the remap. The CPHD files are
 8.7 GB (Umbra) and 9.2 GB (Capella).
 
+On a TPU the image likewise stays on the device. Seconds per stage on a Cloud TPU v5e (one chip, 16 GB), second
+call, on synthetic speckle images with the maps of a spaceborne geometry: a 23 Mpx ground image to a slant grid of
+the same sampling (the SICD path), and a 13 Mpx and a 53 Mpx ground image to slant grids of 49 and 196 Mpx at twice
+Nyquist, apodized, detected and projected to 49 Mpx of ground pixels with the cubic kernel (the SIDD path). The
+resampling to the slant plane includes a mask of valid ground pixels.
+
+| Stage | 23 Mpx slant | 49 Mpx slant, 49 Mpx ground | 196 Mpx slant, 49 Mpx ground |
+|---|---|---|---|
+| Baseband | 0.01 | 0.004 | 0.02 |
+| Quadratic autofocus: estimate, correction | 0.04, 0.10 | 0.03, 0.03 | 0.08, 0.28 |
+| To the slant plane | 0.57 | 0.89 | 4.4 |
+| Apodization | | 0.03 | 0.21 |
+| To the ground plane (cubic) | | 0.24 | 0.63 |
+| Remap (NRL) and layout | | 0.08 | 0.07 |
+| Copy to the host | 0.04 (complex) | 0.01 (8-bit) | 0.01 (8-bit) |
+| Device memory in use at the peak | 1.1 GB | 1.8 GB | 6.4 GB |
+
+Each stage compiles once per image shape: 45, 28 and 110 s for the resampling to the slant plane of the three
+sizes, 8 to 14 s for the projection to the ground, and 30 to 50 s for the autofocus estimate.
+
 ## Planes
 
 FastSAR forms every spotlight image on a ground plane, where backprojection is exact for any track. A planar
