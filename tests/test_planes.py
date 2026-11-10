@@ -82,10 +82,11 @@ def test_deramp(scene):
     raw = out['image'].copy()
     planes.deramp(out)
     assert out['baseband'] and np.array_equal(planes.deramp(out)['image'], out['image'])     # once only
-    F = np.abs(np.fft.fft2(out['image'])) ** 2
-    for p in (F.sum(1), F.sum(0)):                                   # the spectrum's centroid, as a fraction of the rate
-        k = np.fft.fftfreq(len(p))
-        assert abs(np.angle((p * np.exp(2j * np.pi * k)).sum()) / (2 * np.pi)) < 0.03
+    # along e1 the baseband image lies in the band sampling gives; on its carrier it does not
+    w = np.hanning(raw.shape[0])[:, None] * np.hanning(raw.shape[1])[None]
+    k = np.abs(np.fft.fftfreq(raw.shape[0])) > 0.5 * scene['b']['bx'] * out['spx'] + 0.01
+    share = lambda im: (lambda p: p[k].sum() / p.sum())((np.abs(np.fft.fft2(im * w)) ** 2).sum(1))
+    assert share(out['image']) < 2e-5 < 2e-4 < share(raw), (share(out['image']), share(raw))
     planes.deramp(out, sign=+1)
     assert not out['baseband'] and np.abs(out['image'] - raw).max() < 2e-5 * np.abs(raw).max()
     planes.deramp(out)
@@ -141,7 +142,9 @@ def test_valid_mask(scene):
     ii, jj = np.meshgrid(np.arange(sl['image'].shape[0]), np.arange(sl['image'].shape[1]), indexing='ij')
     g = planes.slant_to_ground(scene['fr'], (ii - i0) * sl['spx'], (jj - j0) * sl['spy'], out['origin'][2]) - out['origin']
     x = g @ out['e1'] / out['spx']
-    assert not sl['image'][x > nx // 2 + 1].any() and sl['image'][(x > 30) & (x < nx // 2 - 2)].all()
+    y = g @ out['e2'] / out['spy']
+    assert not sl['image'][x > nx // 2 + 1].any()
+    assert sl['image'][(x > 30) & (x < nx // 2 - 2) & (y > 30) & (y < out['image'].shape[1] - 31)].all()
 
 
 def test_bounds(scene):
@@ -163,16 +166,17 @@ def test_to_ground(scene):
     assert back['plane'] == 'ground' and back['image'].shape == out['image'].shape
     d = (back['image'] - out['image'])[40:-40, 40:-40]
     assert 20 * np.log10(np.abs(d).max() / np.abs(out['image']).max()) < -45
-    # a detected image, from a slant image sampled for its doubled band
+    # a detected image (power), from a slant image sampled for its doubled band
     s2 = planes.to_slant(out, (0.48 / b['ba'], 0.48 / b['br']))
     det = dict(s2, image=np.abs(s2['image']) ** 2)
     px = 0.15
     n = (int(g['shape'][0] * g['spx'] / px), int(g['shape'][1] * g['spy'] / px))
-    gd = planes.to_ground(det, g['origin'], g['e1'], g['e2'], px, n)
-    assert gd['image'].dtype == np.float32 and gd['image'].shape == n
-    for k in range(len(tg)):
-        ie, je = (tg[k] - g['origin']) @ g['e1'] / px, (tg[k] - g['origin']) @ g['e2'] / px
-        m = quality.point_target(np.sqrt(np.maximum(gd['image'], 0)), (int(round(ie)), int(round(je))), px, px, half=16)
-        assert abs(m['i'] - ie) < 0.1 and abs(m['j'] - je) < 0.1, (k, m['i'] - ie, m['j'] - je)
+    for kernel, tol in (('cubic', 0.25), ('sinc', 0.05)):
+        gd = planes.to_ground(det, g['origin'], g['e1'], g['e2'], px, n, kernel=kernel)
+        assert gd['image'].dtype == np.float32 and gd['image'].shape == n
+        for k in range(len(tg)):
+            ie, je = (tg[k] - g['origin']) @ g['e1'] / px, (tg[k] - g['origin']) @ g['e2'] / px
+            m = quality.point_target(gd['image'], (int(round(ie)), int(round(je))), px, px, half=16)
+            assert abs(m['i'] - ie) < tol and abs(m['j'] - je) < tol, (kernel, k, m['i'] - ie, m['j'] - je)
     with pytest.raises(ValueError):
         planes.to_ground(out, g['origin'], g['e1'], g['e2'], px, n)

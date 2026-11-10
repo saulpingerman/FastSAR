@@ -242,14 +242,16 @@ def to_slant(out, spacing, bounds=None, *, margin=0, valid=None, taps=8, knots=3
     return res
 
 
-def to_ground(out, origin, e1, e2, spacing, shape, *, kernel=None, taps=8, knots=32):
+def to_ground(out, origin, e1, e2, spacing, shape, *, kernel=None, taps=8, pad=None, knots=32):
     """A slant-plane image (to_slant's output, or one derived from it on the same grid: detected, apodized)
     resampled to a ground-plane grid: pixel (i, j) at origin + i spacing[0] e1 + j spacing[1] e2 (local frame, e1
     and e2 horizontal and orthonormal, e1 x e2 up), shape (nx, ny).
 
     kernel: 'sinc' (default for a complex image, which the ground grid must then sample as sampling asks, on axes
-    along the line of sight), 'cubic' (default for a real one) or 'linear'. Ground pixels the slant image does not
-    cover are 0.
+    along the line of sight), 'cubic' (default for a real one) or 'linear'; taps, pad: resample.lines's. A detected
+    image is band limited as power (twice the complex image's band, so from a slant image at half the spacing):
+    the sinc kernel then places a point within a few hundredths of a pixel, the cubic one within a quarter. Ground
+    pixels the slant image does not cover are 0.
     -> the product dict on the ground plane (plane 'ground')."""
     if out.get('plane') != 'slant':
         raise ValueError('to_ground takes a slant-plane image')
@@ -274,7 +276,7 @@ def to_ground(out, origin, e1, e2, spacing, shape, *, kernel=None, taps=8, knots
     # pass 2, along azimuth at each ground column: the azimuth index of ground pixel (i, j)
     g = o + (xk * spx)[None, :, None] * e1 + (yk * spy)[:, None, None] * e2                  # [nyk, nxk, 3]
     pos1 = resample.KnotMap(yk, xk, ground_to_slant(fr, g)[0] / sa + i0, nx)
-    kw = dict(kernel=kernel) if kernel != 'sinc' else dict(kernel='sinc', taps=taps)
+    kw = dict(kernel=kernel, pad=pad) if kernel != 'sinc' else dict(kernel='sinc', taps=taps, pad=pad)
     res = {k: v for k, v in out.items() if k not in ('image', 'scp_pixel', 'ground')}
     res.update(image=resample.warp(img.T, pos0, pos1, (ny, nx), **kw).T, origin=o, e1=e1, e2=e2, spx=spx, spy=spy,
                plane='ground', scp=scp)
