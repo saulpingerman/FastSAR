@@ -175,7 +175,7 @@ def _plan(n, kernel, taps, pad):
     from scipy import fft
     tab = kernel_table(kernel, taps)
     pad = (2 if kernel == 'sinc' else 1) if pad is None else int(pad)
-    guard = tab.shape[1] if pad == 1 else 16
+    guard = tab.shape[1] if pad == 1 else max(16, tab.shape[1])
     return tab, pad, guard, fft.next_fast_len(n + 2 * guard) if pad > 1 else n + 2 * guard
 
 

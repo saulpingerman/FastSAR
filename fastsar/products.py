@@ -225,7 +225,8 @@ def sicd_meta(out):
     from . import __version__
     C = 299792458.0
     meta = out['meta']
-    img = np.asarray(out['image'])
+    from ._xp import host
+    img = host(out['image'])                       # a product still on its device is brought to the host
     nx, ny = img.shape
     R = np.asarray(meta['R'], np.float64)
     e1, e2 = np.asarray(out['e1'], np.float64), np.asarray(out['e2'], np.float64)

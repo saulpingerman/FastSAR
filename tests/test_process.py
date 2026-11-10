@@ -89,8 +89,6 @@ def test_sva_sicd(cphd):
     assert pslr.max() < -24                                          # the unweighted aperture's: -13 dB
     assert 0.45 < o['spx'] / ref['spx'] < 0.62 and abs(o['spy'] / ref['spy'] - 0.5 / 0.96) < 0.03   # twice Nyquist
     assert any('keystone' in n for n in o['notes'])
-    with pytest.raises(ValueError, match='spacing'):
-        fastsar.process_cphd(str(d / 'c.cphd'), weighting='sva', spacing=0.3, backend='cpu')
 
 
 @pytest.mark.parametrize('weighting', [None, 'taylor'])
@@ -124,8 +122,10 @@ def test_sidd_spacing_and_remap(cphd):
                              shadows_down=False, backend='cpu')
     assert o['spx'] == 0.5 and o['spy'] == 0.5
     assert o['metadata'].Display.NonInteractiveProcessing[0].ProductGenerationOptions.DataRemapping.LUTName == 'LOG'
-    with pytest.raises(ValueError, match='square'):
-        fastsar.process_cphd(str(d / 'c.cphd'), product='sidd', spacing=(0.5, 0.4), backend='cpu')
+    one = fastsar.process_cphd(str(d / 'c.cphd'), product='sidd', spacing=[0.5], autofocus=False, backend='cpu')
+    assert one['spx'] == 0.5 and one['image'].shape == o['image'].shape
+    tiny = fastsar.process_cphd(str(d / 'c.cphd'), plane='ground', extent=(3.0, 3.0), backend='cpu')   # too small to focus
+    assert tiny['autofocus'] is None and any('autofocus skipped' in n for n in tiny['notes'])
 
 
 def test_quality_areas_need_an_antenna_pattern(cphd):
@@ -133,6 +133,70 @@ def test_quality_areas_need_an_antenna_pattern(cphd):
     for area in ('tasked_quality', 4.0, 'black'):                    # the simulator's CPHD describes no antenna
         with pytest.raises(ValueError, match='antenna pattern'):
             fastsar.process_cphd(str(d / 'c.cphd'), area=area, nesz_db=-20.0, backend='cpu')
+
+
+def test_ground_sicd_spectrum_fits_its_sampling(cphd):
+    """The image as formed is the product: its spectrum must leave a guard band on both axes (sampled for the
+    resampling to the slant plane alone, it wraps along the line of sight)."""
+    d, ecf = cphd
+    o = fastsar.process_cphd(str(d / 'c.cphd'), plane='ground', weighting='uniform', autofocus=False, backend='cpu')
+    F = np.abs(np.fft.fft2(o['image'])) ** 2
+    for axis in (0, 1):
+        p = np.sort(F.sum(1 - axis))
+        assert p[:max(2, len(p) // 100)].mean() < 1e-3 * p[len(p) // 2], axis      # the emptiest 1% of the bins
+    wide = fastsar.process_cphd(str(d / 'c.cphd'), plane='ground', spacing=(0.3, 0.6), autofocus=False, backend='cpu')
+    assert wide['spy'] == 0.6 and any('aliased' in n for n in wide['notes'])
+    assert not any('aliased' in n for n in o['notes'])
+
+
+def test_sidd_targets_keep_their_amplitude(cphd):
+    """Detection at twice Nyquist, then the projection: equal targets come out equal whatever the weighting."""
+    d, ecf = cphd
+    for weighting, limit in (('sva', 1.5), ('taylor', 1.5), ('uniform', 1.5)):
+        o = fastsar.process_cphd(str(d / 'c.cphd'), product='sidd', weighting=weighting, autofocus=False, backend='cpu')
+        img, pk = o['image'].copy(), []
+        for _ in TG:
+            i, j = np.unravel_index(np.argmax(img), img.shape)
+            pk.append(img[i, j])
+            img[max(i - 8, 0):i + 9, max(j - 8, 0):j + 9] = 0
+        assert 20 * np.log10(max(pk) / min(pk)) < limit, (weighting, pk)
+        assert o['remap'] == 'nrl' and o['shadows_down'] is True
+
+
+def test_quality_area_masks_the_product(cphd, monkeypatch):
+    """A quality area end to end with a stand-in for the radiometric model (the simulated file has no antenna
+    pattern): the grid is the area's bounding rectangle and the pixels outside the area are 0, on both planes."""
+    from fastsar import rgiqe
+    d, ecf = cphd
+    seen = {}
+
+    class Model:
+        has_antenna, notes = True, ['stand-in model']
+
+        def __init__(self, path, meta, **kw):
+            seen['kw'] = kw
+
+    def bounds(rad, kind, center, e1, e2, bw, n, tasked=None, **kw):
+        seen.update(center=center, e1=e1, e2=e2, kind=kind)
+        return (-60.0, 60.0, -45.0, 45.0)
+
+    def mask(rad, pts, kind, bw, n, tasked=None, **kw):
+        q = pts - seen['center']
+        level = (1.0 - np.hypot((q @ seen['e1']) / 60.0, (q @ seen['e2']) / 45.0)).astype(np.float32)   # an ellipse
+        return level >= 0, dict(level=level)
+    monkeypatch.setattr(rgiqe, 'Radiometry', Model)
+    monkeypatch.setattr(rgiqe, 'area_bounds', bounds)
+    monkeypatch.setattr(rgiqe, 'area_mask', mask)
+    g = fastsar.process_cphd(str(d / 'c.cphd'), plane='ground', area='black', autofocus=False, backend='cpu')
+    assert seen['kind'] == 'black' and 'stand-in model' in g['notes']
+    nx, ny = g['image'].shape
+    I, J = np.meshgrid(np.arange(nx), np.arange(ny), indexing='ij')
+    q = g['origin'] + I[..., None] * g['spx'] * g['e1'] + J[..., None] * g['spy'] * g['e2'] - seen['center']
+    r = np.hypot((q @ seen['e1']) / 60.0, (q @ seen['e2']) / 45.0)
+    assert not g['image'][r > 1.03].any() and (g['image'][r < 0.97] != 0).mean() > 0.999
+    assert abs((g['image'] != 0).mean() - np.pi / 4) < 0.03          # the ellipse inscribed in its rectangle
+    s = fastsar.process_cphd(str(d / 'c.cphd'), area=4.5, autofocus=False, backend='cpu')
+    assert seen['kind'] == 4.5 and s['plane'] == 'slant' and 0.2 < (s['image'] != 0).mean() < np.pi / 4 + 0.03
 
 
 def test_autofocus_modes(cphd):
@@ -164,6 +228,9 @@ def test_errors(cphd):
     d, ecf = cphd
     p = str(d / 'c.cphd')
     for kw, match in ((dict(product='png'), 'product'), (dict(plane='tilted'), 'plane'),
+                      (dict(product='sidd', remap='nosuch'), 'remap'), (dict(product='sidd', remap='linear'), 'remap'),
+                      (dict(weighting='sva', spacing=0.3), 'spacing'),
+                      (dict(product='sidd', spacing=(0.5, 0.4)), 'square'), (dict(extent=(10.0,)), 'extent'),
                       (dict(weighting='hamming'), 'weighting'), (dict(autofocus='sharpen'), 'autofocus'),
                       (dict(area='everything'), 'area'), (dict(area=True), 'area'), (dict(spacing=-1.0), 'spacing'),
                       (dict(product='sidd', plane='slant'), 'ground plane'),

@@ -13,7 +13,7 @@ Plane. 'slant' or 'ground'. The image is always formed on the ground plane, wher
 track, on axes along the line of sight; a slant-plane product is that image resampled (fastsar.planes), a
 ground-plane SICD is the image as formed, and a ground-plane SIDD is detected on the slant plane and projected.
 Autofocus. 'quadratic' (one quadratic phase error over the aperture, by map drift), 'pga', 'spatially_variant'
-(a phase error that varies over the scene), or False (fastsar.autofocus.image_autofocus).
+or 'spatially_variant_pga' (a phase error that varies over the scene), or False (fastsar.autofocus.image_autofocus).
 Weighting. 'taylor' (nbar 4, 35 dB, on the phase history), 'uniform', or 'sva' (spatially variant apodization,
 fastsar.weighting, on the slant plane at twice Nyquist: the unweighted resolution without the sidelobes).
 Remap (SIDD). A name of fastsar.remap.REMAPS (the NGA MATLAB SAR Toolbox's: 'nrl', 'density', 'brighter', 'darker',
@@ -68,7 +68,9 @@ def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None
 
     -> the product dict (form_cphd's entries on the product's grid: image, origin, e1, e2, spx, spy, plane, meta,
     notes, ...), with product, area, weighting, autofocus (the mode run), autofocus_info, timing (seconds of each
-    stage), and, when written, path and metadata (the sarpy SICDType or SIDDType)."""
+    stage), and, when written, path and metadata (the sarpy SICDType or SIDDType). The image of a SIDD product is
+    the detected amplitude (float32) on the product's own grid; the remap and the layout are applied when the file
+    is written, and fastsar.sidd.to_display(out, out['remap'], **out['remap_args']) gives the same display values."""
     from .api import _backend
     from .cphd import form_cphd
     backend = _backend(backend)
@@ -85,6 +87,14 @@ def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None
         raise ValueError(f'extent must be two positive lengths in meters, got {extent!r}')
     if spacing is not None and (np.size(spacing) not in (1, 2) or np.min(spacing) <= 0):
         raise ValueError(f'spacing must be one or two positive lengths in meters, got {spacing!r}')
+    if product == 'sidd' and spacing is not None and np.size(spacing) != 1:
+        raise ValueError('a SIDD has square pixels: give spacing as one number')
+    if product == 'sidd':
+        from . import remap as _remap
+        if not callable(remap) and (remap not in _remap.REMAPS or remap == 'linear'):
+            raise ValueError(f"remap {remap!r}: one of {sorted(k for k in _remap.REMAPS if k != 'linear')}, or a function")
+    if weighting == 'sva' and product == 'sicd' and spacing is not None:
+        raise ValueError("weighting='sva' sets the slant spacing itself (twice Nyquist): leave spacing=None")
     timing, st = {}, {}
     t0 = time.perf_counter()
     st['start'] = t0
@@ -108,7 +118,8 @@ def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None
                 if not ok:
                     raise ValueError(f'{name}={v!r} is for spotlight collections; this one has a moving beam')
             st.update(spot=False, plane=pl, weighting=wt, autofocus=af)
-            return dict(window=wt == 'taylor')
+            sp = None if spacing is None else tuple(float(v) for v in np.broadcast_to(np.asarray(spacing, np.float64), (2,)))
+            return dict(window=wt == 'taylor', spacing=sp)
         if product == 'sicd' and pl == 'ground' and wt == 'sva':
             raise ValueError("weighting='sva' is applied on the slant plane: for a SICD give plane='slant'")
         if product == 'sidd' and pl == 'slant':
@@ -148,8 +159,14 @@ def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None
                             e1, e2)
         via_slant = pl == 'slant' or product == 'sidd'
         sp = (0.96 / s['bx'], 0.96 / s['by'])
-        if not via_slant and spacing is not None:                    # a ground-plane SICD is the image as formed
-            sp = tuple(float(v) for v in np.broadcast_to(np.asarray(spacing, np.float64), (2,)))
+        if not via_slant:                                            # a ground-plane SICD is the image as formed: its
+            need = (1 / s['bx'], 1 / s['by_full'])                   # spectrum must not wrap along the line of sight
+            sp = (0.96 * need[0], 0.96 * need[1])
+            if spacing is not None:
+                sp = tuple(float(v) for v in np.broadcast_to(np.asarray(spacing, np.float64), (2,)))
+                if sp[0] > need[0] * 1.0001 or sp[1] > need[1] * 1.0001:
+                    g['notes'].append(f'spacing {sp[0]:.3f} x {sp[1]:.3f} m is coarser than the band of the data allows '
+                                      f'({need[0]:.3f} x {need[1]:.3f} m): the image is aliased')
         m = _MARGIN if via_slant else 0
         st.update(spot=True, plane=pl, weighting=wt, autofocus=af, sampling=s, bounds=b, kept=kept, valid=valid,
                   via_slant=via_slant, margin=m)
@@ -168,6 +185,8 @@ def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None
     if st['spot']:
         out = _spotlight(out, st, product, area, spacing, lap)
     out['timing'] = timing
+    if product == 'sidd':
+        out.update(remap=remap, remap_args=dict(remap_args or {}), shadows_down=bool(shadows_down))
     if output is not None and product == 'sidd':                     # remapped where the image lives
         from .sidd import write_sidd
         out['metadata'] = write_sidd(output, out, remap=remap, remap_args=remap_args, shadows_down=shadows_down)
@@ -187,7 +206,9 @@ def _mask(out, st, area):
     from .patches import _rows
     rad, bw_area, n, tasked = st['valid']
     nx, ny, o, e1, e2, spx, spy = planes._grid(out)
-    ki, kj = planes._knots(nx, max(8, int(50.0 / spx))), planes._knots(ny, max(8, int(50.0 / spy)))
+    # nodes every 50 m, and at least 48 across the image
+    ki = planes._knots(nx, max(4, int(min(50.0 / spx, nx / 48))))
+    kj = planes._knots(ny, max(4, int(min(50.0 / spy, ny / 48))))
     pts = o + (ki * spx)[:, None, None] * e1 + (kj * spy)[None, :, None] * e2
     m, info = rgiqe.area_mask(rad, pts, area, bw_area, n, tasked=tasked)
     # the margin over the threshold where the model gives it (a smooth boundary between the nodes), else the mask
@@ -209,7 +230,11 @@ def _spotlight(out, st, product, area, spacing, lap):
     lap('baseband')
     if st['autofocus']:
         from .autofocus import image_autofocus
-        out['image'], info = image_autofocus(out['image'], st['autofocus'])
+        try:
+            out['image'], info = image_autofocus(out['image'], st['autofocus'])
+        except ValueError as e:                                      # an image too small for the estimate
+            info = dict(mode=st['autofocus'], applied=False, reason=str(e))
+            out['notes'].append(f'autofocus skipped: {e}')
         out.update(autofocus=st['autofocus'] if info.get('applied', True) else None, autofocus_info=info)
         lap('autofocus')
     valid = None if st['valid'] is None else _mask(out, st, area)
@@ -217,21 +242,25 @@ def _spotlight(out, st, product, area, spacing, lap):
         if valid is not None:
             xp = _xp.module(out['image'])
             out['image'] = xp.where(xp.asarray(valid), out['image'], 0)
-        out['bandwidth'] = (s['bx'], s['by'])
+        out['bandwidth'] = (s['bx'], s['by_full'])
         lap('mask')
         return out
     if wt == 'sva':                                                  # twice Nyquist of the rectangle keystone left
         sup = planes.support(planes._frame(out), planes._used(out), out['band'],
                              *planes._slant_axes(planes._frame(out), out['height']))
         sp = (0.5 / (st['kept'][1] - st['kept'][0]), 0.5 / (sup['k2'][1] - sup['k2'][0]))
+    elif product == 'sidd':                                          # detected: the band doubles
+        sp = (0.5 / s['ba'], 0.5 / s['br'])
     else:
         sp = (0.96 / s['ba'], 0.96 / s['br'])
     if product == 'sicd' and spacing is not None:
-        if wt == 'sva':
-            raise ValueError("weighting='sva' sets the slant spacing itself (twice Nyquist): leave spacing=None")
         sp = tuple(float(v) for v in np.broadcast_to(np.asarray(spacing, np.float64), (2,)))
+        if sp[0] > 1.0001 / s['ba'] or sp[1] > 1.0001 / s['br']:
+            out['notes'].append(f"spacing {sp[0]:.3f} x {sp[1]:.3f} m is coarser than the band of the data allows "
+                                f"({1 / s['ba']:.3f} x {1 / s['br']:.3f} m): the image is aliased")
     ground = {k: out[k] for k in ('origin', 'e1', 'e2', 'spx', 'spy')}
     sl = planes.to_slant(out, sp, margin=mg, valid=valid)
+    out['image'] = None                                              # the caller's dict too: the ground image is freed
     del out, valid
     lap('to_slant')
     if wt == 'sva':
@@ -252,9 +281,10 @@ def _spotlight(out, st, product, area, spacing, lap):
     sl['image'] = _xp.module(sl['image']).abs(sl['image'])
     lap('detect')
     res = 0.886 / max(s['bx'], s['by'])
-    px = float(spacing) if spacing is not None and np.size(spacing) == 1 else (0.7 * res if spacing is None else None)
-    if px is None:
-        raise ValueError('a ground-plane SIDD has square pixels: give spacing as one number')
+    px = 0.7 * res if spacing is None else float(np.ravel(spacing)[0])
+    if px > res:
+        sl['notes'].append(f'pixel {px:.3f} m is coarser than the resolution ({res:.3f} m): the detected image is not '
+                           'filtered before it is resampled, and speckle aliases')
     b = st['bounds']
     shape = (int(np.ceil((b[1] - b[0]) / px)) + 1, int(np.ceil((b[3] - b[2]) / px)) + 1)
     o = ground['origin'] + mg * ground['spx'] * ground['e1'] + mg * ground['spy'] * ground['e2']

@@ -115,7 +115,9 @@ def sampling(fr, ant, band, points, e1, e2):
     the unit vector from the antenna to the point. ant [P, 3]: the pulses used; band: first and last frequency.
 
     -> dict of the largest full widths (cycles/m; twice the largest offset from zero) over the points: bx along e1;
-    by along e2 of the image resampled to the slant azimuths (to_slant's second pass); ba, br of the slant image
+    by along e2 of the image resampled to the slant azimuths (to_slant's second pass); by_full along e2 of the
+    ground image itself (wider than by under squint: the spacing 1 / by wraps the spectrum along e2 without
+    aliasing it, which to_slant undoes, while an image to be used as it is needs 1 / by_full); ba, br of the slant image
     along azimuth and range; ba_min: the azimuth width at the first frequency (the rectangle inscribed in the
     slant spectrum, whose azimuth width grows with frequency)."""
     pts = np.atleast_2d(np.asarray(points, np.float64))
@@ -136,7 +138,8 @@ def sampling(fr, ant, band, points, e1, e2):
     gax, gay, grx, gry = (v[:, None, None] for v in (ga @ e1, ga @ e2, gr @ e1, gr @ e2))
     ka, kr = kx * gax + ky * gay, kx * grx + ky * gry
     full = lambda k: float(2 * np.abs(k).max())
-    return dict(bx=full(kx), by=full(kx * (grx / gry) + ky), ba=full(ka), br=full(kr), ba_min=full(ka[:, :, 0]))
+    return dict(bx=full(kx), by=full(kx * (grx / gry) + ky), by_full=full(ky), ba=full(ka), br=full(kr),
+                ba_min=full(ka[:, :, 0]))
 
 
 def _frame(out):

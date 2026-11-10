@@ -292,6 +292,8 @@ def test_form_cphd_moving_srp():
     po = fastsar.process_cphd('strip.cphd', backend='cpu', extent=(60.0, 50.0))
     assert po['mode'] == 'moving' and po['plane'] == 'ground' and po['weighting'] == 'taylor' and po['autofocus'] is None
     assert po['image'].shape == img.shape and np.abs(po['image'] - img).max() < 2e-3 * np.abs(img).max()    # another patch size
+    pc = fastsar.process_cphd('strip.cphd', backend='cpu', extent=(60.0, 50.0), spacing=(0.5, 0.7))
+    assert pc['spx'] == 0.5 and pc['spy'] == 0.7 and pc['image'].shape != img.shape       # the spacing asked for
     ps = fastsar.process_cphd('strip.cphd', backend='cpu', extent=(60.0, 50.0), product='sidd')
     from fastsar import sidd
     lay = sidd.shadows_down(ps)
