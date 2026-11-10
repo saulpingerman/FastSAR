@@ -54,10 +54,13 @@ def unit(v):
 
 
 def collection(antenna='poly', P=64, K=256, prf=6000.0, toa=15e-6, toae=None, period=400e-6, pt_ref=None, pn_ref=None,
-               bn_ref=None, pol='HH', steer=(0.0, 0.0), signal=None, sgn=-1):
+               bn_ref=None, pol='HH', steer=(0.0, 0.0), signal=None, sgn=-1, peak=(0.0, 0.0), collector=None):
     """A spotlight collection from 640 km: the reader stand-in, the meta dict, and what the model should see.
     antenna: 'poly' (axis polynomials and a gain polynomial), 'pvp' (per-pulse axes and steering, gain polynomial),
-    'array' (axis polynomials and a gain array) or None."""
+    'array' (axis polynomials and a gain array) or None. The antenna follows CPHD 1.x: X and Y axes with X x Y the
+    mechanical boresight toward the scene, direction cosines of the unit vector from the antenna to the point, the
+    array pattern a function of the direction cosines minus the steering `steer`. peak: the direction cosines,
+    relative to the steering, at which the array pattern peaks."""
     t = 10.0 + np.arange(P) / prf
     apc = np.stack([7500.0 * (t - t.mean()), np.full(P, -400e3), np.full(P, 500e3)], -1)
     srp = np.tile(REF, (P, 1))
@@ -79,12 +82,12 @@ def collection(antenna='poly', P=64, K=256, prf=6000.0, toa=15e-6, toae=None, pe
              TgtRefLevel=None if pt_ref is None else NS(PTRef=pt_ref),
              NoiseLevel=None if pn_ref is None else NS(PNRef=pn_ref, BNRef=bn_ref), Antenna=None)
     m = NS(Global=NS(DomainType='FX', SGN=sgn), Data=NS(Channels=[NS(NumSamples=K)]), Channel=NS(Parameters=[par]),
-           Antenna=None, SupportArray=None)
+           Antenna=None, SupportArray=None, CollectionID=NS(CollectorName=collector))
     t_rcv = t + 2 * np.linalg.norm(srp - apc, axis=1) / C
     support, ax, ay, axr, ayr = {}, xa, ya, xa, ya
     if antenna is not None:
         par.Antenna = NS(TxAPCId='APC', TxAPATId='PAT', RcvAPCId='APC', RcvAPATId='PAT')
-        gain = Poly([[0.0, 0.0, -A_DB], [0.0, 0.0, 0.0], [-A_DB, 0.0, 0.0]])
+        gain = Poly([[0.0, 2 * A_DB * peak[1], -A_DB], [2 * A_DB * peak[0], 0.0, 0.0], [-A_DB, 0.0, 0.0]])
         pat = NS(Identifier='PAT', EB=NS(DCXPoly=Poly([0.0]), DCYPoly=Poly([0.0])),
                  Array=NS(GainPoly=gain, AntGPId=None), Element=NS(GainPoly=Poly([[0.0]]), AntGPId=None))
         acf = NS(Identifier='ACF')
@@ -102,14 +105,14 @@ def collection(antenna='poly', P=64, K=256, prf=6000.0, toa=15e-6, toae=None, pe
         if antenna == 'array':
             x = -0.03 + 1e-4 * np.arange(601)
             a = np.zeros((601, 601), [('Gain', 'f4'), ('Phase', 'f4')])
-            a['Gain'] = -A_DB * (x[:, None] ** 2 + x[None, :] ** 2)
+            a['Gain'] = -A_DB * ((x[:, None] - peak[0]) ** 2 + (x[None, :] - peak[1]) ** 2)     # rows DCX, columns DCY
             support['AGP'] = a
             pat.Array = NS(GainPoly=Poly([[0.0]]), AntGPId='AGP')
             m.SupportArray = NS(AntGainPhase=[NS(Identifier='AGP', X0=-0.03, Y0=-0.03, XSS=1e-4, YSS=1e-4)])
     meta = dict(tx=apc, rcv=apc, srp_pulses=srp, tx_time=t, rcv_time=t_rcv,
                 R=ROT, origin=ORIGIN, srp=ORIGIN + REF @ ROT, pulses=(0, P), channel_index=0, channel='CH')
-    return NS(reader=Reader(m, pv, signal, support), meta=meta, apc=apc, ax=ax, ay=ay, axr=axr, ayr=ayr, steer=steer,
-              toa=toa, P=P, K=K, prf=prf, df=df, wavelength=C / fc)
+    return NS(reader=Reader(m, pv, signal, support), meta=meta, apc=apc, ax=ax, ay=ay, axr=axr, ayr=ayr,
+              steer=np.add(steer, peak), toa=toa, P=P, K=K, prf=prf, df=df, wavelength=C / fc)
 
 
 def expected(col, X, power=False):
@@ -218,6 +221,41 @@ def test_gain(antenna, steer):
     assert ('per-pulse antenna axes' in ' '.join(rad.notes)) == (antenna == 'pvp')
 
 
+def beam_point(col, dc):
+    """Where the ray from the mid-aperture antenna with the direction cosines dc meets the ground z = 0, from the
+    definition alone: dc[0] X + dc[1] Y + sqrt(1 - |dc|^2) (X x Y)."""
+    p = col.P // 2
+    u = dc[0] * col.ax[p] + dc[1] * col.ay[p] + np.sqrt(1 - dc[0] ** 2 - dc[1] ** 2) * np.cross(col.ax[p], col.ay[p])
+    return col.apc[p] - col.apc[p][2] / u[2] * u
+
+
+@pytest.mark.parametrize('antenna', ['poly', 'pvp', 'array'])
+@pytest.mark.parametrize('steer, peak', [((3e-3, 0.0), (0.0, 0.0)), ((0.0, -4e-3), (0.0, 0.0)), ((0.0, 0.0), (-2e-3, 3e-3)),
+                                         ((2e-3, 3e-3), (1e-3, -5e-3))])
+def test_beam_points_where_the_standard_says(antenna, steer, peak):
+    """A beam steered off the reference point, or a pattern that peaks off its own center: the gain peaks where the
+    ray with those direction cosines meets the ground, on the side the antenna axes say. Here +X is the flight
+    direction and +Y points below the line of sight, toward the radar's side of the reference point."""
+    col = collection(antenna, steer=steer, peak=peak)
+    rad = rgiqe.Radiometry(col.reader, col.meta, nesz_db=-20.0)
+    p = col.P // 2
+    assert np.cross(col.ax[p], col.ay[p]) @ unit(REF - col.apc[p]) > 0.999999     # X x Y looks at the scene
+    assert col.ax[p] @ [1.0, 0.0, 0.0] > 0.99 and col.ay[p] @ rad.range_dir < -0.5
+    dc = np.add(steer, peak)
+    want = beam_point(col, dc)
+    off = np.array([(want - REF) @ rad.range_dir, (want - REF) @ rad.cross_dir])
+    assert np.hypot(*off) > 1500.0                                  # well off the reference point
+    # the sides, independently: +DCX is along the flight direction (the -cross side here), +DCY toward the radar
+    assert np.sign(off[1]) == -np.sign(dc[0]) or dc[0] == 0
+    assert np.sign(off[0]) == -np.sign(dc[1]) or dc[1] == 0
+    g = np.arange(-6000.0, 6001.0, 50.0)
+    got = rad.gain_db(ground(rad, g[:, None], g[None, :]))
+    i, j = np.unravel_index(np.argmax(got), got.shape)
+    assert abs(g[i] - off[0]) <= 100.0 and abs(g[j] - off[1]) <= 100.0 and got[i, j] > 1.5
+    mirrored = ground(rad, np.array([-off[0]]), np.array([-off[1]]))
+    assert rad.gain_db(want[None])[0] > got[i, j] - 0.05 and rad.gain_db(mirrored)[0] < got[i, j] - 6.0
+
+
 def test_gain_polynomial_is_held_beyond_its_lobe():
     """A polynomial is trusted to 15 dB one-way below its peak and holds that value beyond, flagged as unknown; an
     array is read as it is."""
@@ -269,13 +307,14 @@ def test_level_sources_in_order():
     assert abs(float(co.rniirs(co.ref_point[None], BA, N, False)[0]) - rgiqe.snr_to_rniirs(BA, 100.0)) < 1e-12
 
 
-def phase_history(P, K, df, toa, noise, clutter, sgn, rs, doppler=1.0):
+def phase_history(P, K, df, toa, noise, clutter, sgn, rs, doppler=1.0, window=None):
     """White noise of the given power per delay bin (a number or a profile over the K bins) and clutter of the given
-    power in the bins of the swath |delay| <= toa, confined to the fraction `doppler` of the Doppler band, written
-    as frequency-domain pulses [P, K]. Returns it and the clutter power per sample."""
+    power in the bins of the swath |delay| <= toa (or window[0] <= delay <= window[1]), confined to the fraction
+    `doppler` of the Doppler band, written as frequency-domain pulses [P, K] whose phase follows sgn. Returns it
+    and the clutter power per sample."""
     cn = lambda: (rs.standard_normal((P, K)) + 1j * rs.standard_normal((P, K))) / np.sqrt(2.0)
     tau = np.fft.fftfreq(K, df)
-    sw = np.abs(tau) <= toa
+    sw = np.abs(tau) <= toa if window is None else (tau >= window[0]) & (tau <= window[1])
     cl = cn() * np.sqrt(clutter)
     if doppler < 1.0:
         F = np.fft.fft(cl, axis=0)
@@ -301,6 +340,23 @@ def test_noise_from_the_doppler_band(sgn):
     with pytest.raises(ValueError, match='frequency-domain'):
         col.reader.cphd_meta.Global.DomainType = 'TOA'
         rgiqe.Radiometry(col.reader, col.meta)
+
+
+@pytest.mark.parametrize('collector, sgn, phase', [(None, -1, -1), (None, 1, 1), ('Capella-12', 1, -1), ('capella', -1, -1)])
+def test_noise_uses_the_phase_sign_of_the_reader(collector, sgn, phase):
+    """The delay axis of the measurement follows the phase sign fastsar.io reads the file with (Capella files
+    declare +1 and follow -1): a swath to one side of the reference delay is found on that side, not mirrored."""
+    P, K, period, toa = 512, 1024, 400e-6, 60e-6
+    S, clutter = phase_history(P, K, 1.0 / period, toa, 3.0, 40.0, phase, np.random.default_rng(13), doppler=0.4,
+                               window=(0.2 * toa, toa))
+    col = collection('array', P=P, K=K, toa=toa, period=period, pt_ref=2e-3, signal=S, sgn=sgn, collector=collector)
+    col.reader.pvp['TOA1'] = 0.2 * toa
+    assert rgiqe._phase_sign(col.reader.cphd_meta) == phase
+    rad = rgiqe.Radiometry(col.reader, col.meta)
+    assert abs(rad.noise_per_sample / 3.0 - 1) < 0.1 and abs(rad.clutter_per_sample * K / (clutter * K) - 1) < 0.05
+    col.reader.cphd_meta.Global.SGN = -sgn                          # read the other way, the swath holds only noise
+    if collector is None:
+        assert rgiqe.Radiometry(col.reader, col.meta).clutter_per_sample < 0.05 * clutter
 
 
 def test_noise_from_the_extended_swath():
@@ -452,6 +508,50 @@ def test_area_is_connected_to_the_scene():
         rgiqe.area_mask(f, pts, 'tasked_quality', BA, N)
 
 
+def test_level_reproduces_the_mask_and_draws_a_finer_boundary():
+    """info['level'] is >= 0 exactly on the mask for every kind and on both evaluation paths, is the margin of the
+    criterion inside, stays negative on a region that meets the criterion apart from the scene, and interpolated
+    from a coarse grid gives the boundary to a fraction of the grid step."""
+    blob = lambda x, y, x0, s: 100.0 * np.exp(-((x - x0) ** 2 + y * y) / (2 * s * s))
+    f = Field(lambda x, y: blob(x, y, 0.0, 800.0) + blob(x, y, 6000.0, 500.0))
+    pts, g = grid(9000.0, 100.0)
+    x, y = pts[..., 0], pts[..., 1]
+    apart = np.array([[-4750.0, 4950.0, 0.0], [-3450.0, 4950.0, 0.0], [-3450.0, 6050.0, 0.0], [-4750.0, 6050.0, 0.0]])
+    for kind, tasked in (('black', None), ('black', apart), (4.2, apart), ('tasked', apart), (9.0, apart)):
+        mask, info = rgiqe.area_mask(f, pts, kind, BA, N, tasked=tasked)
+        lev = info['level']
+        assert lev.dtype == np.float32 and lev.shape == mask.shape and np.array_equal(lev >= 0, mask)
+        assert lev[~mask].max() <= -1e-3 + 1e-9
+    mask, info = rgiqe.area_mask(f, pts, 'black', BA, N, tasked=apart)
+    lev = info['level']
+    snr_db = 10 * np.log10(f.f(x, y))
+    center, island = np.hypot(x, y) <= 2300.0, np.hypot(x - 6000.0, y) <= 1400.0
+    np.testing.assert_allclose(lev[center], snr_db[center], atol=1e-4)          # the SNR in dB over the threshold of 1
+    assert (snr_db[island] > 0).all() and (lev[island] <= -1e-3 + 1e-9).all()   # met, but apart from the scene
+    inside = (x > -4750) & (x < -3450) & (y > 4950) & (y < 6050)
+    assert (lev[inside] == 0).all()                                 # the tasked area, where the criterion fails
+    mask, info = rgiqe.area_mask(f, pts, 4.2, BA, N)
+    r = rgiqe.snr_to_rniirs(BA, f.f(x, y))
+    np.testing.assert_allclose(info['level'][center & mask], (r - 4.2)[center & mask], atol=1e-5)
+    # the lattice path of a large grid
+    one = Field(lambda x, y: 100.0 * np.exp(-(x * x / (2 * 2000.0 ** 2) + y * y / (2 * 1000.0 ** 2))))
+    big, _ = grid(8000.0, 20.0)
+    mask, info = rgiqe.area_mask(one, big, 4.2, BA, N, tasked=apart)
+    assert big.shape[0] * big.shape[1] > 300000 and np.array_equal(info['level'] >= 0, mask) and mask.any() and not mask.all()
+    # a 400 m grid interpolated to 20 m: the boundary lands within 40 m of the true contour, not within 400 m
+    from scipy.ndimage import map_coordinates
+    coarse, gc = grid(8000.0, 400.0)
+    mask, info = rgiqe.area_mask(one, coarse, 'black', BA, N)
+    ij = np.stack(np.meshgrid(np.arange(0, len(gc) - 1 + 1e-9, 0.05), np.arange(0, len(gc) - 1 + 1e-9, 0.05), indexing='ij'))
+    fine = map_coordinates(info['level'].astype(np.float64), ij, order=1) >= 0
+    exact = one.f(big[..., 0], big[..., 1]) >= 1.0
+    assert fine.shape == exact.shape
+    from scipy.ndimage import binary_dilation, binary_erosion
+    assert not (fine & ~binary_dilation(exact, iterations=2)).any() and not (binary_erosion(exact, iterations=2) & ~fine).any()
+    blocky = np.kron(mask, np.ones((20, 20), bool))                 # the mask alone, a block per node
+    assert (fine != exact).sum() < 0.1 * (blocky[:exact.shape[0], :exact.shape[1]] != exact[:blocky.shape[0], :blocky.shape[1]]).sum()
+
+
 def test_area_on_a_large_grid_matches_the_criterion():
     """Above 300,000 points the criterion is evaluated on a lattice and interpolated."""
     f = Field(lambda x, y: 100.0 * np.exp(-(x * x / (2 * 2000.0 ** 2) + y * y / (2 * 1000.0 ** 2))))
@@ -526,7 +626,11 @@ def test_tasked_quality():
     assert info['tasked_rniirs_source'] == 'model' and abs(info['tasked_rniirs'] - low) < 1e-3
     assert any('lowest RNIIRS the model predicts' in n for n in info['notes']) and len(info['notes']) == 1
     same, _ = rgiqe.area_mask(rad, pts, low - 1e-6, BA, N, tasked=tasked)
-    assert np.array_equal(m, same) and m.sum() > 1.1 * (np.abs(g) < 1500).sum() ** 2
+    # the corners of the tasked area are grid nodes and sit on the threshold itself, where the last bit of the SNR
+    # (which varies with the size of the batch the linear algebra library is handed) decides: compare away from it
+    edge = np.abs(rad.rniirs(pts, BA, N) - low) < 1e-4
+    assert edge.sum() < 0.01 * m.sum() and np.array_equal(m[~edge], same[~edge])
+    assert m.sum() > 1.1 * (np.abs(g) < 1500).sum() ** 2
     # a tasked area that leaves the full-bandwidth delay window still gets a quality, from the SNR alone
     wide = tasked_of(rad, 4500.0)
     m, info = rgiqe.area_mask(rad, pts, 'tasked_quality', BA, N, tasked=wide)
@@ -588,6 +692,7 @@ def test_areas_nest_and_bounds_enclose_them():
     for kind in ('tasked', 'tasked_quality', 4.4, 4.0, 'black'):
         m, info = rgiqe.area_mask(rad, pts, kind, BA, N, tasked=tasked)
         assert m.any() and info['border'] == (False,) * 4
+        assert np.array_equal(info['level'] >= 0, m) and info['level'].dtype == np.float32
         if last is not None:
             assert (last <= m).all() and last.sum() < m.sum()
         last = m

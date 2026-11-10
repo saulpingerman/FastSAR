@@ -396,7 +396,13 @@ class Radiometry:
 
     def _oneway(self, k, i, X, rng, clamped=False):
         """One-way gain (dB) of the transmit ('tx') or receive ('rcv') antenna at evaluation pulse i toward the
-        points X [n, 3] at the ranges rng [n] from it, and where it lies beyond the trusted pattern."""
+        points X [n, 3] at the ranges rng [n] from it, and where it lies beyond the trusted pattern.
+
+        CPHD 1.x (and SICD) convention: the direction cosines DCX, DCY are the components along the antenna X and Y
+        axes of the unit vector from the phase center to the point, the mechanical boresight is X x Y (toward the
+        scene), the array pattern is a function of (DCX - EB_DCX, DCY - EB_DCY) with EB the direction cosines of the
+        electrical boresight, and the element pattern a function of (DCX, DCY). A gain array holds DCX along its
+        rows (X0 + row XSS) and DCY along its columns."""
         a, pos = self._ant[k], self._e[k][i]
         dx, dy = (X @ a['ax'][i] - pos @ a['ax'][i]) / rng, (X @ a['ay'][i] - pos @ a['ay'][i]) / rng
         g, cl = 0.0, np.zeros(len(X), bool) if clamped else None
@@ -532,6 +538,18 @@ class Radiometry:
             last, half = area, 2 * half
 
 
+def _phase_sign(m):
+    """The phase sign of the file's samples as fastsar.io reads them: Global.SGN, except for Capella collections,
+    which declare +1 while their phase follows -1 (see io.read_cphd). -1: a later echo has the phase
+    exp(-j 2 pi f delay)."""
+    try:
+        sgn = int(m.Global.SGN)
+    except (AttributeError, TypeError, ValueError):
+        return -1
+    collector = str(getattr(getattr(m, 'CollectionID', None), 'CollectorName', '') or '')
+    return -1 if collector.lower().startswith('capella') else sgn
+
+
 def _line_fit(tau, prof, lo, hi):
     """Robust straight line through the range profile between the delays lo and hi: medians of 3 to 24 groups of
     bins, least squares, and one pass that drops groups standing well above the line (echoes). None when the
@@ -564,11 +582,7 @@ def _measure_noise(r, ch, pv, fsel, K):
     power in the scene swath TOA1..TOA2, expressed per sample."""
     from scipy import fft as sfft
     names = pv.dtype.names
-    sgn = -1
-    try:
-        sgn = int(r.cphd_meta.Global.SGN)
-    except (AttributeError, TypeError, ValueError):
-        pass
+    sgn = _phase_sign(r.cphd_meta)                                  # the delay axis mirrors with the wrong sign
     first, span = int(fsel[0]), int(fsel[-1]) - int(fsel[0]) + 1
     nb = int(min(_NOISE_BLOCK_PULSES, span))
     starts = np.unique(np.rint(np.linspace(first, first + span - nb, max(1, min(_NOISE_BLOCKS, span // nb)))).astype(int))
@@ -678,7 +692,15 @@ def area_mask(rad, points, kind, bandwidth_area, samples, tasked=None, tasked_rn
     The dict holds kind, criterion ('polygon', 'rniirs' or 'snr'), threshold, snr_threshold, tasked_rniirs and
     tasked_rniirs_source, center_rniirs, center_snr_db and nesz_ref_db (model values at the reference point),
     level_source, border (whether the mask reaches the first and last row and the first and last column of the
-    grid) and notes."""
+    grid), notes and level.
+
+    level is a float32 array of the mask's shape with level >= 0 exactly where the mask is set, for drawing the
+    boundary more finely than the grid: interpolate it bilinearly and keep what is >= 0. Inside the mask it is the
+    margin by which the criterion is met (0 where a point of the tasked polygon does not meet it), outside the
+    margin by which it is missed, at most -0.001 (also for points that meet the criterion in a region not connected
+    to the scene). The margin is the lesser of the predicted RNIIRS minus the threshold (for 'black' the SNR in dB)
+    and the time in microseconds by which the echo lies inside the delay window, so only its sign and its zero
+    crossing mean the same thing everywhere. For 'tasked' it is +1 inside the polygon and -1 outside."""
     from scipy import ndimage
     pts = np.asarray(points, np.float64)
     if pts.ndim != 3 or pts.shape[-1] != 3:
@@ -712,7 +734,7 @@ def area_mask(rad, points, kind, bandwidth_area, samples, tasked=None, tasked_rn
         if ring is None:
             raise ValueError("kind 'tasked' needs the tasked area")
         mask = polygon()
-        info['border'] = border(mask)
+        info['border'], info['level'] = border(mask), np.where(mask, 1.0, -1.0).astype(np.float32)
         return mask, info
     extended = False
     if isinstance(kind, str) and kind == 'black':
@@ -759,6 +781,11 @@ def area_mask(rad, points, kind, bandwidth_area, samples, tasked=None, tasked_rn
     mg = mge if extended else mg
     snr = np.where(cl, 0.0, snr)
     ok = (snr >= thr) & (mg >= 0)
+    if info['criterion'] == 'snr':
+        crit = 10 * np.log10(np.maximum(snr, 1e-6))                 # thr is 1
+    else:
+        crit = snr_to_rniirs(bandwidth_area, snr) - info['threshold']
+    lev = np.minimum(crit, 1e6 * np.maximum(mg, -1e-4))
     if cl.any() and (ok & ndimage.binary_dilation(cl)).any():
         notes.append('The area is limited in places by the extent to which the antenna pattern is known.')
     lab, _ = ndimage.label(ok)
@@ -771,10 +798,12 @@ def area_mask(rad, points, kind, bandwidth_area, samples, tasked=None, tasked_rn
     if ring is not None:
         seed |= _in_polygon(lat[..., :2], ring[:, :2])
     region = np.isin(lab, np.unique(lab[seed & ok])) & ok
+    level = np.empty((n1, n2), np.float32)
     if direct:
         mask = region
         if ring is not None:
             mask = mask | polygon()
+        level[:] = np.where(mask, np.maximum(lev, 0.0), np.minimum(lev, -1e-3))
     else:
         mask = np.zeros((n1, n2), bool)
         k2, w2 = _weights(i2, np.arange(n2))
@@ -788,7 +817,9 @@ def area_mask(rad, points, kind, bandwidth_area, samples, tasked=None, tasked_rn
                 return g[:, k2] * (1 - w2) + g[:, np.minimum(k2 + 1, len(i2) - 1)] * w2
             m = (up(snr) >= thr) & (up(mg) >= 0) & (up(reg) > 0)
             mask[rows] = m | polygon(rows) if ring is not None else m
-    info['border'] = border(mask)
+            lv = up(lev)
+            level[rows] = np.where(mask[rows], np.maximum(lv, 0.0), np.minimum(lv, -1e-3))
+    info['border'], info['level'] = border(mask), level
     return mask, info
 
 
