@@ -65,6 +65,20 @@ products.write_geotiff('amp.tif', **products.geocode_image(out))   # amplitude o
 products.write_sicd('scene.nitf', out)            # complex image with its geometry
 ```
 
+`process_cphd` goes from the file to a finished product in one call, with the processed area, the image plane,
+autofocus, sidelobe weighting and the display remap as options
+([product-options.md](https://github.com/saulpingerman/FastSAR/blob/main/docs/product-options.md)):
+
+```python
+fastsar.process_cphd('scene_CPHD.cphd', 'scene_SICD.nitf')                   # slant-plane SICD, autofocused
+fastsar.process_cphd('scene_CPHD.cphd', 'scene_SIDD.nitf', product='sidd')   # ground-plane SIDD: apodized, NRL
+                                                                             # remap, shadows down
+fastsar.process_cphd('scene_CPHD.cphd', 'wide.nitf', product='sidd', area='black')   # out to a signal-to-noise
+                                                                                     # ratio of 1
+```
+
+Every stage after formation runs where the image lives, on the CPU, an Nvidia GPU or a TPU.
+
 [`examples/chain.py`](https://github.com/saulpingerman/FastSAR/blob/main/examples/chain.py) runs this chain from the command line (`--simulate` needs no data);
 [`form_umbra.py`](https://github.com/saulpingerman/FastSAR/blob/main/examples/form_umbra.py) and [`form_capella_stripmap.py`](https://github.com/saulpingerman/FastSAR/blob/main/examples/form_capella_stripmap.py) form
 vendor grids.
