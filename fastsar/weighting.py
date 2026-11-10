@@ -143,8 +143,8 @@ def _sva_jax(jnp, N, axes, joint, x):
     return x
 
 
-def _sva_rows(jnp, N, axes, joint, nb, H, out, x, a):
-    """Rows a ... a + nb of _sva_jax(x), written into out: the passes run on those rows and H more on each side
+def _sva_rows(jnp, N, axes, joint, nb, H, x, a):
+    """Rows a ... a + nb of _sva_jax(x): the passes run on those rows and H more on each side
     (N for every pass along axis 0, rows beyond the image being zero), which is all that the rows kept depend on."""
     from jax import lax
     n0, n1 = x.shape
@@ -155,7 +155,7 @@ def _sva_rows(jnp, N, axes, joint, nb, H, out, x, a):
     two = jnp.concatenate([slab, slab])
     slab = lax.dynamic_slice(two, (jnp.mod(a - H - s, m), 0), (m, n1))
     slab = jnp.where(((row >= 0) & (row < m))[:, None], slab, 0)
-    return lax.dynamic_update_slice(out, _sva_jax(jnp, N, axes, joint, slab)[H:H + nb], (a, 0))
+    return _sva_jax(jnp, N, axes, joint, slab)[H:H + nb]
 
 
 def _sva_blocks(x, N, axes, joint):
@@ -166,16 +166,16 @@ def _sva_blocks(x, N, axes, joint):
     import jax.numpy as jnp
     if 'jax' not in _DEVICE:
         _DEVICE['jax'] = jax.jit(functools.partial(_sva_jax, jnp), static_argnums=(0, 1, 2))
-        _DEVICE['rows'] = jax.jit(functools.partial(_sva_rows, jnp), static_argnums=(0, 1, 2, 3, 4), donate_argnums=(5,))
+        _DEVICE['rows'] = jax.jit(functools.partial(_sva_rows, jnp), static_argnums=(0, 1, 2, 3, 4))
     n0, n1 = x.shape
     H = N * sum(1 for ax in axes if ax == 0 and N < n0)
     nb = int(max(1, _xp.jax_block() // (n1 * 8 * (6 + 2 * len(axes)))) - 2 * H)      # arrays of a slab in flight
     if nb < 1 or nb + 2 * H >= n0:
         return _DEVICE['jax'](N, axes, joint, x)
-    out = jnp.zeros((n0, n1), jnp.complex64)
-    for a in list(range(0, n0 - nb + 1, nb)) + ([n0 - nb] if n0 % nb else []):
-        out = _DEVICE['rows'](N, axes, joint, nb, H, out, x, np.int32(a))
-    return out
+    parts = [_DEVICE['rows'](N, axes, joint, nb, H, x, np.int32(a)) for a in range(0, n0 - nb + 1, nb)]
+    if n0 % nb:                                                     # the last block moved back: the rows not yet done
+        parts.append(_DEVICE['rows'](N, axes, joint, nb, H, x, np.int32(n0 - nb))[nb - n0 % nb:])
+    return jnp.concatenate(parts)
 
 
 def sva(img, oversample=2, *, axes=(1, 0), joint=True, inplace=False):

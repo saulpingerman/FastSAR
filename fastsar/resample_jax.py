@@ -7,9 +7,9 @@ array, one row of knots per line) and sends, for each line and knot interval, th
 the lower knot (int32) and the two knot values less it (float32). The device interpolates the two float32 values
 and carries the integer part in int32: the error is about 1e-7 of the map's change across a knot interval.
 
-Blocks. Lines run in blocks of one size through one jitted step per pass, which writes its block into the output
-(a donated buffer); the last block is moved back to end at the last line, so that every block has the same shape
-and a pass compiles once.
+Blocks. Lines run in blocks of one size through one jitted step per pass, and the blocks are joined at the end;
+the last block is moved back to end at the last line, so that every block has the same shape and a pass compiles
+once.
 
 Two interpolations. 'gather' reads each tap of each output sample with an indexed load, as the CPU and CUDA kernels
 do. A TPU does such loads slowly (about 1e8 a second, and a slice of a line at a row and a column index slower
@@ -38,6 +38,7 @@ WINDOW = 120               # the widest window (oversampled samples) of an outpu
 STRIDE = 8                 # samples between the starts of the windows in the table
 SPAN = 40                  # oversampled samples a block of output samples may span: sets the block size
 PHASES = 2048              # of resample.kernel_table
+SNAP = 1.5e-5              # samples: a position this near a sample is on it (blocks path)
 
 
 def _path():
@@ -155,8 +156,8 @@ def _oversampled(u, pad, n2, real, K):
     return jnp.stack([u * (1.0 / pad)] + parts, -1).reshape(u.shape[0], pad * n2)
 
 
-def _step(out, src, a, P, J, M, tab, K, *, axis, mode, nb, pad, guard, n2):
-    """Lines a ... a + nb of a pass (resample_cuda._pass's conventions), written into out. mode 'knots': P, J as
+def _step(src, a, P, J, M, tab, K, *, axis, mode, nb, pad, guard, n2):
+    """Lines a ... a + nb of a pass (resample_cuda._pass's conventions) -> [nb, m] ([m, nb] along axis 0). mode 'knots': P, J as
     _knot's; 'split': P = (integer part, remainder) [nb, m] from the host; 'device': P = (pos [L, m],) on the device.
     M: None, or (Px, limits [xlo, xhi, ylo, yhi], valid [nx, ny] or None), warp's mask with Px as P."""
     real = not jnp.iscomplexobj(src)
@@ -194,7 +195,7 @@ def _step(out, src, a, P, J, M, tab, K, *, axis, mode, nb, pad, guard, n2):
     for t in range(taps):
         o = o + jnp.take_along_axis(u, i0 + t, axis=1, mode='clip') * jnp.take(tab[:, t], k, mode='clip')
     o = jnp.where(ok, o, 0)
-    return lax.dynamic_update_slice(out, o, (a, 0)) if axis == 1 else lax.dynamic_update_slice(out, o.T, (0, a))
+    return o if axis == 1 else o.T
 
 
 def _poly(tab):
@@ -268,15 +269,18 @@ def _front(g, rel, W, taps):
 
 
 def _at(D, kink, B):
-    """The positions [nb, nblk, B] of a block of lines from _blocks' arrays, as integer part and remainder in [0, 1)."""
+    """The positions [nb, nblk, B] of a block of lines from _blocks' arrays, as integer part and remainder in [0, 1).
+    A remainder within SNAP of an integer is that integer: the sum below holds to a few 1e-6 of a sample, and a
+    position that is the last sample of a line exactly (an output grid that ends on it) must not fall outside."""
     base, lo, s, ds = D
     i = jnp.arange(B, dtype=jnp.float32)
     f = lo[..., None] + i * s[..., None] + jnp.maximum(i - kink[:, None], 0) * ds[..., None]
-    return _floor(base[..., None], jnp.clip(f, -2.0 ** 24, 2.0 ** 24))
+    ib, ff = _floor(base[..., None], jnp.clip(f, -2.0 ** 24, 2.0 ** 24))
+    return ib + (ff > 1 - SNAP).astype(jnp.int32), jnp.where((ff < SNAP) | (ff > 1 - SNAP), 0, ff)
 
 
-def _step_blocks(out, src, a, D, w0, kink, M, coef, K, *, axis, nb, m, pad, guard, n2, B, W, R):
-    """Lines a ... a + nb of a pass by blocks of B output samples, written into out. D, kink: _blocks' and _span's;
+def _step_blocks(src, a, D, w0, kink, M, coef, K, *, axis, nb, m, pad, guard, n2, B, W, R):
+    """Lines a ... a + nb of a pass by blocks of B output samples -> [nb, m] ([m, nb] along axis 0). D, kink: _blocks' and _span's;
     w0 [nb, nblk]: the first oversampled sample of each block's window of R, the first taps of its samples starting
     less than W after it; coef: _poly's, times pad; M: None or (Dx, limits, valid), warp's mask; K: _oversampled's."""
     real = not jnp.iscomplexobj(src)
@@ -314,7 +318,7 @@ def _step_blocks(out, src, a, D, w0, kink, M, coef, K, *, axis, nb, m, pad, guar
          for ch in ((u,) if real else (jnp.real(u), jnp.imag(u)))]
     o = o[0] if real else lax.complex(o[0], o[1])
     o = jnp.where(ok, o, 0).reshape(nb, nblk * B)[:, :m]
-    return lax.dynamic_update_slice(out, o, (a, 0)) if axis == 1 else lax.dynamic_update_slice(out, o.T, (0, a))
+    return o if axis == 1 else o.T
 
 
 def _plan_blocks(pos, posx, L, n, tab, pad, guard, n2, real):
@@ -336,19 +340,21 @@ def _plan_blocks(pos, posx, L, n, tab, pad, guard, n2, real):
         return None
     nblk, off = len(span[0]), guard * pad - (taps // 2 - 1) - 1
     # the whole pass on the host first: the window is one size for every block of lines
-    D, Dx, w0, W = [], [], [], 0
-    for a in range(0, L, 4096):
-        sl = slice(a, min(L, a + 4096))
+    from .patches import _rows
+    got = {}
+
+    def work(sl):
         d, lo, hi = _blocks(pos, sl, span)
         a0, a1 = (np.floor(np.clip(v, 0, n - 1) * pad) for v in (lo, hi))
         start = (a0 + off) // STRIDE * STRIDE                       # where the window starts: on the table's stride
-        W = max(W, int((a1 + off + 3 - start).max()))
-        if W > WINDOW:
-            return None
-        D.append(d)
-        w0.append(start.astype(np.int32))
-        if posx is not None:
-            Dx.append(_blocks(posx, sl, span)[0])
+        got[sl.start] = (d, start.astype(np.int32), int((a1 + off + 3 - start).max()),
+                         _blocks(posx, sl, span)[0] if posx is not None else None)
+    _rows(work, L, 256)
+    got = [got[k] for k in sorted(got)]
+    W = max(g[2] for g in got)
+    if W > WINDOW:
+        return None
+    D, w0, Dx = [g[0] for g in got], [g[1] for g in got], [g[3] for g in got]
     cat = lambda parts: np.concatenate(parts) if len(parts) > 1 else parts[0]
     W = -(-W // 4) * 4
     R = -(-(W + taps - 1) // STRIDE) * STRIDE
@@ -365,8 +371,21 @@ _JIT = {}
 
 def _jit(fn, static):
     if fn not in _JIT:
-        _JIT[fn] = jax.jit(fn, static_argnames=static, donate_argnums=(0,))
+        _JIT[fn] = jax.jit(fn, static_argnames=static)
     return _JIT[fn]
+
+
+def _joined(parts, L, nb, axis=0):
+    """The blocks of lines of _starts(L, nb), in its order, as one array along `axis`: the last block, moved back,
+    gives only the lines the others have not. (A block written into a buffer of the whole image costs a copy of
+    that buffer on a TPU, one for every block.)"""
+    if len(parts) == 1:
+        return parts[0]
+    if L % nb:
+        cut = [slice(None)] * parts[-1].ndim
+        cut[axis] = slice(nb - L % nb, None)
+        parts = parts[:-1] + [parts[-1][tuple(cut)]]
+    return jnp.concatenate(parts, axis)
 
 
 def _starts(L, nb):
@@ -395,8 +414,7 @@ def _pass(src, pos, m, axis, kernel, taps, pad, mask=None):
             raise ValueError('the maps of a mask must share their knots')
         lim = jnp.asarray(np.array([xlo, xhi, ylo, yhi], np.int32))
         valid = None if valid is None else jnp.asarray(valid).astype(bool)
-    out = jnp.zeros((L, m) if axis == 1 else (m, L), dt)
-    plan = None
+    out, plan = [], None
     # on a TPU (wherever the blocks path is chosen) a length that 32 does not divide is transformed at a fast one
     K = _kernels(n2, pad, real) if pad > 1 and n2 % 32 and _path() == 'blocks' else None
     if knots and _path() == 'blocks':
@@ -409,9 +427,9 @@ def _pass(src, pos, m, axis, kernel, taps, pad, mask=None):
             D = tuple(jnp.asarray(v[sl]) for v in plan['D'])
             if mask is not None:
                 M = (tuple(jnp.asarray(v[sl]) for v in plan['Dx']), lim, valid)
-            out = step(out, src, np.int32(a), D, jnp.asarray(plan['w0'][sl]), kink, M, coef, K, axis=axis, nb=nb, m=m,
-                       pad=pad, guard=guard, n2=n2, B=plan['B'], W=plan['W'], R=plan['R'])
-        return out
+            out.append(step(src, np.int32(a), D, jnp.asarray(plan['w0'][sl]), kink, M, coef, K, axis=axis, nb=nb, m=m,
+                            pad=pad, guard=guard, n2=n2, B=plan['B'], W=plan['W'], R=plan['R']))
+        return _joined(out, L, nb, 1 - axis)
     step = _jit(_step, ('axis', 'mode', 'nb', 'pad', 'guard', 'n2'))
     for a in _starts(L, nb):
         sl = slice(a, a + nb)
@@ -426,8 +444,8 @@ def _pass(src, pos, m, axis, kernel, taps, pad, mask=None):
             P = (jnp.asarray(ib.astype(np.int32)), jnp.asarray((q - ib).astype(np.float32)))
         if mask is not None:
             M = (tuple(jnp.asarray(v) for v in _split(posx.rows(sl))), lim, valid)
-        out = step(out, src, np.int32(a), P, J, M, tabd, K, axis=axis, mode=mode, nb=nb, pad=pad, guard=guard, n2=n2)
-    return out
+        out.append(step(src, np.int32(a), P, J, M, tabd, K, axis=axis, mode=mode, nb=nb, pad=pad, guard=guard, n2=n2))
+    return _joined(out, L, nb, 1 - axis)
 
 
 def lines(src, pos, m, *, kernel='sinc', taps=8, pad=None, out=None):
@@ -445,8 +463,8 @@ def warp(src, pos0, pos1, shape, *, kernel='sinc', taps=8, pad=None, transposed=
     return _pass(_pass(src, pos0, m0, 0, kernel, taps, pad), pos1, m1, 1, kernel, taps, pad, mask)
 
 
-def _deramp_step(out, img, a, rows, cols, r0, k, *, nb):
-    """Rows a ... a + nb of deramp, written into out."""
+def _deramp_step(img, a, rows, cols, r0, k, *, nb):
+    """Rows a ... a + nb of deramp."""
     px, pi, q1i, q2i, li, hi = (lax.dynamic_slice(v, (a,), (nb,))[:, None] for v in rows)
     py, pj, q1j, q2j, jr = (v[None, :] for v in cols)
     p, q = pi + pj, (q1i + q1j) ** 2 + (q2i + q2j) ** 2
@@ -456,7 +474,7 @@ def _deramp_step(out, img, a, rows, cols, r0, k, *, nb):
     turns = ((hi * jr) & 4095).astype(jnp.float32) * (1 / 4096) + li * jr.astype(jnp.float32)
     ang = px + py + (2 * np.pi) * turns + k * rest
     z = lax.dynamic_slice(img, (a, 0), (nb, img.shape[1]))
-    return lax.dynamic_update_slice(out, z * lax.complex(jnp.cos(ang), jnp.sin(ang)), (a, 0))
+    return z * lax.complex(jnp.cos(ang), jnp.sin(ang))
 
 
 def deramp(img, d0, a, b, u0, r0, k):
@@ -493,7 +511,5 @@ def deramp(img, d0, a, b, u0, r0, k):
     img = img.astype(jnp.complex64)
     nb = int(max(1, min(nx, _samples(BLOCK, 64) // ny)))
     step = _jit(_deramp_step, ('nb',))
-    out = jnp.zeros((nx, ny), jnp.complex64)
-    for s in _starts(nx, nb):
-        out = step(out, img, np.int32(s), rows, cols, np.float32(r0), np.float32(k), nb=nb)
-    return out
+    return _joined([step(img, np.int32(s), rows, cols, np.float32(r0), np.float32(k), nb=nb) for s in _starts(nx, nb)],
+                   nx, nb)
