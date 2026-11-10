@@ -190,10 +190,18 @@ On a 24-core AMD Ryzen Threadripper PRO 7965WX (Zen 4, AVX-512), best of three, 
 levels (seconds; the factorized former at 4096 by 4096 pixels from 6482 pulses of 6482 samples, polar format at
 1024 by 1024 from the same history, the resampler at 8000 by 8000, exact backprojection at 1024 by 1024):
 
-SPEEDTABLE
+| | native build | `x86-64-v4` | `x86-64-v3` | `x86-64-v2` |
+|---|---|---|---|---|
+| factorized former | 1.23 | 1.27 | 4.81 | 7.11 |
+| polar format | 0.82 | 0.80 | 0.80 | 0.81 |
+| exact backprojection | 1.41 | 1.39 | 1.39 | 1.73 |
+| resampler | 1.20 | 1.21 | 1.23 | 1.24 |
 
-The factorized kernel is written for 16-float vectors, which is why it gains the most from AVX-512; the other
-kernels spend their time in loops that every level vectorizes or in the FFTs of SciPy.
+The factorized kernel is written for 16-float vectors, which is why it alone depends strongly on AVX-512; the
+other kernels spend their time in loops that every level vectorizes or in the FFTs of SciPy. On this processor the
+prebuilt `x86-64-v4` kernels are within 4% of the native build (the run-to-run spread is of that size). A native
+build for an AVX2 processor is no faster than the prebuilt `x86-64-v3` kernel: compiled with `-march=znver3` and
+with `-march=haswell` and run on the same machine, the factorized former takes 4.90 and 5.66 s.
 
 ## Kernel times and stage profile
 
