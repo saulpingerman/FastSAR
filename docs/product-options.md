@@ -110,13 +110,23 @@ convention.
 
 ### Against a vendor's SICD of the same collection
 
-A FastSAR product and the vendor's SICD of the same collection place a scatterer at slightly different ranges.
-`read_cphd` removes the troposphere delay the CPHD file states, and vendors' SICDs keep it, so the FastSAR image
-sits nearer by c times that delay over two: 1.2 m on an Umbra collection that states 8.1 ns, measured as a constant
-4.6 rows against the vendor's image, and 0.07 pixel with `troposphere=False`. Scatterers above or below the
-projection surface also map to slightly different ground points in two products whose centers of aperture
-differ, by about the height times the difference in look direction. `process_cphd(..., sicd=)` takes the vendor's
-footprint; the product is the rectangle that bounds it on FastSAR's own axes.
+A FastSAR product and the vendor's SICD of the same collection can place a scatterer at slightly different
+positions, for reasons that are not errors of either.
+
+- The troposphere delay. `read_cphd` removes the delay the CPHD file states ([real-data.md](real-data.md)). Umbra's
+  SICD images keep it, so the FastSAR image sits nearer by c times that delay over two: 1.2 m on a collection
+  that states 8.1 ns, measured as a constant 4.6 rows against the vendor's image, and 0.07 pixel with
+  `troposphere=False`.
+- The image formation geometry. Against one Capella spotlight SICD whose scene center point lies 590 m from the
+  CPHD's scene reference point, the FastSAR image differs by an azimuth scale of 4e-4 to 6e-4 (3.6 m across a 7 km
+  scene), which matches the ratio of the polar angle rates about the two points (5.4e-4). Synthetic point targets
+  on that collection's real track, spread over 7 km and processed by `process_cphd`, land where FastSAR's own
+  SICD metadata puts them to an azimuth scale of 1e-8.
+- Height. Scatterers above or below the projection surface map to slightly different ground points in two
+  products whose centers of aperture differ, by about the height times the difference in look direction.
+
+`process_cphd(..., sicd=)` takes the vendor's footprint; the product is the rectangle that bounds it on FastSAR's
+own axes.
 
 ## Processed area by image quality
 
