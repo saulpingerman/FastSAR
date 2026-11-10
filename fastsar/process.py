@@ -114,7 +114,7 @@ def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None
         b = np.array([(d @ e1).min(), (d @ e1).max(), (d @ e2).min(), (d @ e2).max()])
         kept = None
         if wt == 'sva':
-            lost, kept = _weighting.keystone(g['S'], g['ant'], g['fmin'], g['df'], c, fr['e1'])
+            lost, kept = _weighting.keystone(g['S'], g['ant'], g['fmin'], g['df'], c, fr['e1'], symmetric=False)
             g['notes'].append(f'keystone trim: {100 * lost:.1f}% of the samples dropped for a rectangular spectrum')
         valid = None
         if area != 'tasked':
@@ -213,7 +213,16 @@ def _spotlight(out, st, product, area, spacing, lap):
     del out, valid
     lap('to_slant')
     if wt == 'sva':
-        _weighting.sva(sl['image'], 2, inplace=True)
+        # apodization takes the band centered: where the aperture is not symmetric about the center of aperture,
+        # the azimuth band is moved to zero for it and back
+        k0, ramp = 0.5 * (st['kept'][0] + st['kept'][1]), None
+        if abs(k0) > 0.002 * (st['kept'][1] - st['kept'][0]):
+            a = (np.arange(sl['image'].shape[0]) - sl['scp_pixel'][0]) * sl['spx']
+            ramp = np.exp(-2j * np.pi * k0 * a).astype(np.complex64)[:, None]
+            sl['image'] *= ramp
+        sl['image'] = _weighting.sva(sl['image'], 2, inplace=True)
+        if ramp is not None and product == 'sicd':
+            sl['image'] *= np.conj(ramp)
         lap('sva')
     if product == 'sicd':
         return sl
