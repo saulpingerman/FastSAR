@@ -152,13 +152,13 @@ def test_sva_jax_in_row_blocks(monkeypatch):
             monkeypatch.delenv('FASTSAR_JAX_BLOCK_MB', raising=False)
             ref = np.asarray(weighting.sva(jnp.asarray(x), N, axes=axes, joint=joint))
             assert not ref[:40, :50].any() and (N > 300 or not np.array_equal(ref, x))
-            for mb in ('0.4', '0.07'):                              # 15 rows a block with their halo, and 3
+            for mb in ('1.6', '0.6'):                               # 15 rows a slab with their halo, and 7
                 monkeypatch.setenv('FASTSAR_JAX_BLOCK_MB', mb)
                 got = weighting.sva(jnp.asarray(x), N, axes=axes, joint=joint)
                 assert np.array_equal(np.asarray(got), ref), (axes, joint, N, mb)
-    size = weighting._DEVICE['rows']._cache_size()                  # 21 blocks of rows, one program
+    size = weighting._DEVICE['core']._cache_size()                  # 21 blocks of rows, one program
     weighting.sva(jnp.asarray(x[::-1].copy()), 2)
-    assert size > 0 and weighting._DEVICE['rows']._cache_size() == size
+    assert size > 0 and weighting._DEVICE['core']._cache_size() == size
 
 
 @pytest.mark.cuda
@@ -188,3 +188,31 @@ def test_small_gpu_gives_the_same_image(monkeypatch):
         assert np.array_equal(_xp.host(y), ramped)
     y = weighting.sva(x.copy(), inplace=True, _cuda=((rd[0], None),))
     assert np.array_equal(y, _xp.host(weighting.sva(cp.asarray(x) * rd[0])))
+
+
+def test_sva_jax_image_on_the_host(monkeypatch):
+    """sva through JAX's device in slabs, for an image on the host or on the device and a result on either
+    (process_cphd's placement): the values of the whole-image program exactly, and with the ramps that center the
+    band its values to float32 rounding (one program multiplies and apodizes)."""
+    jnp = pytest.importorskip('jax.numpy')
+    rng = np.random.default_rng(22)
+    x = (rng.normal(size=(301, 257)) + 1j * rng.normal(size=(301, 257))).astype(np.complex64)
+    x[:40, :50] = 0
+    r = np.exp(1j * rng.normal(size=(301, 1))).astype(np.complex64)
+    for axes in ((1, 0), (0, 1)):
+        monkeypatch.delenv('FASTSAR_JAX_BLOCK_MB', raising=False)
+        ref = np.asarray(weighting.sva(jnp.asarray(x), 2, axes=axes))
+        ramped = np.asarray(weighting.sva(jnp.asarray(x) * jnp.asarray(r), 2, axes=axes) * jnp.asarray(r.conj()))
+        for mb in (None, '1.6', '0.3'):                             # one slab; 15 rows a slab with their halo; 4
+            if mb:
+                monkeypatch.setenv('FASTSAR_JAX_BLOCK_MB', mb)
+            for src in (np.array, jnp.asarray):
+                for where in ('host', 'device'):
+                    got = weighting.sva(src(x), 2, axes=axes, _jax=(None, None, where))
+                    assert _xp.kind(got) == ('numpy' if where == 'host' else 'jax')
+                    assert np.array_equal(_xp.host(got), ref)
+                    got = _xp.host(weighting.sva(src(x), 2, axes=axes, _jax=(r, r.conj(), where)))
+                    assert np.array_equal(got == 0, ramped == 0) and np.abs(got - ramped).max() < 1e-5
+    monkeypatch.setenv('FASTSAR_JAX_BLOCK_MB', '0.001')
+    with pytest.raises(MemoryError, match='apodization on the JAX device'):
+        weighting.sva(x.copy(), 2, _jax=(None, None, 'host'))

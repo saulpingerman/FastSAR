@@ -199,42 +199,75 @@ def _sva_jax(jnp, N, axes, joint, x):
     return x
 
 
-def _sva_rows(jnp, N, axes, joint, nb, H, x, a):
-    """Rows a ... a + nb of _sva_jax(x): the passes run on those rows and H more on each side
-    (N for every pass along axis 0, rows beyond the image being zero), which is all that the rows kept depend on."""
+def _sva_slab(jnp, m, re, im, a):
+    """Rows a ... a + m of a device image given as its real and imaginary parts (a complex array handed to a
+    program on a TPU is converted at every call), zero beyond it (a from -m to the image's last row)."""
     from jax import lax
-    n0, n1 = x.shape
-    m = nb + 2 * H
-    s = jnp.clip(a - H, 0, n0 - m)                                   # the slab's rows, moved inside the image
-    slab = lax.dynamic_slice(x, (s, 0), (m, n1))
-    row = jnp.arange(m, dtype=jnp.int32) + (a - H - s)               # where each row of the slab is in the slice read
-    two = jnp.concatenate([slab, slab])
-    slab = lax.dynamic_slice(two, (jnp.mod(a - H - s, m), 0), (m, n1))
-    slab = jnp.where(((row >= 0) & (row < m))[:, None], slab, 0)
-    return _sva_jax(jnp, N, axes, joint, slab)[H:H + nb]
+    n0, n1 = re.shape
+    s = jnp.clip(a, 0, n0 - m)
+    slab = lax.complex(lax.dynamic_slice(re, (s, 0), (m, n1)), lax.dynamic_slice(im, (s, 0), (m, n1)))
+    row = jnp.arange(m, dtype=jnp.int32) + (a - s)
+    slab = lax.dynamic_slice(jnp.concatenate([slab, slab]), (jnp.mod(a - s, m), 0), (m, n1))
+    return jnp.where(((row >= 0) & (row < m))[:, None], slab, 0)
 
 
-def _sva_blocks(x, N, axes, joint):
-    """sva of a JAX image: whole when it is small, else in blocks of rows sized to _xp.jax_block() (the same
-    values: a row's result depends on N rows on each side for every pass along axis 0)."""
+def _sva_core(jnp, N, axes, joint, H, slab, before, after):
+    """The rows of a slab less H at each end, apodized; before [m, 1], after [m - 2 H, 1]: complex factors of the
+    rows before and after (process_cphd's ramps)."""
+    y = _sva_jax(jnp, N, axes, joint, slab * before)
+    return y[H:y.shape[0] - H] * after
+
+
+def _sva_stream(x, N, axes, joint, before, after, where):
+    """sva through JAX's device in slabs of rows sized to _xp.jax_block(), for an image on the device or on the
+    host (a complex64 NumPy array, whose slabs cross to the device and are never there together), with the result
+    on the device (where='device') or on the host, a host image being written in place. before, after: None or
+    host vectors [n0, 1] that multiply the rows before and after. The values are the whole image's: a row's result
+    depends on N rows on each side for every pass along axis 0, which a slab carries beyond the rows it gives.
+    x: or a list that holds it alone, emptied here, so that a device image is freed once its planes exist."""
     import functools
     import jax
     import jax.numpy as jnp
-    if 'jax' not in _DEVICE:
-        _DEVICE['jax'] = jax.jit(functools.partial(_sva_jax, jnp), static_argnums=(0, 1, 2))
-        _DEVICE['rows'] = jax.jit(functools.partial(_sva_rows, jnp), static_argnums=(0, 1, 2, 3, 4))
+    from .resample_jax import _Sink
+    if 'core' not in _DEVICE:
+        _DEVICE['core'] = jax.jit(functools.partial(_sva_core, jnp), static_argnums=(0, 1, 2, 3))
+        _DEVICE['slab'] = jax.jit(functools.partial(_sva_slab, jnp), static_argnums=(0,))
+    given, x = x, (x[0] if isinstance(x, list) else x)
     n0, n1 = x.shape
+    onhost = _xp.kind(x) != 'jax'
     H = N * sum(1 for ax in axes if ax == 0 and N < n0)
-    nb = int(max(1, _xp.jax_block() // (n1 * 8 * (6 + 2 * len(axes)))) - 2 * H)      # arrays of a slab in flight
-    if nb < 1 or nb + 2 * H >= n0:
-        return _DEVICE['jax'](N, axes, joint, x)
-    parts = [_DEVICE['rows'](N, axes, joint, nb, H, x, np.int32(a)) for a in range(0, n0 - nb + 1, nb)]
-    if n0 % nb:                                                     # the last block moved back: the rows not yet done
-        parts.append(_DEVICE['rows'](N, axes, joint, nb, H, x, np.int32(n0 - nb))[nb - n0 % nb:])
-    return jnp.concatenate(parts)
+    row = n1 * 8 * (6 + 2 * len(axes))                              # arrays of a slab in flight
+    nb = int(min(n0, max(H, 1, _xp.jax_rows(n0 + 2 * H, row, 'apodization on the JAX device') - 2 * H)))
+    if (nb + 2 * H) * row > (_xp.jax_budget() or np.inf):
+        raise MemoryError(f'apodization on the JAX device: a slab of {nb + 2 * H} rows takes '
+                          f'{(nb + 2 * H) * row / 1e6:.1f} MB and {_xp.jax_budget() / 1e6:.1f} MB are available')
+    one = np.ones((n0, 1), np.complex64)
+    before, after = (one if v is None else np.asarray(v, np.complex64).reshape(n0, 1) for v in (before, after))
+    out = _Sink(where, n0, n1, nb, 1, np.complex64, into=x if onhost and where == 'host' else None, moved=False)
+    if not onhost and nb + 2 * H > n0:                              # the whole image in one slab
+        x = jnp.pad(x, ((H, H), (0, 0)))
+    elif not onhost:
+        x = (jnp.real(x), jnp.imag(x))
+    if isinstance(given, list):
+        given.clear()
+    del given
+    for a in range(0, n0, nb):                                      # the last slab ends beyond the image, in zeros
+        lo, hi = a - H, a + nb + H
+        r0, r1 = np.ones((nb + 2 * H, 1), np.complex64), np.ones((nb, 1), np.complex64)
+        r0[max(-lo, 0):n0 - lo] = before[max(lo, 0):min(hi, n0)]
+        r1[:min(nb, n0 - a)] = after[a:a + nb]
+        if onhost:
+            slab = np.zeros((nb + 2 * H, n1), np.complex64)
+            slab[max(-lo, 0):n0 - lo] = x[max(lo, 0):min(hi, n0)]
+            slab = jnp.asarray(slab)
+        else:
+            slab = x if nb + 2 * H > n0 else _DEVICE['slab'](nb + 2 * H, *x, np.int32(lo))
+        res = _DEVICE['core'](N, axes, joint, H, slab, jnp.asarray(r0), jnp.asarray(r1))
+        out.put(a, res if a + nb <= n0 else res[:n0 - a])
+    return out.done()
 
 
-def sva(img, oversample=2, *, axes=(1, 0), joint=True, inplace=False, _cuda=None):
+def sva(img, oversample=2, *, axes=(1, 0), joint=True, inplace=False, _cuda=None, _jax=None):
     """Spatially variant apodization of a complex image sampled at `oversample` times its Nyquist rate on the axes
     treated (an integer: 2 for an image at spacings of half the reciprocal of its bandwidth), one axis after the
     other in the order of `axes` (default range, then azimuth, of an image [azimuth, range]).
@@ -249,6 +282,9 @@ def sva(img, oversample=2, *, axes=(1, 0), joint=True, inplace=False, _cuda=None
     N = int(oversample)
     if N < 1 or N != oversample:
         raise ValueError(f'oversample must be a positive integer (the image at that multiple of Nyquist), got {oversample!r}')
+    given = img if isinstance(img, list) and _jax is not None else None     # process_cphd's: the image, given up
+    if given is not None:
+        img = given[0]
     kind = _xp.kind(img)
     x = np.asarray(img) if kind == 'numpy' else img
     if x.ndim != 2 or not _xp.module(x).iscomplexobj(x):
@@ -256,8 +292,15 @@ def sva(img, oversample=2, *, axes=(1, 0), joint=True, inplace=False, _cuda=None
     axes = tuple(int(a) % 2 for a in np.atleast_1d(axes))
     if kind == 'cupy' or _cuda is not None:                         # _cuda: process_cphd's, a host image and its ramps
         return _sva_cupy(x, N, axes, bool(joint), inplace, *(_cuda or ()))
+    if _jax is not None:                                            # process_cphd's: ramps, and where the result goes
+        if kind == 'numpy' and x.dtype != np.complex64:
+            x = x.astype(np.complex64)
+        if given is not None and x.dtype == np.complex64:
+            del img, x
+            return _sva_stream(given, N, axes, bool(joint), *_jax)
+        return _sva_stream(x if kind == 'numpy' else x.astype('complex64'), N, axes, bool(joint), *_jax)
     if kind == 'jax':
-        return _sva_blocks(x.astype('complex64'), N, axes, bool(joint))
+        return _sva_stream(x.astype('complex64'), N, axes, bool(joint), None, None, 'device')
     if x.dtype != np.complex64:
         x, inplace = x.astype(np.complex64), True
     if not axes:

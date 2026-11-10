@@ -94,13 +94,16 @@ def _blocked(step, x, valid, *static):
         import jax.numpy as jnp
         from jax import lax
 
-        def block(x, valid, a, *args, size):
+        def block(planes, valid, a, *args, size):
             cut = lambda v: lax.dynamic_slice(v.reshape(-1), (a,), (size,))
-            return step(jnp, *static, cut(x), None if valid is None else cut(valid), *args)
+            xb = cut(planes[0]) if len(planes) == 1 else lax.complex(cut(planes[0]), cut(planes[1]))
+            return step(jnp, *static, xb, None if valid is None else cut(valid), *args)
         _JIT[key] = jax.jit(block, static_argnames='size')
     if valid is not None and valid.shape != x.shape:
         valid = _xp.module(x).broadcast_to(valid.reshape(valid.shape + (1,) * (x.ndim - valid.ndim)), x.shape)
-    return lambda *args: [_JIT[key](x, valid, np.int32(a), *args, size=min(c, n - a)) for a in range(0, n, c)]
+    from .resample_jax import _planes
+    planes = _planes(x)                                            # a complex image as two real ones: see there
+    return lambda *args: [_JIT[key](planes, valid, np.int32(a), *args, size=min(c, n - a)) for a in range(0, n, c)]
 
 
 def _args(x, valid):
@@ -138,8 +141,41 @@ def _cupy_rows(step, x):
     return [slice(a, a + nb) for a in range(0, x.shape[0], nb)]
 
 
+_VIA = []                # not empty: the per-pixel steps of a NumPy image run on JAX's device (_via_jax)
+
+
+class _via_jax:
+    """with _via_jax(): the per-pixel step of a remap of an image on the host runs on JAX's device, the image
+    crossing it in blocks of pixels (process_cphd's, for an image the device cannot hold). The statistics are taken
+    on the host, where they are the same order statistics; the result is on the host."""
+
+    def __enter__(self):
+        _VIA.append(1)
+
+    def __exit__(self, *exc):
+        _VIA.pop()
+
+
+def _through_jax(step, dtype, x, valid, *args):
+    """_apply for a NumPy image through JAX's device: blocks of _xp.jax_block() bytes at 48 a pixel."""
+    import jax.numpy as jnp
+    f, n = _jit(step), x.size
+    c = max(1, _xp.jax_block() // 48 // 16384) * 16384
+    xf, vf = np.ascontiguousarray(x).reshape(-1), (None if valid is None else np.ascontiguousarray(valid).reshape(-1))
+    out, last = np.empty(n, dtype), None
+    for a in range(0, n, c):
+        cur, last = last, (a, f(jnp.asarray(xf[a:a + c]), None if vf is None else jnp.asarray(vf[a:a + c]), *args))
+        if cur is not None:                                         # copied while the next block is under way
+            out[cur[0]:cur[0] + c] = np.asarray(cur[1])
+    if last is not None:
+        out[last[0]:] = np.asarray(last[1])
+    return out.reshape(x.shape)
+
+
 def _apply(step, dtype, x, valid, *args):
     """The array a step gives, where x lives. dtype: of the result (for the host's output array)."""
+    if _VIA and _xp.kind(x) == 'numpy' and x.ndim and step not in (_linear,):
+        return _through_jax(step, dtype, x, valid, *args)
     if _xp.kind(x) == 'jax':
         parts = _blocked(step, x, valid)
         if parts is not None:

@@ -61,8 +61,14 @@ was published on PyPI.
   an indexed load per tap at only about 1e8 a second (`fastsar/resample_jax.py`; `FASTSAR_RESAMPLE_JAX=blocks|gather`,
   `blocks` by default on a TPU, `gather` elsewhere); `remap.nrl` and `remap.percentile` find their order
   statistics from counts of the pixels below thresholds (`FASTSAR_REMAP_JAX=count|histogram`); a complex image
-  leaves the device as its two real planes; and every stage bounds its temporary arrays on the device
-  (`FASTSAR_JAX_BLOCK_MB`, by default a sixteenth of the device's memory). On a TPU v5e a 23 Mpx image goes to the
+  leaves the device as its two real planes; every stage bounds its temporary arrays on the device; and
+  `process_cphd` keeps on the host the images of a product that the device cannot hold (an image written there is
+  there twice while its blocks are joined) and passes them through it in blocks, with a note in `out['notes']`
+  (`FASTSAR_JAX_BLOCK_MB` overrides the device memory counted on, by default nine tenths of what is not in use).
+  A complex image is handed to the per-block programs as its two real arrays: a TPU converts a complex argument
+  at every call, which made the resampling's cost per pixel grow with the image. On a TPU v6e a 1,155 Mpx slant
+  image at twice Nyquist (9.2 GB) is made in 9.8 s and apodized in 4.0 s with 22 GB of the 31 GB device in use at
+  the peak. On a TPU v5e a 23 Mpx image goes to the
   slant plane in 0.57 s, a 49 Mpx slant image at twice Nyquist is made in 0.89 s and warped back to the ground
   with the cubic kernel in 0.24 s, within -90 dB of the CPU kernel's result, and a 196 Mpx slant image is
   apodized, detected and projected on the 16 GB device with 6.4 GB in use at the peak.

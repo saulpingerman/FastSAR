@@ -9,7 +9,7 @@ image crosses to the host once, at the end.
 """
 import numpy as np
 
-__all__ = ['kind', 'module', 'fft', 'host', 'device', 'jax_block', 'cuda_budget', 'cuda_block']
+__all__ = ['kind', 'module', 'fft', 'host', 'device', 'jax_block', 'jax_budget', 'cuda_budget', 'cuda_block']
 
 
 def kind(a):
@@ -48,26 +48,74 @@ def fft(a):
     return f
 
 
-def jax_block():
-    """Bytes of temporary arrays a stage after formation may hold on JAX's device at a time, beside the image and
-    its result: FASTSAR_JAX_BLOCK_MB if set, else a sixteenth of the device's memory (1 GB where the device does
-    not report it; a 16 GB TPU reports it), at most 2 GB. The stages cut the image into blocks of rows, columns or
-    pixels that fit, each through one compiled program per block shape."""
+def _jax_env():
+    """FASTSAR_JAX_BLOCK_MB in bytes, or None when it is not set."""
     import os
     mb = os.environ.get('FASTSAR_JAX_BLOCK_MB', '').strip()
-    if mb:
-        try:
-            if not float(mb) > 0:
-                raise ValueError
-        except ValueError:
-            raise ValueError(f'FASTSAR_JAX_BLOCK_MB must be a positive number of megabytes, got {mb!r}') from None
-        return int(float(mb) * (1 << 20))
+    if not mb:
+        return None
+    try:
+        if not float(mb) > 0:
+            raise ValueError
+    except ValueError:
+        raise ValueError(f'FASTSAR_JAX_BLOCK_MB must be a positive number of megabytes, got {mb!r}') from None
+    return int(float(mb) * (1 << 20))
+
+
+def _jax_stats():
     import jax
     try:
-        limit = (jax.devices()[0].memory_stats() or {}).get('bytes_limit')
+        return jax.devices()[0].memory_stats() or {}
     except Exception:                                              # a device without statistics
-        limit = None
+        return {}
+
+
+def jax_budget():
+    """Bytes of JAX's device new arrays may take now, or None where the device does not say (JAX on a CPU):
+    FASTSAR_JAX_BLOCK_MB megabytes if set (for a test, or to hold FastSAR to part of a device), else nine tenths of
+    what is not in use on the device (a TPU v5e has about 16 GB, a v6e about 31 GB). The stages after formation size
+    their blocks from it, and process_cphd decides with it which images of a product stay on the host
+    (memory.cuda_plan)."""
+    env = _jax_env()
+    if env is not None:
+        return env
+    st = _jax_stats()
+    return int(0.9 * (st['bytes_limit'] - st.get('bytes_in_use', 0))) if st.get('bytes_limit') else None
+
+
+def jax_block():
+    """Bytes of temporary arrays a stage after formation may hold on JAX's device at a time, beside its input and
+    its result: a quarter of FASTSAR_JAX_BLOCK_MB if set, else a sixteenth of the device's memory (1 GB where the
+    device does not report it), at most 2 GB. The stages cut the image into blocks of rows, columns or pixels that
+    fit, each through one compiled program per block shape."""
+    env = _jax_env()
+    if env is not None:
+        return int(min(2 << 30, max(env // 4, 1)))
+    limit = _jax_stats().get('bytes_limit')
     return int(min(2 << 30, limit // 16)) if limit else 1 << 30
+
+
+def jax_rows(n, row_bytes, what):
+    """Rows (of n) a block may hold at row_bytes of device memory a row, within jax_block(). MemoryError when one
+    row does not fit in jax_budget(); what: the stage, for the message."""
+    nb = jax_block() // max(int(row_bytes), 1)
+    if nb < 1:
+        free = jax_budget()
+        if free is not None and row_bytes > free:
+            raise MemoryError(f'{what}: one line takes {row_bytes / 1e6:.1f} MB of device memory and '
+                              f'{free / 1e6:.1f} MB are available (FASTSAR_JAX_BLOCK_MB, or the device itself)')
+        nb = 1
+    return int(min(n, nb))
+
+
+def to_host(out, index, block):
+    """A JAX block written into the NumPy array out at index (a tuple of slices): a complex block as its two real
+    planes, which a TPU hands over some thirty times faster than the complex array."""
+    if 'complex' in str(block.dtype):
+        import jax.numpy as jnp
+        out.real[index], out.imag[index] = np.asarray(jnp.real(block)), np.asarray(jnp.imag(block))
+    else:
+        out[index] = np.asarray(block)
 
 
 def cuda_budget():

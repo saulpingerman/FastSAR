@@ -391,3 +391,33 @@ def test_cuda_plan_places_the_images_of_a_product():
         for sizes in (sidd, sicd, dict(ground=2 * G)):
             p = memory.cuda_plan(sizes, budget, autofocus=True, sva='slant' in sizes)
             assert p['fits'] == (p['need'] <= budget) == (len(dev(p)) == len(p['place'])), (budget, p)
+
+
+def test_plan_of_a_jax_device_counts_the_join():
+    """memory.cuda_plan(joined=True), the JAX path's: an array written on the device is there as its blocks and as
+    their join (2.4 times a complex one), beside what the stage reads; autofocus and the display work in blocks
+    wherever the image is; the last image of a complex product goes to the host as it is made."""
+    from fastsar import memory
+    G = 1e9
+    sidd = dict(ground=2 * G, mid=3.8 * G, slant=6 * G, detected=3 * G, ground_mid=2.4 * G, product=1.7 * G,
+                display=0.43 * G)
+    sicd = {k: sidd[k] for k in ('ground', 'mid', 'slant')}
+    dev = lambda p: sorted(k for k, v in p['place'].items() if v == 'device')
+    p = memory.cuda_plan(sidd, 31 * G, autofocus=True, sva=True, joined=True)
+    assert p['fits'] and len(dev(p)) == 6
+    assert p['need'] == pytest.approx(20.4 * G + 31 * G / 8)         # apodization: the slant image and 2.4 times it
+    assert p['need'] > memory.cuda_plan(sidd, 31 * G, autofocus=True, sva=True)['need']
+    p = memory.cuda_plan(sicd, 31 * G, joined=True)                 # room for all: the slant image made on the host,
+    assert p['fits'] and dev(p) == ['ground', 'mid']                # unless apodization reads it again
+    assert dev(memory.cuda_plan(sicd, 31 * G, sva=True, joined=True)) == ['ground', 'mid', 'slant']
+    p = memory.cuda_plan(sidd, 16 * G, autofocus=True, sva=True, joined=True)
+    assert not p['fits'] and 'slant' not in dev(p) and 'ground' in dev(p)
+    assert dev(memory.cuda_plan(sidd, 1e6, autofocus=True, sva=True, joined=True)) == []
+    # a gigapixel slant image (9.2 GB) and its neighbors on a 31 GB device: on the host
+    big = dict(ground=2.7 * G, mid=5 * G, slant=9.2 * G, detected=4.6 * G, ground_mid=3 * G, product=2 * G,
+               display=0.5 * G)
+    p = memory.cuda_plan(big, 0.9 * 31 * G, sva=True, joined=True)
+    assert not p['fits'] and 'slant' not in dev(p)
+    for budget in np.geomspace(1e6, 60 * G, 40):
+        p = memory.cuda_plan(sidd, budget, autofocus=True, sva=True, joined=True)
+        assert p['fits'] == (p['need'] <= budget) == (len(dev(p)) == len(p['place'])), (budget, p)

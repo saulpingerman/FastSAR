@@ -156,24 +156,18 @@ def _oversampled(u, pad, n2, real, K):
     return jnp.stack([u * (1.0 / pad)] + parts, -1).reshape(u.shape[0], pad * n2)
 
 
-def _step(src, a, P, J, M, tab, K, *, axis, mode, nb, pad, guard, n2):
-    """Lines a ... a + nb of a pass (resample_cuda._pass's conventions) -> [nb, m] ([m, nb] along axis 0). mode
-    'knots': P, J as
-    _knot's; 'split': P = (integer part, remainder) [nb, m] from the host; 'device': P = (pos [L, m],) on the device.
-    M: None, or (Px, limits [xlo, xhi, ylo, yhi], valid [nx, ny] or None), warp's mask with Px as P."""
-    real = not jnp.iscomplexobj(src)
-    if axis == 1:
-        n = src.shape[1]
-        z = lax.dynamic_slice(src, (a, 0), (nb, n))
-    else:
-        n = src.shape[0]
-        z = lax.dynamic_slice(src, (0, a), (n, nb)).T
+def _step(z, P, J, M, tab, K, *, mode, pad, guard, n2):
+    """The lines z [nb, n] of a pass (resample_cuda._pass's conventions) -> [nb, m]. mode
+    'knots': P, J as _knot's; 'split': P = (integer part, remainder) [nb, m] from the host; 'device': P = (pos [nb, m],)
+    on the device. M: None, or (Px, limits [xlo, xhi, ylo, yhi], valid [nx, ny] or None), warp's mask with Px as P."""
+    real = not jnp.iscomplexobj(z)
+    n = z.shape[1]
     if mode == 'knots':
         ib, ff = _knot(P, J)
     elif mode == 'split':
         ib, ff = P
     else:
-        p = resample._snap(lax.dynamic_slice(P[0], (a, 0), (nb, P[0].shape[1])).astype(jnp.float32), n, jnp)
+        p = resample._snap(P[0].astype(jnp.float32), n, jnp)
         ib, ff = _floor(jnp.zeros(p.shape, jnp.int32), p)
     ok = _within(ib, ff, 0, n - 1)
     if M is not None:
@@ -195,8 +189,7 @@ def _step(src, a, P, J, M, tab, K, *, axis, mode, nb, pad, guard, n2):
     o = jnp.zeros(ib.shape, u.dtype)
     for t in range(taps):
         o = o + jnp.take_along_axis(u, i0 + t, axis=1, mode='clip') * jnp.take(tab[:, t], k, mode='clip')
-    o = jnp.where(ok, o, 0)
-    return o if axis == 1 else o.T
+    return jnp.where(ok, o, 0)
 
 
 def _poly(tab):
@@ -280,18 +273,12 @@ def _at(D, kink, B):
     return ib + (ff > 1 - SNAP).astype(jnp.int32), jnp.where((ff < SNAP) | (ff > 1 - SNAP), 0, ff)
 
 
-def _step_blocks(src, a, D, w0, kink, M, coef, K, *, axis, nb, m, pad, guard, n2, B, W, R):
-    """Lines a ... a + nb of a pass by blocks of B output samples -> [nb, m] ([m, nb] along axis 0). D, kink:
-    _blocks' and _span's;
+def _step_blocks(z, D, w0, kink, M, coef, K, *, m, pad, guard, n2, B, W, R):
+    """The lines z [nb, n] of a pass by blocks of B output samples -> [nb, m]. D, kink: _blocks' and _span's;
     w0 [nb, nblk]: the first oversampled sample of each block's window of R, the first taps of its samples starting
     less than W after it; coef: _poly's, times pad; M: None or (Dx, limits, valid), warp's mask; K: _oversampled's."""
-    real = not jnp.iscomplexobj(src)
-    if axis == 1:
-        n = src.shape[1]
-        z = lax.dynamic_slice(src, (a, 0), (nb, n))
-    else:
-        n = src.shape[0]
-        z = lax.dynamic_slice(src, (0, a), (n, nb)).T
+    real = not jnp.iscomplexobj(z)
+    nb, n = z.shape
     taps, nblk = coef.shape[1], w0.shape[1]
     ib, ff = _at(D, kink, B)
     ok = _within(ib, ff, 0, n - 1)
@@ -319,8 +306,7 @@ def _step_blocks(src, a, D, w0, kink, M, coef, K, *, axis, nb, m, pad, guard, n2
     o = [(_front(_windows(ch, w0, R)[:, :, None, :], rel, W, taps) * w).sum(-1)
          for ch in ((u,) if real else (jnp.real(u), jnp.imag(u)))]
     o = o[0] if real else lax.complex(o[0], o[1])
-    o = jnp.where(ok, o, 0).reshape(nb, nblk * B)[:, :m]
-    return o if axis == 1 else o.T
+    return jnp.where(ok, o, 0).reshape(nb, nblk * B)[:, :m]
 
 
 def _plan_blocks(pos, posx, L, n, tab, pad, guard, n2, real):
@@ -380,7 +366,8 @@ def _jit(fn, static):
 def _joined(parts, L, nb, axis=0):
     """The blocks of lines of _starts(L, nb), in its order, as one array along `axis`: the last block, moved back,
     gives only the lines the others have not. (A block written into a buffer of the whole image costs a copy of
-    that buffer on a TPU, one for every block.)"""
+    that buffer on a TPU, one for every block, and the buffer is there twice meanwhile, as the blocks and their
+    join are here: memory.cuda_plan counts it.)"""
     if len(parts) == 1:
         return parts[0]
     if L % nb:
@@ -395,14 +382,92 @@ def _starts(L, nb):
     return list(range(0, L - nb + 1, nb)) + ([L - nb] if L % nb else [])
 
 
-def _pass(src, pos, m, axis, kernel, taps, pad, mask=None):
-    """One pass along `axis` of src, as resample_cuda._pass, returning the new array."""
-    real = not jnp.iscomplexobj(src)
-    dt = jnp.float32 if real else jnp.complex64
-    src = src.astype(dt)
+def _cut(planes, a, *, nb, axis):
+    """Lines a ... a + nb along `axis` of a device image given as its real planes (_planes) -> [nb, n], float32 or
+    complex64."""
+    def cut(p):
+        if axis == 1:
+            return lax.dynamic_slice(p, (a, 0), (nb, p.shape[1]))
+        return lax.dynamic_slice(p, (0, a), (p.shape[0], nb)).T
+    z = [cut(p).astype(jnp.float32) for p in planes]
+    return z[0] if len(z) == 1 else lax.complex(z[0], z[1])
+
+
+def _planes(src):
+    """A device image as the real arrays a compiled step takes as arguments: itself, or the real and imaginary
+    parts of a complex one. (A TPU has no complex numbers of its own: a complex array handed to a program is
+    converted at every call, 12 ms for 1.8 GB, which a step per block of lines would pay hundreds of times.)"""
+    return (src,) if not jnp.iscomplexobj(src) else (jnp.real(src), jnp.imag(src))
+
+
+def _source(src, axis=1):
+    """lines(a, nb) -> the lines a ... a + nb along `axis` of an image on the device or on the host, as a device
+    array [nb, n] (float32 or complex64): a host image crosses block by block. src: the image, or a list that holds
+    it alone, emptied here, so that a complex device image nothing else refers to is freed once its planes exist."""
+    own = isinstance(src, list)
+    img = src.pop() if own else src
+    if _xp.kind(img) == 'jax':
+        planes, cut = _planes(img), _jit(_cut, ('nb', 'axis'))
+        del img
+        return lambda a, nb: cut(planes, np.int32(a), nb=nb, axis=axis)
+    dt = np.float32 if img.dtype.kind != 'c' else np.complex64
+    return lambda a, nb: jnp.asarray(np.ascontiguousarray(img[a:a + nb] if axis == 1 else img[:, a:a + nb].T, dt))
+
+
+class _Sink:
+    """The blocks of lines of a stage as one array [L, m] ([m, L] for lines along axis 0): on the device, joined at
+    the end, or on the host (where='host', or `into`, a host array to write), each block written as the next one
+    is under way, a complex one as two real planes."""
+
+    def __init__(self, where, L, m, nb, axis, dtype, into=None, moved=True):
+        self.host, self.L, self.nb, self.axis, self.wait = where == 'host' or into is not None, L, nb, axis, None
+        self.moved = moved                                          # the last block was moved back (_starts)
+        shape = (L, m) if axis == 1 else (m, L)
+        self.out = into if into is not None else np.empty(shape, dtype) if self.host else []
+
+    def put(self, a, block):
+        """The lines a ... a + len(block) (block [nb, m])."""
+        if not self.host:
+            self.out.append(block if self.axis == 1 else block.T)
+            return
+        last, self.wait = self.wait, (a, block)
+        if last is not None:
+            self._write(*last)
+
+    def _write(self, a, block):
+        sl = slice(a, a + block.shape[0])
+        if self.axis == 1:
+            _xp.to_host(self.out, (sl,), block)
+        else:
+            _xp.to_host(self.out, (slice(None), sl), block.T)
+
+    def done(self):
+        if not self.host:
+            return _joined(self.out, self.L if self.moved else 0, self.nb, 1 - self.axis)
+        if self.wait is not None:
+            self._write(*self.wait)
+        return self.out
+
+
+def _fits(line_bytes, what):
+    """MemoryError when one line of a stage (line_bytes of device memory) is more than the device has."""
+    free = _xp.jax_budget()
+    if free is not None and line_bytes > free:
+        raise MemoryError(f'{what}: one line takes {line_bytes / 1e6:.1f} MB of device memory and {free / 1e6:.1f} MB '
+                          'are available (FASTSAR_JAX_BLOCK_MB, or the device itself)')
+
+
+def _pass(src, pos, m, axis, kernel, taps, pad, mask=None, where='device'):
+    """One pass along `axis` of src (on the device or on the host), as resample_cuda._pass, returning the new
+    array: on the device, or with where='host' a NumPy array its blocks were written to. src: or a list that holds
+    it alone (_source's)."""
+    given, src = src, (src[0] if isinstance(src, list) else src)
+    real = src.dtype.kind != 'c'
+    dt = np.float32 if real else np.complex64
     L, n = (src.shape[0], src.shape[1]) if axis == 1 else (src.shape[1], src.shape[0])
     tab, pad, guard, n2 = resample._plan(n, kernel, taps, pad)
     tabd = jnp.asarray(tab * np.float32(pad))
+    _fits((16 if real else 32) * (pad * n2 + m), 'resampling on the JAX device')
     nb = int(max(1, min(L, _samples(BLOCK, 64) // max(pad * n2, m))))
     knots = isinstance(pos, resample.KnotMap)
     mode = 'knots' if knots else 'device' if isinstance(pos, jax.Array) else 'split'
@@ -416,29 +481,32 @@ def _pass(src, pos, m, axis, kernel, taps, pad, mask=None):
             raise ValueError('the maps of a mask must share their knots')
         lim = jnp.asarray(np.array([xlo, xhi, ylo, yhi], np.int32))
         valid = None if valid is None else jnp.asarray(valid).astype(bool)
-    out, plan = [], None
+    lines, plan = _source(given, axis), None
+    del src, given
     # on a TPU (wherever the blocks path is chosen) a length that 32 does not divide is transformed at a fast one
     K = _kernels(n2, pad, real) if pad > 1 and n2 % 32 and _path() == 'blocks' else None
     if knots and _path() == 'blocks':
         plan = _plan_blocks(pos, posx if mask is not None else None, L, n, tab, pad, guard, n2, real)
     if plan is not None:
-        step = _jit(_step_blocks, ('axis', 'nb', 'm', 'pad', 'guard', 'n2', 'B', 'W', 'R'))
+        step = _jit(_step_blocks, ('m', 'pad', 'guard', 'n2', 'B', 'W', 'R'))
         coef, kink, nb = jnp.asarray(_poly(tab) * np.float32(pad)), jnp.asarray(plan['kink']), plan['nb']
+        out = _Sink(where, L, m, nb, axis, dt)
         for a in _starts(L, nb):
             sl = slice(a, a + nb)
             D = tuple(jnp.asarray(v[sl]) for v in plan['D'])
             if mask is not None:
                 M = (tuple(jnp.asarray(v[sl]) for v in plan['Dx']), lim, valid)
-            out.append(step(src, np.int32(a), D, jnp.asarray(plan['w0'][sl]), kink, M, coef, K, axis=axis, nb=nb, m=m,
-                            pad=pad, guard=guard, n2=n2, B=plan['B'], W=plan['W'], R=plan['R']))
-        return _joined(out, L, nb, 1 - axis)
-    step = _jit(_step, ('axis', 'mode', 'nb', 'pad', 'guard', 'n2'))
+            out.put(a, step(lines(a, nb), D, jnp.asarray(plan['w0'][sl]), kink, M, coef, K, m=m, pad=pad, guard=guard,
+                            n2=n2, B=plan['B'], W=plan['W'], R=plan['R']))
+        return out.done()
+    step = _jit(_step, ('mode', 'pad', 'guard', 'n2'))
+    out = _Sink(where, L, m, nb, axis, dt)
     for a in _starts(L, nb):
         sl = slice(a, a + nb)
         if knots:
             P = tuple(jnp.asarray(v) for v in _split(pos.rows(sl)))
         elif mode == 'device':
-            P = (pos,)
+            P = (_jit(_cut, ('nb', 'axis'))((pos,), np.int32(a), nb=nb, axis=1),)
         else:
             q = np.clip(np.nan_to_num(np.asarray(pos(sl) if callable(pos) else pos[sl], np.float64), nan=-2.0 ** 30),
                         -2.0 ** 30, 2.0 ** 30)
@@ -447,8 +515,8 @@ def _pass(src, pos, m, axis, kernel, taps, pad, mask=None):
             P = (jnp.asarray(ib.astype(np.int32)), jnp.asarray((q - ib).astype(np.float32)))
         if mask is not None:
             M = (tuple(jnp.asarray(v) for v in _split(posx.rows(sl))), lim, valid)
-        out.append(step(src, np.int32(a), P, J, M, tabd, K, axis=axis, mode=mode, nb=nb, pad=pad, guard=guard, n2=n2))
-    return _joined(out, L, nb, 1 - axis)
+        out.put(a, step(lines(a, nb), P, J, M, tabd, K, mode=mode, pad=pad, guard=guard, n2=n2))
+    return out.done()
 
 
 def lines(src, pos, m, *, kernel='sinc', taps=8, pad=None, out=None):
@@ -458,17 +526,24 @@ def lines(src, pos, m, *, kernel='sinc', taps=8, pad=None, out=None):
     return _pass(src, pos, m, 1, kernel, taps, pad)
 
 
-def warp(src, pos0, pos1, shape, *, kernel='sinc', taps=8, pad=None, transposed=False, mask=None):
-    """resample.warp for a JAX array; transposed and mask as resample_cuda.warp's (the mask's bounds integers)."""
+def warp(src, pos0, pos1, shape, *, kernel='sinc', taps=8, pad=None, transposed=False, mask=None, place=None):
+    """resample.warp for a JAX array; transposed and mask as resample_cuda.warp's (the mask's bounds integers).
+    place: where the intermediate image of the two passes and the result are made, ('device' or 'host') for each
+    (default both on the device); an image on the host crosses the device in blocks of lines and is never whole
+    on it, and src may be one (a NumPy array). src: or a list that holds it alone, emptied here, so that an image
+    nothing else refers to is freed after the first pass."""
     m0, m1 = shape
+    wm, wo = place or ('device', 'device')
+    mid = [_pass(src, pos0, m0, 1 if transposed else 0, kernel, taps, pad, where=wm)]
+    del src
     if transposed:
-        return _pass(_pass(src, pos0, m0, 1, kernel, taps, pad), pos1, m1, 0, kernel, taps, pad)
-    return _pass(_pass(src, pos0, m0, 0, kernel, taps, pad), pos1, m1, 1, kernel, taps, pad, mask)
+        return _pass(mid, pos1, m1, 0, kernel, taps, pad, where=wo)
+    return _pass(mid, pos1, m1, 1, kernel, taps, pad, mask, where=wo)
 
 
-def _deramp_step(img, a, rows, cols, r0, k, *, nb):
-    """Rows a ... a + nb of deramp."""
-    px, pi, q1i, q2i, li, hi = (lax.dynamic_slice(v, (a,), (nb,))[:, None] for v in rows)
+def _deramp_step(z, a, rows, cols, r0, k):
+    """Rows a ... a + len(z) of deramp, z those rows of the image."""
+    px, pi, q1i, q2i, li, hi = (lax.dynamic_slice(v, (a,), (z.shape[0],))[:, None] for v in rows)
     py, pj, q1j, q2j, jr = (v[None, :] for v in cols)
     p, q = pi + pj, (q1i + q1j) ** 2 + (q2i + q2j) ** 2
     s = r0 + p
@@ -476,13 +551,14 @@ def _deramp_step(img, a, rows, cols, r0, k, *, nb):
     rest = -(q / (2 * r0)) * (2 * p + Q) / (2 * r0 + 2 * p + Q)                # Q less q / (2 R0)
     turns = ((hi * jr) & 4095).astype(jnp.float32) * (1 / 4096) + li * jr.astype(jnp.float32)
     ang = px + py + (2 * np.pi) * turns + k * rest
-    z = lax.dynamic_slice(img, (a, 0), (nb, img.shape[1]))
     return z * lax.complex(jnp.cos(ang), jnp.sin(ang))
 
 
 def deramp(img, d0, a, b, u0, r0, k):
     """planes.deramp's multiplication in float32: img [nx, ny] times exp(j k (R - r0)), R the range of pixel (i, j)
-    at scp + d0 + i a + j b (m) from the antenna at scp - r0 u0. -> the new array (complex64).
+    at scp + d0 + i a + j b (m) from the antenna at scp - r0 u0. -> the new array (complex64); an image on the host
+    (a complex64 NumPy array) crosses the device in blocks of rows and is written in place. img: or a list that
+    holds it alone (_source's).
 
     With d the pixel less the scene center, p = u0 . d and q1, q2 the components of d across u0, the range is
     R - r0 = p + Q, Q = (q1^2 + q2^2) / (R + r0 + p), with no cancellation. d is linear in (i, j), so k p and the
@@ -491,6 +567,7 @@ def deramp(img, d0, a, b, u0, r0, k):
     one constant theta: the host sends, per row, theta i modulo 1 as an integer number of 1/4096 turns and a small
     remainder, and the device takes the integer part times j modulo 4096 in int32. The device computes only what
     is left of Q, less than a part in a hundred of it, in float32. Columns must number under 2^20."""
+    given, img = img, (img[0] if isinstance(img, list) else img)
     nx, ny = img.shape
     d0, a, b, u0 = (np.asarray(v, np.float64) for v in (d0, a, b, u0))
     ic, jc = nx // 2, ny // 2
@@ -511,8 +588,15 @@ def deramp(img, d0, a, b, u0, r0, k):
     rows = (wrap(px), f32(pi), f32(q1i), f32(q2i), f32(ti - hi / 4096), hi.astype(np.int32))
     cols = (wrap(py), f32(pj), f32(q1j), f32(q2j), j.astype(np.int32))
     rows, cols = tuple(jnp.asarray(v) for v in rows), tuple(jnp.asarray(v) for v in cols)
-    img = img.astype(jnp.complex64)
+    _fits(64 * ny, 'the baseband step on the JAX device')
     nb = int(max(1, min(nx, _samples(BLOCK, 64) // ny)))
-    step = _jit(_deramp_step, ('nb',))
-    return _joined([step(img, np.int32(s), rows, cols, np.float32(r0), np.float32(k), nb=nb) for s in _starts(nx, nb)],
-                   nx, nb)
+    host = _xp.kind(img) != 'jax'
+    if host and img.dtype != np.complex64:
+        raise ValueError('a host image is brought to baseband in place: complex64')
+    out = _Sink('device', nx, ny, nb, 1, np.complex64, into=img if host else None)
+    step, lines = _jit(_deramp_step, ()), _source(given)
+    del img, given
+    # a host image is written where it is read: no block moved back over rows already done
+    for s in (range(0, nx, nb) if host else _starts(nx, nb)):
+        out.put(s, step(lines(s, min(nb, nx - s)), np.int32(s), rows, cols, np.float32(r0), np.float32(k)))
+    return out.done()
