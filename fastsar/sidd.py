@@ -288,6 +288,5 @@ def write_sidd(path, out, *, remap='nrl', remap_args=None, valid=None, shadows_d
     xmls = [(sd.to_xml_bytes(), 'SIDD', _siddxml.SPECIFICATION[version])]
     if sicd is not None:
         xmls.append((sm.to_xml_bytes(), 'SICD', _sicdxml.specification(sm)))
-    _nitf.write_sidd(path, data, xmls, corners=lambda r0, r1, c0, c1: latlon(outline(r0, r1, c0, c1)),
-                     fields=_siddxml.nitf_fields(sd, sm))
+    _nitf.write_sidd(path, data, xmls, corners=lambda r0, r1, c0, c1: latlon(outline(r0, r1, c0, c1)))
     return sd

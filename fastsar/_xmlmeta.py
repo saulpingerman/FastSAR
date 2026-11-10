@@ -11,7 +11,8 @@
 
 Conventions. Element names are the XML's own local names (namespaces are dropped on parsing and the root's is
 restored on writing). A Spec (one per format) names what the tree alone cannot tell: which leaves are text whatever
-they look like, which are integers (by name, or as 'Parent/Name'), which children repeat (and so read as lists), and aliases, the plural names
+they look like, which are integers (by name, or as 'Parent/Name'), which children repeat (and so read as lists),
+and aliases, the plural names
 under which a list is also reached (Data.Channels for the Channel elements of a CPHD's Data block). Leaves not named
 in the Spec read as bool ('true', 'false'), else float where the text parses as one, else str."""
 import copy as _copy

@@ -29,7 +29,7 @@ was published on PyPI.
   gradient autofocus, and a spatially variant correction estimated on overlapping blocks.
 - Spatially variant apodization (`weighting.sva`) on the slant plane at twice Nyquist, with the trim of the phase
   history that makes the spectrum a rectangle (`weighting.keystone`).
-- SIDD output (`sidd.write_sidd`, SIDD 3.0 or 2.0 through sarpy) and the display layout (`sidd.shadows_down`,
+- SIDD output (`sidd.write_sidd`, SIDD 3.0 or 2.0) and the display layout (`sidd.shadows_down`,
   `sidd.to_display`): range increases down the rows and the view is the one from above, for either look side.
 - The remaps of the NGA MATLAB SAR Toolbox (`fastsar.remap`: `nrl`, `density`, `brighter`, `darker`,
   `highcontrast`, `pedf`, `log`, `linear`), checked against the toolbox run in Octave.
@@ -43,8 +43,26 @@ was published on PyPI.
 
 ### Changed
 
-- `read_cphd` reads the samples of a CPHD 1.x file from the file's own bytes on all cores (sarpy still parses the
-  header and metadata, and reads compressed signal blocks), and conjugates and checks them on all cores. The
+- FastSAR no longer uses sarpy at run time: CPHD files (1.0.1, 1.1.0, 0.3) are parsed, SICD and SIDD metadata built
+  and projected, and the NITF files written and read by FastSAR's own code (`fastsar._cphdxml`, `_sicdxml`,
+  `_siddxml`, `_nitf`), with only NumPy, SciPy and JAX installed. sarpy and sarkit remain in the `test` group as
+  independent readers and consistency checkers of the files. The `io` extra is kept, empty.
+  - `products.sicd_meta` and `write_sicd` return `fastsar._sicdxml.SICD`, and `sidd.write_sidd` returns
+    `fastsar._siddxml.SIDD`, in place of sarpy's `SICDType` and `SIDDType`: attribute access by the XML's element
+    names (`sm.Grid.Row.SS`, `sm.GeoData.SCP.ECF.get_array()`, `sm.SCPCOA.GrazeAng`), `None` for an absent
+    element, `to_xml_bytes()`. Dates are their XML text (not `numpy.datetime64`), `sm.is_valid()`,
+    `sm.derive()` and the other methods of the sarpy classes are gone, and the SIDD object is read-only. A sarpy
+    `SICDType` is still accepted wherever a SICD is an argument (it is converted through its XML).
+  - `write_sidd(classification=)` takes `'UNCLASSIFIED'` or a dict of the ISM markings where it took a sarpy
+    `ProductClassificationType`.
+  - The SCPCOA angles use the geodetic vertical at the scene center point, as the standard defines them; they
+    differ from sarpy's by less than 1e-4 degrees.
+  - A CPHD with a compressed signal block is refused (it was read through sarpy); `meta['tx_time']` and
+    `meta['rcv_time']` are in the machine's byte order.
+  - A SICD is written at 2.6 GB/s into the page cache where sarpy's writer ran at 0.6 GB/s (12000 x 12000 pixels,
+    48 cores).
+- `io.read_sicd(path)`: the pixels (a memory map) and metadata of a SICD file.
+- `read_cphd` reads the samples of a CPHD 1.x file from the file's own bytes on all cores, and conjugates and checks them on all cores. The
   samples are identical; reading an 8.7 GB Umbra collection takes 2.1 s where it took 5.9 s, and a 9.2 GB Capella
   collection 3.6 s where it took 13.0 s (48 cores, file in the page cache).
 - `products.sicd_meta` arranges the SICD array as the view from above for either look side: rows along range away

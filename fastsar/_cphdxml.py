@@ -259,7 +259,8 @@ class Reader:
                              f'{self.compression!r}), in a format its producer defines; FastSAR reads plain samples only')
         if self.v03:
             raw = _SIGNAL03[str(d.SampleType)]
-            off = h.CPHD_BYTE_OFFSET + sum(int(a.NumVectors) * int(a.NumSamples) for a in ch[:c]) * 2 * np.dtype(raw).itemsize
+            before = sum(int(a.NumVectors) * int(a.NumSamples) for a in ch[:c])
+            off = h.CPHD_BYTE_OFFSET + before * 2 * np.dtype(raw).itemsize
         else:
             if str(d.SignalArrayFormat) not in _SIGNAL:
                 raise ValueError(f'SignalArrayFormat {d.SignalArrayFormat!r}: CI2, CI4 or CF8')

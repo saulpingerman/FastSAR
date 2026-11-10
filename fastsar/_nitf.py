@@ -81,7 +81,8 @@ class _Cursor:
 def _file_header(fh):
     head = fh.read(360)
     if head[:9] != b'NITF02.10':
-        raise ValueError('not a NITF 2.1 file' + (' (NITF 2.0 and NSIF are not read)' if head[:4] in (b'NITF', b'NSIF') else ''))
+        other = head[:4] in (b'NITF', b'NSIF')
+        raise ValueError('not a NITF 2.1 file' + (' (NITF 2.0 and NSIF are not read)' if other else ''))
     hl = int(head[354:360])
     fh.seek(0)
     h = {}
@@ -237,7 +238,8 @@ class Nitf:
 
     def _segment(self, im):
         if im['IC'] != 'NC':
-            raise ValueError(f"NITF image compression IC = {im['IC']} is not supported (NC, uncompressed and unmasked, only)")
+            raise ValueError(f"NITF image compression IC = {im['IC']} is not supported (NC, uncompressed and "
+                             'unmasked, only)')
         if im['NBPR'] * im['NBPC'] != 1:
             raise ValueError(f"NITF images of more than one block are not supported (NBPR {im['NBPR']}, NBPC {im['NBPC']})")
         nb = im['NBANDS']
@@ -474,7 +476,8 @@ def write(path, images, des, fields=None):
     subs, lens = [], []
     for im in images:
         a, dt = im['data'], np.dtype(im['dtype'])
-        g = dict(f, **{k: v for k, v in im.items() if k not in ('data', 'dtype', 'bands')}, NROWS=a.shape[0], NCOLS=a.shape[1])
+        g = dict(f, **{k: v for k, v in im.items() if k not in ('data', 'dtype', 'bands')}, NROWS=a.shape[0],
+                 NCOLS=a.shape[1])
         subs.append(_image_subheader_bytes(g, im['bands']))
         lens.append(int(np.prod(a.shape, dtype=np.int64)) * dt.itemsize)
         if lens[-1] > IS_SIZE_MAX:
@@ -528,10 +531,12 @@ def _xml_facts(xml):
     out = dict(kind=kind, corners=None)
     if kind == 'SIDD':
         cl = find('ProductCreation/Classification')
-        out.update(core=text('ProductCreation/ProductName'), created=text('ProductCreation/ProcessorInformation/ProcessingDateTime'),
+        out.update(core=text('ProductCreation/ProductName'),
+                   created=text('ProductCreation/ProcessorInformation/ProcessingDateTime'),
                    collector=text('ExploitationFeatures/Collection/Information/SensorName'),
                    start=text('ExploitationFeatures/Collection/Information/CollectionDateTime'),
-                   classification=None if cl is None else next((v for k, v in cl.attrib.items() if loc(k) == 'classification'), None))
+                   classification=None if cl is None else next(
+                       (v for k, v in cl.attrib.items() if loc(k) == 'classification'), None))
     else:
         out.update(core=text('CollectionInfo/CoreName'), collector=text('CollectionInfo/CollectorName'),
                    start=text('Timeline/CollectStart'), created=text('ImageCreation/DateTime'),
@@ -623,7 +628,8 @@ def write_sidd(path, a, xmls, *, corners=None, fields=None, size_max=None, rows_
     attribute), CLSY ('US'), ... size_max, rows_max: the segment limits, for tests. -> file length in bytes."""
     a = a if isinstance(a, np.ndarray) else np.asarray(a)
     if a.dtype != np.uint8 or not (a.ndim == 2 or (a.ndim == 3 and a.shape[2] == 3)):
-        raise ValueError(f'a SIDD image is uint8 [rows, cols] (MONO8I) or [rows, cols, 3] (RGB24I), not {a.dtype} {a.shape}')
+        raise ValueError('a SIDD image is uint8 [rows, cols] (MONO8I) or [rows, cols, 3] (RGB24I), not '
+                         f'{a.dtype} {a.shape}')
     facts = [_xml_facts(bytes(x[0])) for x in xmls]
     x = next((v for v in facts if v['kind'] == 'SIDD'), None)
     if x is None:
@@ -638,6 +644,7 @@ def write_sidd(path, a, xmls, *, corners=None, fields=None, size_max=None, rows_
     sub = dict(dtype='u1', PVTYPE='INT', IREP='MONO' if mono else 'RGB', ABPP=8, NBPP=8, IMODE='B' if mono else 'P')
     bands = [('M', '')] if mono else [('R', ''), ('G', ''), ('B', '')]
     images = _layout(a, 'SIDD', bands, sub, corners, f, size_max, rows_max)
-    des = [dict(xml=bytes(xb), kind=kind, spec=spec, when=_stamp(v['created'] or f.get('FDT') or datetime.now(timezone.utc)),
+    des = [dict(xml=bytes(xb), kind=kind, spec=spec,
+                when=_stamp(v['created'] or f.get('FDT') or datetime.now(timezone.utc)),
                 corners=v['corners']) for (xb, kind, spec), v in zip(xmls, facts)]
     return write(path, images, des, f)

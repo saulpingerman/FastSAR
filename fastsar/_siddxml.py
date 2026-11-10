@@ -268,7 +268,8 @@ def build(f, version=3):
         _e('ExploitationFeatures', [
             _e('Collection', [
                 _e('Information', [
-                    _e('SensorName', str(ci.CollectorName)), _e('RadarMode', [_e('sicommon:ModeType', str(ci.RadarMode.ModeType))]),
+                    _e('SensorName', str(ci.CollectorName)),
+                    _e('RadarMode', [_e('sicommon:ModeType', str(ci.RadarMode.ModeType))]),
                     _e('CollectionDateTime', str(tl.CollectStart)), _e('CollectionDuration', float(tl.CollectDuration)),
                     _c('Resolution', ('Range', 'Azimuth'), ex['resolution']),
                     _e('Polarization', [_e('TxPolarization', tx), _e('RcvPolarization', rcv)])]),
@@ -283,16 +284,3 @@ def build(f, version=3):
                            _e('North', ex['north'])])])],
         xmlns=SPECIFICATION[version][2], **_NS)
     return SIDD(ET.tostring(root, encoding='utf-8'))
-
-
-def nitf_fields(sd, sm):
-    """The NITF header text a SIDD's metadata supply (SIDD Volume 2): the file and image titles from the product
-    name, the image source from the sensor, the image date from the collection start."""
-    name = str(sd.ProductCreation.ProductName)
-    f = dict(FTITLE=f'SIDD: {name}', IID2=f'SIDD: {name}')
-    info = sd.ExploitationFeatures.Collections[0].Information
-    if info.SensorName:
-        f['ISORCE'] = str(info.SensorName)
-    if info.CollectionDateTime:
-        f['IDATIM'] = ''.join(ch for ch in str(info.CollectionDateTime)[:19] if ch.isdigit())
-    return f

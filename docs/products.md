@@ -49,7 +49,8 @@ of the squared window. CPHD has no radiometric calibration; beta0 and sigma0 nee
 `write_sicd(path, out)` builds the metadata with `sicd_meta`: a PLANE ground grid, rows along range away from the
 radar, columns along track, the aperture position as a polynomial in time and one center-of-aperture time, so
 SICD's projection is the model of `geolocate`. Impulse response parameters are nominal; there is no Radiometric
-block. ImageFormAlgo is OTHER, which sarpy's `is_valid` rejects; sarkit's consistency check passes. In
+block. The file is written by FastSAR's own NITF writer (no SAR-format library is needed), and `tests/` read it back
+with sarpy and sarkit. ImageFormAlgo is OTHER, which sarpy's `is_valid` rejects; sarkit's consistency check passes. In
 `tests/test_chain.py` the round trip keeps every pixel, and sarpy's projection of the peaks agrees with
 `geolocate` to better than a micrometer.
 

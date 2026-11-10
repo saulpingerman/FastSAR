@@ -191,8 +191,7 @@ def write_sicd(path, img, template=None, transpose=None):
     if corners is None:
         _sicdxml.derive_corners(sm)
         corners = sm.GeoData.ImageCorners
-    _nitf.write_sicd(path, a, sm.to_xml_bytes(), corners=corners.get_array(), fields=_sicdxml.nitf_fields(sm),
-                     spec=_sicdxml.specification(sm))
+    _nitf.write_sicd(path, a, sm.to_xml_bytes(), corners=corners.get_array(), spec=_sicdxml.specification(sm))
     return sm
 
 

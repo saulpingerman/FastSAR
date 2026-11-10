@@ -32,12 +32,11 @@ line tools, `xcode-select --install`, which also serve the Metal backend of `Exa
 
 ```bash
 pip install fastsar                  # CPU (and JAX on whatever device it has)
-pip install "fastsar[io]"            # io: sarpy for CPHD and SICD
 pip install "fastsar[cuda]"          # cuda: CuPy for Nvidia GPUs
 pip install "fastsar[tpu]"           # tpu: jax[tpu] for Cloud TPUs
 pip install "fastsar[geo]"           # geo: rasterio for GeoTIFFs and DEMs
 pip install "fastsar[raw]"           # raw: h5py for the NISAR raw reader
-pip install "fastsar[cuda,io,geo]"   # extras combine
+pip install "fastsar[cuda,geo]"      # extras combine
 ```
 
 What a machine needs beyond pip's packages depends on its hardware. After installing, `python -m fastsar.doctor`

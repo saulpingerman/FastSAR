@@ -243,8 +243,8 @@ left out of the statistics the remap draws from the image; `valid`, or a mask in
 default. A uint8 image is taken as display values already.
 
 `write_sidd(path, out, *, remap='nrl', remap_args=None, valid=None, shadows_down=True, version=3,
-product_name=None, classification='UNCLASSIFIED', sicd=None)` writes those pixels as a MONO8I SIDD through sarpy
-and returns the SIDD structure. It accepts ground-plane products only. The metadata are:
+product_name=None, classification='UNCLASSIFIED', sicd=None)` writes those pixels as a MONO8I SIDD
+and returns the SIDD metadata (a light object over the XML, `fastsar._siddxml.SIDD`). It accepts ground-plane products only. The metadata are:
 
 - Measurement: a plane projection (reference point at the center pixel, sample spacings, row and column unit
   vectors in ECF), the aperture position polynomial and one center-of-aperture time, so the SIDD's own projection
@@ -254,14 +254,15 @@ and returns the SIDD structure. It accepts ground-plane products only. The metad
 - Display: the remap's name and the shadow direction (DOWN when shadows follow the rows to within one degree,
   otherwise UP, LEFT, RIGHT or ARBITRARY).
 - ExploitationFeatures: azimuth, graze, slope, tilt, squint and Doppler cone angles, the shadow, layover,
-  multipath, ground-track and north directions in the pixel frame, and the resolution, all computed by sarpy
-  from the SICD metadata of the same product (`sicd_meta(out)`, or the `sicd` argument, which is then stored in
+  multipath, ground-track and north directions in the pixel frame, and the resolution, all computed
+  by the standard's definitions from the SICD metadata of the same product (`sicd_meta(out)`, or the `sicd` argument, which is then stored in
   the file as well).
 - ProductCreation: FastSAR and its version as the processor.
 
-SIDD 3.0 is written by default and 2.0 on request. Two NITF header fields that sarpy 2.1.1 fills differently from
-the standard are corrected: the specification version and date in the XML segment's subheader, and the image
-segment's corner coordinates, which sarpy truncates to the arcsecond where the standard rounds.
+SIDD 3.0 is written by default and 2.0 on request, by FastSAR's own NITF writer. Two NITF header fields differ
+from what sarpy 2.1.1 writes for the same product: the specification version and date in the XML segment's
+subheader, and the image segment's corner coordinates, which sarpy truncates to the arcsecond where the standard
+rounds. `classification` is `'UNCLASSIFIED'` or a dict of the ISM markings (`classification`, `ownerProducer`, ...).
 
 In `tests/test_sidd.py`, on a simulated collection flown both ways, the round trip keeps every pixel, the SIDD's
 projection of the measured peaks falls within 5 mm (0.01 pixel) of the true target positions, an asymmetric

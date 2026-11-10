@@ -1072,6 +1072,16 @@ def orbit_type(orb):
     return v.decode() if isinstance(v, bytes) else str(v)
 
 
+def read_sicd(path, native=False):
+    """A SICD file (NITF 2.1) -> (pixels [rows, cols], metadata). metadata: fastsar._sicdxml.SICD, attribute access
+    by the SICD XML's element names (meta.Grid.Row.SS, meta.GeoData.SCP.ECF.get_array()) and the SICD's projection
+    (project_image_to_ground, project_ground_to_image). pixels: a read-only memory map in the file's big-endian
+    type (complex64 for RE32F_IM32F; [rows, cols, 2] for RE16I_IM16I and AMP8I_PHS8I), or with native=True an array
+    in memory, complex64 for the I and Q types (AMP8I_PHS8I stays its two bytes: amplitude index and phase)."""
+    from . import _nitf, _sicdxml
+    return _nitf.read(path).pixels(native=native), _sicdxml.read(path)
+
+
 def sicd_points(sicd, rows, cols, meta, hae=None):
     """Positions [..., 3] in read_cphd's local frame of the SICD pixels (rows, cols) (arrays of one shape), projected
     by the SICD's own model onto the surface at height hae above the ellipsoid (default: the SCP's). Any grid type,

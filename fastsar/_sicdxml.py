@@ -241,7 +241,8 @@ def weight_function(name, parameters=None, size=WEIGHT_SIZE):
     name = str(name).upper()
     p = parameters or {}
     if name == 'TAYLOR':
-        return windows.taylor(size, nbar=int(float(p.get('NBAR', 4))), sll=abs(float(p.get('SLL', -30))), norm=True, sym=True)
+        nbar, sll = int(float(p.get('NBAR', 4))), abs(float(p.get('SLL', -30)))
+        return windows.taylor(size, nbar=nbar, sll=sll, norm=True, sym=True)
     if name == 'HANNING':
         return windows.general_hamming(size, 0.5, sym=True)
     if name == 'HAMMING':
@@ -337,66 +338,6 @@ def specification(sm):
     segment's subheader states them (DESSHSV, DESSHSD, DESSHTN)."""
     v = sm.version
     return v, SPECIFICATION.get(v, SPECIFICATION['1.3.0']), str(sm.namespace)
-
-
-def nitf_fields(sm):
-    """The NITF header text a SICD's metadata supply (SICD Volume 2): the file and image titles from the core name,
-    the image source from the collector, the image date from the collection start."""
-    ci = sm.CollectionInfo
-    core = str(ci.CoreName) if ci is not None and ci.CoreName is not None else 'Unknown'
-    f = dict(FTITLE=f'SICD: {core}', IID2=f'SICD: {core}')
-    if ci is not None and ci.CollectorName is not None:
-        f['ISORCE'] = str(ci.CollectorName)
-    start = sm.Timeline.CollectStart if sm.Timeline is not None else None
-    if start:
-        f['IDATIM'] = ''.join(ch for ch in str(start)[:19] if ch.isdigit())
-    return f
-
-
-def build(f):
-    """SICD 1.3.0 metadata of a product imaged on a plane, with its derived fields. f: dict(
-    collector, core_name, mode ('SPOTLIGHT', 'STRIPMAP', 'DYNAMIC STRIPMAP'), application, created (the creation
-    time, 'YYYY-MM-DDThh:mm:ss.ffffffZ'), rows, cols, scp_pixel (row, col), scp [3] (ECF, m), plane ('GROUND' or
-    'SLANT'), t_coa (s), row and col (each dict(u [3] ECF, ss (m), wid (m), bw, kctr, k1, k2, dk (cycles/m), window
-    (None, 'hann', 'taylor' or 'sva'))), start (the collection start, as created), duration (s), arp [3, n] (the
-    polynomial coefficients of X, Y and Z in t), f0, f1 (Hz), pol ('V:V' or 'UNKNOWN'), t0, t1 (the processed
-    times, s), autofocus ('NO', 'GLOBAL' or 'SV'))."""
-    wgt = {None: [el('WindowName', 'UNIFORM')], 'hann': [el('WindowName', 'HANNING')],
-           'taylor': [el('WindowName', 'TAYLOR'), el('Parameter', '4', name='NBAR'), el('Parameter', '-35', name='SLL')],
-           'sva': [el('WindowName', 'SVA')]}
-
-    def axis(tag, a):
-        return el(tag, [el('UVectECF', np.asarray(a['u'], np.float64)), el('SS', float(a['ss'])),
-                        el('ImpRespWid', float(a['wid'])), el('Sgn', -1), el('ImpRespBW', float(a['bw'])),
-                        el('KCtr', float(a['kctr'])), el('DeltaK1', float(a['k1'])), el('DeltaK2', float(a['k2'])),
-                        poly('DeltaKCOAPoly', [[float(a['dk'])]]), el('WgtType', wgt[a['window']])])
-    pol = f['pol']
-    arp = np.asarray(f['arp'], np.float64)
-    root = el('SICD', [
-        el('CollectionInfo', [el('CollectorName', f['collector']), el('CoreName', f['core_name']),
-                              el('CollectType', 'MONOSTATIC'), el('RadarMode', [el('ModeType', f['mode'])]),
-                              el('Classification', 'UNCLASSIFIED')]),
-        el('ImageCreation', [el('Application', f['application']), el('DateTime', f['created'])]),
-        el('ImageData', [el('PixelType', 'RE32F_IM32F'), el('NumRows', int(f['rows'])), el('NumCols', int(f['cols'])),
-                         el('FirstRow', 0), el('FirstCol', 0),
-                         el('FullImage', [el('NumRows', int(f['rows'])), el('NumCols', int(f['cols']))]),
-                         el('SCPPixel', [el('Row', int(f['scp_pixel'][0])), el('Col', int(f['scp_pixel'][1]))])]),
-        el('GeoData', [el('EarthModel', 'WGS_84'), el('SCP', [el('ECF', np.asarray(f['scp'], np.float64))])]),
-        el('Grid', [el('ImagePlane', f['plane']), el('Type', 'PLANE'), poly('TimeCOAPoly', [[float(f['t_coa'])]]),
-                    axis('Row', f['row']), axis('Col', f['col'])]),
-        el('Timeline', [el('CollectStart', f['start']), el('CollectDuration', float(f['duration']))]),
-        el('Position', [el('ARPPoly', [poly(k, arp[i]) for i, k in enumerate('XYZ')])]),
-        el('RadarCollection', [el('TxFrequency', [el('Min', float(f['f0'])), el('Max', float(f['f1']))]),
-                               el('TxPolarization', pol[0] if pol != 'UNKNOWN' else 'OTHER'),
-                               el('RcvChannels', [el('ChanParameters', [el('TxRcvPolarization', pol)], index=1)],
-                                  size=1)]),
-        el('ImageFormation', [el('RcvChanProc', [el('NumChanProc', 1), el('ChanIndex', 1)]),
-                              el('TxRcvPolarizationProc', pol), el('TStartProc', float(f['t0'])),
-                              el('TEndProc', float(f['t1'])),
-                              el('TxFrequencyProc', [el('MinProc', float(f['f0'])), el('MaxProc', float(f['f1']))]),
-                              el('ImageFormAlgo', 'OTHER'), el('STBeamComp', 'NO'), el('ImageBeamComp', 'NO'),
-                              el('AzAutofocus', f['autofocus']), el('RgAutofocus', 'NO')])])
-    return derive(SICD(root))
 
 
 # ---------------------------------------------------------------------------------------------- projection
