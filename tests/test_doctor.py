@@ -62,3 +62,29 @@ def test_tpu_vm_without_the_tpu_build(monkeypatch):
     t = [t for t in c['todo'] if 'TPU' in t['what']]
     assert len(t) == 1 and 'jax[tpu]' in t[0]['command'] and 'libtpu_releases' in t[0]['command']
     assert not machine(monkeypatch)['backends']['tpu']['ok']
+
+
+def test_available_memory_honors_a_control_group_limit(tmp_path, monkeypatch):
+    """host_available under a memory limit (a container, a systemd scope): the limit less the usage, not the host's."""
+    import builtins
+    from fastsar import memory
+    files = {'/proc/self/cgroup': '0::/user.slice/job.scope\n',
+             '/sys/fs/cgroup/user.slice/job.scope/memory.max': '8589934592\n',
+             '/sys/fs/cgroup/user.slice/job.scope/memory.current': '1073741824\n',
+             '/sys/fs/cgroup/user.slice/memory.max': 'max\n',
+             '/proc/meminfo': 'MemTotal: 131072000 kB\nMemAvailable: 104857600 kB\n'}
+    real = builtins.open
+
+    def fake(path, *a, **k):
+        if path in files:
+            p = tmp_path / str(abs(hash(path)))
+            p.write_text(files[path])
+            return real(p, *a, **k)
+        if str(path).startswith(('/sys/fs/cgroup', '/proc/')):
+            raise FileNotFoundError(path)
+        return real(path, *a, **k)
+    monkeypatch.setattr(builtins, 'open', fake)
+    assert memory._cgroup_available() == 7 * 2 ** 30
+    assert memory.host_available() == 7 * 2 ** 30
+    files['/sys/fs/cgroup/user.slice/job.scope/memory.max'] = 'max\n'
+    assert memory._cgroup_available() is None and memory.host_available() == 104857600 * 1024

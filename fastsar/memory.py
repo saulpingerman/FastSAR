@@ -68,13 +68,53 @@ def _pinned(n):
     return cp.cuda.alloc_pinned_memory(_pinned_size(n))
 
 
+def _cgroup_available():
+    """Bytes this process may still use under its control group's memory limit (a container, a systemd scope, a
+    batch job), or None where there is no limit: the least of limit minus usage over the group and its ancestors
+    (cgroup v2, else v1)."""
+    try:
+        with open('/proc/self/cgroup') as fh:
+            lines = fh.read().split()
+    except OSError:
+        return None
+    best = None
+    for line in lines:
+        parts = line.split(':', 2)
+        if len(parts) != 3:
+            continue
+        if parts[0] == '0' and parts[1] == '':                      # v2: one hierarchy
+            base, lim, use = '/sys/fs/cgroup', 'memory.max', 'memory.current'
+        elif 'memory' in parts[1].split(','):                       # v1: the memory controller's hierarchy
+            base, lim, use = '/sys/fs/cgroup/memory', 'memory.limit_in_bytes', 'memory.usage_in_bytes'
+        else:
+            continue
+        d = parts[2].rstrip('/')
+        while True:
+            try:
+                with open(f'{base}{d}/{lim}') as fh:
+                    v = fh.read().strip()
+                if v != 'max' and int(v) < 1 << 60:                 # (v1 writes a huge number for no limit)
+                    with open(f'{base}{d}/{use}') as fh:
+                        left = int(v) - int(fh.read().strip())
+                    best = left if best is None else min(best, left)
+            except (OSError, ValueError):
+                pass
+            if not d:
+                break
+            d = d.rsplit('/', 1)[0]
+    return best
+
+
 def host_available():
-    """Bytes of host memory available (MemAvailable on Linux, else total physical memory)."""
+    """Bytes of host memory available: MemAvailable on Linux, less where the process runs under a control group's
+    memory limit; else total physical memory."""
     try:
         with open('/proc/meminfo') as fh:
             for line in fh:
                 if line.startswith('MemAvailable:'):
-                    return int(line.split()[1]) * 1024
+                    free = int(line.split()[1]) * 1024
+                    cg = _cgroup_available()
+                    return free if cg is None else max(min(free, cg), 0)
     except OSError:
         pass
     try:

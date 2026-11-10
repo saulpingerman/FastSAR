@@ -77,6 +77,9 @@ was published on PyPI.
 
 ### Fixed
 
+- Memory planning under a control group's limit (a container, a systemd scope, a batch job): the memory available
+  was read from the host alone, so a run limited to less than the host's free memory planned for more than it
+  could use and was killed. The limit, less the group's usage, now bounds it.
 - The CUDA backend on an image narrow in range from a wide-band collection (a range decimation of 55 with a
   403-tap filter on an Umbra collection formed on axes along the line of sight): the first-level kernel's window
   did not fit the GPU's shared memory and the former raised a `ValueError`. The kernel now keeps one copy of the
