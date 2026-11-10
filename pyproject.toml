@@ -37,6 +37,8 @@ Source = "https://github.com/saulpingerman/FastSAR"
 Issues = "https://github.com/saulpingerman/FastSAR/issues"
 Changelog = "https://github.com/saulpingerman/FastSAR/blob/main/CHANGELOG.md"
 
+[project.scripts]
+fastsar-doctor = "fastsar.doctor:main"
 [project.optional-dependencies]
 cuda = ["cupy-cuda12x>=13"]
 io = ["sarpy>=1.3.64"]

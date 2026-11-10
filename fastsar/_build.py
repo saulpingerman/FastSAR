@@ -159,7 +159,8 @@ def shared_object(name, src, flags):
             except FileNotFoundError:
                 raise RuntimeError(f"fastsar's cpu backend compiles its C++ kernels on first use and needs a C++ compiler "
                                    f'with OpenMP: {cxx!r} was not found. Install g++ (Debian/Ubuntu: apt install g++; '
-                                   'RHEL/Fedora: dnf install gcc-c++) or point CXX at one') from None
+                                   'RHEL/Fedora: dnf install gcc-c++) or point CXX at one. python -m fastsar.doctor lists '
+                                   'what this machine is missing') from None
             except subprocess.CalledProcessError as e:
                 raise RuntimeError(f'compiling the {name} kernel failed ({" ".join(cmd)}):\n{e.stderr.strip()}') from None
         os.replace(tmp, so)
