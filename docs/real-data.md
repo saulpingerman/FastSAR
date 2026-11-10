@@ -1,6 +1,6 @@
 # Real data: CPHD, SICD and vendor collections
 
-Reading CPHD needs sarpy (the `io` extra).
+Reading CPHD uses sarpy for the file's metadata (a dependency of FastSAR); the samples are read directly.
 
 ## Reading CPHD
 

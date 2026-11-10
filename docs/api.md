@@ -6,7 +6,8 @@
 ## `fastsar`
 
 - `process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None, autofocus=None, weighting=None,
-  remap='nrl', remap_args=None, spacing=None, sicd=None, mode='auto', backend='auto', precision='float32',
+  remap='nrl', remap_args=None, spacing=None, extent=None, sicd=None, mode='auto', backend='auto',
+  precision='float32',
   shadows_down=True, nesz_db=None, scene_sigma0_db=-10.0, height=None, channel=0, troposphere=None,
   reader_options=None, target_db=-40.0)`: from a CPHD file to a SICD or SIDD
   ([product-options.md](product-options.md)). Returns the product dict (`form_cphd`'s entries on the product's
@@ -14,12 +15,14 @@
   written, `path` and `metadata`.
 - `form_cphd(cphd, sicd=None, *, mode='auto', backend='auto', window=True, spacing=None, channel=0, patch=1024,
   azimuth_fraction=0.8, extent=None, height=None, precision='float32', target_db=-40.0, info=None,
-  autofocus=False, troposphere=None, reader_options=None)`: the image of a CPHD file ([processing-chain.md](processing-chain.md#2-form)).
+  autofocus=False, troposphere=None, reader_options=None, axes='track', aperture='auto')`: the image of a CPHD file ([processing-chain.md](processing-chain.md#2-form)).
   `mode`: `'auto'`, `'spotlight'`, `'moving'`. `troposphere`: passed to `read_cphd` (default: the delay the file
   gives is removed; `'model'` removes a standard-atmosphere delay for files that give none). `sicd`: path, `.xml` or sarpy SICDType. `spacing`, `extent`: (along, across
   track) in m. `height`: grid height above the ellipsoid. Returns a dict: `image` [nx, ny] complex64, `origin`
   (pixel (0, 0)), `e1`, `e2`, `spx`, `spy`, `mode`, `band` (first and last frequency), `bandwidth` (spatial
-  frequency support along e1, e2), `window`, `phase_error` (or None), `meta` (from `read_cphd`), `notes`.
+  frequency support along e1, e2), `window`, `phase_error` (or None), `meta` (from `read_cphd`), `notes`, and the
+  grid's geometry: `plane`, `axes`, `center`, `height`, `graze`, `pulses`. `axes`: `'track'`, `'los'` (a spotlight:
+  e2 along the line of sight on the ground) or `'auto'`. `aperture`: `'auto'`, `'square'` or `'full'`.
 - `form_image(S, ant, fmin, df, nx, ny, spx, spy, e1, e2, *, algorithm='ffbp', backend='auto', precision='float32',
   window=True, T='auto', ..., target_db=-40.0, ref=None, interp=None, upsample=None, center=None)`: a spotlight
   image on a grid centered on the frame origin ([algorithms.md](algorithms.md)). `algorithm`: `'ffbp'`, `'pfa'` or
@@ -125,7 +128,7 @@ SICD needs sarpy; GeoTIFFs, DEMs and map projections other than `EPSG:4326` need
 ## `fastsar.rgiqe`, `fastsar.doctor`
 
 - `rgiqe.Radiometry(cphd_path, meta, *, channel=0, pulses=None, nesz_db=None, sicd=None, sigma0_db=None,
-  scene_sigma0_db=-10.0)` with `gain_db`, `nesz_db`, `snr`, `rniirs`; `rgiqe.area_mask` and `rgiqe.area_bounds`;
+  scene_sigma0_db=-10.0, eval_pulses=64)` with `gain_db`, `nesz_db`, `snr`, `rniirs`; `rgiqe.area_mask` and `rgiqe.area_bounds`;
   `rgiqe.rniirs`, `information_density`, `snr_to_rniirs`, `rniirs_to_snr`
   ([product-options.md](product-options.md#processed-area-by-image-quality)).
 - `python -m fastsar.doctor [--install] [--json]`, or `doctor.check()`: what this machine can run and the commands
@@ -144,8 +147,8 @@ SICD needs sarpy; GeoTIFFs, DEMs and map projections other than `EPSG:4326` need
 - `image_autofocus(img, mode, **kw)`: `(img2, info)` for a baseband image whose axis 0 is azimuth; mode
   `'quadratic'`, `'pga'`, `'spatially_variant'`, `'spatially_variant_pga'` or `None`
   ([product-options.md](product-options.md#autofocus-on-the-image)). `quadratic(img, *, iterations=6, lines=0.3,
-  tol=0.02, guard=True)` and `spatially_variant(img, *, block=512, overlap=0.5, method='quadratic', order=2,
-  guard=True)` are the modes themselves.
+  tol=0.02, guard=True, ...)` and `spatially_variant(img, *, block=512, overlap=0.5, method='quadratic', order=2,
+  guard=True, ...)` are the modes themselves.
 - `autofocus(S, ant, fmin, df, nx, ny, spx, spy, e1, e2, rounds=2, pga_kwargs=None, **form_kwargs)`: returns
   `(image, phi)`, phi per pulse. `pga(img, ...)` works on an image in the polar-format convention; `deramp_phase`
   and `pulse_bins` support it.

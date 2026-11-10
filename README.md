@@ -28,17 +28,19 @@ a float64 backprojection at 64 times oversampling, the open-source codes to the 
 Linux on x86-64 or 64-bit ARM and macOS on Apple silicon, Python 3.10 to 3.13. The CPU kernels compile on first
 use: with `g++` and OpenMP on Linux (GCC 12 or later on ARM; Debian and Ubuntu: `apt install g++`), with Apple's clang on macOS (the command
 line tools, `xcode-select --install`, which also serve the Metal backend of `ExactFormer` on Apple GPUs); the
-`cuda` extra needs an Nvidia driver for CUDA 12 and the `tpu` extra a Cloud TPU VM.
+GPU backend needs an Nvidia driver for CUDA 12 or later and the `tpu` extra a Cloud TPU VM.
 
 ```bash
-pip install fastsar                  # CPU (and JAX on whatever device it has)
-pip install "fastsar[io]"            # io: sarpy for CPHD and SICD
-pip install "fastsar[cuda]"          # cuda: CuPy for Nvidia GPUs
+pip install fastsar                  # CPU, Nvidia GPU, and the CPHD, SICD and SIDD files
 pip install "fastsar[tpu]"           # tpu: jax[tpu] for Cloud TPUs
 pip install "fastsar[geo]"           # geo: rasterio for GeoTIFFs and DEMs
 pip install "fastsar[raw]"           # raw: h5py for the NISAR raw reader
-pip install "fastsar[cuda,io,geo]"   # extras combine
 ```
+
+On Linux x86-64 the installation includes CuPy and the CUDA runtime libraries (about 2 GB), so a machine with an
+Nvidia driver uses its GPU with no system CUDA toolkit; on other platforms `pip install "fastsar[cuda]"` adds
+CuPy where its wheels exist. An environment that already holds another CuPy build should install FastSAR with
+`--no-deps` and its dependencies by hand, since two CuPy wheels cannot share an environment.
 
 What a machine needs beyond pip's packages depends on its hardware. After installing, `python -m fastsar.doctor`
 reports which backends are ready (the C++ compiler for the CPU kernels, CuPy for the GPU's CUDA version, the TPU

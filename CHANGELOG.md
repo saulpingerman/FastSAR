@@ -3,7 +3,7 @@
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The date of a version is the day it
 was published on PyPI.
 
-## [Unreleased]
+## [0.2.0] - unreleased
 
 ### Added
 
@@ -38,11 +38,16 @@ was published on PyPI.
 - `python -m fastsar.doctor` (also the `fastsar-doctor` command): reports which backends this machine can run and
   prints the command that installs each missing piece, from the C++ compiler of the CPU kernels to the CuPy build
   for the GPU driver's CUDA version; `--install` runs the pip commands among them.
+- `process_cphd(..., spacing=, extent=)`: the product's pixel spacing, and the tasked area's sides for a collection
+  that states no image area.
 - `form_cphd(..., axes='los' | 'auto', aperture='auto' | 'square' | 'full')`, and the grid's geometry in its
   output (`plane`, `axes`, `center`, `height`, `graze`, `pulses`).
 
 ### Changed
 
+- Installation. CuPy with the CUDA runtime libraries is a dependency on Linux x86-64, and sarpy everywhere, so
+  that `pip install fastsar` alone gives the GPU backend and the file formats; the `cuda` and `io` extras remain
+  as names. An environment that already holds another CuPy build should install with `--no-deps`.
 - `read_cphd` reads the samples of a CPHD 1.x file from the file's own bytes on all cores (sarpy still parses the
   header and metadata, and reads compressed signal blocks), and conjugates and checks them on all cores. The
   samples are identical; reading an 8.7 GB Umbra collection takes 2.1 s where it took 5.9 s, and a 9.2 GB Capella
@@ -54,6 +59,10 @@ was published on PyPI.
 
 ### Fixed
 
+- The CUDA backend on an image narrow in range from a wide-band collection (a range decimation of 55 with a
+  403-tap filter on an Umbra collection formed on axes along the line of sight): the first-level kernel's window
+  did not fit the GPU's shared memory and the former raised a `ValueError`. The kernel now keeps one copy of the
+  window there and reloads the raw samples.
 - Polar format on the CPU from an installed wheel or source distribution. `pfa_cpu.cpp`, the C++ kernel of the
   final resampling added in 0.1.7, was not listed as package data, so 0.1.7 and 0.1.8 installed from PyPI raise
   `FileNotFoundError` on `form_image(..., algorithm='pfa')` with the CPU backend (a checkout or an editable install

@@ -224,7 +224,7 @@ def form_cphd(cphd, sicd=None, *, mode='auto', backend='auto', window=True, spac
                                                 pulses=used)) or {})
     if plan.get('window') is not None:
         window = bool(plan['window'])
-    if plan.get('axes') is not None:                  # any plane through the center (a study's slant-plane grid)
+    if plan.get('axes') is not None:                  # any plane through the center (a slant-plane grid)
         e1, e2 = (np.asarray(v, np.float64) for v in plan['axes'])
     if window:
         wk = _taylor(K)

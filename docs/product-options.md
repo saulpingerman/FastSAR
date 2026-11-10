@@ -1,7 +1,7 @@
 # Product options: area, plane, autofocus, weighting, SICD and SIDD
 
-`process_cphd` goes from a CPHD file to a product on disk in one call and exposes the choices a production
-processor offers. `form_cphd` remains the formation step underneath it and keeps its own defaults.
+`process_cphd` goes from a CPHD file to a product on disk in one call. `form_cphd` remains the formation step
+underneath it and keeps its own defaults.
 
 ```python
 import fastsar
@@ -19,10 +19,21 @@ The options and their defaults:
 - `weighting`: `'taylor'`, `'uniform'` or `'sva'`. The default is Taylor for a SICD and spatially variant
   apodization for a SIDD.
 - `remap`: for a SIDD, one of the remaps of the NGA MATLAB SAR Toolbox (`'nrl'` by default).
-- `spacing`: the product's pixel spacing. The default follows the bandwidth of the data.
+- `spacing`: the product's pixel spacing. The default follows the bandwidth of the data: 0.96 of the reciprocal
+  of the band for a complex product, half of it with `'sva'`, and 0.7 of the finer ground resolution for a SIDD
+  (one number: its pixels are square). A spacing coarser than the band allows is used as given, with a note in
+  the product that the image is aliased.
+- `extent`: the sides of the tasked area in meters about the scene center, for a collection that states no image
+  area or in place of the one it states.
+
+Some combinations are refused with a `ValueError` before the image is formed: a SIDD on the slant plane, a
+ground-plane SICD with `'sva'` (apodization runs on the slant plane), and a `spacing` with `'sva'` for a SICD
+(apodization fixes the spacing at twice Nyquist). Without an `output` nothing is written, and the image of a SIDD
+product is returned as the detected amplitude; `sidd.to_display(out, out['remap'])` gives its display values.
 
 A moving-beam collection (stripmap, sliding spotlight) is formed on the ground plane on axes along the track.
-The slant plane, autofocus, apodization and the quality areas apply to spotlight collections.
+The slant plane, autofocus, apodization and the quality areas apply to spotlight collections: asking for one of
+them on a moving-beam collection raises a `ValueError`.
 
 ## Planes
 
@@ -39,8 +50,8 @@ both ways are closed forms (`planes.ground_to_slant`, `planes.slant_to_ground`).
 
 The resampling works on ground axes along the line of sight (`form_cphd(axes='los')`). After the carrier is
 removed (`planes.deramp`, exact at every pixel), the image's spectrum is a parallelogram whose extent across the
-line of sight is the azimuth band alone. Each line across the line of sight is then band limited however the
-spectrum wraps along it. `planes.to_slant` interpolates along that axis first, which leaves a spectrum that is a
+line of sight is the azimuth band alone. Each line across the line of sight is then band limited, and a
+one-dimensional interpolation along it is exact even though the spectrum wraps along the other axis. `planes.to_slant` interpolates along that axis first, which leaves a spectrum that is a
 rectangle in azimuth and ground range, and then along the line of sight. Each pass oversamples by two with an FFT
 and applies an 8-tap Kaiser sinc from a table. `planes.sampling` gives the pixel spacings the ground image needs
 from the collection's own spectrum at points of the scene; `process_cphd` uses 0.96 of their reciprocal.
@@ -57,20 +68,24 @@ collections over their tasked areas, the slant grid being the rectangle that cov
 | Capella spotlight, 152 Mpx on the ground | 2.3 degrees, 33,073 pulses | 5.8 s | 12.9 s + 4.4 s | 0.45 |
 
 Direct formation is the cheaper one, for two reasons. The projection is a second pass over the image, and the
-slant rectangle that covers a ground rectangle is larger than it wherever the collection is squinted (2.3 and 1.4
-times the pixels here). It is also the exact one. Backprojection onto a plane is exact for the points of that
+slant rectangle that covers a ground rectangle is larger than it wherever the collection is squinted (2.3 times the pixels
+for the Umbra collection and 1.4 times for the Capella one). It is also the exact one. Backprojection onto a plane is exact for the points of that
 plane, and a ground scatterer is not on the slant plane: its range history equals that of its slant-plane image
 point only on a straight track. Over the Umbra aperture the difference is small. Over the longer Capella aperture
-the slant-formed image no longer matches the ground-formed one (amplitude correlation 0.56). FastSAR therefore
+the slant-formed image no longer matches the ground-formed one (the correlation of the two amplitude images, which
+ignores phase altogether, is 0.56). FastSAR therefore
 forms on the ground plane always, and derives the slant-plane product from it by the range and range-rate map,
 which is exact at the center of aperture for any track.
 
 A ground-plane SICD is the image as formed, at baseband, on axes along the line of sight. Its rows run along
-ground range away from the radar whatever the squint.
+ground range away from the radar whatever the squint. It is sampled for the whole extent of its spectrum along
+the line of sight, which under squint is wider than the range band alone, so that the product's spectrum does not
+wrap.
 
 In `tests/test_planes.py` and `tests/test_process.py`, on a simulated collection with a 20 to 25 degree squint
 and a curved track, flown to either side, each target falls within 0.05 pixel of the position sarpy's projection
-of the written SICD gives, on both planes, and its phase is within 0.05 rad of SICD's convention.
+of the written SICD gives, on both planes, and on the slant plane its phase is within 0.01 rad of SICD's
+convention.
 
 ## Processed area by image quality
 
@@ -124,12 +139,17 @@ area is the connected region around the scene reference point, joined with the t
 ### Example
 
 ```python
+import numpy as np
 from fastsar import io, rgiqe
 data, meta = io.read_collection('collect.cphd', meta=True)
 rad = rgiqe.Radiometry('collect.cphd', meta)                  # see rad.level_source and rad.notes
-c = rad.ref_point[None]                                       # points are [n, 3] in the local frame of meta
-print(rad.nesz_db(c, bw_area, samples), rad.rniirs(c, bw_area, samples))
-lo1, hi1, lo2, hi2 = rgiqe.area_bounds(rad, 'black', c[0], e1, e2, bw_area, samples, tasked=corners)
+c = rad.ref_point                                             # the scene reference point, local frame of meta
+e2 = rad.range_dir                                            # ground axes: along the line of sight, and across
+e1 = np.cross(e2, [0.0, 0.0, 1.0])
+bw_area = 4.0 * 3.5 * np.cos(rad.graze)                       # range band x azimuth band (cycles/m) x cos(slope)
+samples = data['S'].size                                      # pulses x frequency samples
+print(rad.nesz_db(c[None], bw_area, samples), rad.rniirs(c[None], bw_area, samples))
+lo1, hi1, lo2, hi2 = rgiqe.area_bounds(rad, 'black', c, e1, e2, bw_area, samples)
 ```
 
 ### Limitations
@@ -142,8 +162,10 @@ lo1, hi1, lo2, hi2 = rgiqe.area_bounds(rad, 'black', c[0], e1, e2, bw_area, samp
 
 `process_cphd(..., area=)` takes the same four kinds. The image is formed over the bounding rectangle of the area
 on the ground axes, with one impulse response everywhere and a noise-equivalent sigma zero that rises toward the
-edges, and the pixels outside the area are set to 0. A file that describes no antenna pattern gives the signal no
-edge to follow, and only the tasked area can then be processed.
+edges, and the pixels outside the area are set to 0. For a file that describes no antenna pattern the model cannot
+predict where the signal fades, and an `area` other than `'tasked'` raises a `ValueError`. The model's beam is
+the one the file's antenna block states; where a producer's stated boresight differs from the true beam, the
+area is displaced with it.
 
 ## Autofocus on the image
 
@@ -197,9 +219,9 @@ smaller block or a larger `overlap` reduces. The block PGA estimate is single-th
 
 `process_cphd(..., autofocus=)` runs these on the baseband ground image, before any resampling, and records the
 mode in the SICD (`AzAutofocus` GLOBAL or SV). In `tests/test_autofocus_image.py` a quadratic error of 2 to 40
-rad at the band edge is recovered within 0.5% on synthetic images, and a simulated collection with a quadratic
-error injected into its phase history returns to the error-free azimuth resolution within 0.7% and peak sidelobe
-within 0.3 dB.
+rad at the band edge is recovered within 3% on synthetic images (0.5% measured), and a simulated collection
+with a quadratic error injected into its phase history returns to the error-free azimuth resolution within 2%
+and peak sidelobe within 0.5 dB (0.7% and 0.3 dB measured).
 
 ## Weighting and spatially variant apodization
 
@@ -209,8 +231,8 @@ within 0.3 dB.
 the cosine-on-pedestal weighting that gives the least output. Main lobes keep the unweighted width and sidelobes
 are removed where the spectrum is a rectangle sampled at an integer multiple of Nyquist. Two steps make it so.
 `weighting.keystone` drops, at each frequency, the pulses outside the azimuth band the lowest frequency reaches
-(the azimuth band of a pulse fan grows with frequency; about 3% of the samples go on an X-band collection with
-600 MHz of bandwidth). The slant image is then resampled at exactly twice Nyquist of the rectangle that is left.
+(the azimuth band of a pulse fan grows with frequency; 2.8% and 2.6% of the samples on the Umbra and Capella
+collections of the table above). The slant image is then resampled at exactly twice Nyquist of the rectangle that is left.
 The result is not band limited and not linear in the scene, so it suits detection and display. A SICD with
 `weighting='sva'` is allowed on the slant plane and records the weighting as SVA.
 
@@ -264,6 +286,7 @@ the standard are corrected: the specification version and date in the XML segmen
 segment's corner coordinates, which sarpy truncates to the arcsecond where the standard rounds.
 
 In `tests/test_sidd.py`, on a simulated collection flown both ways, the round trip keeps every pixel, the SIDD's
-projection of the measured peaks falls within 5 mm (0.01 pixel) of the true target positions, an asymmetric
+projection of the measured peaks falls within 0.1 pixel of the true target positions (0.01 pixel measured), an asymmetric
 target pattern appears with range down the rows and unmirrored for either look direction, and sarkit's
-consistency check passes without errors or warnings for SIDD 3.0, SIDD 2.0, a masked product and an embedded SICD.
+consistency check (Python 3.11 or later) reports no errors for SIDD 3.0, SIDD 2.0, a masked product and an
+embedded SICD.
