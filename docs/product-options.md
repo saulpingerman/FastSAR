@@ -76,6 +76,16 @@ resampling to the slant plane includes a mask of valid ground pixels.
 Each stage compiles once per image shape: 45, 28 and 110 s for the resampling to the slant plane of the three
 sizes, 8 to 14 s for the projection to the ground, and 30 to 50 s for the autofocus estimate.
 
+The default products of a small Umbra spotlight collection (a 0.64 GB CPHD file) on the same TPU v5e, second run,
+in seconds:
+
+| Product | Read | Form | After formation | Write | Total |
+|---|---|---|---|---|---|
+| Slant SICD, 23 Mpx | 13.0 | 1.49 | 0.46 | 0.22 | 15.2 |
+| Ground SIDD, 50 Mpx | 13.0 | 1.42 | 1.32 | 0.22 | 16.0 |
+
+The first run of each product, which compiles, takes 103 and 84 s.
+
 ## Planes
 
 FastSAR forms every spotlight image on a ground plane, where backprojection is exact for any track. A planar
