@@ -115,8 +115,9 @@ that a missing one raises an `ImportError` naming the extra to install.
    after upload.
 3. `rm -rf build dist *.egg-info && uv build && uvx twine check dist/*`, then install the wheel in a fresh
    environment with a C++ compiler and run `python examples/chain.py --simulate out` (the `package` job does the same).
-   Run the `wheels` workflow at the release commit and add the platform wheels from its artifacts to `dist/`
-   before the upload.
+   Run the `wheels` workflow at the release commit. A release carries its platform wheels and the source
+   distribution, and no pure wheel: remove `dist/*-none-any.whl` and put the workflow's wheels in `dist/` before
+   the upload. Platforms without a wheel then install the source distribution.
 4. Commit, tag annotated (`git tag -a vX.Y.Z -m "FastSAR X.Y.Z"`), push the tag, upload with `uvx twine upload
    dist/*`, and publish the GitHub release with the changelog section as its notes.
 

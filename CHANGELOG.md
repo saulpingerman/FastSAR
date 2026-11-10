@@ -12,13 +12,20 @@ was published on PyPI.
   x86-64-v3 (AVX2) and x86-64-v4 (AVX-512), and the best one the processor runs is loaded. The prebuilt objects
   need no OpenMP runtime: their loops run on threads kept between calls (`par.hpp`), and `OMP_NUM_THREADS` sets
   their number. Where a compiler is present the kernels are still compiled on first use for the exact processor.
-- `FASTSAR_KERNELS=native` or `prebuilt` forces one of the two; `FASTSAR_KERNEL_LEVEL` selects one prebuilt level,
+- `FASTSAR_KERNELS=native` or `prebuilt` forces one of the two, with no fallback to the other; `FASTSAR_KERNEL_LEVEL` selects one prebuilt level,
   for tests ([docs/performance.md](docs/performance.md#cpu-kernels-native-and-prebuilt)).
 - `python -m fastsar.doctor` reports the kernels in use ("native build" or "prebuilt (x86-64-v3)"; the `kernels`
   entry of `--json`), and says when a compiler would let the CPU backend use vector extensions that the prebuilt
   level leaves out (`hints`).
 - `.github/workflows/wheels.yml` builds the wheels with cibuildwheel and tests each one in a container without a
   compiler and with one (`tests/wheel_check.py`).
+
+### Fixed
+
+- `resample.lines` and `warp`: a position within 1e-9 sample outside an end of a line is taken as the end, on the
+  CPU, CUDA and JAX paths. A map that reaches the end exactly lands some 1e-16 to either side of it in float64, and
+  the side depended on whether the kernel was compiled with fused multiply-adds, so an edge pixel could be zero on
+  one processor and not on another.
 
 ### Changed
 

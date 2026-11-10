@@ -215,6 +215,22 @@ def test_installed_prebuilt_objects_match_the_sources():
             assert o['hash'] == _build.source_hash(_build.kernel_source(spec), list(extra)), (name, level)
 
 
+def test_kept_threads_of_the_prebuilt_kernels(tmp_path):
+    """par.hpp's loops as the prebuilt Linux kernels run them (tests/par_pool.cpp): each index once, for loops in
+    succession, nested, from several threads at once and after a fork; OMP_NUM_THREADS sets the thread count."""
+    cxx = os.environ.get('CXX') or 'g++'
+    if not sys.platform.startswith('linux') or shutil.which(cxx) is None:
+        pytest.skip(f'needs Linux and a compiler ({cxx})')
+    here = os.path.dirname(os.path.abspath(__file__))
+    exe = str(tmp_path / 'par_pool')
+    r = subprocess.run([cxx, '-O2', '-std=c++17', '-pthread', '-DFASTSAR_PAR_POOL', '-I' + os.path.dirname(_build.__file__),
+                        os.path.join(here, 'par_pool.cpp'), '-o', exe], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr[-2000:]
+    r = subprocess.run([exe], capture_output=True, text=True, timeout=600, env=dict(os.environ, OMP_NUM_THREADS='5'))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert r.stdout.split() == ['threads', '5', 'serial', '0', 'concurrent', '0', 'child', '0', 'parent', '0'], r.stdout
+
+
 @pytest.fixture(scope='module')
 def built(tmp_path_factory):
     """The prebuilt objects of this platform, built as the wheel's build step builds them."""

@@ -135,7 +135,7 @@ warnings.simplefilter('ignore', fastsar.MemoryWarning)   # silence the fallback 
 | Variable | Default | Effect |
 |---|---|---|
 | `CXX` | `g++` on Linux, `clang++` on macOS | CPU kernel compiler |
-| `FASTSAR_KERNELS` | unset: the native build where there is a compiler, else the prebuilt kernels | `native`: only the kernels compiled on this machine (an error without a compiler); `prebuilt`: only the kernels a platform wheel carries. See [CPU kernels](#cpu-kernels-native-and-prebuilt) |
+| `FASTSAR_KERNELS` | unset: the native build where there is a compiler, else the prebuilt kernels | `native`: only the kernels compiled on this machine (a missing compiler or a failed build is an error: no fallback to the prebuilt kernels); `prebuilt`: only the kernels a platform wheel carries. See [CPU kernels](#cpu-kernels-native-and-prebuilt) |
 | `FASTSAR_CACHE_DIR` | `$XDG_CACHE_HOME/fastsar`, else `~/.cache/fastsar` | where natively compiled CPU kernels are cached (one shared object per source, compiler, flags and CPU) |
 | `XLA_PYTHON_CLIENT_PREALLOCATE` | set to `false` by `import fastsar` unless already set | JAX otherwise reserves 75% of a GPU's memory on first use, which the CUDA kernels and JAX programs then could not share; set it before the import to keep JAX's default |
 | `FFBP_CPU_FLAGS` | `-O3 -march=native`, with `-mprefer-vector-width=512` on x86-64 (`-O3 -mcpu=native` on macOS); the factorized kernel adds `-funroll-loops`; `backproject`: `-O3 -march=native` | compiler flags; `ExactFormer` always adds `-ffast-math`, at compile time only: the shared objects are linked without it, so loading them leaves the process's floating-point mode alone. Builds are cached per source, compiler, flags and CPU. The prebuilt kernels have fixed flags; with options here other than `-O` and `-m` ones they are not used |
@@ -182,6 +182,10 @@ the prebuilt object otherwise, or when the native build fails; a failed build le
 entry so that it is not attempted by every later process. If there is neither a compiler nor a prebuilt object
 (an installation from the source distribution on a machine without a compiler, or `FFBP_CPU_FLAGS` with options
 other than `-O` and `-m` ones), the first CPU image raises an error that says so.
+
+`FASTSAR_KERNELS=native` asks for the native build alone: without a compiler, or when the build fails, the first
+CPU image raises the build's error instead of loading a prebuilt object, so that a timing or a test of the native
+build cannot run on other kernels unnoticed. `FASTSAR_KERNELS=prebuilt` likewise never compiles.
 
 `python -m fastsar.doctor` reports which kernels are in use ("native build" or "prebuilt (x86-64-v3)"), and
 `fastsar._build.USED` lists, in a running process, the object each loaded kernel came from.

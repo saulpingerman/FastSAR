@@ -6,6 +6,7 @@ name: wheels
 on:
   push:
     tags: ['v*']
+    branches: ['prebuilt-wheels']
   workflow_dispatch:
 
 permissions:

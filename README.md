@@ -30,8 +30,9 @@ carry the CPU kernels prebuilt, so the CPU backend needs no compiler: on x86-64 
 (x86-64-v2, x86-64-v3 with AVX2, x86-64-v4 with AVX-512), of which the best one the processor runs is loaded. Where
 a C++ compiler is present the kernels are compiled on first use for the exact processor instead: `g++` with OpenMP
 on Linux (GCC 12 or later on ARM; Debian and Ubuntu: `apt install g++`), Apple's clang on macOS (the command line
-tools, `xcode-select --install`, which also serve the Metal backend of `ExactFormer` on Apple GPUs). An
-installation from the source distribution has no prebuilt kernels and needs the compiler. The GPU backend needs an
+tools, `xcode-select --install`, which also serve the Metal backend of `ExactFormer` on Apple GPUs). Other
+platforms (Linux with musl such as Alpine, other processors) have no wheel: pip installs the source distribution
+there, which has no prebuilt kernels, so the CPU backend needs the compiler. The GPU backend needs an
 Nvidia driver for CUDA 12 or later and the `tpu` extra a Cloud TPU VM.
 
 ```bash
