@@ -87,6 +87,16 @@ and a curved track, flown to either side, each target falls within 0.05 pixel of
 of the written SICD gives, on both planes, and on the slant plane its phase is within 0.01 rad of SICD's
 convention.
 
+### Against a vendor's SICD of the same collection
+
+A FastSAR product and the vendor's SICD of the same collection place a scatterer at slightly different ranges.
+`read_cphd` removes the troposphere delay the CPHD file states, and vendors' SICDs keep it, so the FastSAR image
+sits nearer by c times that delay over two: 1.2 m on an Umbra collection that states 8.1 ns, measured as a constant
+4.6 rows against the vendor's image, and 0.07 pixel with `troposphere=False`. Scatterers above or below the
+projection surface also map to slightly different ground points in two products whose centers of aperture
+differ, by about the height times the difference in look direction. `process_cphd(..., sicd=)` takes the vendor's
+footprint; the product is the rectangle that bounds it on FastSAR's own axes.
+
 ## Processed area by image quality
 
 `fastsar.rgiqe` predicts the signal-to-noise ratio and the RNIIRS rating of the image a CPHD collection forms, at
