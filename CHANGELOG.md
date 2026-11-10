@@ -12,6 +12,14 @@ was published on PyPI.
   are still refused without it, and the refusal now reports the file's `Fx0` range. From `form_cphd`, pass
   `reader_options=dict(ref_freq=0.0)`.
 
+### Fixed
+
+- Polar format on the CPU from an installed wheel or source distribution. `pfa_cpu.cpp`, the C++ kernel of the
+  final resampling added in 0.1.7, was not listed as package data, so 0.1.7 and 0.1.8 installed from PyPI raise
+  `FileNotFoundError` on `form_image(..., algorithm='pfa')` with the CPU backend (a checkout or an editable install
+  has the file, which is why the tests passed). The package data now takes every kernel source, and a test checks
+  the list against the files the modules open. Factorized backprojection, the default, was not affected.
+
 ## [0.1.8] - 2026-10-27
 
 ### Added

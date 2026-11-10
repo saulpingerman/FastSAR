@@ -57,7 +57,7 @@ packages = ["fastsar"]
 version = {attr = "fastsar.__version__"}
 
 [tool.setuptools.package-data]
-fastsar = ["ffbp_cpu.cpp", "par.hpp"]
+fastsar = ["*.cpp", "*.hpp"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
