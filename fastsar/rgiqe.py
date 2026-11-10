@@ -278,6 +278,7 @@ class Radiometry:
             self.notes.append('The file gives no delay window per pulse (TOA1, TOA2), so the range swath is not limited.')
         self._e = e
         self._ant = self._antenna(r, m, par, pv, fi, t_tx[idx], t_rcv[idx]) if v1 else None
+        self.has_antenna = self._ant is not None
         if self._ant is None:
             self.notes.append('The file has no antenna description that could be used, so the antenna gain is taken '
                               'as 0 dB everywhere and only the spreading loss shapes the signal.')

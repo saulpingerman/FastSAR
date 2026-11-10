@@ -128,6 +128,13 @@ def test_sidd_spacing_and_remap(cphd):
         fastsar.process_cphd(str(d / 'c.cphd'), product='sidd', spacing=(0.5, 0.4), autofocus=False, backend='cpu')
 
 
+def test_quality_areas_need_an_antenna_pattern(cphd):
+    d, ecf = cphd
+    for area in ('tasked_quality', 4.0, 'black'):                    # the simulator's CPHD describes no antenna
+        with pytest.raises(ValueError, match='antenna pattern'):
+            fastsar.process_cphd(str(d / 'c.cphd'), area=area, nesz_db=-20.0, autofocus=False, backend='cpu')
+
+
 def test_errors(cphd):
     d, ecf = cphd
     p = str(d / 'c.cphd')

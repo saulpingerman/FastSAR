@@ -127,6 +127,9 @@ def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None
             bw_area = (sup['k1_mid'][1] - sup['k1_mid'][0]) * (sup['k2'][1] - sup['k2'][0]) * abs(fr['normal'][2])
             rad = rgiqe.Radiometry(cphd, g['meta'], channel=channel, pulses=g['pulses'], nesz_db=nesz_db,
                                    sicd=g['sicd'], scene_sigma0_db=scene_sigma0_db)
+            if not rad.has_antenna:
+                raise ValueError(f'area={area!r}: the file describes no antenna pattern, so the signal has no edge '
+                                 "to follow; only area='tasked' can be processed")
             tasked = c + np.stack([b[[0, 1, 1, 0]], b[[2, 2, 3, 3]]], 1) @ np.stack([e1, e2])
             n = g['S'].shape[0] * K
             b = np.array(rgiqe.area_bounds(rad, area, c, e1, e2, bw_area, n, tasked=tasked))
