@@ -231,6 +231,27 @@ def test_metadata_object():
     assert type(p) is type(sm) and p.to_xml_bytes() == sm.to_xml_bytes()
     with pytest.raises(ValueError, match='root element'):
         _sicdxml.read(b'<CPHD/>')
+    assert not hasattr(sm, 'sicd_meta') and not hasattr(sm, 'shape')    # not mistaken for a reader or an array
+    for version in ('1.1.0', '1.2.1', '1.4.0'):                        # the versions read: the same elements
+        other = _sicdxml.read(sm.to_xml_bytes().replace(b'urn:SICD:1.3.0', f'urn:SICD:{version}'.encode()))
+        assert other.version == version and other.Grid.Row.SS == 0.5 and version in other.to_xml_bytes().decode()
+        assert _sicdxml.specification(other)[0] == version
+
+
+def test_radiometric_levels():
+    """The radiometry model reads the noise level and the predicted RNIIRS of a vendor SICD from the native
+    metadata as it does from sarpy's."""
+    from sarpy.io.complex.sicd_elements.SICD import SICDType
+    from sarpy.io.complex.sicd_elements.Radiometric import RadiometricType, NoiseLevelType_
+    from sarpy.io.complex.sicd_elements.CollectionInfo import CollectionInfoType
+    from fastsar import rgiqe
+    for kind, noise in (('ABSOLUTE', -30.0), ('ABSOLUTE', -80.0), ('RELATIVE', -30.0)):
+        s = SICDType(CollectionInfo=CollectionInfoType(Parameters={'PREDICTED_RNIIRS': '4.7'}),
+                     Radiometric=RadiometricType(NoiseLevel=NoiseLevelType_(NoiseLevelType=kind, NoisePoly=[[noise]]),
+                                                 SigmaZeroSFPoly=[[0.5]]))
+        a, b = [], []
+        assert rgiqe._sicd_levels(s, a) == rgiqe._sicd_levels(_sicdxml.read(s), b) and a == b
+    assert rgiqe._sicd_levels(_sicdxml.read(s), [])[1] == 4.7
 
 
 def vendor(sm, kind):

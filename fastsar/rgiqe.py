@@ -153,7 +153,7 @@ def _sicd_meta(sicd):
     if isinstance(sicd, (str, bytes, os.PathLike)):
         from . import _sicdxml
         return _sicdxml.read(sicd)
-    s = getattr(sicd, 'sicd_meta', sicd)
+    s = getattr(sicd, 'sicd_meta', sicd)                 # a reader's metadata, or the metadata themselves
     return s[0] if isinstance(s, (tuple, list)) else s
 
 

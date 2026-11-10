@@ -5,7 +5,8 @@
     root.GeoData.SCP.ECF.get_array()         # [X, Y, Z] as float64
     root.Grid.TimeCOAPoly.get_array()        # polynomial coefficients [order1 + 1, order2 + 1]
     root.Grid.TimeCOAPoly[0, 0]
-    root.Nope                                # None: a missing element reads as None
+    root.Nope                                # None: a missing element reads as None (an all-lower-case name, which
+                                             # no element has, raises AttributeError)
     root.Grid.Type = 'PLANE'; root.PFA = None    # set a leaf's text; None removes the element
     root.to_xml_bytes()
 
@@ -105,7 +106,7 @@ class Node:
             return t
 
     def __getattr__(self, name):
-        if name.startswith('_'):
+        if name.startswith('_') or name.islower():      # no element name is all lower case: not a metadata field
             raise AttributeError(name)
         e, sp = self._e, self._spec
         al = sp.aliases.get((e.tag, name))
