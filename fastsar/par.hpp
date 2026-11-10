@@ -30,6 +30,9 @@ template <class F> void for_dynamic(long n, int chunk, F&& f)
 #include <atomic>
 #include <thread>
 #include <vector>
+#if defined(FASTSAR_PAR_POOL) && defined(__linux__)
+#include <sched.h>
+#endif
 namespace par {
 inline int max_threads()
 {
@@ -37,6 +40,10 @@ inline int max_threads()
         const int n = std::atoi(s);
         if (n > 0) return n;
     }
+#if defined(FASTSAR_PAR_POOL) && defined(__linux__)
+    cpu_set_t set;                                // the CPUs this process may run on (taskset, a cpuset), as OpenMP
+    if (sched_getaffinity(0, sizeof set, &set) == 0 && CPU_COUNT(&set) > 0) return CPU_COUNT(&set);       // counts
+#endif
     const unsigned h = std::thread::hardware_concurrency();
     return h ? (int)h : 1;
 }

@@ -65,6 +65,30 @@ version = {attr = "fastsar.__version__"}
 [tool.setuptools.package-data]
 fastsar = ["*.cpp", "*.hpp"]
 
+# Platform wheels with prebuilt CPU kernels (setup.py; .github/workflows/wheels.yml runs this). The kernels are
+# loaded with ctypes, so one py3-none wheel per platform serves every Python version: one build each.
+[tool.cibuildwheel]
+build = "cp312-*"
+skip = "*-musllinux_*"
+archs = ["native"]
+build-frontend = "build"
+environment = {FASTSAR_PREBUILT = "1"}
+# in the build image, which has a compiler: the kernels are then built natively, the prebuilt ones when asked for
+test-command = [
+    "python {project}/tests/wheel_check.py --expect native",
+    "FASTSAR_KERNELS=prebuilt python {project}/tests/wheel_check.py --expect prebuilt",
+    "python -m fastsar.doctor --no-probe",
+]
+
+[tool.cibuildwheel.linux]
+manylinux-x86_64-image = "manylinux_2_28"
+manylinux-aarch64-image = "manylinux_2_28"
+# the test environment needs no GPU packages
+test-environment = {JAX_PLATFORMS = "cpu", CUDA_VISIBLE_DEVICES = ""}
+
+[tool.cibuildwheel.macos]
+environment = {FASTSAR_PREBUILT = "1", MACOSX_DEPLOYMENT_TARGET = "11.0"}
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]

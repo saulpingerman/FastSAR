@@ -138,6 +138,21 @@ def _supported():
     return (sys.platform == 'darwin' or sys.platform.startswith('linux')) and platform.machine() in MACHINES
 
 
+def compiler_found(cxx):
+    """Whether the compiler command exists. On macOS /usr/bin/clang++ exists on every machine: without the command
+    line tools it is a stub that opens an installation dialog and fails, so there the tools are asked for
+    (xcode-select -p, which opens nothing)."""
+    path = shutil.which(cxx)
+    if path is None:
+        return False
+    if sys.platform == 'darwin' and os.path.dirname(os.path.abspath(path)) == '/usr/bin':
+        try:
+            return subprocess.run(['/usr/bin/xcode-select', '-p'], capture_output=True, timeout=10).returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            return False
+    return True
+
+
 def _no_compiler(cxx):
     return (f"fastsar's cpu backend compiles its C++ kernels on first use and needs a C++ compiler "
             f'with OpenMP: {cxx!r} was not found. Install g++ (Debian/Ubuntu: apt install g++; '
@@ -209,13 +224,14 @@ KERNELS = (('ffbp_cpu', 'ffbp_cpu.cpp', ('-funroll-loops', '-std=c++17'), True, 
 LEVELS = {
     ('linux', 'x86_64'): (
         ('v2', 'x86-64-v2', ('-march=x86-64-v2',), ('cx16', 'lahf_lm', 'popcnt', 'pni', 'sse4_1', 'sse4_2', 'ssse3')),
-        ('v3', 'x86-64-v3', ('-march=x86-64-v3',), ('avx', 'avx2', 'bmi1', 'bmi2', 'f16c', 'fma', 'abm', 'movbe', 'xsave')),
+        ('v3', 'x86-64-v3', ('-march=x86-64-v3',),
+         ('avx', 'avx2', 'bmi1', 'bmi2', 'f16c', 'fma', 'abm', 'movbe', 'xsave')),
         ('v4', 'x86-64-v4', ('-march=x86-64-v4',), ('avx512f', 'avx512bw', 'avx512cd', 'avx512dq', 'avx512vl'))),
     ('linux', 'aarch64'): (('neon', 'armv8-a', ('-march=armv8-a',), ('asimd',)),),
     ('darwin', 'arm64'): (('apple', 'Apple silicon', ('-mcpu=apple-m1',), ()),),
 }
 PREBUILT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '_prebuilt')
-USED = {}                    # kernel name -> dict(path 'native' or 'prebuilt', level, file, note): what this process loaded
+USED = {}        # kernel name -> dict(path 'native' or 'prebuilt', level, file, note): what this process loaded
 _MANIFEST = []
 
 
@@ -330,7 +346,8 @@ def prebuilt(name, src, flags, load=True):
     are present). -> (path, level label, None) or (None, None, the reason there is none)."""
     m = prebuilt_manifest()
     if m is None:
-        return None, None, 'this installation carries no prebuilt kernels for this platform'
+        return None, None, ('this installation carries no prebuilt kernels for this platform (the platform wheels do; '
+                            'an installation from the source distribution or from a checkout does not)')
     want = _level_wanted()
     h = source_hash(src, flags)
     why = f'this installation carries no prebuilt {name} kernel for this CPU'
@@ -384,7 +401,7 @@ def shared_object(name, src, flags):
             raise RuntimeError(f'FASTSAR_KERNELS=prebuilt (or FASTSAR_KERNEL_LEVEL): {why}')
         USED[name] = dict(path='prebuilt', level=label, file=so, note=None)
         return so
-    cxx, failed, err = None, None, None
+    cxx, failed, err, tried = None, None, None, False
     try:
         so, failed = _native(name, src, flags, build=False)
         if so is not None:
@@ -393,10 +410,9 @@ def shared_object(name, src, flags):
         cxx = compiler()[0]
     except RuntimeError as e:                                      # macOS without a compiler, GCC before 12 on ARM
         err = e
-    pre, label, why = prebuilt(name, src, flags)
-    if cxx is not None and shutil.which(cxx) is None:
+    if cxx is not None and not compiler_found(cxx):
         err = RuntimeError(_no_compiler(cxx))
-    elif cxx is not None and pre is not None and os.path.exists(failed):
+    elif cxx is not None and os.path.exists(failed) and prebuilt(name, src, flags)[0] is not None:
         err = RuntimeError(f'an earlier native build failed (remove {failed} to try again)')
     elif cxx is not None:
         try:
@@ -404,16 +420,16 @@ def shared_object(name, src, flags):
             USED[name] = dict(path='native', level=None, file=so, note=None)
             return so
         except RuntimeError as e:
-            err = e
-            if pre is not None:                                    # not compiled again by every later process
-                try:
-                    with open(failed, 'w') as fh:
-                        fh.write(str(e))
-                except OSError:
-                    pass
+            err, tried = e, True
+    pre, label, why = prebuilt(name, src, flags)                   # looked up only now: a native build loads no other
     if pre is None:
-        raise RuntimeError(f'{err}\n{why[0].upper() + why[1:]} (the platform wheels from PyPI do; an installation '
-                           'from the source distribution or a checkout does not).') from None
+        raise RuntimeError(f'{err}\n{why[0].upper() + why[1:]}.') from None
+    if tried:                                                      # so that later processes do not compile again
+        try:
+            with open(failed, 'w') as fh:
+                fh.write(str(err))
+        except OSError:
+            pass
     USED[name] = dict(path='prebuilt', level=label, file=pre, note=str(err).splitlines()[0])
     return pre
 

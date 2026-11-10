@@ -135,9 +135,10 @@ warnings.simplefilter('ignore', fastsar.MemoryWarning)   # silence the fallback 
 | Variable | Default | Effect |
 |---|---|---|
 | `CXX` | `g++` on Linux, `clang++` on macOS | CPU kernel compiler |
-| `FASTSAR_CACHE_DIR` | `$XDG_CACHE_HOME/fastsar`, else `~/.cache/fastsar` | where compiled CPU kernels are cached (one shared object per source, compiler, flags and CPU) |
+| `FASTSAR_KERNELS` | unset: the native build where there is a compiler, else the prebuilt kernels | `native`: only the kernels compiled on this machine (an error without a compiler); `prebuilt`: only the kernels a platform wheel carries. See [CPU kernels](#cpu-kernels-native-and-prebuilt) |
+| `FASTSAR_CACHE_DIR` | `$XDG_CACHE_HOME/fastsar`, else `~/.cache/fastsar` | where natively compiled CPU kernels are cached (one shared object per source, compiler, flags and CPU) |
 | `XLA_PYTHON_CLIENT_PREALLOCATE` | set to `false` by `import fastsar` unless already set | JAX otherwise reserves 75% of a GPU's memory on first use, which the CUDA kernels and JAX programs then could not share; set it before the import to keep JAX's default |
-| `FFBP_CPU_FLAGS` | `-O3 -march=native`, with `-mprefer-vector-width=512` on x86-64 (`-O3 -mcpu=native` on macOS); the factorized kernel adds `-funroll-loops`; `backproject`: `-O3 -march=native` | compiler flags; `ExactFormer` always adds `-ffast-math`, at compile time only: the shared objects are linked without it, so loading them leaves the process's floating-point mode alone. Builds are cached per source, compiler, flags and CPU |
+| `FFBP_CPU_FLAGS` | `-O3 -march=native`, with `-mprefer-vector-width=512` on x86-64 (`-O3 -mcpu=native` on macOS); the factorized kernel adds `-funroll-loops`; `backproject`: `-O3 -march=native` | compiler flags; `ExactFormer` always adds `-ffast-math`, at compile time only: the shared objects are linked without it, so loading them leaves the process's floating-point mode alone. Builds are cached per source, compiler, flags and CPU. The prebuilt kernels have fixed flags; with options here other than `-O` and `-m` ones they are not used |
 | `FASTSAR_CPU_GROUP_GB` | a quarter of available memory | CPU first-level group budget (GB) |
 | `FASTSAR_CUDA_GROUP` | from free memory: 8 at full speed | CUDA first-level children per group |
 | `FASTSAR_TPU_GROUP` | from the device's memory: 4 at full speed | TPU first-level children per group |
@@ -154,8 +155,45 @@ warnings.simplefilter('ignore', fastsar.MemoryWarning)   # silence the fallback 
 
 Numeric settings out of range raise `ValueError`. The `FFBP_` prefix is a legacy name. `FASTSAR_CPU_BLOCKED` (`1`
 forces the CPU's pulse blocks, `0` forbids them), `FASTSAR_PROFILE_WINDOW_ROWS`, `FASTSAR_FIRP` (`smem` or `global`; `FASTSAR_FIRP_GLOBAL` as before), the cuda launch parameters `FASTSAR_CUDA_PB`, `FASTSAR_CUDA_JT`, `FASTSAR_FIRP_SMEM`, `FASTSAR_FINAL_PPS`, `FASTSAR_FINAL_COLB`, `FASTSAR_TC_KERNEL`, `FASTSAR_TC_PPS`, `FASTSAR_TC_MW`, `FASTSAR_TC_SPEC`, `FASTSAR_TC_NH`,
-`FFBP_FORCE_TPU_KERNELS` and `FASTSAR_TEST_MAX_GB` (the default of the tests' `--max-rss-gb` option) exist for the
-tests only.
+`FFBP_FORCE_TPU_KERNELS`, `FASTSAR_KERNEL_LEVEL` (one level of the prebuilt kernels: `v2`, `v3` or `v4` on x86-64,
+`neon` on Linux ARM, `apple` on macOS; an error if the processor lacks the level) and `FASTSAR_TEST_MAX_GB` (the
+default of the tests' `--max-rss-gb` option) exist for the tests only.
+
+## CPU kernels: native and prebuilt
+
+The CPU kernels are C++ sources in the package. Each is used as a shared object from one of two places.
+
+**Native build.** Where a C++ compiler is present, a kernel is compiled on first use with `-O3 -march=native` for
+the exact processor and cached in `FASTSAR_CACHE_DIR`. Its loops run on the compiler's OpenMP runtime (on macOS,
+which has none by default, on `std::thread`).
+
+**Prebuilt.** The wheels for Linux x86-64, Linux 64-bit ARM and macOS on Apple silicon carry every kernel
+compiled ahead of time, on x86-64 at three levels: `x86-64-v2` (SSE4.2), `x86-64-v3` (AVX2 and FMA: Intel Haswell
+and AMD Excavator onward) and `x86-64-v4` (AVX-512 F, BW, CD, DQ and VL with 512-bit vectors: Intel Skylake-X and
+later servers, Ice Lake to Rocket Lake, AMD Zen 4 onward). On ARM there is one level each (`armv8-a` with NEON;
+Apple silicon). The best level the processor runs is chosen from the flags in `/proc/cpuinfo` (`sysctl` on macOS),
+and an object is used only if the hash recorded for it equals that of the source and flags the library asks
+for. The prebuilt objects have no OpenMP runtime and need only the C library (the Linux x86-64 wheel is tagged
+manylinux_2_24): their loops run on threads that the object keeps between calls. `OMP_NUM_THREADS` sets their number (default: the
+CPUs the process may run on); the other OpenMP variables do not apply to them.
+
+With `FASTSAR_KERNELS` unset, a native build is used where there is a compiler (or a cached native object), and
+the prebuilt object otherwise, or when the native build fails; a failed build leaves a note next to the cache
+entry so that it is not attempted by every later process. If there is neither a compiler nor a prebuilt object
+(an installation from the source distribution on a machine without a compiler, or `FFBP_CPU_FLAGS` with options
+other than `-O` and `-m` ones), the first CPU image raises an error that says so.
+
+`python -m fastsar.doctor` reports which kernels are in use ("native build" or "prebuilt (x86-64-v3)"), and
+`fastsar._build.USED` lists, in a running process, the object each loaded kernel came from.
+
+On a 24-core AMD Ryzen Threadripper PRO 7965WX (Zen 4, AVX-512), best of three, native build against the prebuilt
+levels (seconds; the factorized former at 4096 by 4096 pixels from 6482 pulses of 6482 samples, polar format at
+1024 by 1024 from the same history, the resampler at 8000 by 8000, exact backprojection at 1024 by 1024):
+
+SPEEDTABLE
+
+The factorized kernel is written for 16-float vectors, which is why it gains the most from AVX-512; the other
+kernels spend their time in loops that every level vectorizes or in the FFTs of SciPy.
 
 ## Kernel times and stage profile
 

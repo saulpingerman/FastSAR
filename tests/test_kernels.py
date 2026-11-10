@@ -167,6 +167,7 @@ def test_no_compiler_and_no_prebuilt_objects(install, monkeypatch):
     with pytest.raises(RuntimeError) as e:
         _build.shared_object('k', 'int k;', FLAGS)
     assert 'was not found' in str(e.value) and 'carries no prebuilt kernels for this platform' in str(e.value)
+    assert not os.path.exists(os.environ['FASTSAR_CACHE_DIR']) or not os.listdir(os.environ['FASTSAR_CACHE_DIR'])
 
 
 def test_compiler_present(install, monkeypatch, tmp_path):

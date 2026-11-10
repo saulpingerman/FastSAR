@@ -12,7 +12,7 @@ uv sync --group test            # the versions pinned in uv.lock, with the test 
 ```
 
 or, with pip, `pip install -e ".[io,test]"` (add `cuda` on a machine with an Nvidia GPU: `".[cuda,io,test]"`).
-The CPU backend needs a C++ compiler: `g++` with OpenMP on Linux (GCC 12 or later on ARM), Apple's clang on macOS. The `test` dependency group (and the `test` extra) holds pytest and the
+A checkout has no prebuilt kernels, so its CPU backend needs a C++ compiler: `g++` with OpenMP on Linux (GCC 12 or later on ARM), Apple's clang on macOS. The `test` dependency group (and the `test` extra) holds pytest and the
 packages some tests need that are not dependencies of the library: `sarpy` (the independent reader of the files
 FastSAR writes: `tests/test_chain.py`, `test_process.py`, `test_sidd.py`, `test_nitf.py`, `test_native_sicd.py`, `test_native_cphd.py`), `finufft`
 (`tests/test_insar.py`), `rasterio` (`products.write_geotiff`, `read_dem` and map projections other than
@@ -115,8 +115,30 @@ that a missing one raises an `ImportError` naming the extra to install.
    after upload.
 3. `rm -rf build dist *.egg-info && uv build && uvx twine check dist/*`, then install the wheel in a fresh
    environment with a C++ compiler and run `python examples/chain.py --simulate out` (the `package` job does the same).
+   Run the `wheels` workflow at the release commit and add the platform wheels from its artifacts to `dist/`
+   before the upload.
 4. Commit, tag annotated (`git tag -a vX.Y.Z -m "FastSAR X.Y.Z"`), push the tag, upload with `uvx twine upload
    dist/*`, and publish the GitHub release with the changelog section as its notes.
+
+## Platform wheels
+
+`uv build` gives the source distribution and a pure wheel with the kernel sources. The wheels published for
+Linux x86-64, Linux 64-bit ARM and macOS on Apple silicon also carry the kernels prebuilt: with `FASTSAR_PREBUILT=1`
+in the environment, `setup.py` compiles every kernel of `fastsar/_build.py`'s `KERNELS` table at every level of
+its `LEVELS` table into `fastsar/_prebuilt` of the wheel, with a manifest of the source hash of each, and tags the
+wheel `py3-none-<platform>`. The `wheels` workflow (run by hand or on a version tag) does this with cibuildwheel in
+the manylinux_2_28 images and on a macOS runner, and tests each wheel without a compiler and with one
+(`tests/wheel_check.py`). Locally, for Linux:
+
+```bash
+uvx cibuildwheel --platform linux        # needs docker; the wheel is written to wheelhouse/
+```
+
+A kernel added to the package needs a row in `KERNELS` with the flags its module passes to `shared_object`;
+`tests/test_kernels.py` compares the table with the modules, builds the objects and forms images with each level
+the test machine's processor runs. To try the prebuilt objects in a checkout, build them in place with
+`python -c "from fastsar import _build; _build.build_prebuilt(_build.PREBUILT_DIR)"` and set
+`FASTSAR_KERNELS=prebuilt`.
 
 ## Reporting a bug
 

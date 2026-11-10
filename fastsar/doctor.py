@@ -67,7 +67,7 @@ def _compiler():
         cxx, omp_c, omp_l = _build.compiler()
     except RuntimeError:
         cxx, omp_c, omp_l = 'clang++', [], []
-    path = shutil.which(cxx)
+    path = shutil.which(cxx) if _build.compiler_found(cxx) else None
     out = dict(command=cxx, found=path is not None, version=None, openmp=None, install=None)
     if path is None:
         if sys.platform == 'darwin':

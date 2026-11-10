@@ -8,7 +8,7 @@ source distribution is: the kernels are then compiled on first use and need a C+
 import importlib.util
 import os
 
-from setuptools import setup
+from setuptools import Distribution, setup
 from setuptools.command.bdist_wheel import bdist_wheel
 from setuptools.command.build_py import build_py
 
@@ -32,15 +32,17 @@ class BuildPy(build_py):
 
 
 class BdistWheel(bdist_wheel):
-    def finalize_options(self):
-        super().finalize_options()
-        if PREBUILT:
-            self.root_is_pure = False
-
     def get_tag(self):
         if not PREBUILT:
             return super().get_tag()
         return 'py3', 'none', super().get_tag()[2]
 
 
-setup(cmdclass=dict(build_py=BuildPy, bdist_wheel=BdistWheel))
+class PlatformDistribution(Distribution):
+    """With the prebuilt kernels the package is installed as platform-specific (platlib), not pure."""
+
+    def has_ext_modules(self):
+        return PREBUILT or super().has_ext_modules()
+
+
+setup(cmdclass=dict(build_py=BuildPy, bdist_wheel=BdistWheel), distclass=PlatformDistribution)
