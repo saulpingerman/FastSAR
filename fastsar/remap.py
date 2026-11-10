@@ -27,11 +27,12 @@ pixels that enter the statistics; the others come out 0. Without it the result i
 
 Where the image lives. The image may be a NumPy array, a CuPy array or a JAX array, and the result comes back in the
 same place (fastsar._xp); from a device only scalars, partial sums and histogram counts cross to the host. On the
-host the image is taken in row blocks on the thread pool of fastsar.patches. The statistics are the host's on every
-device: the 99th percentile from the same order statistics, which two histogram passes over the bit patterns of the
-amplitudes find without a sort (on a TPU, which adds into indexed bins slowly, a search by counts of the pixels
-below thresholds: FASTSAR_REMAP_JAX=count|histogram), and the means from float64 sums on a GPU. JAX works in single
-precision throughout,
+host the image is taken in row blocks on the thread pool of fastsar.patches, and on a GPU with little free memory the
+steps that hold temporary arrays (log, linear) in row blocks of _xp.cuda_block() bytes. The statistics are the
+host's on every device: the 99th percentile from the same order statistics, which two histogram passes over the
+bit patterns of the amplitudes find without a sort (on a TPU, which adds into indexed bins slowly, a search by
+counts of the pixels below thresholds: FASTSAR_REMAP_JAX=count|histogram), and the means from float64 sums on a
+GPU. JAX works in single precision throughout,
 as a TPU must: its sums are float32 sums over blocks of 128 pixels, and of 128 of those, whose few thousand partial
 sums are added in float64 on the host. A device's amplitude and logarithm differ from NumPy's in the last bit, so a
 display value on a rounding boundary can come out one count away: a few pixels in a million (one in 100,000 for
@@ -127,6 +128,16 @@ def _on_device(step, x):
     return _cupy_steps().get(step) or functools.partial(step, cupy)
 
 
+def _cupy_rows(step, x):
+    """The row blocks (slices) in which a step runs on a CuPy image, or None for the whole image at once: the
+    fused kernels hold no temporary array; the other steps hold some 48 bytes a pixel, and run in blocks of
+    _xp.cuda_block() bytes when that is more than a quarter of the free device memory."""
+    if step in _cupy_steps() or x.ndim == 0 or 48 * x.size <= _xp.cuda_budget() // 4:
+        return None
+    nb = _xp.cuda_rows(x.shape[0], 48 * x[:1].size, 'remap on the GPU')
+    return [slice(a, a + nb) for a in range(0, x.shape[0], nb)]
+
+
 def _apply(step, dtype, x, valid, *args):
     """The array a step gives, where x lives. dtype: of the result (for the host's output array)."""
     if _xp.kind(x) == 'jax':
@@ -134,6 +145,14 @@ def _apply(step, dtype, x, valid, *args):
         if parts is not None:
             import jax.numpy as jnp
             return jnp.concatenate(parts(*args)).reshape(x.shape)
+    if _xp.kind(x) == 'cupy':
+        rows = _cupy_rows(step, x)
+        if rows is not None:
+            import cupy
+            out, f = cupy.empty(x.shape, dtype), _on_device(step, x)
+            for sl in rows:
+                out[sl] = f(x[sl], None if valid is None else valid[sl], *args)
+            return out
     if _xp.kind(x) != 'numpy':
         return _on_device(step, x)(x, valid, *args)
     if x.ndim == 0:
@@ -151,7 +170,12 @@ def _reduce(step, x, valid, *args):
     float64 on the host), the minimum and maximum as float32 (None where the step has none)."""
     if _xp.kind(x) != 'numpy':
         parts = _blocked(step, x, valid) if _xp.kind(x) == 'jax' else None
-        parts = [_on_device(step, x)(x, valid, *args)] if parts is None else parts(*args)
+        rows = _cupy_rows(step, x) if _xp.kind(x) == 'cupy' else None
+        if rows is not None:
+            f = _on_device(step, x)
+            parts = [f(x[sl], None if valid is None else valid[sl], *args) for sl in rows]
+        else:
+            parts = [_on_device(step, x)(x, valid, *args)] if parts is None else parts(*args)
         sums = [float(np.concatenate([np.ravel(_xp.host(p[0][i])) for p in parts]).astype(np.float64).sum())
                 for i in range(len(parts[0][0]))]
         return sums, *(None if parts[0][j] is None else _f(fn([_xp.host(p[j]) for p in parts]))

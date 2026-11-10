@@ -10,6 +10,7 @@
                                rebuilt for half its effective group, with a MemoryWarning; groups of 1 raise
                                MemoryError; other errors pass through
   program cache                formers built on several threads at once build one program per signature
+  memory.cuda_plan             where process_cphd keeps a product's images, for device memory from ample to none
   environment variables        integer and float FASTSAR_* settings below their minimum or not numbers raise ValueError
 
 Each check prints its value and limit; a test fails if any of its checks fails."""
@@ -357,3 +358,36 @@ def test_pinned_size():
         assert n <= c <= n + n // 8 + 1 and _pinned_size(c) == c
     sizes = {_pinned_size(int(1.0e8 * (1 + 0.003 * k))) for k in range(10)}
     assert len(sizes) <= 2
+
+
+def test_cuda_plan_places_the_images_of_a_product():
+    """memory.cuda_plan: everything on the device when its stages fit, else the placement that moves the fewest
+    bytes, down to every image on the host; the sizes are those of a 430-megapixel spotlight SIDD."""
+    from fastsar import memory
+    G = 1e9
+    sidd = dict(ground=2 * G, mid=3.8 * G, slant=6 * G, detected=3 * G, ground_mid=2.4 * G, product=1.7 * G,
+                display=0.43 * G)
+    sicd = {k: sidd[k] for k in ('ground', 'mid', 'slant')}
+    dev = lambda p: sorted(k for k, v in p['place'].items() if v == 'device')
+    p = memory.cuda_plan(sidd, 20 * G, autofocus=True, sva=True)
+    assert p['fits'] and len(dev(p)) == 6 and p['budget'] == 20 * G
+    assert p['need'] == pytest.approx(9.8 * G + 20 * G / 8)          # the slant resampling, and the stages' blocks
+    # 11 GB: the two images of the slant resampling do not fit together; its intermediate image goes to the host
+    p = memory.cuda_plan(sidd, 11 * G, autofocus=True, sva=True)
+    assert not p['fits'] and dev(p) == ['detected', 'ground', 'ground_mid', 'product', 'slant']
+    # 7.2 GB: nor does autofocus (the ground image twice and blocks of 1 GiB), nor the slant image with its detection
+    p = memory.cuda_plan(sidd, 7.2 * G, autofocus=True, sva=True)
+    assert dev(p) == ['ground_mid', 'product', 'slant']
+    p = memory.cuda_plan(sidd, 7.2 * G, autofocus=False, sva=True)
+    assert dev(p) == ['ground', 'ground_mid', 'product', 'slant']
+    assert dev(memory.cuda_plan(sicd, 7.2 * G, sva=True)) == ['ground', 'slant']
+    assert dev(memory.cuda_plan(sicd, 6.7 * G, sva=True)) == ['ground', 'mid']         # the slant image and blocks: no
+    p = memory.cuda_plan(sidd, 1e6, autofocus=True, sva=True)
+    assert not p['fits'] and dev(p) == []
+    assert memory.cuda_plan(dict(ground=2 * G), 2.5 * G)['fits']
+    assert not memory.cuda_plan(dict(ground=2 * G), 2.5 * G, autofocus=True)['fits']
+    assert not memory.cuda_plan(dict(ground=2 * G, valid=0.25 * G, display=0.25 * G), 3 * G)['fits']
+    for budget in np.geomspace(1e6, 30 * G, 60):                     # fits: exactly when the need is within the budget
+        for sizes in (sidd, sicd, dict(ground=2 * G)):
+            p = memory.cuda_plan(sizes, budget, autofocus=True, sva='slant' in sizes)
+            assert p['fits'] == (p['need'] <= budget) == (len(dev(p)) == len(p['place'])), (budget, p)

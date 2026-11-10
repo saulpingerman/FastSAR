@@ -26,7 +26,9 @@ was published on PyPI.
   region above a given RNIIRS, or everything with a signal-to-noise ratio of at least 1. Pixels of the rectangular
   product outside the area are 0.
 - Autofocus on the image (`autofocus.image_autofocus`): a global quadratic phase error by map drift, phase
-  gradient autofocus, and a spatially variant correction estimated on overlapping blocks.
+  gradient autofocus, and a spatially variant correction estimated on overlapping blocks. A correction is applied
+  only when the contrast of the whole image rises and, for the two global modes, the parts of the image agree on
+  the estimate; otherwise the image is left as formed and `autofocus_info['reason']` says why.
 - Spatially variant apodization (`weighting.sva`) on the slant plane at twice Nyquist, with the trim of the phase
   history that makes the spectrum a rectangle (`weighting.keystone`).
 - SIDD output (`sidd.write_sidd`, SIDD 3.0 or 2.0) and the display layout (`sidd.shadows_down`,
@@ -35,6 +37,10 @@ was published on PyPI.
   `highcontrast`, `pedf`, `log`, `linear`), checked against the toolbox run in Octave.
 - The stages after formation (baseband, autofocus, resampling, apodization, remap) take the image as a NumPy,
   CuPy or JAX array and run where it lives, so a GPU or TPU run keeps the image on the device until it is written.
+- On the cuda backend the stages after formation size their blocks from the free device memory
+  (`FASTSAR_CUDA_BLOCK_MB` overrides it), and `process_cphd` keeps on the host the images of a product that the
+  device cannot hold together, passing them through the GPU in blocks: the same pixels, with a note in the
+  product (`memory.cuda_plan`; `docs/performance.md`, Memory).
 - `python -m fastsar.doctor` (also the `fastsar-doctor` command): reports which backends this machine can run and
   prints the command that installs each missing piece, from the C++ compiler of the CPU kernels to the CuPy build
   for the GPU driver's CUDA version; `--install` runs the pip commands among them. It also reports the CPU kernels

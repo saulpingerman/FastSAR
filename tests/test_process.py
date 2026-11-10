@@ -224,6 +224,45 @@ def test_backends_agree(cphd, backend):
         assert np.abs(o['image'] - ref['image']).max() < 2e-2 * np.abs(ref['image']).max()
 
 
+@pytest.mark.cuda
+@pytest.mark.parametrize('kw', [dict(), dict(product='sidd'), dict(weighting='sva'), dict(plane='ground'),
+                                dict(product='sidd', autofocus=False, remap='log')],
+                         ids=['sicd', 'sidd', 'sva', 'ground', 'sidd-log'])
+def test_small_gpu_gives_the_same_product(cphd, kw, monkeypatch, tmp_path):
+    """A GPU with too little memory for the images of a product (FASTSAR_CUDA_BLOCK_MB: a megabyte to count on, or
+    half the product's need) gives the product of a GPU with room: the images stay on the host and cross the
+    device in blocks, a note says so, and the pixels are the same, the zeros exactly (autofocus then estimates
+    with the host's transforms: float32 rounding)."""
+    pytest.importorskip('cupy')
+    from fastsar import memory
+    d, ecf = cphd
+    ext = 'sidd' if kw.get('product') == 'sidd' else 'sicd'
+    ref = fastsar.process_cphd(str(d / 'c.cphd'), str(tmp_path / f'ref.{ext}'), backend='cuda', **kw)
+    assert not any('GPU has' in n for n in ref['notes'])
+    plans = []
+    plan = memory.cuda_plan
+    monkeypatch.setattr(memory, 'cuda_plan', lambda *a, **k: plans.append(plan(*a, **k)) or plans[-1])
+    for mb in (1.0, None, None):
+        if mb is None:                                               # some of the images on the device
+            mb = 0.55 * plans[0]['need'] / 2 ** 20 if len(plans) == 1 else 0.8 * plans[0]['need'] / 2 ** 20
+        monkeypatch.setenv('FASTSAR_CUDA_BLOCK_MB', str(mb))
+        o = fastsar.process_cphd(str(d / 'c.cphd'), str(tmp_path / f'small.{ext}'), backend='cuda', **kw)
+        assert not plans[-1]['fits'] and sum('GPU has' in n and 'kept on the host' in n for n in o['notes']) == 1
+        assert [n for n in o['notes'] if 'GPU has' not in n] == ref['notes']
+        assert o['image'].dtype == ref['image'].dtype and o['image'].shape == ref['image'].shape
+        assert np.array_equal(o['image'] == 0, ref['image'] == 0)
+        e = np.abs(o['image'] - ref['image']).max() / np.abs(ref['image']).max()
+        assert e < 2e-6, (mb, e)
+        a, b = (np.fromfile(str(tmp_path / f'{k}.{ext}'), np.uint8) for k in ('small', 'ref'))
+        differ = np.count_nonzero(a != b) if a.size == b.size else a.size
+        assert differ < (64 if ext == 'sidd' and kw.get('remap') != 'log' else 1e-2 * a.size), (mb, differ)
+    # the budgets gave different placements, when the product has more than one image
+    assert len({tuple(p['place'].values()) for p in plans}) >= min(2, len(plans[0]['place']))
+    monkeypatch.setenv('FASTSAR_CUDA_BLOCK_MB', '0')
+    with pytest.raises(ValueError, match='FASTSAR_CUDA_BLOCK_MB'):
+        fastsar.process_cphd(str(d / 'c.cphd'), backend='cuda', **kw)
+
+
 def test_errors(cphd):
     d, ecf = cphd
     p = str(d / 'c.cphd')

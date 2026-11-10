@@ -18,7 +18,8 @@ keystone drops, at each frequency, the pulses outside the azimuth band the lowes
 The result is not band limited and not a linear function of the scene: it is a product for detection and display.
 
 sva takes the image where it is (a NumPy array, a CuPy array on a GPU, a JAX array on a TPU or another JAX device)
-and returns the result there (fastsar._xp).
+and returns the result there (fastsar._xp). On a GPU without room for a second array of the image's size it works
+in slabs of rows (_xp.cuda_block), with the same values.
 """
 import numpy as np
 
@@ -96,18 +97,71 @@ y = complex<float>(__fadd_rn(xr, __fmul_rn(wr, br)), __fadd_rn(xi, __fmul_rn(wi,
 '''
 
 
-def _sva_cupy(img, N, axes, joint, inplace):
+def _sva_slabs(x, N, axes, joint, ramp=None):
+    """sva on a GPU in place, in slabs of rows sized to _xp.cuda_block(): x [n0, n1] complex64, C-contiguous, a
+    CuPy array or a NumPy array whose slabs cross to the device and back. A row's result depends on N rows on each
+    side for every pass along axis 0, which a slab carries beyond the rows it gives (the same values as the whole
+    image's). ramp: device vectors [n0, 1] (before, after or None) that multiply the rows before and after."""
+    import cupy as cp
+    from .resample_cuda import upload
+    n0, n1 = x.shape
+    onhost = not isinstance(x, cp.ndarray)
+    H = N * sum(1 for ax in axes if ax == 0)
+    nb = max(1, _xp.cuda_rows(n0 + 2 * H, 8 * n1 * (3 + onhost), 'apodization on the GPU') - 2 * H)
+    tail = None                                                     # rows a - H ... a - 1 as they were
+    for a in range(0, n0, nb):
+        b, lo = min(n0, a + nb), max(a - H, 0)
+        hi = min(b + H, n0)
+        cur = cp.empty((hi - lo, n1), cp.complex64)
+        if a > lo:
+            cur[:a - lo] = tail
+        if onhost:
+            cur[a - lo:] = upload(x[a:hi])
+        else:
+            cur[a - lo:] = x[a:hi]
+        tail = cur[max(b - H, lo) - lo:b - lo].copy()
+        if ramp is not None:
+            cur *= ramp[0][lo:hi]
+        other = cp.empty_like(cur)
+        for ax in axes:
+            _DEVICE['cupy'](cur, hi - lo, n1, N, ax, joint, other)
+            cur, other = other, cur
+        del other
+        res = cur[a - lo:b - lo]
+        if ramp is not None and ramp[1] is not None:
+            res *= ramp[1][a:b]
+        if onhost:
+            res.get(out=x[a:b])
+        else:
+            x[a:b] = res
+        del cur, res
+    return x
+
+
+def _sva_cupy(img, N, axes, joint, inplace, ramp=None):
     """sva on a GPU: one kernel call a pass, each into another array (the result and one scratch array; in place,
-    the image and one scratch array)."""
+    the image and one scratch array). Where the scratch array would take more than a quarter of the free device
+    memory (_xp.cuda_budget), and for a NumPy image, in slabs of rows (_sva_slabs)."""
     import cupy as cp
     if 'cupy' not in _DEVICE:
         _DEVICE['cupy'] = cp.ElementwiseKernel('raw complex64 x, int32 n0, int32 n1, int32 N, int32 axis, bool joint',
                                                'complex64 y', _CUDA, 'fastsar_sva')
+    if not isinstance(img, cp.ndarray):                             # a host image through the device
+        x = np.ascontiguousarray(img, np.complex64)
+        return _sva_slabs(x if inplace or x is not img else x.copy(), N, axes, joint, ramp)
     x = img if img.dtype == cp.complex64 else img.astype(cp.complex64)
     inplace = inplace or x is not img
     src = cp.ascontiguousarray(x)
     if not axes:
         return x if inplace else x.copy()
+    if src.nbytes > _xp.cuda_budget() // 4:
+        y = _sva_slabs(src if inplace else src.copy(), N, axes, joint, ramp)
+        if inplace and y is not x:
+            x[...] = y
+            return x
+        return y
+    if ramp is not None:                                            # process_cphd's, in place
+        src *= ramp[0]
     cur, free = src, [src] if inplace or src is not x else []      # free: the arrays a pass may write to
     for ax in axes:
         dst = next((a for a in free if a is not cur), None)
@@ -120,6 +174,8 @@ def _sva_cupy(img, N, axes, joint, inplace):
         return cur
     if cur is not x:
         x[...] = cur
+    if ramp is not None and ramp[1] is not None:
+        x *= ramp[1]
     return x
 
 
@@ -178,7 +234,7 @@ def _sva_blocks(x, N, axes, joint):
     return jnp.concatenate(parts)
 
 
-def sva(img, oversample=2, *, axes=(1, 0), joint=True, inplace=False):
+def sva(img, oversample=2, *, axes=(1, 0), joint=True, inplace=False, _cuda=None):
     """Spatially variant apodization of a complex image sampled at `oversample` times its Nyquist rate on the axes
     treated (an integer: 2 for an image at spacings of half the reciprocal of its bandwidth), one axis after the
     other in the order of `axes` (default range, then azimuth, of an image [azimuth, range]).
@@ -198,8 +254,8 @@ def sva(img, oversample=2, *, axes=(1, 0), joint=True, inplace=False):
     if x.ndim != 2 or not _xp.module(x).iscomplexobj(x):
         raise ValueError('sva takes a complex image [n0, n1]')
     axes = tuple(int(a) % 2 for a in np.atleast_1d(axes))
-    if kind == 'cupy':
-        return _sva_cupy(x, N, axes, bool(joint), inplace)
+    if kind == 'cupy' or _cuda is not None:                         # _cuda: process_cphd's, a host image and its ramps
+        return _sva_cupy(x, N, axes, bool(joint), inplace, *(_cuda or ()))
     if kind == 'jax':
         return _sva_blocks(x.astype('complex64'), N, axes, bool(joint))
     if x.dtype != np.complex64:

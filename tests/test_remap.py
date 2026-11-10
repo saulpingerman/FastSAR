@@ -216,3 +216,27 @@ def test_jax_in_blocks(statistics, monkeypatch):
         monkeypatch.setenv('FASTSAR_JAX_BLOCK_MB', mb)
         assert remap._blocked(remap._nrl_u8, jnp.asarray(x), None) is not None
         assert all(np.array_equal(g, r) for g, r in zip(run(), ref))
+
+
+@pytest.mark.cuda
+def test_small_gpu_gives_the_same_values(monkeypatch):
+    """With little device memory to count on (FASTSAR_CUDA_BLOCK_MB), the remaps that hold temporary arrays run in
+    blocks of rows on a CuPy image: the same display values (log's mean is then a sum of block sums, which can
+    move a value on a rounding boundary by a count)."""
+    cp = pytest.importorskip('cupy')
+    x = speckle()
+    valid = x != 0
+    names = [k for k in remap.REMAPS if k != 'linear']
+    refs = {k: _xp.host(remap.REMAPS[k](cp.asarray(x), valid=cp.asarray(valid))) for k in names}
+    lin, dens = (_xp.host(f(cp.asarray(x), valid=cp.asarray(valid)))
+                 for f in (remap.linear, remap.amplitude_to_density))
+    monkeypatch.setenv('FASTSAR_CUDA_BLOCK_MB', '1')
+    assert len(remap._cupy_rows(remap._log_u8, cp.asarray(x))) > 100                # log in blocks of rows,
+    assert remap._cupy_rows(remap._nrl_u8, cp.asarray(x)) is None                   # the fused kernels whole
+    for k in names:
+        got = _xp.host(remap.REMAPS[k](cp.asarray(x), valid=cp.asarray(valid)))
+        d = np.abs(got.astype(int) - refs[k])
+        assert got.dtype == np.uint8 and d.max() <= (k == 'log') and np.count_nonzero(d) <= 1e-4 * d.size, k
+        assert not got[~valid].any(), k
+    assert np.array_equal(_xp.host(remap.linear(cp.asarray(x), valid=cp.asarray(valid))), lin)
+    assert np.array_equal(_xp.host(remap.amplitude_to_density(cp.asarray(x), valid=cp.asarray(valid))), dens)

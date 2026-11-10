@@ -9,7 +9,7 @@ image crosses to the host once, at the end.
 """
 import numpy as np
 
-__all__ = ['kind', 'module', 'fft', 'host', 'device', 'jax_block']
+__all__ = ['kind', 'module', 'fft', 'host', 'device', 'jax_block', 'cuda_budget', 'cuda_block']
 
 
 def kind(a):
@@ -68,6 +68,43 @@ def jax_block():
     except Exception:                                              # a device without statistics
         limit = None
     return int(min(2 << 30, limit // 16)) if limit else 1 << 30
+
+
+def cuda_budget():
+    """Bytes of the CUDA device new arrays may take now: FASTSAR_CUDA_BLOCK_MB megabytes if set (for a test, or to
+    hold FastSAR to part of a shared device), else nine tenths of what is free on the device, counting the blocks
+    CuPy's pool holds unused (memory.cuda_free). The stages after formation size their blocks from it, and
+    process_cphd decides with it which images of a product stay on the host (memory.cuda_plan)."""
+    import os
+    mb = os.environ.get('FASTSAR_CUDA_BLOCK_MB', '').strip()
+    if mb:
+        try:
+            if not float(mb) > 0:
+                raise ValueError
+        except ValueError:
+            raise ValueError(f'FASTSAR_CUDA_BLOCK_MB must be a positive number of megabytes, got {mb!r}') from None
+        return int(float(mb) * (1 << 20))
+    from .memory import cuda_free
+    return int(0.9 * cuda_free())
+
+
+def cuda_block():
+    """Bytes of temporary arrays a stage after formation may hold on the CUDA device at a time, beside its input
+    and its result: a quarter of cuda_budget(), at most 2 GB."""
+    return int(min(2 << 30, cuda_budget() // 4))
+
+
+def cuda_rows(n, row_bytes, what):
+    """Rows (of n) a block may hold at row_bytes of device memory a row, within cuda_block(). MemoryError when
+    one row does not fit in cuda_budget(); what: the stage, for the message."""
+    nb = cuda_block() // max(int(row_bytes), 1)
+    if nb < 1:
+        free = cuda_budget()
+        if row_bytes > free:
+            raise MemoryError(f'{what}: one line takes {row_bytes / 1e6:.1f} MB of device memory and '
+                              f'{free / 1e6:.1f} MB are free (FASTSAR_CUDA_BLOCK_MB, or the device itself)')
+        nb = 1
+    return int(min(n, nb))
 
 
 def host(a):

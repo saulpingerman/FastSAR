@@ -137,9 +137,13 @@ def cuda_release():
 
 def cuda_free():
     """Free bytes on the current CUDA device, counting the blocks CuPy's memory pool holds cached but unused (an
-    earlier call's arrays, freed to the pool and not to the driver)."""
+    earlier call's arrays, freed to the pool and not to the driver); under a limit of the pool, no more than the
+    limit leaves."""
     import cupy as cp
-    return cp.cuda.Device().mem_info[0] + cp.get_default_memory_pool().free_bytes()
+    pool = cp.get_default_memory_pool()
+    free = cp.cuda.Device().mem_info[0] + pool.free_bytes()
+    limit = pool.get_limit()
+    return min(free, limit - pool.used_bytes()) if limit else free
 
 
 def _jax_stats():
@@ -250,3 +254,66 @@ def full_speed(plan, K, backend, isz=8):
                 dict(history=hist, first_level=groups, later_levels=rest, image=image))
     groups = 8 * child_bytes(plan, backend)
     return 4 * groups + image, dict(history=0.0, first_level=groups, image=image)
+
+
+def cuda_plan(sizes, budget, *, autofocus=False, sva=False):
+    """Where the images of a process_cphd product live while the stages after formation run on a CUDA device.
+
+    sizes: bytes of the arrays the product goes through, by name, those it has among 'ground' (the image as
+    formed), 'mid' and 'slant' (to_slant's intermediate and its result), 'detected', 'ground_mid' and 'product'
+    (the detected slant image, to_ground's intermediate and its result), and 'valid' (a mask of the ground image),
+    'display' (the uint8 image of a SIDD, remapped from the last array). budget: device bytes the arrays and the
+    stages' temporaries may take (_xp.cuda_budget()). autofocus, sva: whether those stages run.
+
+    A stage needs the arrays it reads and writes that are on the device, and an eighth of the budget for its own
+    blocks; autofocus, which writes a new image through blocks of up to 1 GiB, runs on the device only when the
+    ground image is there. Of the placements whose every stage fits, the one that moves the fewest bytes between
+    host and device is taken (an array on the host crosses once for every stage that reads or writes it).
+
+    -> dict(place: {name: 'device' or 'host'}, fits: everything is on the device, need: the bytes that takes,
+    budget)."""
+    import itertools
+    names = [k for k in ('ground', 'mid', 'slant', 'detected', 'ground_mid', 'product') if k in sizes]
+    size = {k: float(sizes[k]) for k in names}
+    valid, display = float(sizes.get('valid', 0)), float(sizes.get('display', 0))
+    reserve = budget / 8
+    # (arrays read, arrays written, device bytes beside them, runs only where its input is)
+    stages = [(('ground',), ('ground',), 0.0, False)]                                      # baseband
+    if autofocus:
+        stages.append((('ground',), (), size['ground'] + 4 * min(size['ground'], float(1 << 30)), True))
+    if 'mid' in size:
+        stages += [(('ground',), ('mid',), 0.0, False), (('mid',), ('slant',), valid, False)]
+        if sva:
+            stages.append((('slant',), ('slant',), 0.0, False))
+    elif valid:
+        stages.append((('ground',), (), valid, True))
+    if 'detected' in size:
+        stages += [(('slant',), ('detected',), 0.0, False), (('detected',), ('ground_mid',), 0.0, False),
+                   (('ground_mid',), ('product',), 0.0, False)]
+    if display:
+        stages.append(((names[-1],), (), 3 * display, True))
+
+    def need(dev):
+        worst = 0.0
+        for read, written, extra, local in stages:
+            if local and read[0] not in dev:
+                continue
+            worst = max(worst, sum(size[k] for k in set(read + written) if k in dev) + extra)
+        return worst + reserve
+
+    def moved(dev):
+        n = size['ground'] if 'ground' in dev else 0.0
+        if not display and names[-1] in dev:
+            n += size[names[-1]]                                    # a complex product comes to the host at the end
+        for read, written, _, local in stages:
+            if not local:
+                n += sum(size[k] for k in read + written if k not in dev)
+        return n
+    best = None
+    for r in range(len(names), -1, -1):
+        for dev in itertools.combinations(names, r):
+            if need(dev) <= budget and (best is None or moved(dev) < moved(best)):
+                best = dev
+    best = () if best is None else best
+    return dict(place={k: 'device' if k in best else 'host' for k in names}, fits=len(best) == len(names),
+                need=need(tuple(names)), budget=float(budget))

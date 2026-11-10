@@ -387,3 +387,23 @@ def test_sarkit_consistency(scene, need):
         print(f'sarkit consistency of the SIDD ({name}): {len(con.all())} checks, {len(err)} errors'
               + (f', warnings {warn}' if warn else ''))
         assert not err, (name, err)
+
+
+@pytest.mark.cuda
+def test_small_gpu_gives_the_same_display(scene, monkeypatch, tmp_path):
+    """With little device memory to count on (FASTSAR_CUDA_BLOCK_MB), to_display and write_sidd of a CuPy image
+    give the display values of a device with room (log, whose mean is then a sum over blocks: a count at most)."""
+    cp = pytest.importorskip('cupy')
+    out = scene.out['left']
+    dev = dict(out, image=cp.asarray(out['image']))
+    cases = (dict(), dict(remap='density'), dict(remap='log'), dict(remap='pedf', shadows_down=False))
+    refs = [_xp.host(sidd.to_display(dev, **kw)) for kw in cases]
+    monkeypatch.setenv('FASTSAR_CUDA_BLOCK_MB', '0.5')
+    for kw, ref in zip(cases, refs):
+        d = _xp.host(sidd.to_display(dev, **kw)).astype(int) - ref
+        assert np.abs(d).max() <= (kw.get('remap') == 'log') and np.count_nonzero(d) <= 1e-4 * d.size, kw
+    sidd.write_sidd(str(tmp_path / 'small.nitf'), dev)
+    monkeypatch.delenv('FASTSAR_CUDA_BLOCK_MB')
+    sidd.write_sidd(str(tmp_path / 'room.nitf'), dev)
+    a, b = (np.fromfile(str(tmp_path / f), np.uint8) for f in ('small.nitf', 'room.nitf'))
+    assert a.size == b.size and np.count_nonzero(a != b) < 64          # the creation times

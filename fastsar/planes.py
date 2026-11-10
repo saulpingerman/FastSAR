@@ -24,8 +24,10 @@ spacings this takes from the exact spectrum of the collection at points of the s
 for complex images or, with a cubic kernel, detected ones.
 
 Devices. deramp, to_slant and to_ground work where the image is: a NumPy array on the host, a CuPy array on its
-GPU (kernels in double: resample_cuda), a JAX array on JAX's device (float32 throughout, as a TPU needs:
-resample_jax), and the product holds an array of the same kind. The maps are computed on the host at the knots.
+GPU (kernels in double: resample_cuda; their blocks are sized to the free device memory, _xp.cuda_block, and the
+intermediate image of a resampling is kept on the host when the device cannot hold it), a JAX array on JAX's
+device (float32 throughout, as a TPU needs: resample_jax), and the product holds an array of the same kind. The
+maps are computed on the host at the knots.
 """
 import numpy as np
 
@@ -174,7 +176,7 @@ def _slant_axes(fr, hz, h=1.0):
             (slant_to_ground(fr, 0.0, h, hz) - slant_to_ground(fr, 0.0, -h, hz)) / (2 * h))
 
 
-def deramp(out, sign=-1):
+def deramp(out, sign=-1, *, _cuda=False):
     """Bring a ground-plane spotlight image to baseband, in place: multiplied by exp(sign j 4 pi fc (R - R0) / c),
     R each pixel's range to the COA antenna position, R0 the scene center's, fc the center frequency. out['baseband']
     records it (products.sicd_meta reads it); sign=+1 puts the carrier back. A JAX image is replaced in out by the
@@ -187,8 +189,10 @@ def deramp(out, sign=-1):
     fr = _frame(out)
     k = sign * 4 * np.pi * 0.5 * (out['band'][0] + out['band'][1]) / C
     dev = resample._device(img)
+    if dev is None and _cuda:                                        # a host image through the GPU in blocks of rows
+        from . import resample_cuda as dev
     if dev is not None:
-        if _xp.kind(img) == 'cupy':
+        if _xp.kind(img) == 'cupy' or _cuda:
             dev.deramp(img, o - fr['arp'], spx * e1, spy * e2, fr['r0'], k)
         else:
             out['image'] = dev.deramp(img, o - fr['scp'], spx * e1, spy * e2, fr['e2'], fr['r0'], k)
@@ -221,7 +225,26 @@ def _solve(f, x, iterations=8, h=1.0):
     return x
 
 
-def to_slant(out, spacing, bounds=None, *, margin=0, valid=None, taps=8, knots=32):
+def _slant_bounds(out, margin=0):
+    """The outline of a ground image (less `margin` pixels at each edge) in the slant plane: (a0, a1, r0, r1), m."""
+    nx, ny, o, e1, e2, spx, spy = _grid(out)
+    mg = int(margin)
+    ti, tj = np.linspace(mg, nx - 1 - mg, 65), np.linspace(mg, ny - 1 - mg, 65)
+    ij = np.concatenate([np.stack([ti, np.full(65, v)], -1) for v in (mg, ny - 1 - mg)]
+                        + [np.stack([np.full(65, v), tj], -1) for v in (mg, nx - 1 - mg)])
+    a, r = ground_to_slant(_frame(out), o + ij[:, :1] * spx * e1 + ij[:, 1:] * spy * e2)
+    return a.min(), a.max(), r.min(), r.max()
+
+
+def _slant_shape(spacing, bounds):
+    """The SCP's pixel (i0, j0) and the shape (na, nr) of the slant grid of to_slant."""
+    sa, sr = (float(v) for v in np.broadcast_to(np.asarray(spacing, np.float64), (2,)))
+    a0, a1, r0, r1 = (float(v) for v in bounds)
+    i0, j0 = int(np.ceil(-a0 / sa)), int(np.ceil(-r0 / sr))
+    return (i0, j0), (i0 + int(np.ceil(a1 / sa)) + 1, j0 + int(np.ceil(r1 / sr)) + 1)
+
+
+def to_slant(out, spacing, bounds=None, *, margin=0, valid=None, taps=8, knots=32, _cuda=None):
     """A ground-plane spotlight image on axes along the line of sight, resampled to the slant plane.
 
     out: form_cphd(axes='los')'s output, sampled as sampling asks (spx <= 1 / bx, spy <= 1 / by, with a few
@@ -241,7 +264,7 @@ def to_slant(out, spacing, bounds=None, *, margin=0, valid=None, taps=8, knots=3
     from .patches import _rows
     if out.get('plane', 'ground') != 'ground':
         raise ValueError('to_slant takes a ground-plane image')
-    deramp(out)
+    deramp(out, _cuda=_cuda is not None)
     nx, ny, o, e1, e2, spx, spy = _grid(out)
     scp = _scp(out)
     fr = _frame(out)
@@ -251,14 +274,8 @@ def to_slant(out, spacing, bounds=None, *, margin=0, valid=None, taps=8, knots=3
     sa, sr = (float(v) for v in np.broadcast_to(np.asarray(spacing, np.float64), (2,)))
     mg = int(margin)
     if bounds is None:                                               # the ground rectangle's outline in the slant plane
-        ti, tj = np.linspace(mg, nx - 1 - mg, 65), np.linspace(mg, ny - 1 - mg, 65)
-        ij = np.concatenate([np.stack([ti, np.full(65, v)], -1) for v in (mg, ny - 1 - mg)]
-                            + [np.stack([np.full(65, v), tj], -1) for v in (mg, nx - 1 - mg)])
-        a, r = ground_to_slant(fr, o + ij[:, :1] * spx * e1 + ij[:, 1:] * spy * e2)
-        bounds = (a.min(), a.max(), r.min(), r.max())
-    a0, a1, r0, r1 = (float(v) for v in bounds)
-    i0, j0 = int(np.ceil(-a0 / sa)), int(np.ceil(-r0 / sr))            # the SCP's pixel
-    na, nr = i0 + int(np.ceil(a1 / sa)) + 1, j0 + int(np.ceil(r1 / sr)) + 1
+        bounds = _slant_bounds(out, mg)
+    (i0, j0), (na, nr) = _slant_shape((sa, sr), bounds)                # the SCP's pixel
     if na < 2 or nr < 2:
         raise ValueError(f'slant bounds {bounds} hold no image')
     ak, rk, yk = _knots(na, knots), _knots(nr, knots), _knots(ny, knots)
@@ -279,10 +296,18 @@ def to_slant(out, spacing, bounds=None, *, margin=0, valid=None, taps=8, knots=3
     pos1 = resample.KnotMap(ak, rk, (G @ e2) / spy, nr)
     dev = resample._device(out['image'])
     masked = mg > 0 or valid is not None
+    kw = {}
+    if _cuda is not None:                                            # process_cphd's placement (memory.cuda_plan)
+        from . import resample_cuda as dev
+        kw = dict(place=(_cuda['mid'], _cuda['out']))
     if dev is not None:
         posx = resample.KnotMap(ak, rk, (G @ e1) / spx, nr)
         mask = (posx, (mg, nx - 1 - mg), (mg, ny - 1 - mg), valid) if masked else None
-        img = dev.warp(out['image'], pos0, pos1, (na, nr), taps=taps, mask=mask)
+        src = out['image']
+        if _cuda is not None:                                        # the ground image is given up: freed after pass 1
+            src, out['image'] = [src], None
+        img = dev.warp(src, pos0, pos1, (na, nr), taps=taps, mask=mask, **kw)
+        del src
     else:
         img = resample.warp(out['image'], pos0, pos1, (na, nr), taps=taps)
     if masked and dev is None:
@@ -305,7 +330,7 @@ def to_slant(out, spacing, bounds=None, *, margin=0, valid=None, taps=8, knots=3
     return res
 
 
-def to_ground(out, origin, e1, e2, spacing, shape, *, kernel=None, taps=8, pad=None, knots=32):
+def to_ground(out, origin, e1, e2, spacing, shape, *, kernel=None, taps=8, pad=None, knots=32, _cuda=None):
     """A slant-plane image (to_slant's output, or one derived from it on the same grid: detected, apodized)
     resampled to a ground-plane grid: pixel (i, j) at origin + i spacing[0] e1 + j spacing[1] e2 (local frame, e1
     and e2 horizontal and orthonormal, e1 x e2 up), shape (nx, ny).
@@ -319,6 +344,11 @@ def to_ground(out, origin, e1, e2, spacing, shape, *, kernel=None, taps=8, pad=N
     if out.get('plane') != 'slant':
         raise ValueError('to_ground takes a slant-plane image')
     dev = resample._device(out['image'])
+    if _cuda is not None:                                            # process_cphd's placement (memory.cuda_plan)
+        from . import resample_cuda as dev
+        kw_dev = dict(place=(_cuda['mid'], _cuda['out']))
+    else:
+        kw_dev = {}
     img = out['image'] if dev is not None else np.asarray(out['image'])
     na, nr = img.shape
     o, e1, e2 = (np.asarray(v, np.float64) for v in (origin, e1, e2))
@@ -342,7 +372,9 @@ def to_ground(out, origin, e1, e2, spacing, shape, *, kernel=None, taps=8, pad=N
     pos1 = resample.KnotMap(yk, xk, ground_to_slant(fr, g)[0] / sa + i0, nx)
     kw = dict(kernel=kernel, pad=pad) if kernel != 'sinc' else dict(kernel='sinc', taps=taps, pad=pad)
     res = {k: v for k, v in out.items() if k not in ('image', 'scp_pixel', 'ground', 'support', 'bandwidth')}
-    img = dev.warp(img, pos0, pos1, (ny, nx), transposed=True, **kw) if dev is not None else \
+    if _cuda is not None:                                            # the slant image is given up: freed after pass 1
+        img, out['image'] = [img], None
+    img = dev.warp(img, pos0, pos1, (ny, nx), transposed=True, **kw, **kw_dev) if dev is not None else \
         resample.warp(img.T, pos0, pos1, (ny, nx), **kw).T
     res.update(image=img, origin=o, e1=e1, e2=e2, spx=spx, spy=spy,
                plane='ground', scp=scp)

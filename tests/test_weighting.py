@@ -159,3 +159,32 @@ def test_sva_jax_in_row_blocks(monkeypatch):
     size = weighting._DEVICE['rows']._cache_size()                  # 21 blocks of rows, one program
     weighting.sva(jnp.asarray(x[::-1].copy()), 2)
     assert size > 0 and weighting._DEVICE['rows']._cache_size() == size
+
+
+@pytest.mark.cuda
+def test_small_gpu_gives_the_same_image(monkeypatch):
+    """With little device memory to count on (FASTSAR_CUDA_BLOCK_MB) apodization runs in slabs of a few rows, on a
+    CuPy image and on a host image passed through the device (process_cphd's, with its ramps), to the bit."""
+    cp = pytest.importorskip('cupy')
+    rng = np.random.default_rng(3)
+    x = (rng.standard_normal((203, 150)) + 1j * rng.standard_normal((203, 150))).astype(np.complex64)
+    x[:40, :60] = 0
+    ramp = np.exp(-2j * np.pi * 0.013 * np.arange(203)).astype(np.complex64)[:, None]
+    rd = (cp.asarray(ramp), cp.asarray(ramp.conj()))
+    cases = (dict(), dict(joint=False), dict(axes=(0,)), dict(oversample=3, axes=(1, 0, 1, 0)), dict(axes=(1,)))
+    refs = [weighting.sva(x, **kw) for kw in cases]
+    ramped = _xp.host(weighting.sva(cp.asarray(x), inplace=True, _cuda=(rd,)))
+    assert np.abs(ramped - weighting.sva(x * ramp) * ramp.conj()).max() <= 1e-5 * np.abs(x).max()
+    monkeypatch.setenv('FASTSAR_CUDA_BLOCK_MB', '0.05')             # slabs of one to seven rows
+    for kw, ref in zip(cases, refs):
+        w = cp.asarray(x)
+        y = weighting.sva(w, **kw)
+        assert y is not w and np.array_equal(_xp.host(y), ref) and np.array_equal(_xp.host(w), x), kw
+        assert weighting.sva(w, inplace=True, **kw) is w and np.array_equal(_xp.host(w), ref), kw
+        h = x.copy()
+        assert weighting.sva(h, inplace=True, _cuda=(), **kw) is h and np.array_equal(h, ref), kw
+    for put in (cp.asarray, np.array):
+        y = weighting.sva(put(x), inplace=True, _cuda=(rd,))
+        assert np.array_equal(_xp.host(y), ramped)
+    y = weighting.sva(x.copy(), inplace=True, _cuda=((rd[0], None),))
+    assert np.array_equal(y, _xp.host(weighting.sva(cp.asarray(x) * rd[0])))

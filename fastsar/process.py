@@ -27,7 +27,7 @@ import time
 
 import numpy as np
 
-from . import _xp, planes, weighting as _weighting
+from . import _xp, memory, planes, weighting as _weighting
 
 __all__ = ['process_cphd']
 
@@ -99,8 +99,13 @@ def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None
     t0 = time.perf_counter()
     st['start'] = t0
 
+    cuda = backend == 'cuda'
+
     def lap(name):
         nonlocal t0
+        if cuda:                                                     # the stage's kernels have run
+            import cupy
+            cupy.cuda.Stream.null.synchronize()
         t1 = time.perf_counter()
         timing[name] = timing.get(name, 0.0) + t1 - t0
         t0 = t1
@@ -180,17 +185,34 @@ def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None
     lap('form')
     timing['read'] = st['read'] - st['start']                        # the file, to the phase history in memory
     timing['form'] -= timing['read']
-    out['image'] = _xp.device(out['image'], backend)                 # the stages that follow run where it lives
+    if not cuda:                                                     # the stages that follow run where it lives;
+        out['image'] = _xp.device(out['image'], backend)             # on a GPU, where _cuda_place finds room
     out.update(product=product, area=area, weighting=st['weighting'], autofocus=None, autofocus_info=None)
-    if st['spot']:
-        out = _spotlight(out, st, product, area, spacing, lap)
-    out['timing'] = timing
-    if product == 'sidd':
-        out.update(remap=remap, remap_args=dict(remap_args or {}), shadows_down=bool(shadows_down))
-    if output is not None and product == 'sidd':                     # remapped where the image lives
-        from .sidd import write_sidd
-        out['metadata'] = write_sidd(output, out, remap=remap, remap_args=remap_args, shadows_down=shadows_down)
-    out['image'] = _xp.host(out['image'])
+    tight = False
+    try:
+        if st['spot']:
+            out, tight = _spotlight(out, st, product, area, spacing, lap, cuda)
+        elif cuda and product == 'sidd':                             # a moving beam: the remap alone is the device's
+            place, tight = _cuda_place(out, dict(ground=out['image'].nbytes, display=out['image'].size))
+            if place['ground'] == 'device':
+                out['image'] = _xp.device(out['image'], backend)
+        out['timing'] = timing
+        if product == 'sidd':
+            out.update(remap=remap, remap_args=dict(remap_args or {}), shadows_down=bool(shadows_down))
+        if output is not None and product == 'sidd':                 # remapped where the image lives
+            from .sidd import write_sidd
+            out['metadata'] = write_sidd(output, out, remap=remap, remap_args=remap_args, shadows_down=shadows_down)
+        out['image'] = _xp.host(out['image'])
+    except Exception as e:
+        if not cuda or type(e).__name__ != 'OutOfMemoryError':
+            raise
+        raise MemoryError(f'the GPU ran out of memory after image formation ({memory._gb(memory.cuda_free())} free '
+                          f'now): {e}. FASTSAR_CUDA_BLOCK_MB sets the device memory these stages count on') from None
+    if tight:
+        memory.cuda_release()
+    if tight == 'host':                                              # the page-locked blocks the images crossed through
+        import cupy
+        cupy.get_default_pinned_memory_pool().free_all_blocks()
     if output is not None and product == 'sicd':
         from .products import write_sicd
         out['metadata'] = write_sicd(output, out)
@@ -223,45 +245,126 @@ def _mask(out, st, area):
     return valid
 
 
-def _spotlight(out, st, product, area, spacing, lap):
+def _cuda_place(out, sizes, **stages):
+    """Where the images of the product live on a CUDA device (memory.cuda_plan on the memory free now) -> (place,
+    tight: False, True when the plan takes more than half of the device, so that the stages return their cached
+    blocks as they go, or 'host' when some image stays on the host). A note says so when the device cannot hold
+    them all."""
+    plan = memory.cuda_plan(sizes, _xp.cuda_budget(), **stages)
+    tight = 'host' if not plan['fits'] else plan['need'] > 0.5 * plan['budget']
+    if tight:
+        memory.cuda_release()                                        # the former's cached blocks and FFT plans
+    if not plan['fits']:
+        names = dict(ground='the image as formed', mid='the intermediate image of the slant resampling',
+                     slant='the slant image', detected='the detected slant image',
+                     ground_mid='the intermediate image of the ground projection', product='the product image')
+        held = [names[k] for k, v in plan['place'].items() if v == 'host']
+        af = stages.get('autofocus') and plan['place']['ground'] == 'host'
+        out['notes'].append(
+            f"the GPU has {plan['budget'] / 1e9:.1f} GB for the stages after formation, which take "
+            f"{plan['need'] / 1e9:.1f} GB with every image of this product on it: kept on the host and passed "
+            "through the GPU in blocks: "
+            + ', '.join(held) + ('; autofocus ran on the host' if af else ''))
+    return plan['place'], tight
+
+
+def _detect(img, where):
+    """The amplitude (float32) of a complex image on the host or a CUDA device, as an array on the device
+    (where='device') or the host, through the device in blocks of rows unless both are there."""
+    import cupy as cp
+    if isinstance(img, cp.ndarray) and where == 'device':
+        return cp.abs(img)
+    n0, n1 = img.shape
+    from .resample_cuda import host_empty, upload
+    out = cp.empty((n0, n1), np.float32) if where == 'device' else host_empty((n0, n1), np.float32)
+    nb = _xp.cuda_rows(n0, 12 * n1, 'detection on the GPU')
+    for a in range(0, n0, nb):
+        blk = img[a:a + nb]
+        r = cp.abs(blk if isinstance(blk, cp.ndarray) else upload(np.ascontiguousarray(blk)))
+        if where == 'device':
+            out[a:a + nb] = r
+        else:
+            r.get(out=out[a:a + nb])
+    return out
+
+
+def _spotlight(out, st, product, area, spacing, lap, cuda):
     s, wt, mg = st['sampling'], st['weighting'], st['margin']
     out['window'] = (wt, wt)
-    planes.deramp(out)
+    nx, ny = out['image'].shape
+    # the grids of the product, before any of its images is made
+    if st['via_slant']:
+        if wt == 'sva':                                              # twice Nyquist of the rectangle keystone left
+            sup = planes.support(planes._frame(out), planes._used(out), out['band'],
+                                 *planes._slant_axes(planes._frame(out), out['height']))
+            sp = (0.5 / (st['kept'][1] - st['kept'][0]), 0.5 / (sup['k2'][1] - sup['k2'][0]))
+        elif product == 'sidd':                                      # detected: the band doubles
+            sp = (0.5 / s['ba'], 0.5 / s['br'])
+        else:
+            sp = (0.96 / s['ba'], 0.96 / s['br'])
+        if product == 'sicd' and spacing is not None:
+            sp = tuple(float(v) for v in np.broadcast_to(np.asarray(spacing, np.float64), (2,)))
+        res = 0.886 / max(s['bx'], s['by'])
+        px = 0.7 * res if spacing is None or product == 'sicd' else float(np.ravel(spacing)[0])
+        b = st['bounds']
+        shape = (int(np.ceil((b[1] - b[0]) / px)) + 1, int(np.ceil((b[3] - b[2]) / px)) + 1)
+    place, tight, release = None, False, lambda: None
+    if cuda:
+        sizes = dict(ground=8 * nx * ny, valid=0 if st['valid'] is None else nx * ny)
+        if st['via_slant']:
+            na, nr = planes._slant_shape(sp, planes._slant_bounds(out, mg))[1]
+            sizes.update(mid=8 * na * ny, slant=8 * na * nr)
+            if product == 'sidd':
+                sizes.update(detected=4 * na * nr, ground_mid=4 * na * shape[1], product=4 * shape[0] * shape[1],
+                             display=shape[0] * shape[1])
+        place, tight = _cuda_place(out, sizes, autofocus=bool(st['autofocus']), sva=wt == 'sva')
+        if tight:
+            release = memory.cuda_release
+        if place['ground'] == 'device':
+            out['image'] = _xp.device(out['image'], 'cuda')
+    planes.deramp(out, _cuda=cuda)
     lap('baseband')
     if st['autofocus']:
         from .autofocus import image_autofocus
         try:
-            out['image'], info = image_autofocus(out['image'], st['autofocus'])
+            try:
+                out['image'], info = image_autofocus(out['image'], st['autofocus'])
+            except Exception as e:                                   # the device held the image, not the correction
+                if _xp.kind(out['image']) != 'cupy' or type(e).__name__ != 'OutOfMemoryError':
+                    raise
+                img = _xp.host(out['image'])
+                out['image'] = None
+                memory.cuda_release()
+                img, info = image_autofocus(img, st['autofocus'])
+                out['image'] = _xp.device(img, 'cuda')
+                del img
+                out['notes'].append('autofocus ran on the host: the GPU had no memory for its correction')
         except ValueError as e:                                      # an image too small for the estimate
             info = dict(mode=st['autofocus'], applied=False, reason=str(e))
             out['notes'].append(f'autofocus skipped: {e}')
         out.update(autofocus=st['autofocus'] if info.get('applied', True) else None, autofocus_info=info)
+        release()
         lap('autofocus')
     valid = None if st['valid'] is None else _mask(out, st, area)
     if not st['via_slant']:                                          # a ground-plane SICD: the image as formed
-        if valid is not None:
+        if valid is not None and _xp.kind(out['image']) == 'cupy':
+            import cupy
+            cupy.putmask(out['image'], cupy.asarray(~valid), 0)
+        elif valid is not None:
             xp = _xp.module(out['image'])
             out['image'] = xp.where(xp.asarray(valid), out['image'], 0)
         out['bandwidth'] = (s['bx'], s['by_full'])
         lap('mask')
-        return out
-    if wt == 'sva':                                                  # twice Nyquist of the rectangle keystone left
-        sup = planes.support(planes._frame(out), planes._used(out), out['band'],
-                             *planes._slant_axes(planes._frame(out), out['height']))
-        sp = (0.5 / (st['kept'][1] - st['kept'][0]), 0.5 / (sup['k2'][1] - sup['k2'][0]))
-    elif product == 'sidd':                                          # detected: the band doubles
-        sp = (0.5 / s['ba'], 0.5 / s['br'])
-    else:
-        sp = (0.96 / s['ba'], 0.96 / s['br'])
-    if product == 'sicd' and spacing is not None:
-        sp = tuple(float(v) for v in np.broadcast_to(np.asarray(spacing, np.float64), (2,)))
-        if sp[0] > 1.0001 / s['ba'] or sp[1] > 1.0001 / s['br']:
-            out['notes'].append(f"spacing {sp[0]:.3f} x {sp[1]:.3f} m is coarser than the band of the data allows "
-                                f"({1 / s['ba']:.3f} x {1 / s['br']:.3f} m): the image is aliased")
+        return out, tight
+    if product == 'sicd' and spacing is not None and (sp[0] > 1.0001 / s['ba'] or sp[1] > 1.0001 / s['br']):
+        out['notes'].append(f"spacing {sp[0]:.3f} x {sp[1]:.3f} m is coarser than the band of the data allows "
+                            f"({1 / s['ba']:.3f} x {1 / s['br']:.3f} m): the image is aliased")
     ground = {k: out[k] for k in ('origin', 'e1', 'e2', 'spx', 'spy')}
-    sl = planes.to_slant(out, sp, margin=mg, valid=valid)
+    sl = planes.to_slant(out, sp, margin=mg, valid=valid,
+                         **(dict(_cuda=dict(mid=place['mid'], out=place['slant'])) if cuda else {}))
     out['image'] = None                                              # the caller's dict too: the ground image is freed
     del out, valid
+    release()
     lap('to_slant')
     if wt == 'sva':
         # apodization takes the band centered: where the aperture is not symmetric about the center of aperture,
@@ -269,27 +372,39 @@ def _spotlight(out, st, product, area, spacing, lap):
         k0, ramp = 0.5 * (st['kept'][0] + st['kept'][1]), None
         if abs(k0) > 0.002 * (st['kept'][1] - st['kept'][0]):
             a = (np.arange(sl['image'].shape[0]) - sl['scp_pixel'][0]) * sl['spx']
-            ramp = _xp.module(sl['image']).asarray(np.exp(-2j * np.pi * k0 * a).astype(np.complex64)[:, None])
-            sl['image'] = sl['image'] * ramp
-        sl['image'] = _weighting.sva(sl['image'], 2, inplace=True)
-        if ramp is not None and product == 'sicd':
-            sl['image'] = sl['image'] * ramp.conj()
+            ramp = np.exp(-2j * np.pi * k0 * a).astype(np.complex64)[:, None]
+        if cuda:                                                     # the ramps on the device, with the image's blocks
+            import cupy
+            if ramp is not None:
+                ramp = (cupy.asarray(ramp), cupy.asarray(ramp.conj()) if product == 'sicd' else None)
+            sl['image'] = _weighting.sva(sl['image'], 2, inplace=True, _cuda=(ramp,))
+        else:
+            if ramp is not None:
+                ramp = _xp.module(sl['image']).asarray(ramp)
+                sl['image'] = sl['image'] * ramp
+            sl['image'] = _weighting.sva(sl['image'], 2, inplace=True)
+            if ramp is not None and product == 'sicd':
+                sl['image'] = sl['image'] * ramp.conj()
+        release()
         lap('sva')
     if product == 'sicd':
-        return sl
+        return sl, tight
     # a SIDD: detected on the slant plane, projected to square ground pixels on axes along the line of sight
-    sl['image'] = _xp.module(sl['image']).abs(sl['image'])
+    sl['image'] = _detect(sl['image'], place['detected']) if cuda else _xp.module(sl['image']).abs(sl['image'])
+    release()
     lap('detect')
-    res = 0.886 / max(s['bx'], s['by'])
-    px = 0.7 * res if spacing is None else float(np.ravel(spacing)[0])
     if px > res:
         sl['notes'].append(f'pixel {px:.3f} m is coarser than the resolution ({res:.3f} m): the detected image is not '
                            'filtered before it is resampled, and speckle aliases')
-    b = st['bounds']
-    shape = (int(np.ceil((b[1] - b[0]) / px)) + 1, int(np.ceil((b[3] - b[2]) / px)) + 1)
     o = ground['origin'] + mg * ground['spx'] * ground['e1'] + mg * ground['spy'] * ground['e2']
-    g = planes.to_ground(sl, o, ground['e1'], ground['e2'], px, shape)
-    g['image'] = _xp.module(g['image']).maximum(g['image'], 0)
+    g = planes.to_ground(sl, o, ground['e1'], ground['e2'], px, shape,
+                         **(dict(_cuda=dict(mid=place['ground_mid'], out=place['product'])) if cuda else {}))
+    del sl
+    if _xp.kind(g['image']) == 'jax':
+        g['image'] = _xp.module(g['image']).maximum(g['image'], 0)
+    else:
+        _xp.module(g['image']).maximum(g['image'], 0, out=g['image'])
     g['bandwidth'] = (s['bx'], s['by'])
+    release()
     lap('to_ground')
-    return g
+    return g, tight

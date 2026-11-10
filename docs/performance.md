@@ -130,6 +130,52 @@ former.memory()     # bytes: {'backend': 'cuda', 'needed': ..., 'available': ...
 warnings.simplefilter('ignore', fastsar.MemoryWarning)   # silence the fallback warnings
 ```
 
+### The stages after formation on a small GPU
+
+The images that follow formation can be larger than the image formed: the slant image of a spotlight at twice
+Nyquist (apodization, and the default SIDD) has 751 million pixels for a March 2025 Capella spotlight (Capella-10,
+78,269 pulses, the tasked area at the default aperture), 6 GB as complex64, and resampling to it holds a 3.8 GB
+intermediate image beside it. On the cuda backend these stages size their temporary arrays from the device memory
+free when they run: resampling and the baseband step work in blocks of lines, apodization in slabs of rows where a
+second array of the image's size does not fit, and the remaps that hold temporary arrays in blocks of rows.
+`planes.to_slant` and `planes.to_ground` keep their intermediate image on the host when it does not fit beside
+the result.
+
+`process_cphd` plans before the first of these stages. From the sizes of the product's images (the image as formed,
+the intermediate and the result of each resampling, the detected image) and nine tenths of the free device memory
+it decides which of them live on the device; an eighth of that memory is left to the stages' blocks. When they all
+fit, the image stays on the device from formation to the file, as on a large GPU. When they do not, the plan
+keeps on the host the images whose absence from the device costs the fewest bytes moved, in page-locked memory,
+and the stages pass them through the GPU in blocks. The pixels are the same either way (autofocus, which then
+runs on the host when the image as formed is one of those kept there, to float32 rounding), and `out['notes']`
+names the images kept on the host. A plan that takes more than half of the free memory also returns CuPy's cached
+blocks and FFT plans to the device between stages. A line of an image that does not fit on the device alone
+raises `MemoryError` with the bytes it takes and the bytes free.
+
+Measured with CuPy's memory pool limited to the memory of a smaller GPU, on the RTX PRO 6000 of the development
+machine (second run in a process; the limit also slows formation, which is in the totals; peaks are the pool's
+bytes in use after formation, and the driver counted 0.56 GiB more for the process than the pool held):
+
+| Collection, product | Device memory | Total | After formation | Peak in use | Kept on the host |
+|---|---|---|---|---|---|
+| March 2025 Capella spotlight, default SIDD (429 Mpx) | unlimited | 6.4 s | 1.7 s | 11.0 GiB | nothing |
+| | 22 GB | 6.7 s | 1.9 s | 9.8 GiB | nothing |
+| | 14 GB | 8.3 s | 1.9 s | 9.6 GiB | nothing |
+| | 8 GB | 16.5 s | 6.0 s | 5.9 GiB | the image as formed, the slant resampling's intermediate, the detected slant image |
+| the same, apodized SICD (751 Mpx) | unlimited | 9.3 s | 4.6 s | 11.5 GiB | nothing |
+| | 22 GB | 9.2 s | 4.5 s | 9.9 GiB | nothing |
+| | 14 GB | 11.1 s | 4.6 s | 9.2 GiB | nothing |
+| | 8 GB | 19.2 s | 8.5 s | 6.0 GiB | the image as formed, the slant resampling's intermediate |
+| January 2025 Capella spotlight (Capella-15), default SIDD (733 Mpx) | 14 GB | 29 s | 10.4 s | 8.6 GiB | the slant resampling's intermediate, the detected slant image |
+| | 8 GB | 90 s | 12.0 s | 4.9 GiB | the image as formed, the slant image, the ground projection's intermediate |
+| the same, apodized SICD (1,022 Mpx) | 14 GB | 34 s | 13.0 s | 8.5 GiB | the slant resampling's intermediate |
+| | 8 GB | 76 s | 10.5 s | 4.8 GiB | the image as formed, the slant image |
+
+Every product under a limit equals the unlimited one pixel for pixel. Passing the whole slant resampling of the
+March spotlight through the device took 0.9 s, against 0.2 s on the device and 11 s on 48 CPU threads, so no stage
+but autofocus is moved to the CPU for lack of device memory. The January rows were timed while the machine ran
+other work.
+
 ## Environment variables
 
 | Variable | Default | Effect |
@@ -153,6 +199,7 @@ warnings.simplefilter('ignore', fastsar.MemoryWarning)   # silence the fallback 
 | `FASTSAR_PINNED` | `1` | `0` returns the cuda image by a plain copy instead of through pinned memory |
 | `FASTSAR_RESAMPLE_JAX` | `blocks` on a TPU, `gather` on JAX's other devices | how `resample` interpolates a JAX image on a knot map (`planes.to_slant`, `planes.to_ground`): `gather` reads every tap with an indexed load, as the CPU and CUDA kernels do; `blocks` reads one window per block of output samples as a row of a table and moves the taps by selects, which a TPU does some fifty times faster |
 | `FASTSAR_REMAP_JAX` | `count` on a TPU, `histogram` on JAX's other devices | how the order statistics of a JAX image are found (`remap.nrl`, `remap.percentile`): from two histograms, or from counts of the pixels below thresholds; the same statistics either way |
+| `FASTSAR_CUDA_BLOCK_MB` | nine tenths of the free device memory, counting the unused blocks of CuPy's pool | megabytes of device memory the stages after formation count on, on the cuda backend: their blocks take a quarter of it at a time (at most 2048 MB), and `process_cphd` keeps on the host the images of a product that do not fit in it (see [Memory](#the-stages-after-formation-on-a-small-gpu)) |
 | `FASTSAR_JAX_BLOCK_MB` | a sixteenth of the device's memory, at most 2048 (1024 where the device does not report its memory) | megabytes of temporary arrays a stage after formation holds on JAX's device at a time; apodization, the remaps, the autofocus correction, the baseband step and the resampling cut the image into blocks that fit |
 | `FASTSAR_FINAL` | `tc3` | `fp32` keeps the cuda float32 final stage on the CUDA cores instead of three bfloat16 tensor-core passes |
 

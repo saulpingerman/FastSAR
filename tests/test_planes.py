@@ -284,8 +284,7 @@ def test_blocks_on_device(lib, need, monkeypatch, jax_path):
     lib = jax_path(lib)
     if lib == 'cupy':
         xp, tol, rms, flips = need('cupy'), 5e-6, 5e-6, 0
-        from fastsar import resample_cuda
-        monkeypatch.setattr(resample_cuda, '_free', lambda: 12 << 20)
+        monkeypatch.setenv('FASTSAR_CUDA_BLOCK_MB', '12')
     else:
         xp, tol, rms, flips = need('jax.numpy'), 2e-3, 2e-4, 2
         from fastsar import resample_jax
@@ -305,3 +304,48 @@ def test_blocks_on_device(lib, need, monkeypatch, jax_path):
     g = sl['ground']
     bk, bd = (planes.to_ground(o, g['origin'], g['e1'], g['e2'], (g['spx'], g['spy']), g['shape']) for o in (sl, sd))
     _close(bd['image'], bk['image'], lib, tol, rms)
+
+
+@pytest.mark.cuda
+def test_small_gpu_gives_the_same_images(need, monkeypatch):
+    """With a quarter of a megabyte of device memory to count on (FASTSAR_CUDA_BLOCK_MB), deramp, to_slant and
+    to_ground give the images of a device with room, value for value: on a CuPy image, whose intermediate image
+    then stays on the host, and for every placement process_cphd may ask for (source, intermediate and result each
+    on the host or on the device), the host arrays crossing in blocks of a few lines."""
+    cp = need('cupy')
+    from fastsar import _xp
+    nx, ny = 310, 270
+    rng = np.random.default_rng(8)
+    base = _product(nx, ny, 0.5, 0.35, 10e3, 0.0, -15.0)
+    img = (rng.normal(size=(nx, ny)) + 1j * rng.normal(size=(nx, ny))).astype(np.complex64)
+    valid = np.ones((nx, ny), bool)
+    valid[: nx // 3, : ny // 2] = False
+
+    def chain(put, cuda=None):
+        """(baseband image, slant image, ground image, detected ground image), as host arrays."""
+        o = dict(base, image=put(img.copy()))
+        planes.deramp(o, _cuda=cuda is not None)
+        bb = _xp.host(o['image']).copy()
+        kw = {} if cuda is None else dict(_cuda=dict(mid=cuda[0], out=cuda[1]))
+        sl = planes.to_slant(o, (0.45, 0.25), margin=10, valid=valid, **kw)
+        where = None if cuda is None else 'cupy' if cuda[1] == 'device' else 'numpy'
+        assert cuda is None or (o['image'] is None and _xp.kind(sl['image']) == where)
+        g = sl['ground']
+        slant = _xp.host(sl['image']).copy()
+        det = abs(cp.asarray(sl['image']))                           # the device's amplitude in every case
+        det = dict(sl, image=det if _xp.kind(sl['image']) == 'cupy' else det.get())
+        bk = planes.to_ground(dict(sl), g['origin'], g['e1'], g['e2'], (g['spx'], g['spy']), g['shape'], **kw)
+        gd = planes.to_ground(det, g['origin'], g['e1'], g['e2'], 0.3, (400, 350), **kw)
+        return bb, slant, _xp.host(bk['image']), _xp.host(gd['image'])
+    ref = chain(cp.asarray)
+    assert planes.deramp(dict(base, image=img.copy()), _cuda=True)['image'].dtype == np.complex64
+    monkeypatch.setenv('FASTSAR_CUDA_BLOCK_MB', '0.25')
+    assert _xp.cuda_block() == 1 << 16
+    cases = [(cp.asarray, None)] + [(put, (mid, out)) for put in (cp.asarray, np.asarray)
+                                    for mid in ('host', 'device') for out in ('host', 'device')]
+    for put, cuda in cases:
+        for got, want in zip(chain(put, cuda), ref):
+            assert got.dtype == want.dtype and np.array_equal(got, want), (put.__module__, cuda)
+    monkeypatch.setenv('FASTSAR_CUDA_BLOCK_MB', '0.001')                 # not one line: said, with the sizes
+    with pytest.raises(MemoryError, match='one line takes .* MB of device memory'):
+        planes.to_slant(planes.deramp(dict(base, image=cp.asarray(img))), (0.45, 0.25))
