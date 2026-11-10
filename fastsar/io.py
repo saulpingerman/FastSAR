@@ -162,13 +162,47 @@ def _cphd03_channel(r, m, arrays, channel):
     return pv, read_rows
 
 
-def _phase_rows(S, f, coef, sign):
+_LIB = []
+
+
+def _lib():
+    """The C++ row passes (io_cpu.cpp), compiled on first use as the other CPU kernels; None where there is no compiler
+    or FASTSAR_IO_KERNEL=0, and the NumPy passes then run."""
+    if not _LIB:
+        import ctypes
+        import os
+        L = None
+        if os.environ.get('FASTSAR_IO_KERNEL', '1') != '0':
+            try:
+                from ._build import shared_object, default_flags
+                with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'io_cpu.cpp')) as fh:
+                    src = fh.read()
+                L = ctypes.CDLL(shared_object('io_cpu', src, default_flags() + ['-std=c++17', '-fopenmp-simd']))
+                n, i, p = ctypes.c_long, ctypes.c_int, ctypes.c_void_p
+                L.phase_ramp.argtypes = [p, n, n, p, p]
+                L.cphd_load.argtypes = [p, i, n, n, p, i, p, p, p, p]
+                L.phase_ramp.restype = L.cphd_load.restype = None
+            except (RuntimeError, OSError):
+                L = None
+        _LIB.append(L)
+    return _LIB[0]
+
+
+def _phase_rows(S, f, coef, sign, linear=None):
     """In place, in row blocks on all cores: S[p, k] *= exp(sign 2j pi f[p, k] coef[p]) with f(slice, out) writing the
     frequencies (Hz) of a row slice into out [rows, K] (no full-size temporary). The phase is formed in float64 and its
-    cosine and sine taken straight into complex64 (on one core a 17 GB history took 100 s, the most of a read)."""
+    cosine and sine taken straight into complex64 (on one core a 17 GB history took 100 s, the most of a read).
+    linear: (f0, df), numbers or arrays [P], when the frequencies are f0[p] + k df[p]: the compiled pass then steps
+    the phasor along each row instead of taking a cosine and a sine per sample, in a fifth of the time."""
     from .patches import _rows_with
     c = sign * 2 * np.pi * np.asarray(coef, np.float64)
     P, K = S.shape
+    lib = _lib() if linear is not None and S.dtype == np.complex64 and S.flags.c_contiguous else None
+    if lib is not None:
+        a = np.ascontiguousarray(np.broadcast_to(np.asarray(linear[0], np.float64) * c, (P,)))
+        b = np.ascontiguousarray(np.broadcast_to(np.asarray(linear[1], np.float64) * c, (P,)))
+        lib.phase_ramp(S.ctypes.data, P, K, a.ctypes.data, b.ctypes.data)
+        return S
     rows = 128
 
     def blk(sl, scratch):
@@ -235,7 +269,7 @@ def _assemble(S, tx, rcv, srp, f0, df, notes, sicd, meta, info):
 
             def freq(sl, out):
                 out[:] = fk
-            _phase_rows(S, freq, 2 * (ref - ref0) / C, -1)
+            _phase_rows(S, freq, 2 * (ref - ref0) / C, -1, linear=(f0, df))
             notes.append(f're-referenced to the mid-aperture scene reference point (range change up to {moved:.1f} m)')
         else:
             fixed_ref = False
@@ -371,7 +405,15 @@ def read_cphd(cphd, sicd=None, channel=0, meta=False, regrid_tol=1e-3, drop_flag
     # reader needs about the history's complex64 size (a 16.5 GB ICEYE file needed over 128 GB with whole-array steps)
     S = np.empty((P, K), np.complex64)
     direct = None if v03 else _cphd1_samples(r, m, channel)
-    if direct is not None:                      # the file's own bytes, converted on all cores
+    loaded = None
+    if direct is not None and _lib() is not None:
+        # one compiled pass on all cores: byte order, scale, conjugation, the check for non-finite and empty rows
+        sig, amp = direct
+        loaded = np.zeros(P, np.uint8)
+        _lib().cphd_load(sig.ctypes.data, {'>i1': 1, '>i2': 2, '>f4': 4}[sig.dtype.str], P, K,
+                         None if amp is None else amp.ctypes.data, 0, None, None, S.ctypes.data, loaded.ctypes.data)
+        del sig
+    elif direct is not None:                    # the file's own bytes, converted on all cores
         sig, amp = direct
         Sv = S.view(np.float32).reshape(P, K, 2)
 
@@ -406,12 +448,16 @@ def read_cphd(cphd, sicd=None, channel=0, meta=False, regrid_tol=1e-3, drop_flag
         blk = S[sl]
         if sgn > 0:
             np.conjugate(blk, out=blk)
-        nonfinite = ~np.isfinite(blk)
-        if nonfinite.any():
-            blk[nonfinite] = 0
-        empty[sl] = ~blk.view(np.float32).any(axis=1)
+        if loaded is None:
+            nonfinite = ~np.isfinite(blk)
+            if nonfinite.any():
+                blk[nonfinite] = 0
+            empty[sl] = ~blk.view(np.float32).any(axis=1)
     from .patches import _rows
-    _rows(clean, P, int(max(1, min(256, (1 << 21) // max(K, 1)))))
+    if loaded is None or sgn > 0:
+        _rows(clean, P, int(max(1, min(256, (1 << 21) // max(K, 1)))))
+    if loaded is not None:
+        empty[:] = loaded != 0
     bad = posbad | empty
     sig = pv('SIGNAL')
     flagged = np.zeros(P, bool) if sig is None else np.asarray(sig).ravel() == 0
@@ -465,7 +511,7 @@ def read_cphd(cphd, sicd=None, channel=0, meta=False, regrid_tol=1e-3, drop_flag
         def freq(sl, out):                      # sc0 + scss k, formed in out
             np.multiply(scss[sl, None], kk[None, :], out=out)
             out += sc0[sl, None]
-        _phase_rows(S, freq, td, +1)
+        _phase_rows(S, freq, td, +1, linear=(sc0, scss))
         notes.append(f'removed {what} at the SRP (mean {td.mean() * 1e9:.2f} ns, span {np.ptp(td) * 1e9:.3f} ns)')
     f0, df = float(np.median(sc0)), float(np.median(scss))
     t1, t2 = pv('TOA1'), pv('TOA2')
