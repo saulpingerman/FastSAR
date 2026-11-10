@@ -263,9 +263,12 @@ def _centroid(a):
 def _contrast(a, axes=None):
     """Contrast of the intensity of a, std / mean over the axes (all pixels, zeros included) -> host float64."""
     xp = _xp.module(a)
-    p = xp.abs(a) ** 2
-    m1 = _xp.host(p.mean(axes)).astype(np.float64)
-    m2 = _xp.host((p * p).mean(axes)).astype(np.float64)
+    if _xp.kind(a) == 'jax':                                        # one compiled program, not one an operation
+        m1, m2 = (_xp.host(v).astype(np.float64) for v in _jit('contrast')(a, axes))
+    else:
+        p = xp.abs(a) ** 2
+        m1 = _xp.host(p.mean(axes)).astype(np.float64)
+        m2 = _xp.host((p * p).mean(axes)).astype(np.float64)
     return np.where(m1 > 0, np.sqrt(np.maximum(m2 - m1 * m1, 0.0)) / np.where(m1 > 0, m1, 1.0), 0.0)
 
 
@@ -297,23 +300,29 @@ def _map_drift(A, band, iterations, tol, workers=-1):
     n, nb = A.shape[:2]
     v = _offsets(n, f0, hf)
     dn, up = (xp.asarray(k.astype(np.float32))[:, None, None] for k in ((v < 0) & (v >= -1), (v >= 0) & (v <= 1)))
-    G = _ft(A, 'fft', workers)
+    jitted = _xp.kind(A) == 'jax'                                   # an iteration as one compiled program
+    G = _jit('fft0')(A) if jitted else _ft(A, 'fft', workers)
     quad = lambda c: xp.asarray(np.exp(-1j * c[None, :] * v[:, None] ** 2).astype(np.complex64))[:, :, None]
     c, corr, step = np.zeros(nb), np.zeros(nb), np.zeros(nb)
     for it in range(max(1, int(iterations))):
-        Gq = G * quad(c)
-        a, b = xp.abs(_ft(Gq * dn, 'ifft', workers)) ** 2, xp.abs(_ft(Gq * up, 'ifft', workers)) ** 2
-        a, b = a - a.mean(0, keepdims=True), b - b.mean(0, keepdims=True)
-        X = _xp.host((xp.conj(_ft(a, 'rfft', workers)) * _ft(b, 'rfft', workers)).sum(-1)).T.astype(np.complex128)
-        ee = _xp.host((a * a).sum((0, 2))).astype(np.float64) * _xp.host((b * b).sum((0, 2))).astype(np.float64)
+        if jitted:
+            xr, xi, ea, eb = (_xp.host(t) for t in _jit('drift')(G, quad(c), dn, up))
+            X, ee = (xr + 1j * xi).T.astype(np.complex128), ea.astype(np.float64) * eb.astype(np.float64)
+        else:
+            Gq = G * quad(c)
+            a, b = xp.abs(_ft(Gq * dn, 'ifft', workers)) ** 2, xp.abs(_ft(Gq * up, 'ifft', workers)) ** 2
+            a, b = a - a.mean(0, keepdims=True), b - b.mean(0, keepdims=True)
+            X = _xp.host((xp.conj(_ft(a, 'rfft', workers)) * _ft(b, 'rfft', workers)).sum(-1)).T.astype(np.complex128)
+            ee = _xp.host((a * a).sum((0, 2))).astype(np.float64) * _xp.host((b * b).sum((0, 2))).astype(np.float64)
         d, pk = _peaks(X, n)
         corr = np.where(ee > 0, pk / np.sqrt(np.where(ee > 0, ee, 1.0)), 0.0)
         step = np.where(ee > 0, -np.pi * hf / sep * d, 0.0)
         c = c + step
         if np.all(np.abs(step) < tol):
             break
+    after = _jit('undo')(G, quad(c)) if jitted else _ft(G * quad(c), 'ifft', workers)
     return dict(c=c, corr=corr, step=step, iterations=it + 1, before=_contrast(A, (0, 2)),
-                after=_contrast(_ft(G * quad(c), 'ifft', workers), (0, 2)))
+                after=_contrast(after, (0, 2)))
 
 
 def _jit(name):
@@ -332,7 +341,20 @@ def _jit(name):
             ph = sum(V[n][:, None] * Cf[n][None, :] for n in range(V.shape[0]))    # not a matrix product: exact float32
             t = jnp.fft.ifft(jnp.fft.fft(blk, axis=0) * (jnp.cos(ph) - 1j * jnp.sin(ph)), axis=0)
             return (jnp.where(blk != 0, t, 0) * w[:, None]).astype(jnp.complex64)
-        _JIT.update(fixed=jax.jit(fixed), strip=jax.jit(strip))
+
+        def drift(G, q, dn, up):                    # _map_drift's iteration: the looks' cross-spectrum and energies
+            Gq = G * q
+            a, b = jnp.abs(jnp.fft.ifft(Gq * dn, axis=0)) ** 2, jnp.abs(jnp.fft.ifft(Gq * up, axis=0)) ** 2
+            a, b = a - a.mean(0, keepdims=True), b - b.mean(0, keepdims=True)
+            X = (jnp.conj(jnp.fft.rfft(a, axis=0)) * jnp.fft.rfft(b, axis=0)).sum(-1)
+            return jnp.real(X), jnp.imag(X), (a * a).sum((0, 2)), (b * b).sum((0, 2))
+
+        def contrast(a, axes):                      # _contrast's two means
+            p = jnp.abs(a) ** 2
+            return p.mean(axes), (p * p).mean(axes)
+        _JIT.update(fixed=jax.jit(fixed), strip=jax.jit(strip), drift=jax.jit(drift),
+                    contrast=jax.jit(contrast, static_argnums=1), fft0=jax.jit(lambda a: jnp.fft.fft(a, axis=0)),
+                    undo=jax.jit(lambda G, q: jnp.fft.ifft(G * q, axis=0)))
     return _JIT[name]
 
 
@@ -344,14 +366,15 @@ def _threads(work, items):
 def _apply(img, phi):
     """img with the phase phi [nx] (rad, FFT order) removed from its azimuth spectrum, complex64, on the device of
     img: ifft(fft(img, axis=0) * exp(-1j * phi)[:, None], axis=0), exact zeros of img kept. Column blocks: on the
-    host one thread per block of about 4 MB, on a GPU blocks of 1 GB, in JAX equal blocks of at most 2 GB through
-    one jitted kernel (the last block overlaps its neighbor so that every block has the same shape)."""
+    host one thread per block of about 4 MB, on a GPU blocks of 1 GB, in JAX equal blocks of at most 2 GB (less on
+    a device with little memory: _xp.jax_block) through one jitted kernel (the last block overlaps its neighbor
+    so that every block has the same shape)."""
     nx, ny = img.shape
     q = np.exp(-1j * np.asarray(phi, np.float64)).astype(np.complex64)
     k = _xp.kind(img)
     if k == 'jax':
         import jax.numpy as jnp
-        f, w = _jit('fixed'), int(min(ny, max(1, _BLOCK['jax'] // nx)))
+        f, w = _jit('fixed'), int(min(ny, max(1, min(_BLOCK['jax'], _xp.jax_block() // 64) // nx)))
         parts = [f(img[:, j:j + w], q) for j in range(0, ny - w + 1, w)]
         if ny % w:
             parts.append(f(img[:, ny - w:], q)[:, w - ny % w:])

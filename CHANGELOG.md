@@ -29,6 +29,25 @@ was published on PyPI.
 
 ### Changed
 
+- The stages after formation on a TPU. `planes.to_slant` and `planes.to_ground` of a JAX image on a TPU no longer
+  read every tap of every output sample with an indexed load, which a TPU does at about 1e8 a second: the samples
+  a block of 16 or 32 output samples needs are read as one row of a table of the line's windows, and each sample
+  moves its taps to the front of the window by selects (`fastsar/resample_jax.py`; `FASTSAR_RESAMPLE_JAX=blocks|gather`,
+  `blocks` by default on a TPU, `gather` elsewhere). The weights are the kernel table's, as a polynomial in its
+  phase. A line whose padded length 32 does not divide is oversampled through transforms of a length a TPU does
+  fast, with the same samples. On a TPU v5e a 23 Mpx image goes to the slant plane in 0.57 s (15.0 s before), a
+  49 Mpx slant image at twice Nyquist is made in 0.89 s and warped back to the ground with the cubic kernel in
+  0.24 s (31.2 s and 9.2 s), and the device's result is within -90 dB of the CPU kernel's (-64 dB before).
+- A complex image leaves a TPU as its two real planes (`_xp.host`): 0.04 s for 23 Mpx on a v5e, 1.2 s before.
+- `remap.nrl` and `remap.percentile` of a JAX image on a TPU find their order statistics from counts of the pixels
+  below thresholds instead of histograms built by indexed adds (`FASTSAR_REMAP_JAX=count|histogram`): the same
+  statistics, 0.08 s for the display values of a 49 Mpx image on a v5e against 1.2 s.
+- Every stage after formation bounds its temporary arrays on JAX's device (`FASTSAR_JAX_BLOCK_MB`, by default a
+  sixteenth of the device's memory): `weighting.sva` runs in blocks of rows with the rows its passes reach, the
+  remaps and their statistics in blocks of pixels, the autofocus correction in column blocks, with the values of
+  the whole-image programs. A 196 Mpx slant image is apodized, detected and projected on a 16 GB TPU with 6.4 GB
+  in use at the peak.
+- The map-drift iteration of `autofocus.quadratic` is one compiled JAX program.
 - With a compiler present but unable to build a kernel (no OpenMP runtime, GCC before 12 on ARM), an installation
   from a platform wheel now falls back to the prebuilt kernel instead of raising. Without prebuilt kernels the
   error is as before, and also says that the installation carries none.

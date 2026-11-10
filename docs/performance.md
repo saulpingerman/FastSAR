@@ -151,6 +151,9 @@ warnings.simplefilter('ignore', fastsar.MemoryWarning)   # silence the fallback 
 | `FASTSAR_PULSE_SLACK` | `0.04` | relative widening of mosaic range gates and pulse counts so patches share compiled programs |
 | `FASTSAR_TIMING` | off | `1` times mosaic steps; `patches.report_timing()` returns them |
 | `FASTSAR_PINNED` | `1` | `0` returns the cuda image by a plain copy instead of through pinned memory |
+| `FASTSAR_RESAMPLE_JAX` | `blocks` on a TPU, `gather` on JAX's other devices | how `resample` interpolates a JAX image on a knot map (`planes.to_slant`, `planes.to_ground`): `gather` reads every tap with an indexed load, as the CPU and CUDA kernels do; `blocks` reads one window per block of output samples as a row of a table and moves the taps by selects, which a TPU does some fifty times faster |
+| `FASTSAR_REMAP_JAX` | `count` on a TPU, `histogram` on JAX's other devices | how the order statistics of a JAX image are found (`remap.nrl`, `remap.percentile`): from two histograms, or from counts of the pixels below thresholds; the same statistics either way |
+| `FASTSAR_JAX_BLOCK_MB` | a sixteenth of the device's memory, at most 2048 (1024 where the device does not report its memory) | megabytes of temporary arrays a stage after formation holds on JAX's device at a time; apodization, the remaps, the autofocus correction, the baseband step and the resampling cut the image into blocks that fit |
 | `FASTSAR_FINAL` | `tc3` | `fp32` keeps the cuda float32 final stage on the CUDA cores instead of three bfloat16 tensor-core passes |
 
 Numeric settings out of range raise `ValueError`. The `FFBP_` prefix is a legacy name. `FASTSAR_CPU_BLOCKED` (`1`
