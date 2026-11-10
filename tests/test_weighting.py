@@ -137,9 +137,18 @@ def test_keystone_keeps_a_rectangle():
     assert np.abs((S != 0).astype(int) - (np.abs(ka) <= fmin * 299792458.0 / (2 * fmin) * band2[1] * (1 + 1e-3))).sum() <= P
 
 
+def _same_sva(got, ref, x):
+    """A blocked result against the whole-image one: float32 rounding apart (the compiled programs of two array shapes
+    may round differently, and a null of the apodization at 1e-11 of the peak then lands on zero or beside it), with
+    the zeros of the input exactly zero in both."""
+    got = np.asarray(got)
+    return (not got[x == 0].any() and not ref[x == 0].any()
+            and np.abs(got - ref).max() <= 2e-6 * np.abs(ref).max())
+
+
 def test_sva_jax_in_row_blocks(monkeypatch):
     """A JAX image larger than the device's block budget is apodized in blocks of rows with the rows each pass
-    along axis 0 reaches: the values of the whole-image program exactly, zeros and edges included, for every order
+    along axis 0 reaches: the values of the whole-image program to float32 rounding, its zeros exactly, for every order
     of the axes, and through one compiled program."""
     jnp = pytest.importorskip('jax.numpy')
     from fastsar import weighting
@@ -155,7 +164,7 @@ def test_sva_jax_in_row_blocks(monkeypatch):
             for mb in ('1.6', '0.6'):                               # 15 rows a slab with their halo, and 7
                 monkeypatch.setenv('FASTSAR_JAX_BLOCK_MB', mb)
                 got = weighting.sva(jnp.asarray(x), N, axes=axes, joint=joint)
-                assert np.array_equal(np.asarray(got), ref), (axes, joint, N, mb)
+                assert _same_sva(got, ref, x), (axes, joint, N, mb)
     size = weighting._DEVICE['core']._cache_size()                  # 21 blocks of rows, one program
     weighting.sva(jnp.asarray(x[::-1].copy()), 2)
     assert size > 0 and weighting._DEVICE['core']._cache_size() == size
@@ -210,9 +219,9 @@ def test_sva_jax_image_on_the_host(monkeypatch):
                 for where in ('host', 'device'):
                     got = weighting.sva(src(x), 2, axes=axes, _jax=(None, None, where))
                     assert _xp.kind(got) == ('numpy' if where == 'host' else 'jax')
-                    assert np.array_equal(_xp.host(got), ref)
+                    assert _same_sva(_xp.host(got), ref, x)
                     got = _xp.host(weighting.sva(src(x), 2, axes=axes, _jax=(r, r.conj(), where)))
-                    assert np.array_equal(got == 0, ramped == 0) and np.abs(got - ramped).max() < 1e-5
+                    assert not got[x == 0].any() and np.abs(got - ramped).max() < 1e-5
     monkeypatch.setenv('FASTSAR_JAX_BLOCK_MB', '0.001')
     with pytest.raises(MemoryError, match='apodization on the JAX device'):
         weighting.sva(x.copy(), 2, _jax=(None, None, 'host'))

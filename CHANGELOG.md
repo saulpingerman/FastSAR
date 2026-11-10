@@ -139,6 +139,22 @@ was published on PyPI.
   has the file, which is why the tests passed). The package data now takes every kernel source, and a test checks
   the list against the files the modules open. Factorized backprojection, the default, was not affected.
 
+### Known issues
+
+- The 2026 Capella spotlight collection named under 0.1.8 still gives the images it gave there (factorized
+  backprojection -42.6 dB from exact backprojection on an 8192 by 8192 grid, polar format -17.4 dB). On one more
+  collection of 2024 the float16 former overflows the half range, as in 0.1.8, and `precision='float32'` forms it.
+- Polar format on one Umbra spotlight collection (2023-10-13, UMBRA-04) differs from exact backprojection by
+  -24.8 dB, where the other collections checked give -26 to -33 dB. 0.1.8 gives the same image.
+- Quadratic autofocus applies nothing where the parts of an image disagree on the error, which is the case on
+  scenes with strong relief off the focus plane (a caldera; estimates from -4 to +3 rad across one scene). The
+  image is then the one formed. `autofocus='spatially_variant'` is the mode for such scenes.
+- After spatially variant apodization the main lobe measured on 30 compact points of six real collections is
+  0.97 of the unweighted width along range and 1.05 along azimuth, with the sidelobe energy 5.3 dB lower.
+- A vendor's SICD of the same collection can differ from the FastSAR product by a range offset and an azimuth
+  scale that are properties of the vendor's processing ([docs/product-options.md](docs/product-options.md#against-a-vendors-sicd-of-the-same-collection)):
+  several Capella spotlight SICDs show an azimuth scale of 4.5e-4 to 4.8e-4.
+
 ## [0.1.8] - 2026-10-27
 
 ### Added
