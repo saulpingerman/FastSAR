@@ -100,6 +100,15 @@ def _oversample(z, pad, n2, workers=1):
     return fft.ifft(G, axis=1, overwrite_x=True, workers=workers)
 
 
+EDGE = 1e-9       # a position within this of an end of a line is on it (resample_cpu.cpp)
+
+
+def _snap(pos, n, xp=np):
+    """Positions on a line of n samples, those within EDGE outside an end moved onto it."""
+    pos = xp.where((pos < 0) & (pos > -EDGE), 0.0, pos)
+    return xp.where((pos > n - 1) & (pos < n - 1 + EDGE), n - 1.0, pos)
+
+
 def _block(src, pos, tab, pad, guard, n2, real):
     """Lines src [L, n] at positions pos [L, m] (source samples): oversample, then the table-driven interpolation."""
     L, n = src.shape
@@ -110,6 +119,7 @@ def _block(src, pos, tab, pad, guard, n2, real):
     if real and pad > 1:
         u = u.real
     u = np.ascontiguousarray(u, np.float32 if real else np.complex64).reshape(-1)
+    pos = _snap(pos, n)
     ok = (pos >= 0) & (pos <= n - 1)
     p = (np.where(ok, pos, 0.0) + guard) * pad
     i0 = np.floor(p)

@@ -9,6 +9,10 @@
 
 // u [L, nu] and out [L, m] hold ch floats per sample (1: real, 2: complex). A source position x (samples of the
 // line before oversampling) lies at x * scale + offset in u; outside [0, nsrc - 1] the output is zero.
+// A position within EDGE of an end of the line is on it: a map that reaches the end exactly lands some 1e-16 to
+// either side of it in float64, and on which side depends on whether the compiler fuses the multiply-adds.
+static const double EDGE = 1e-9;
+
 extern "C" void resample_lines(const float* u, long L, long nu, int ch, const double* pos, long line0,
                                const double* lk, int na, const double* ok, int nb, const double* v,
                                double scale, double offset, double nsrc, long m,
@@ -36,6 +40,8 @@ extern "C" void resample_lines(const float* u, long L, long nu, int ch, const do
         const double w = ((double)j - ok[seg]) / (ok[seg + 1] - ok[seg]);
         x = row[seg] * (1.0 - w) + row[seg + 1] * w;
       }
+      if (x < 0.0 && x > -EDGE) x = 0.0;
+      else if (x > nsrc - 1.0 && x < nsrc - 1.0 + EDGE) x = nsrc - 1.0;
       if (!(x >= 0.0 && x <= nsrc - 1.0)) {
         for (int c = 0; c < ch; ++c) ol[ch * j + c] = 0.f;
         continue;

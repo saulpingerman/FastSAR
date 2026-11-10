@@ -34,7 +34,9 @@ void resample_lines(const float* u, long long ubase, long long usl, long long us
   const long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
   if (idx >= L * m) return;
   const long long l = idx / m, j = idx - l * m;
-  const double x = haspos ? pos[idx] : knot(v, nb, li[l], lw[l], oj[j], ow[j]);
+  double x = haspos ? pos[idx] : knot(v, nb, li[l], lw[l], oj[j], ow[j]);
+  if (x < 0.0 && x > -1e-9) x = 0.0;                           // within rounding of an end: on it (resample_cpu.cpp)
+  else if (x > nsrc - 1.0 && x < nsrc - 1.0 + 1e-9) x = nsrc - 1.0;
   float* o = out + ch * (obase + l * osl + j * osj);
   float ar = 0.f, ai = 0.f;
   if (x >= 0.0 && x <= nsrc - 1.0) {

@@ -1,6 +1,7 @@
 """The installation check (fastsar.doctor): on this machine, and on machines made up by replacing what it looks at
 (no compiler, a GPU without CuPy, a TPU VM without the TPU build of JAX), the commands it recommends."""
 import json
+import sys
 
 import pytest
 
@@ -9,7 +10,7 @@ from fastsar import doctor
 
 def test_this_machine(capsys):
     c = doctor.check(probe=False)
-    assert set(c) >= {'fastsar', 'python', 'cpu', 'compiler', 'nvidia', 'tpu', 'packages', 'backends', 'todo'}
+    assert set(c) >= {'fastsar', 'python', 'cpu', 'compiler', 'kernels', 'nvidia', 'tpu', 'packages', 'backends', 'todo', 'hints'}
     assert c['packages']['numpy'] and c['packages']['scipy'] and c['cpu']['cores'] >= 1
     assert all(set(t) == {'what', 'command', 'pip'} for t in c['todo'])
     text = doctor.report(c)
@@ -18,12 +19,23 @@ def test_this_machine(capsys):
     assert json.loads(capsys.readouterr().out)['fastsar'] == c['fastsar']
 
 
-def machine(monkeypatch, *, compiler=True, openmp=True, nvidia=None, tpu=False, missing=()):
+def machine(monkeypatch, *, compiler=True, openmp=True, nvidia=None, tpu=False, missing=(), prebuilt=None, mode='',
+            simd=('AVX2',)):
+    """prebuilt: the level label of the prebuilt kernels the made-up installation carries (None: none)."""
+    from fastsar import _build
     monkeypatch.setattr(doctor, '_compiler', lambda: dict(
         command='g++', found=compiler, version='g++ 13' if compiler else None, openmp=openmp if compiler else None,
         install=None if compiler and openmp else 'sudo apt-get install -y g++'))
     monkeypatch.setattr(doctor, '_nvidia', lambda: nvidia)
     monkeypatch.setattr(doctor, '_tpu', lambda: tpu)
+    cpu = dict(doctor._cpu(), machine='x86_64', system='linux', simd=list(simd))
+    monkeypatch.setattr(doctor, '_cpu', lambda: cpu)
+    monkeypatch.setattr(sys, 'platform', 'linux')
+    monkeypatch.setattr(_build, 'status', lambda: dict(
+        mode=mode, levels=[prebuilt] if prebuilt else [], prebuilt=dict(platform='linux-x86_64') if prebuilt else None,
+        kernels={name: dict(what=what, prebuilt=prebuilt, used=None,
+                            why=None if prebuilt else 'this installation carries no prebuilt kernels for this platform')
+                 for name, _, _, _, what in _build.KERNELS}))
     real = doctor._has
     monkeypatch.setattr(doctor, '_has', lambda m: False if m in missing else (True if m in ('jax', 'numpy', 'scipy') else real(m)))
     return doctor.check(probe=False)
@@ -35,8 +47,34 @@ def test_no_compiler(monkeypatch):
     t = [t for t in c['todo'] if 'compiler' in t['what']]
     assert len(t) == 1 and not t[0]['pip'] and 'g++' in t[0]['command']
     assert 'sudo apt-get install -y g++' in doctor.report(c)
+    assert 'no prebuilt kernels' in c['backends']['cpu']['why'] and 'CPU kernels: none' in doctor.report(c)
     c = machine(monkeypatch, openmp=False)
     assert not c['backends']['cpu']['ok'] and any('OpenMP' in t['what'] for t in c['todo'])
+
+
+def test_kernel_paths(monkeypatch):
+    """Which shared objects the CPU backend uses: the native build with a compiler, the prebuilt objects of a
+    platform wheel without one (the backend is then ready and nothing is missing), and a hint where a compiler
+    would use vector extensions the prebuilt level leaves out."""
+    c = machine(monkeypatch, prebuilt='x86-64-v3')
+    assert c['backends']['cpu']['ok'] and 'CPU kernels: native build' in doctor.report(c) and not c['hints']
+    assert all(f['path'] == 'native' for f in c['kernels']['families'].values())
+    c = machine(monkeypatch, compiler=False, prebuilt='x86-64-v3')
+    assert c['backends']['cpu']['ok'] and 'prebuilt kernels (x86-64-v3); no C++ compiler' in c['backends']['cpu']['why']
+    assert not [t for t in c['todo'] if 'compiler' in t['what']] and not c['hints']
+    assert 'CPU kernels: prebuilt (x86-64-v3)' in doctor.report(c)
+    c = machine(monkeypatch, openmp=False, prebuilt='x86-64-v3')              # a compiler that cannot build them
+    assert c['backends']['cpu']['ok'] and 'cannot link OpenMP' in c['backends']['cpu']['why']
+    c = machine(monkeypatch, compiler=False, prebuilt='x86-64-v3', simd=('AVX-512', 'AVX2'))
+    assert c['backends']['cpu']['ok'] and len(c['hints']) == 1 and 'AVX-512' in c['hints'][0]['what']
+    assert 'Optional:' in doctor.report(c) and 'sudo apt-get install -y g++' in doctor.report(c)
+    c = machine(monkeypatch, compiler=False, prebuilt='x86-64-v4', simd=('AVX-512', 'AVX2'))
+    assert c['backends']['cpu']['ok'] and not c['hints']
+    c = machine(monkeypatch, prebuilt='x86-64-v3', mode='prebuilt')            # FASTSAR_KERNELS=prebuilt with a compiler
+    assert c['backends']['cpu']['ok'] and 'FASTSAR_KERNELS=prebuilt' in doctor.report(c)
+    assert all(f['text'] == 'prebuilt (x86-64-v3)' for f in c['kernels']['families'].values())
+    c = machine(monkeypatch, compiler=False, prebuilt='x86-64-v3', mode='native')
+    assert not c['backends']['cpu']['ok'] and 'FASTSAR_KERNELS=native' in c['backends']['cpu']['why']
 
 
 @pytest.mark.parametrize('cuda, wheel', [((12, 4), 'cupy-cuda12x[ctk]'), ((13, 2), 'cupy-cuda13x[ctk]'),

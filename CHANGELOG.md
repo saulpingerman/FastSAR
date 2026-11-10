@@ -37,7 +37,29 @@ was published on PyPI.
   CuPy or JAX array and run where it lives, so a GPU or TPU run keeps the image on the device until it is written.
 - `python -m fastsar.doctor` (also the `fastsar-doctor` command): reports which backends this machine can run and
   prints the command that installs each missing piece, from the C++ compiler of the CPU kernels to the CuPy build
-  for the GPU driver's CUDA version; `--install` runs the pip commands among them.
+  for the GPU driver's CUDA version; `--install` runs the pip commands among them. It also reports the CPU kernels
+  in use (a native build, or the prebuilt level), and says when a compiler would let the CPU backend use vector
+  extensions the prebuilt level leaves out.
+- Platform wheels with prebuilt CPU kernels for Linux x86-64, Linux 64-bit ARM and macOS on Apple silicon: the CPU
+  backend runs on a machine with no C++ compiler. On x86-64 the kernels are carried at the levels x86-64-v2,
+  x86-64-v3 (AVX2) and x86-64-v4 (AVX-512), and the best one the processor runs is loaded. The prebuilt objects
+  need no OpenMP runtime: their loops run on threads kept between calls (`par.hpp`), and `OMP_NUM_THREADS` sets
+  their number. Where a compiler is present the kernels are still compiled on first use for the exact processor,
+  and a compiler that cannot build one (no OpenMP runtime, GCC before 12 on ARM) falls back to the prebuilt
+  kernel. `FASTSAR_KERNELS=native` or `prebuilt` forces one of the two, with no fallback to the other
+  ([docs/performance.md](docs/performance.md#cpu-kernels-native-and-prebuilt)). Other platforms install the source
+  distribution and compile as before. `.github/workflows/wheels.yml` builds the wheels with cibuildwheel and tests
+  each one in a container without a compiler and with one.
+- The stages after formation on a TPU. `planes.to_slant` and `planes.to_ground` of a JAX image on a TPU read the
+  samples a block of 16 or 32 output samples needs as one row of a table of the line's windows, where a TPU does
+  an indexed load per tap at only about 1e8 a second (`fastsar/resample_jax.py`; `FASTSAR_RESAMPLE_JAX=blocks|gather`,
+  `blocks` by default on a TPU, `gather` elsewhere); `remap.nrl` and `remap.percentile` find their order
+  statistics from counts of the pixels below thresholds (`FASTSAR_REMAP_JAX=count|histogram`); a complex image
+  leaves the device as its two real planes; and every stage bounds its temporary arrays on the device
+  (`FASTSAR_JAX_BLOCK_MB`, by default a sixteenth of the device's memory). On a TPU v5e a 23 Mpx image goes to the
+  slant plane in 0.57 s, a 49 Mpx slant image at twice Nyquist is made in 0.89 s and warped back to the ground
+  with the cubic kernel in 0.24 s, within -90 dB of the CPU kernel's result, and a 196 Mpx slant image is
+  apodized, detected and projected on the 16 GB device with 6.4 GB in use at the peak.
 - `process_cphd(..., spacing=, extent=)`: the product's pixel spacing, and the tasked area's sides for a collection
   that states no image area.
 - `form_cphd(..., axes='los' | 'auto', aperture='auto' | 'square' | 'full')`, and the grid's geometry in its
