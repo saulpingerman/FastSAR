@@ -236,7 +236,8 @@ def test_matmul_zeros_mask_and_fallback(need, monkeypatch):
     p1 = resample.KnotMap(lk, ok, 0.8137 * ok[None] + 0.0519 * lk[:, None] - 9.07, m1)
     px = resample.KnotMap(lk, ok, 0.9033 * lk[:, None] - 0.1017 * ok[None] + 3.01, m1)    # no position on a tie
     valid = rng.random((n0, n1)) > 0.2
-    out = {}
+    out, calls, plan = {}, [], resample_jax._plan_mm
+    monkeypatch.setattr(resample_jax, '_plan_mm', lambda *a: calls.append(plan(*a)) or calls[-1])
     for path in ('gather', 'matmul'):
         monkeypatch.setenv('FASTSAR_RESAMPLE_JAX', path)
         out[path] = [np.asarray(resample_jax.warp(jnp.asarray(src), p0, p1, (m0, m1), mask=mk))
@@ -245,9 +246,11 @@ def test_matmul_zeros_mask_and_fallback(need, monkeypatch):
         same = (g == 0) == (mm == 0)                    # a position within 1e-5 of a mask's edge may fall either way
         assert 0.05 < (g == 0).mean() < 0.95 and np.count_nonzero(~same) <= (0, 2, 2)[k], (k, np.count_nonzero(~same))
         assert np.abs(g - mm)[same].max() < 2e-3 * np.abs(g).max()
-    calls = []
-    plan = resample_jax._plan_mm
-    monkeypatch.setattr(resample_jax, '_plan_mm', lambda *a: calls.append(plan(*a)) or calls[-1])
+    # the mask through windows of it (two one-hot products) and read sample by sample: the same pixels
+    assert [c['Wv'] is not None for c in calls] == [False] * 5 + [True]
+    monkeypatch.setattr(resample_jax, 'MASK_WINDOW', 0)
+    got = np.asarray(resample_jax.warp(jnp.asarray(src), p0, p1, (m0, m1), mask=(px, (10, n0 - 11), (12, n1 - 13), valid)))
+    assert calls[-1]['Wv'] is None and np.array_equal(got, out['matmul'][2])
     pos = p1(slice(0, m0))
     dense = resample.KnotMap(np.arange(m0, dtype=float), np.arange(m1, dtype=float), pos, m1)   # a knot at every sample
     back = resample.KnotMap(np.array([0.0, m0 - 1]), np.array([0.0, 100.0, m1 - 1]), np.array([[5.0, 150, 20], [9.0, 150, 30]]), m1)

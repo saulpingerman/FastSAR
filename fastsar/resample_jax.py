@@ -35,6 +35,7 @@ from . import resample
 BLOCK = 1 << 24            # samples of an oversampled block of lines (complex64: 128 MB, and a few times it in flight)
 BLOCK_MM = 1 << 28         # elements of a block's shifted windows in the matmul path (bfloat16 on a TPU: 512 MB)
 WINDOW = 96                # the widest window (oversampled samples) of an output block the matmul path takes
+MASK_WINDOW = 1024         # the most pixels of a mask in a block's window; above it the mask is read sample by sample
 PHASES = 2048              # of resample.kernel_table
 
 
@@ -215,10 +216,12 @@ def _at(D, kink, B):
     return _floor(base[..., None], jnp.clip(f, -2.0 ** 24, 2.0 ** 24))
 
 
-def _step_mm(out, src, a, D, w0, kink, M, coef, *, axis, nb, m, pad, guard, n2, B, W, exact):
+def _step_mm(out, src, a, D, w0, kink, M, coef, *, axis, nb, m, pad, guard, n2, B, W, exact, Wv=None):
     """Lines a ... a + nb of a pass by matrix products, written into out. D, kink: _blocks' and _span's; w0 [nb, nblk]:
     the first oversampled sample of each block's window of W + taps - 1; coef: _poly's, times pad; M: None or (Dx,
-    limits, valid), warp's mask; exact: float32 products are exact here (else three bfloat16 parts)."""
+    limits, valid, v0), warp's mask; exact: float32 products are exact here (else three bfloat16 parts). Wv: None
+    (the mask read sample by sample), or the size of each block's window of the mask, whose first pixel is
+    v0 [nb, nblk, 2]: the nearest pixel of each sample is then the product of two one-hot matrices with the window."""
     real = not jnp.iscomplexobj(src)
     if axis == 1:
         n = src.shape[1]
@@ -229,14 +232,23 @@ def _step_mm(out, src, a, D, w0, kink, M, coef, *, axis, nb, m, pad, guard, n2, 
     taps, nblk = coef.shape[1], w0.shape[1]
     ib, ff = _at(D, kink, B)
     ok = _within(ib, ff, 0, n - 1)
+    mm = jnp.float32 if exact else jnp.bfloat16
     if M is not None:
-        Dx, lim, valid = M
+        Dx, lim, valid, v0 = M
         ix, fx = _at(Dx, kink, B)
         ok = ok & _within(ix, fx, lim[0], lim[1]) & _within(ib, ff, lim[2], lim[3])
         if valid is not None:
             nx, ny = valid.shape
-            at = jnp.clip(_rint(ix, fx), 0, nx - 1) * ny + jnp.clip(_rint(ib, ff), 0, ny - 1)
-            ok = ok & jnp.take(valid.reshape(-1), at, mode='clip')
+            ax, ay = jnp.clip(_rint(ix, fx), 0, nx - 1), jnp.clip(_rint(ib, ff), 0, ny - 1)
+            if Wv is None:
+                ok = ok & jnp.take(valid.reshape(-1), ax * ny + ay, mode='clip')
+            else:
+                dn = lax.GatherDimensionNumbers(offset_dims=(2, 3), collapsed_slice_dims=(), start_index_map=(0, 1))
+                V = lax.gather(valid.astype(mm), v0, dn, slice_sizes=Wv, mode='promise_in_bounds')    # [nb, nblk, Wx, Wy]
+                hot = lambda i, i0, w: (jnp.clip(i - i0[..., None], 0, w - 1)[..., None]
+                                        == jnp.arange(w, dtype=jnp.int32)).astype(mm)
+                rows = jnp.einsum('lbjx,lbxy->lbjy', hot(ax, v0[..., 0], Wv[0]), V, preferred_element_type=jnp.float32)
+                ok = ok & ((rows * hot(ay, v0[..., 1], Wv[1]).astype(jnp.float32)).sum(-1) > 0.5)
     Wg = W + taps - 1
     u = jnp.pad(z, ((0, 0), (guard, n2 - n - guard)))
     if pad > 1:
@@ -246,7 +258,6 @@ def _step_mm(out, src, a, D, w0, kink, M, coef, *, axis, nb, m, pad, guard, n2, 
     q = jnp.where(ok, ff, 0) * pad
     fl = jnp.floor(q)
     i0 = (jnp.where(ok, ib, 0) + guard) * pad + fl.astype(jnp.int32) - (taps // 2 - 1)
-    mm = jnp.float32 if exact else jnp.bfloat16
     E = (jnp.clip(i0 - w0[..., None], 0, W - 1)[..., None] == jnp.arange(W, dtype=jnp.int32)).astype(mm)
     parts = []
     for ch in ((u,) if real else (jnp.real(u), jnp.imag(u))):
@@ -266,9 +277,10 @@ def _step_mm(out, src, a, D, w0, kink, M, coef, *, axis, nb, m, pad, guard, n2, 
     return lax.dynamic_update_slice(out, o, (a, 0)) if axis == 1 else lax.dynamic_update_slice(out, o.T, (0, a))
 
 
-def _plan_mm(pos, posx, L, n, tab, pad, guard, n2, real, exact):
-    """The matmul path's plan of a pass on a knot map, or None when the map does not suit it: dict(B, W, nb, span,
-    lines: for each block of lines its start and the host arrays of _step_mm)."""
+def _plan_mm(pos, posx, L, n, tab, pad, guard, n2, real, exact, vshape=None):
+    """The matmul path's plan of a pass on a knot map, or None when the map does not suit it: dict(B, W (_step_mm's),
+    nb (lines a step), D, w0, kink (the host arrays of _step_mm for all the lines), Dx (the mask's map, when posx is
+    given), Wv, v0 (the windows of a mask of shape vshape, when they are small enough))."""
     taps = tab.shape[1]
     with np.errstate(invalid='ignore', divide='ignore'):
         sp = np.nanmedian(np.abs(np.diff(pos.v, axis=1) / np.diff(pos.ok))) * pad
@@ -285,7 +297,7 @@ def _plan_mm(pos, posx, L, n, tab, pad, guard, n2, real, exact):
     nblk, N = len(span[0]), max(pad * n2, 1)
     # whole pass on the host first: the window is one size for every block of lines
     step = 4096
-    D, Dx, w0, W = [], [], [], 0
+    D, Dx, w0, v0, W, Wv = [], [], [], [], 0, np.zeros(2, np.int64)
     for a in range(0, L, step):
         sl = slice(a, min(L, a + step))
         d, lo, hi = _blocks(pos, sl, span)
@@ -296,15 +308,26 @@ def _plan_mm(pos, posx, L, n, tab, pad, guard, n2, real, exact):
         D.append(d)
         w0.append((a0 + (guard * pad - (taps // 2 - 1) - 1)).astype(np.int32))
         if posx is not None:
-            Dx.append(_blocks(posx, sl, span)[0])
+            dx, xlo, xhi = _blocks(posx, sl, span)
+            Dx.append(dx)
+            if vshape is not None:                                  # the nearest pixels of a block, and one more around
+                r = [[np.floor(np.clip(v, 0, k - 1) + 0.5) for v in c] for c, k in zip(((xlo, xhi), (lo, hi)), vshape)]
+                Wv = np.maximum(Wv, [int((c[1] - c[0]).max()) + 3 for c in r])
+                v0.append(np.stack([r[0][0] - 1, r[1][0] - 1], -1).astype(np.int32))
     W = -(-max(W, 4) // 4) * 4
     cat = lambda parts: np.concatenate(parts) if len(parts) > 1 else parts[0]
     D, w0 = tuple(cat([d[k] for d in D]) for k in range(4)), cat(w0)
     w0 = np.clip(w0, 0, max(N, W + taps - 1) - (W + taps - 1))
     Dx = tuple(cat([d[k] for d in Dx]) for k in range(4)) if posx is not None else None
+    mwin = None
+    if v0:
+        Wv = tuple(int(-(-w // 4) * 4) for w in Wv)
+        if Wv[0] * Wv[1] <= MASK_WINDOW and Wv[0] <= vshape[0] and Wv[1] <= vshape[1]:
+            mwin = Wv, np.clip(cat(v0), 0, np.array(vshape) - Wv)
     per = nblk * W * taps * (1 if real else 2) * (1 if exact else 3)
     nb = int(max(1, min(L, BLOCK_MM // per, BLOCK // max(pad * n2, pos.m))))
-    return dict(B=B, W=W, nb=nb, D=D, Dx=Dx, w0=w0, kink=span[4].astype(np.float32))
+    return dict(B=B, W=W, nb=nb, D=D, Dx=Dx, w0=w0, kink=span[4].astype(np.float32), Wv=mwin and mwin[0],
+                v0=mwin and mwin[1].astype(np.int32))
 
 
 _JIT = {}
@@ -346,17 +369,19 @@ def _pass(src, pos, m, axis, kernel, taps, pad, mask=None):
     plan = None
     if knots and _path() == 'matmul':
         exact = _exact_products()
-        plan = _plan_mm(pos, posx if mask is not None else None, L, n, tab, pad, guard, n2, real, exact)
+        plan = _plan_mm(pos, posx if mask is not None else None, L, n, tab, pad, guard, n2, real, exact,
+                        valid.shape if mask is not None and valid is not None else None)
     if plan is not None:
-        step = _jit(_step_mm, ('axis', 'nb', 'm', 'pad', 'guard', 'n2', 'B', 'W', 'exact'))
+        step = _jit(_step_mm, ('axis', 'nb', 'm', 'pad', 'guard', 'n2', 'B', 'W', 'exact', 'Wv'))
         coef, kink, nb = jnp.asarray(_poly(tab) * np.float32(pad)), jnp.asarray(plan['kink']), plan['nb']
         for a in _starts(L, nb):
             sl = slice(a, a + nb)
             D = tuple(jnp.asarray(v[sl]) for v in plan['D'])
             if mask is not None:
-                M = (tuple(jnp.asarray(v[sl]) for v in plan['Dx']), lim, valid)
+                M = (tuple(jnp.asarray(v[sl]) for v in plan['Dx']), lim, valid,
+                     None if plan['v0'] is None else jnp.asarray(plan['v0'][sl]))
             out = step(out, src, np.int32(a), D, jnp.asarray(plan['w0'][sl]), kink, M, coef, axis=axis, nb=nb, m=m,
-                       pad=pad, guard=guard, n2=n2, B=plan['B'], W=plan['W'], exact=exact)
+                       pad=pad, guard=guard, n2=n2, B=plan['B'], W=plan['W'], exact=exact, Wv=plan['Wv'])
         return out
     step = _jit(_step, ('axis', 'mode', 'nb', 'pad', 'guard', 'n2'))
     for a in _starts(L, nb):
