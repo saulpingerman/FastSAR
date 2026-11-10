@@ -67,6 +67,20 @@ was published on PyPI.
   - A SICD is written at 2.6 GB/s into the page cache where sarpy's writer ran at 0.6 GB/s (12000 x 12000 pixels,
     48 cores).
 - `io.read_sicd(path)`: the pixels (a memory map) and metadata of a SICD file.
+- `products.sicd_meta`: the fields of each grid direction follow SICD's rules among themselves, so that every SICD
+  FastSAR writes passes sarkit's consistency check, on real collections as on simulated ones. DeltaK1 and DeltaK2
+  are the band's center less and plus half of ImpRespBW, or the whole sampled band (-1 / (2 SS) to 1 / (2 SS)) for
+  a band that wraps around the sampling rate; ImpRespBW is the band measured from the collection where the product
+  carries it. Rows run along the grid axis nearer the line of sight (the first axis of a grid on track axes squinted
+  past 45 degrees), so shadows fall down the rows. Where the first pulse precedes the collection start the file
+  states, the SICD's start is moved to that pulse (its times cannot be negative).
+- The readers of CPHD, NITF and SICD files check a file before they use it, and every file that cannot be read
+  raises a `ValueError` that starts with the file's path and says what is wrong. Header offsets and sizes are checked
+  against the file's length, the blocks' order and each other (the CPHD blocks against the arrays the XML describes,
+  the section terminator after the XML block, a NITF's image segments against the SICD's NumRows and NumCols). XML
+  that declares a document type or entities is refused. A SICD's root element is found however far into its segment
+  it starts.
+- `io.read_sicd(path, native=True)` converts AMP8I_PHS8I pixels to complex through the SICD's amplitude table.
 - `read_cphd` reads the samples of a CPHD 1.x file from the file's own bytes on all cores, and conjugates and checks them on all cores. The
   samples are identical; reading an 8.7 GB Umbra collection takes 2.1 s where it took 5.9 s, and a 9.2 GB Capella
   collection 3.6 s where it took 13.0 s (48 cores, file in the page cache).

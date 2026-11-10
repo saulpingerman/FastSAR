@@ -90,7 +90,8 @@ the CPU), `'auto'`. Precision: `'float32'`, `'float16'` (CUDA, JAX),
   (Saastamoinen hydrostatic zenith delay, cosecant mapping); what `read_cphd(troposphere='model')` removes.
 - `sicd_points(sicd, rows, cols, meta, hae=None)`: local positions of SICD pixels on any grid type.
 - `read_sicd(path, native=False)`: the pixels (a memory map, or an array in memory in the machine's byte order)
-  and the metadata of a SICD file.
+  and the metadata of a SICD file. `native=True` gives complex64 for every pixel type. A file that cannot be read raises a
+  `ValueError` that starts with its path, as `read_cphd` does.
 - `local_to_ecf(points, meta)`, `ecf_to_local(points, meta)`, `ecf_to_geodetic(ecf)`, `geodetic_to_ecf(lat, lon,
   h)`: frame and WGS-84 conversions (degrees, meters).
 - `rereference(S, fmin, df, dref)`: moves each pulse's reference point by `dref` m of range.

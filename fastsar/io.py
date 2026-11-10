@@ -287,9 +287,10 @@ def _assemble(S, tx, rcv, srp, f0, df, notes, sicd, meta, info):
     origin = s0
     if sicd is not None:
         from . import _sicdxml
-        sm = _sicdxml.read(sicd)
+        sm = _sicdxml.read(sicd, core=True)
         if sm.Grid.Type not in ('RGAZIM', 'PLANE', 'XRGYCR', 'XCTYAT'):
-            raise ValueError(f'the SICD grid is {sm.Grid.Type}, not a plane: read without sicd and form its pixels with '
+            raise ValueError((f'{sm.source}: ' if sm.source else '') + f'the SICD grid is {sm.Grid.Type}, not a plane: '
+                             'read without sicd and form its pixels with '
                              'fastsar.backproject(S, ..., io.sicd_points(sicd, rows, cols, meta))')
         rows, cols = int(sm.ImageData.NumRows), int(sm.ImageData.NumCols)
         row_ss, col_ss = float(sm.Grid.Row.SS), float(sm.Grid.Col.SS)
@@ -340,7 +341,16 @@ def read_cphd(cphd, sicd=None, channel=0, meta=False, regrid_tol=1e-3, drop_flag
     domain); a 0.3 file's channels are identified by index or polarization, and its TropoSRP field, whose units 0.3
     does not define, is reported but not applied. A 0.3 file with RefFreqIndex set declares its frequencies to be
     offsets from a reference frequency it does not contain, and is refused unless ref_freq gives that reference in
-    Hz; ref_freq=0.0 asserts that the file's frequencies are absolute despite the flag."""
+    Hz; ref_freq=0.0 asserts that the file's frequencies are absolute despite the flag.
+    A file that cannot be read as the format describes it (a header or XML that does not parse, blocks or arrays
+    that do not fit the file, a time-of-arrival or compressed signal array) raises a ValueError that starts with the
+    file's path."""
+    from ._xmlmeta import reading
+    with reading(cphd, 'CPHD file', wrap=False):
+        return _read_cphd(cphd, sicd, channel, meta, regrid_tol, drop_flagged, troposphere, phase_sign, ref_freq)
+
+
+def _read_cphd(cphd, sicd, channel, meta, regrid_tol, drop_flagged, troposphere, phase_sign, ref_freq):
     r = _open_cphd(cphd)
     m = r.cphd_meta
     # CPHD 0.3 (the pre-standard NGA format) keeps the per-vector positions and times under the 1.x names but sizes
@@ -1077,9 +1087,16 @@ def read_sicd(path, native=False):
     by the SICD XML's element names (meta.Grid.Row.SS, meta.GeoData.SCP.ECF.get_array()) and the SICD's projection
     (project_image_to_ground, project_ground_to_image). pixels: a read-only memory map in the file's big-endian
     type (complex64 for RE32F_IM32F; [rows, cols, 2] for RE16I_IM16I and AMP8I_PHS8I), or with native=True an array
-    in memory, complex64 for the I and Q types (AMP8I_PHS8I stays its two bytes: amplitude index and phase)."""
+    in memory, complex64 for every pixel type (AMP8I_PHS8I through the SICD's amplitude table, or the amplitude
+    byte itself without one). ValueError, starting with the path, for a file that is not a readable SICD or whose
+    image segments do not make the rows and columns its metadata state."""
     from . import _nitf, _sicdxml
-    return _nitf.read(path).pixels(native=native), _sicdxml.read(path)
+    from ._xmlmeta import reading
+    sm = _sicdxml.read(path)
+    with reading(path, 'SICD'):
+        table = sm.ImageData.AmpTable
+        table = None if table is None else _sicdxml.amp_table(sm)
+        return _nitf.read(path).pixels(native=native, amp_table=table), sm
 
 
 def sicd_points(sicd, rows, cols, meta, hae=None):
@@ -1088,7 +1105,7 @@ def sicd_points(sicd, rows, cols, meta, hae=None):
     including range / zero-Doppler grids, which are not planes; backproject onto these points forms the image on the
     vendor's pixels."""
     from . import _sicdxml
-    sm = _sicdxml.read(sicd)
+    sm = _sicdxml.read(sicd, core=True)
     rows, cols = np.broadcast_arrays(np.asarray(rows, np.float64), np.asarray(cols, np.float64))
     h = float(sm.GeoData.SCP.LLH.HAE) if hae is None else float(hae)
     ecf = sm.project_image_to_ground(np.stack([rows.ravel(), cols.ravel()], 1), projection_type='HAE', hae0=h)

@@ -165,7 +165,7 @@ def write_sicd(path, img, template=None, transpose=None):
     if template is None:
         sm, a = sicd_meta(img)
     else:
-        sm = _sicdxml.read(template).copy()
+        sm = _sicdxml.require(_sicdxml.read(template, core=True), 'ImageFormation', 'ImageData/PixelType').copy()
         rows, cols = int(sm.ImageData.NumRows), int(sm.ImageData.NumCols)
         a = np.asarray(img)
         if transpose is None:
@@ -200,17 +200,21 @@ def sicd_meta(out):
     the SICD's own projection) for a form_cphd output, or a slant-plane image (planes.to_slant), and its image
     arranged as the SICD array [rows, cols].
 
-    Rows run along range away from the radar (e2 or -e2) and columns along e1 or against it, whichever makes the
-    array the view from above (row x column upward: the left of the image is the left of an observer at the radar,
-    for either look side); the scene center point is the grid's center pixel, or the product's own (scp,
+    Rows run along the grid axis nearer the line of sight, away from the radar (e2 or -e2; e1 or -e1 for a grid on
+    track axes squinted past 45 degrees, or one whose first axis is the range axis), and columns along the other axis
+    in the sense that makes the array the view from above (row x column upward: the left of the image is the left of
+    an observer at the radar, for either look side); shadows fall down the rows. The scene center point is the grid's
+    center pixel, or the product's own (scp,
     scp_pixel). Grid.Type PLANE on the ground plane of the grid, or the slant plane (plane 'slant'), ImageFormAlgo
     OTHER, the aperture position as a polynomial in time fitted to the pulses (degree 5 at most), and one center of
     aperture time for the whole image (the mid-aperture pulse's): SICD's projection of a pixel is then the
     range-Doppler model of geolocate and locate, and for a slant-plane image the map of fastsar.planes. Impulse
     response bandwidths and widths are nominal (the data's spatial frequency support, and the 3 dB width that
-    support and the window give). An image as formed keeps backprojection's phase: the band of each axis is
-    centered at its spatial frequency, KCtr, modulo the sampling rate. A baseband image (planes.deramp) has its
-    band where its support entry says, or centered at zero. There is no radiometric calibration (see the module
+    support and the window give), or the band measured from the collection where the product carries it (support).
+    An image as formed keeps backprojection's phase: the band of each axis is centered at its spatial frequency,
+    KCtr, modulo the sampling rate, and DeltaK1 and DeltaK2 are that center less and plus half of ImpRespBW, or the
+    whole sampled band when it wraps. A baseband image (planes.deramp) has its band where its support entry says,
+    or centered at zero. Times count from the collection start, moved to the first pulse if that precedes it. There is no radiometric calibration (see the module
     docstring)."""
     from datetime import datetime, timezone
     from .io import local_to_ecf
@@ -227,13 +231,26 @@ def sicd_meta(out):
     scp_l = np.asarray(out['origin'], np.float64) + i0 * out['spx'] * e1 + j0 * out['spy'] * e2
     ant = 0.5 * (np.asarray(meta['tx'], np.float64) + np.asarray(meta['rcv'], np.float64))
     t = np.asarray(meta['tx_time'], np.float64)
+    # SICD counts time from the collection start and has no time before it: where the first pulse precedes the start
+    # the file states (Capella: by nanoseconds), the start is moved to that pulse
+    early = min(float(t.min()), 0.0)
+    t = t - early
     p0, p1 = (int(v) for v in (out.get('pulses') or (0, len(t))))     # the pulses used
     m = (p0 + p1) // 2
-    away = (scp_l - ant[m]) @ e2 > 0               # e2 points away from the radar: rows follow it
-    # rows along range away from the radar, columns so that row x column is upward (e1 x e2 is)
-    a = img.T[:, ::-1] if away else img.T[::-1]
-    srow = 1 if away else -1
-    urow, ucol = srow * e2 @ R, -srow * e1 @ R
+    # rows along the grid axis nearer the line of sight, away from the radar (e2 for a grid on track axes unless the
+    # squint passes 45 degrees, and for one on line-of-sight axes), columns so that row x column is upward (e1 x e2
+    # is): shadows then fall down the rows, and the array is the view from above
+    look = scp_l - ant[m]
+    rows_e2 = abs(look @ e2) >= abs(look @ e1)
+    srow = 1 if look @ (e2 if rows_e2 else e1) > 0 else -1
+    if rows_e2:
+        a = img.T[:, ::-1] if srow > 0 else img.T[::-1]
+        urow, ucol = srow * e2 @ R, -srow * e1 @ R
+        scp_pixel = (j0, nx - 1 - i0) if srow > 0 else (ny - 1 - j0, i0)
+    else:
+        a = img if srow > 0 else img[::-1, ::-1]
+        urow, ucol = srow * e1 @ R, srow * e2 @ R
+        scp_pixel = (i0, j0) if srow > 0 else (nx - 1 - i0, ny - 1 - j0)
     scp = local_to_ecf(scp_l, meta)
     # aperture position against time
     deg = int(min(5, len(t) - 1))
@@ -246,22 +263,32 @@ def sicd_meta(out):
     f0, f1 = out['band']
     los = (scp - apc[m]) / np.linalg.norm(scp - apc[m])
     kr, kc = (2 * 0.5 * (f0 + f1) / C * (los @ u) for u in (urow, ucol))
-    bw_c, bw_r = out['bandwidth']
     win = tuple(None if w == 'uniform' else w for w in (out.get('window') or (None, None)))
     width = {'taylor': 1.184, 'hann': 1.441, None: 0.886, 'sva': 0.886}           # 3 dB width times bandwidth
     base = bool(out.get('baseband'))
     sup = out.get('support') if base else None      # the spectrum's limits along e1 and e2, on the SICD's axes
-    sup_r, sup_c = (None, None) if sup is None else (
-        tuple(srow * v for v in sup[1])[::srow], tuple(-srow * v for v in sup[0])[::-srow])
+    flip = lambda lim, sgn: None if lim is None else tuple(sgn * v for v in lim)[::sgn]
+    # (spacing, bandwidth, window, measured limits) of the row and the column axis
+    along = {1: (out['spx'], out['bandwidth'][0], win[0], None if sup is None else sup[0]),
+             2: (out['spy'], out['bandwidth'][1], win[1], None if sup is None else sup[1])}
+    (ss_r, bw_r, w_r, lim_r), (ss_c, bw_c, w_c, lim_c) = (along[2], along[1]) if rows_e2 else (along[1], along[2])
+    lim_r, lim_c = flip(lim_r, srow), flip(lim_c, -srow if rows_e2 else srow)
 
     def axis(u, ss, bw, kctr, w, lim):
+        """One direction's parameters, tied together as SICD defines them: the band's center in the sampled image
+        (DeltaKCOAPoly), its width (ImpRespBW, at most the sampling rate 1 / SS), and its limits DeltaK1 and DeltaK2,
+        the center less and plus half the width, or the whole of -1 / (2 SS) to 1 / (2 SS) for a band that wraps
+        around the sampling rate."""
+        half = 0.5 / ss
+        if lim is not None:                         # the band as measured from the collection: its center and width
+            dk, bw = 0.5 * (lim[0] + lim[1]), lim[1] - lim[0]
+        else:                                       # its center folded into the sampled band, nominal width
+            dk = 0.0 if base else (kctr * ss + 0.5) % 1.0 / ss - half
         bw = min(bw, 1.0 / ss)                      # 'sva': apodized after formation, no one aperture weighting
-        if lim is not None:                                         # the band as measured from the collection
-            k1, k2 = max(lim[0], -0.5 / ss), min(lim[1], 0.5 / ss)
-            dk = 0.5 * (k1 + k2)
-        else:                                                       # its center in the sampled image, nominal width
-            dk = 0.0 if base else (kctr * ss + 0.5) % 1.0 / ss - 0.5 / ss
-            k1, k2 = dk - bw / 2, dk + bw / 2
+        k1, k2 = dk - bw / 2, dk + bw / 2
+        if k1 < -half * (1 + 1e-9) or k2 > half * (1 + 1e-9):
+            k1, k2 = -half, half
+        k1, k2 = max(k1, -half), min(k2, half)
         return dict(u=u, ss=ss, wid=width[w] / bw, bw=bw, kctr=kctr, k1=k1, k2=k2, dk=dk, window=w)
     pol = meta.get('polarization')
     pol = f'{pol[0]}:{pol[1]}' if pol else 'UNKNOWN'
@@ -274,16 +301,17 @@ def sicd_meta(out):
     stamp = lambda d: d.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
     start = str(meta.get('start')).strip()
     try:                                            # the collection start as SICD's date and time, to the microsecond
-        start = str(np.datetime64(start.rstrip('Z'), 'us')) + 'Z'
+        start = str(np.datetime64(start.rstrip('Z'), 'ns') + np.timedelta64(int(round(early * 1e9)), 'ns'))
+        start = str(np.datetime64(start, 'us')) + 'Z'
     except ValueError:
         pass
     sm = _sicdxml.build(dict(
         collector=meta.get('collector') or 'UNKNOWN', core_name=meta.get('core_name') or 'UNKNOWN', mode=mode,
-        application=f'FastSAR {__version__}', created=stamp(datetime.now(timezone.utc)), rows=ny, cols=nx,
-        scp_pixel=(j0, nx - 1 - i0) if away else (ny - 1 - j0, i0), scp=scp,
+        application=f'FastSAR {__version__}', created=stamp(datetime.now(timezone.utc)), rows=a.shape[0],
+        cols=a.shape[1], scp_pixel=scp_pixel, scp=scp,
         plane='SLANT' if out.get('plane') == 'slant' else 'GROUND', t_coa=float(t[m]),
-        row=axis(urow, out['spy'], bw_r, kr, win[1], sup_r), col=axis(ucol, out['spx'], bw_c, kc, win[0], sup_c),
-        start=start, duration=float(t[-1]), arp=arp, f0=f0, f1=f1, pol=pol, t0=float(t[p0]), t1=float(t[p1 - 1]),
+        row=axis(urow, ss_r, bw_r, kr, w_r, lim_r), col=axis(ucol, ss_c, bw_c, kc, w_c, lim_c),
+        start=start, duration=float(t.max()), arp=arp, f0=f0, f1=f1, pol=pol, t0=float(t[p0]), t1=float(t[p1 - 1]),
         autofocus=focus))
     return sm, a
 

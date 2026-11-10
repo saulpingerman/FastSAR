@@ -58,9 +58,12 @@ class _Cursor:
         self.b, self.i, self.out = b, 0, out
 
     def raw(self, n):
+        if n < 0:
+            raise ValueError(f'a NITF header length field gives {n} bytes')
         v = self.b[self.i:self.i + n]
         if len(v) != n:
-            raise ValueError('truncated NITF header')
+            raise ValueError(f'the NITF header ends {n - len(v)} bytes short of what its length fields say '
+                             '(truncated file, or wrong lengths)')
         self.i += n
         return v
 
@@ -70,6 +73,8 @@ class _Cursor:
 
     def n(self, name, n):
         t = self.raw(n).decode('latin-1').strip()
+        if t and not t.isdigit():
+            raise ValueError(f'NITF header field {name} is not a number: {t!r}')
         v = self.out[name] = int(t) if t else 0
         return v
 
@@ -83,6 +88,8 @@ def _file_header(fh):
     if head[:9] != b'NITF02.10':
         other = head[:4] in (b'NITF', b'NSIF')
         raise ValueError('not a NITF 2.1 file' + (' (NITF 2.0 and NSIF are not read)' if other else ''))
+    if len(head) < 360 or not head[354:360].isdigit() or int(head[354:360]) < 388:
+        raise ValueError(f'the NITF file header is cut short or its length field HL is wrong ({head[354:360]!r})')
     hl = int(head[354:360])
     fh.seek(0)
     h = {}
@@ -172,7 +179,8 @@ def _des_subheader(b):
 
 
 def _dtype(im):
-    """(big-endian sample dtype, kind) of an image subheader: kind 'iq' for two bands I and Q (complex), else ''."""
+    """(big-endian sample dtype, kind) of an image subheader: kind 'iq' for two bands I and Q (complex), 'mp' for two
+    bytes of magnitude and phase (SICD's AMP8I_PHS8I), else ''."""
     pv, nbpp = im['PVTYPE'], im['NBPP']
     try:
         dt = {('R', 32): '>f4', ('R', 64): '>f8', ('SI', 8): 'i1', ('SI', 16): '>i2', ('SI', 32): '>i4',
@@ -180,7 +188,7 @@ def _dtype(im):
     except KeyError:
         raise ValueError(f'NITF pixel type PVTYPE {pv!r} with {nbpp} bits per band is not supported') from None
     sub = [b['ISUBCAT'] for b in im['bands']]
-    return np.dtype(dt), ('iq' if sub == ['I', 'Q'] else '')
+    return np.dtype(dt), ('iq' if sub == ['I', 'Q'] else 'mp' if sub == ['M', 'P'] and dt == 'u1' else '')
 
 
 class Nitf:
@@ -190,13 +198,20 @@ class Nitf:
     subheader's fields for XML_DATA_CONTENT, `offset`, `length`, and `data`, the segment's bytes). path."""
 
     def __init__(self, path):
-        self.path = str(path)
-        with open(self.path, 'rb') as fh:
+        from ._xmlmeta import reading
+        self.path = os.fspath(path) if not isinstance(path, str) else path
+        with open(self.path, 'rb') as fh, reading(self.path, 'NITF header'):
+            size = os.fstat(fh.fileno()).st_size
             self.header, sizes = _file_header(fh)
             pos = self.header['HL']
             self.images, self.des = [], []
+            # every segment must lie within the file, in the order the header lists them, before anything is read
             for key in ('image', 'graphic', 'text', 'des', 'res'):
-                for lsh, ld in sizes[key]:
+                for k, (lsh, ld) in enumerate(sizes[key]):
+                    if pos + lsh + ld > size:
+                        raise ValueError(f'{key} segment {k + 1} (a subheader of {lsh} bytes and {ld} bytes of data at '
+                                         f'byte {pos}) runs past the end of the file ({size} bytes): truncated file, '
+                                         'or wrong lengths in the header')
                     if key in ('image', 'des'):
                         fh.seek(pos)
                         sub = (_image_subheader if key == 'image' else _des_subheader)(fh.read(lsh))
@@ -210,15 +225,14 @@ class Nitf:
         """The XML documents the file carries, as bytes, in file order: the data of each XML_DATA_CONTENT segment
         (and of the SICD_XML and SIDD_XML segments of files older than SICD 1.0). kind: 'SICD' or 'SIDD' keeps
         those whose root element is that; None keeps all."""
+        from ._xmlmeta import root_name
         out = []
         for d in self.des:
             if d['DESID'] not in ('XML_DATA_CONTENT', 'SICD_XML', 'SIDD_XML'):
                 continue
             x = d['data']
-            if kind is not None:
-                m = re.search(rb'<(?![?!])(?:[\w.-]+:)?([\w.-]+)', x[:4096])
-                if m is None or m.group(1).decode() != kind:
-                    continue
+            if kind is not None and root_name(x) != kind:
+                continue
             out.append(x)
         return out
 
@@ -236,42 +250,86 @@ class Nitf:
             key = k
         return out
 
-    def _segment(self, im):
+    def _layout(self, im):
+        """(big-endian dtype, shape, kind) of an image segment's pixels, checked against the segment's length."""
         if im['IC'] != 'NC':
             raise ValueError(f"NITF image compression IC = {im['IC']} is not supported (NC, uncompressed and "
                              'unmasked, only)')
         if im['NBPR'] * im['NBPC'] != 1:
-            raise ValueError(f"NITF images of more than one block are not supported (NBPR {im['NBPR']}, NBPC {im['NBPC']})")
+            raise ValueError('NITF images of more than one block are not supported '
+                             f"(NBPR {im['NBPR']}, NBPC {im['NBPC']})")
         nb = im['NBANDS']
         if nb > 1 and im['IMODE'] != 'P':
-            raise ValueError(f"NITF band layout IMODE = {im['IMODE']} with {nb} bands is not supported (P, by pixel, only)")
+            raise ValueError(f"NITF band layout IMODE = {im['IMODE']} with {nb} bands is not supported "
+                             '(P, by pixel, only)')
         dt, kind = _dtype(im)
         rows, cols = im['NROWS'], im['NCOLS']
+        if rows < 1 or cols < 1 or nb < 1:
+            raise ValueError(f'NITF image segment of {rows} rows, {cols} columns and {nb} bands')
         if rows * cols * nb * dt.itemsize != im['length']:
-            raise ValueError('NITF image segment length does not match its rows, columns, bands and bits per pixel')
+            raise ValueError(f"NITF image segment {im['IID1']}: {rows} rows x {cols} columns x {nb} bands of "
+                             f"{dt.itemsize} bytes do not make its length, {im['length']} bytes")
         if kind == 'iq' and dt == np.dtype('>f4'):
-            dt, shape = np.dtype('>c8'), (rows, cols)
-        else:
-            shape = (rows, cols) if nb == 1 else (rows, cols, nb)
+            return np.dtype('>c8'), (rows, cols), kind
+        return dt, ((rows, cols) if nb == 1 else (rows, cols, nb)), kind
+
+    def _segment(self, im):
+        dt, shape, kind = self._layout(im)
         return np.memmap(self.path, dtype=dt, mode='r', offset=im['offset'], shape=shape), kind
 
-    def pixels(self, native=False, index=0):
+    def _group(self, index):
+        g = self.groups()
+        if not g:
+            raise ValueError('the NITF file has no image segment')
+        if not 0 <= index < len(g):
+            raise ValueError(f'image {index}: the NITF file has {len(g)} images')
+        return g[index]
+
+    def shape(self, index=0):
+        """(rows, cols) of image `index`, its segments' layouts checked against their lengths in the file (ValueError
+        when they disagree, or for a layout that is not read)."""
+        from ._xmlmeta import reading
+        with reading(self.path, 'NITF image'):
+            lay = [self._layout(self.images[i]) for i in self._group(index)]
+            if len({(sh[1:], dt) for dt, sh, _ in lay}) != 1:
+                raise ValueError('the segments of the NITF image differ in columns or pixel type')
+            return sum(sh[0] for _, sh, _ in lay), lay[0][1][1]
+
+    def pixels(self, native=False, index=0, amp_table=None):
         """The pixels of image `index` (see groups), its segments joined along rows.
 
         native False: in the file's big-endian types, a read-only memory map for an image of one segment and an
         array in memory for several. [rows, cols] big-endian complex64 for float32 I and Q bands, [rows, cols] for
         one band, [rows, cols, bands] otherwise (int16 I and Q, amplitude and phase bytes, RGB).
         native True: an array in memory in the machine's byte order, converted in row blocks on all cores; I and Q
-        bands of any type become complex64 [rows, cols]."""
-        segs = [self._segment(self.images[i]) for i in self.groups()[index]]
+        bands of any type become complex64 [rows, cols], and so do magnitude and phase bytes (SICD's AMP8I_PHS8I):
+        amp_table[magnitude] exp(2j pi phase / 256), with amp_table the 256 amplitudes of the SICD's
+        ImageData.AmpTable, or the magnitude byte itself when the SICD has none (None)."""
+        self.shape(index)
+        segs = [self._segment(self.images[i]) for i in self._group(index)]
         maps, kind = [s[0] for s in segs], segs[0][1]
-        if len({(m.shape[1:], m.dtype) for m in maps}) != 1:
-            raise ValueError('the segments of the NITF image differ in columns or pixel type')
         if not native:
             return maps[0] if len(maps) == 1 else np.concatenate(maps)
         from .patches import _rows
         m0 = maps[0]
         iq = kind == 'iq' and m0.ndim == 3
+        if kind == 'mp':
+            table = np.arange(256, dtype=np.float32) if amp_table is None else np.asarray(amp_table, np.float32).ravel()
+            if table.size != 256:
+                raise ValueError(f'{self.path}: the amplitude table of an AMP8I_PHS8I image has 256 entries, not '
+                                 f'{table.size}')
+            turn = np.exp(2j * np.pi * np.arange(256) / 256).astype(np.complex64)
+            out = np.empty((sum(len(m) for m in maps), m0.shape[1]), np.complex64)
+            r0 = 0
+            for m in maps:
+                dst = out[r0:r0 + len(m)]
+
+                def blk(sl, m=m, dst=dst):
+                    b = m[sl]
+                    np.multiply(table[b[..., 0]], turn[b[..., 1]], out=dst[sl])
+                _rows(blk, len(m), _chunk(m[:1].nbytes * 4))
+                r0 += len(m)
+            return out
         out = np.empty((sum(len(m) for m in maps), m0.shape[1]) if iq else (sum(len(m) for m in maps),) + m0.shape[1:],
                        np.complex64 if iq else m0.dtype.newbyteorder('='))
         r0 = 0
@@ -512,8 +570,8 @@ def write(path, images, des, fields=None):
 def _xml_facts(xml):
     """What the headers take from a SICD or SIDD XML document: dict(kind, core, collector, start, created,
     classification, corners [4, 2] or None), each None where the document lacks it."""
-    import xml.etree.ElementTree as ET
-    root = ET.fromstring(xml)
+    from ._xmlmeta import fromstring
+    root = fromstring(xml, 'XML document')
     loc = lambda t: t.rsplit('}', 1)[-1]
 
     def find(path):

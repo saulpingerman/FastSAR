@@ -113,12 +113,15 @@ def sarpy_sicd(out):
         wgt = {None: WgtTypeType(WindowName='UNIFORM'), 'hann': WgtTypeType(WindowName='HANNING'),
                'taylor': WgtTypeType(WindowName='TAYLOR', Parameters={'NBAR': '4', 'SLL': '-35'}),
                'sva': WgtTypeType(WindowName='SVA')}[w]             # apodized after formation: no one aperture weighting
-        if lim is not None:                                         # the band as measured from the collection
-            k1, k2 = max(lim[0], -0.5 / ss), min(lim[1], 0.5 / ss)
-            dk = 0.5 * (k1 + k2)
-        else:                                                       # its center in the sampled image, nominal width
-            dk = 0.0 if base else (kctr * ss + 0.5) % 1.0 / ss - 0.5 / ss
-            k1, k2 = dk - bw / 2, dk + bw / 2
+        half = 0.5 / ss                             # SICD's rules between the band's center, width and limits
+        if lim is not None:
+            dk, bw = 0.5 * (lim[0] + lim[1]), min(lim[1] - lim[0], 1.0 / ss)
+        else:
+            dk = 0.0 if base else (kctr * ss + 0.5) % 1.0 / ss - half
+        k1, k2 = dk - bw / 2, dk + bw / 2
+        if k1 < -half * (1 + 1e-9) or k2 > half * (1 + 1e-9):
+            k1, k2 = -half, half
+        k1, k2 = max(k1, -half), min(k2, half)
         return DirParamType(UVectECF=u, SS=ss, ImpRespWid=width[w] / bw, Sgn=-1, ImpRespBW=bw, KCtr=kctr,
                             DeltaK1=k1, DeltaK2=k2, DeltaKCOAPoly=[[dk]], WgtType=wgt)
     pol = meta.get('polarization')

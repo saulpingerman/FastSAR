@@ -251,7 +251,14 @@ def test_reader(scene):
     ap = rng.integers(0, 256, (37, 23, 2)).astype(np.uint8)
     _nitf.write(path, [dict(sub, data=ap, dtype='u1', bands=[('', 'M'), ('', 'P')], PVTYPE='INT', ABPP=8, NBPP=8)], des)
     f = _nitf.read(path)
-    assert np.array_equal(f.pixels(), ap) and np.array_equal(f.pixels(native=True), ap)
+    assert np.array_equal(f.pixels(), ap)
+    # magnitude and phase bytes as complex: the amplitude table's entry (or the byte itself) at 256ths of a turn
+    turn = np.exp(2j * np.pi * ap[..., 1] / 256)
+    table = np.linspace(0.0, 5.0, 256) ** 2
+    assert np.allclose(f.pixels(native=True), ap[..., 0] * turn, rtol=1e-6, atol=1e-4)
+    assert np.allclose(f.pixels(native=True, amp_table=table), table[ap[..., 0]] * turn, rtol=1e-6, atol=1e-4)
+    with pytest.raises(ValueError, match='256 entries'):
+        f.pixels(native=True, amp_table=table[:100])
     # a compressed image, more than one block, bands by block
     raw = path.read_bytes()
     at = f.images[0]['offset'] - f.header['LISH001']

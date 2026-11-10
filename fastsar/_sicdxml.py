@@ -141,18 +141,24 @@ class SICD(Node):
     get_array() on vectors and polynomials, None for absent elements, assignment to leaves) with the SICD's own
     projection model. Lists: RadarCollection.RcvChannels, ImageFormation.RcvChanProc.ChanIndices,
     CollectionInfo.Parameters (a dict), GeoData.ImageCorners.get_array() ([4, 2] latitude, longitude)."""
-    __slots__ = ()
+    __slots__ = ('_src',)
 
-    def __init__(self, element, namespace=NAMESPACE):
+    def __init__(self, element, namespace=NAMESPACE, source=''):
         Node.__init__(self, element, SPEC)
         object.__setattr__(self, '_ns', namespace)
+        object.__setattr__(self, '_src', source)
 
     @classmethod
-    def from_xml(cls, xml):
-        n = parse(xml, SPEC)
+    def from_xml(cls, xml, source=''):
+        n = parse(xml, SPEC, 'SICD XML')
         if n.tag != 'SICD':
             raise ValueError(f'not SICD metadata: the root element is {n.tag}')
-        return cls(n.element, n.namespace or NAMESPACE)
+        return cls(n.element, n.namespace or NAMESPACE, source)
+
+    @property
+    def source(self):
+        """The path of the file the metadata were read from, or ''."""
+        return getattr(self, '_src', '')
 
     from_xml_string = from_xml
 
@@ -162,10 +168,11 @@ class SICD(Node):
 
     def copy(self):
         import copy
-        return SICD(copy.deepcopy(self._e), self._ns)
+        return SICD(copy.deepcopy(self._e), self._ns, self.source)
 
     def __setstate__(self, s):
         Node.__setstate__(self, s)
+        object.__setattr__(self, '_src', '')
 
     def to_xml_bytes(self, declaration=False, **kw):
         return Node.to_xml_bytes(self, declaration)
@@ -193,30 +200,88 @@ class SICD(Node):
         return self.project_ground_to_image(_ecf(llh), **kw)
 
 
-def read(sicd):
+CORE = ('ImageData/NumRows', 'ImageData/NumCols', 'ImageData/FirstRow', 'ImageData/FirstCol',
+        'ImageData/SCPPixel/Row', 'ImageData/SCPPixel/Col', 'GeoData/SCP/ECF', 'Grid/Type', 'Grid/Row/UVectECF',
+        'Grid/Row/SS', 'Grid/Col/UVectECF', 'Grid/Col/SS')        # what every use of a SICD's grid reads
+
+
+def require(sm, *paths):
+    """Check that the SICD metadata sm have the elements at paths ('Grid/Row/SS', ...), with numbers where numbers
+    belong (finite; counts and spacings positive): ValueError naming the file (when known), the element and what is
+    wrong with it. -> sm."""
+    src = f'{sm.source}: ' if sm.source else ''
+    for path in paths:
+        e = sm.element.find(path)
+        if e is None:
+            raise ValueError(f'{src}the SICD metadata have no {path.replace("/", ".")} element')
+        name = path.rsplit('/', 1)[-1]
+        if len(e) == 0 and name not in SPEC.text:
+            try:
+                v = float(e.text)
+            except (TypeError, ValueError):
+                raise ValueError(f'{src}SICD {path.replace("/", ".")} is not a number: {e.text!r}') from None
+            if not np.isfinite(v) or (name in ('NumRows', 'NumCols', 'SS') and v <= 0) or \
+                    (name in SPEC.ints and v != int(v)):
+                raise ValueError(f'{src}SICD {path.replace("/", ".")} is {e.text.strip()}')
+        elif len(e) and name in ('ECF', 'UVectECF', 'ARPPoly', 'TimeCOAPoly'):
+            try:
+                a = Node(e, SPEC).get_array()
+            except (TypeError, ValueError) as err:
+                raise ValueError(f'{src}SICD {path.replace("/", ".")}: {err}') from None
+            if not np.isfinite(a).all():
+                raise ValueError(f'{src}SICD {path.replace("/", ".")} has values that are not finite')
+    return sm
+
+
+def amp_table(sm):
+    """The 256 amplitudes of ImageData.AmpTable (AMP8I_PHS8I pixels) by index, or None when the SICD has none."""
+    t = sm.element.find('ImageData/AmpTable')
+    if t is None:
+        return None
+    out = np.zeros(256)
+    for k, a in enumerate(t.findall('Amplitude')):
+        out[int(a.get('index', k))] = float(a.text)
+    return out
+
+
+def read(sicd, core=False):
     """SICD metadata of: a SICD object (returned as it is), XML bytes or an XML string, the path of a .xml file
     (the metadata alone), or the path of a SICD NITF. An object with a to_xml_bytes method (another library's
-    SICD type) is converted through its XML."""
+    SICD type) is converted through its XML. A file's metadata are checked: the XML must parse (and declare no
+    document type or entities), have the elements every use of the grid reads (CORE), and, in a NITF, state the rows
+    and columns its image segments hold; core=True checks CORE on metadata that did not come from a file as well.
+    ValueError, starting with the path for a file, says what is wrong."""
     import os
+    from ._xmlmeta import reading
     if isinstance(sicd, SICD):
-        return sicd
+        return require(sicd, *CORE) if core else sicd
     if isinstance(sicd, bytes) or (isinstance(sicd, str) and sicd.lstrip().startswith('<')):
-        return SICD.from_xml(sicd)
+        sm = SICD.from_xml(sicd)
+        return require(sm, *CORE) if core else sm
     if isinstance(sicd, (str, os.PathLike)):
         path = os.fspath(sicd)
-        if path.lower().endswith('.xml'):
-            with open(path, 'rb') as fh:
-                return SICD.from_xml(fh.read())
-        from . import _nitf
-        xml = _nitf.read(path).xml('SICD')
-        if not xml:
-            raise ValueError(f'{path}: no SICD XML data extension segment in the file')
-        return SICD.from_xml(xml[0])
+        with reading(path, 'SICD'):
+            if path.lower().endswith('.xml'):
+                with open(path, 'rb') as fh:
+                    return require(SICD.from_xml(fh.read(), path), *CORE)
+            from . import _nitf
+            f = _nitf.read(path)
+            xml = f.xml('SICD')
+            if not xml:
+                raise ValueError('no SICD XML data extension segment in the file')
+            sm = require(SICD.from_xml(xml[0], path), *CORE)
+            if f.images:
+                rows, cols = f.shape(0)
+                if (rows, cols) != (int(sm.ImageData.NumRows), int(sm.ImageData.NumCols)):
+                    raise ValueError(f'the SICD metadata state {int(sm.ImageData.NumRows)} rows and '
+                                     f'{int(sm.ImageData.NumCols)} columns, the image segments hold {rows} and {cols}')
+            return sm
     if hasattr(sicd, 'to_xml_bytes'):
         try:
-            return SICD.from_xml(sicd.to_xml_bytes(tag='SICD'))
+            sm = SICD.from_xml(sicd.to_xml_bytes(tag='SICD'))
         except TypeError:
-            return SICD.from_xml(sicd.to_xml_bytes())
+            sm = SICD.from_xml(sicd.to_xml_bytes())
+        return require(sm, *CORE) if core else sm
     raise TypeError(f'not a SICD: {type(sicd).__name__}')
 
 
@@ -392,6 +457,7 @@ class _Model:
     image coordinates to range and range rate at the center of aperture (Volume 3, section 4)."""
 
     def __init__(self, sm):
+        require(sm, *CORE, 'Grid/TimeCOAPoly', 'Position/ARPPoly')
         g = sm.Grid
         self.scp = sm.GeoData.SCP.ECF.get_array()
         self.pixel = np.array([float(sm.ImageData.SCPPixel.Row) - float(sm.ImageData.FirstRow or 0),
@@ -405,21 +471,22 @@ class _Model:
         algo = str(sm.ImageFormation.ImageFormAlgo) if sm.ImageFormation is not None else ''
         self.fpn = None
         if self.kind == 'RGAZIM' and algo == 'PFA':
+            require(sm, 'PFA/PolarAngPoly', 'PFA/SpatialFreqSFPoly', 'PFA/FPN')
             self.kind = 'PFA'
             self.polar = sm.PFA.PolarAngPoly.get_array()
             self.ksf = sm.PFA.SpatialFreqSFPoly.get_array()
             self.fpn = sm.PFA.FPN.get_array()
         elif self.kind == 'RGAZIM' and algo == 'RGAZCOMP':
+            require(sm, 'RgAzComp/AzSF')
             self.kind = 'RGAZCOMP'
             self.azsf = float(sm.RgAzComp.AzSF)
         elif self.kind == 'RGZERO':
-            inca = sm.RMA.INCA if sm.RMA is not None else None
-            if inca is None:
-                raise ValueError('an RGZERO grid needs the RMA.INCA parameters to be projected')
+            require(sm, 'RMA/INCA/R_CA_SCP', 'RMA/INCA/TimeCAPoly', 'RMA/INCA/DRateSFPoly')
+            inca = sm.RMA.INCA
             self.r_ca, self.tca = float(inca.R_CA_SCP), inca.TimeCAPoly.get_array()
             self.drsf = np.atleast_2d(inca.DRateSFPoly.get_array())
         elif self.kind not in ('PLANE', 'XRGYCR', 'XCTYAT'):
-            raise ValueError(f'the projection of a SICD grid of type {self.kind} '
+            raise ValueError(f'{sm.source + ": " if sm.source else ""}the projection of a SICD grid of type {self.kind} '
                              f'(image formation {algo or "unknown"}) is not implemented')
         # the scene center point's slant plane normal at its center of aperture, for the scene to image iteration
         t0 = float(self.tcoa[0, 0])

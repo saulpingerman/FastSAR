@@ -84,6 +84,8 @@ _SIGNAL03 = {'RE08I_IM08I': '>i1', 'RE16I_IM16I': '>i2', 'RE32F_IM32F': '>f4'}
 def _one_format(s, order):
     s = s.strip()
     if s.startswith('S') and s[1:].isdigit():
+        if not 0 < int(s[1:]) <= 1 << 16:
+            raise ValueError(f'CPHD binary format {s!r}: a string of that length cannot be a parameter')
         return np.dtype(s)
     if s in _PAIRS:
         return np.dtype([('real', order + _PAIRS[s]), ('imag', order + _PAIRS[s])])
@@ -100,6 +102,8 @@ def format_dtype(fmt, order='>'):
     if '=' not in fmt:
         return _one_format(fmt.rstrip(';'), order)
     parts = [p.split('=') for p in fmt.split(';') if p.strip()]
+    if any(len(p) != 2 or not p[0].strip() for p in parts):
+        raise ValueError(f'CPHD binary format {fmt!r} is not NAME=TYPE; pairs')
     names, types = [p[0].strip() for p in parts], [_one_format(p[1], order) for p in parts]
     if tuple(names) in (('X', 'Y', 'Z'), ('DCX', 'DCY')) and len(set(types)) == 1:
         return np.dtype((types[0], len(names)))
@@ -113,20 +117,36 @@ def _local(e):
 def pvp_dtype(pvp, nbytes, order='>'):
     """The structured dtype of one vector of a CPHD 1.x file, from the XML's PVP element (an ElementTree element,
     with or without namespaces) and Data.NumBytesPVP. Fields in the XML's order, each at its own offset."""
-    names, formats, offsets = [], [], []
+    names, formats, offsets, spans = [], [], [], []
 
     def walk(e):
         kids = {_local(c): c for c in e}
         if {'Offset', 'Size', 'Format'} <= set(kids):
-            name = kids['Name'].text.strip() if 'Name' in kids else _local(e)
+            name = kids['Name'].text.strip() if 'Name' in kids and kids['Name'].text else _local(e)
+            try:
+                off, size = int(kids['Offset'].text), int(kids['Size'].text)
+            except (TypeError, ValueError):
+                raise ValueError(f'CPHD per-vector parameter {name}: Offset and Size must be whole numbers') from None
+            dt = format_dtype(kids['Format'].text or '', order)
+            if off < 0 or size < 1 or dt.itemsize > 8 * size or 8 * (off + size) > int(nbytes):
+                raise ValueError(f'CPHD per-vector parameter {name}: Offset {off}, Size {size} (8-byte words) and '
+                                 f'Format {kids["Format"].text!r} ({dt.itemsize} bytes) do not fit a vector of '
+                                 f'{nbytes} bytes')
             names.append(name)
-            formats.append(format_dtype(kids['Format'].text, order))
-            offsets.append(8 * int(kids['Offset'].text))
+            formats.append(dt)
+            offsets.append(8 * off)
+            spans.append((off, off + size, name))
         else:
             for c in e:
                 walk(c)
     for c in pvp:
         walk(c)
+    if not names or len(set(names)) != len(names):
+        raise ValueError('the CPHD PVP block of the XML defines no parameters, or one twice')
+    spans.sort()
+    for (_, end, a), (start, _, b) in zip(spans, spans[1:]):
+        if start < end:
+            raise ValueError(f'CPHD per-vector parameters {a} and {b} overlap (word {start} lies inside {a})')
     return np.dtype(dict(names=names, formats=formats, offsets=offsets, itemsize=int(nbytes)))
 
 
@@ -137,10 +157,12 @@ def vbp_dtype(vp, nbytes, order='>'):
     for c in vp:
         if len(c):
             fields += [(_local(k), order + 'f8') for k in c]
-        elif int(c.text) == 24:
+        elif (c.text or '').strip() == '24':
             fields.append((_local(c), order + 'f8', (3,)))
-        else:
+        elif (c.text or '').strip() == '8':
             fields.append((_local(c), order + 'f8'))
+        else:
+            raise ValueError(f'CPHD 0.3 vector parameter {_local(c)} has size {c.text!r}: 8 or 24 bytes')
     dt = np.dtype(fields)
     if dt.itemsize != int(nbytes):
         raise ValueError(f'CPHD 0.3 vector parameters take {dt.itemsize} bytes, NumBytesVBP says {nbytes}')
@@ -154,8 +176,10 @@ def read_header(f):
     buf = f.read(4096)
     while TERMINATOR not in buf:
         more = f.read(4096)
+        if not buf.startswith(b'CPHD/'[:len(buf)]) or not buf:
+            raise ValueError(f'not a CPHD file: it starts {buf[:16]!r}')
         if not more or len(buf) > (1 << 20):
-            raise ValueError('not a CPHD file: no header section terminator')
+            raise ValueError('not a CPHD file: no header section terminator (form feed, line feed)')
         buf += more
     head = buf[:buf.index(TERMINATOR)]
     lines = head.decode('utf-8', 'replace').split('\n')
@@ -177,30 +201,118 @@ class Reader:
 
     def __init__(self, path):
         self.file_name = os.fspath(path)
-        with open(self.file_name, 'rb') as f:
-            self.cphd_version, kv, _ = read_header(f)
+        with open(self.file_name, 'rb') as f, _xmlmeta.reading(self.file_name, 'CPHD file'):
+            size = os.fstat(f.fileno()).st_size
+            self.cphd_version, kv, hlen = read_header(f)
             self.v03 = self.cphd_version.startswith('0.3')
-            off, size = (kv['XML_BYTE_OFFSET'], kv['XML_DATA_SIZE']) if self.v03 else \
-                (kv['XML_BLOCK_BYTE_OFFSET'], kv['XML_BLOCK_SIZE'])
+            if not self.v03 and not self.cphd_version.startswith('1.'):
+                raise ValueError(f'CPHD version {self.cphd_version!r} is not read (0.3, 1.0.1 and 1.1.0 are)')
+            self._blocks = self._check_blocks(kv, hlen, size)
+            off, n = self._blocks['XML']
             f.seek(off)
-            self._xml = f.read(size)
-        self.cphd_header = types.SimpleNamespace(**kv)
-        self.cphd_details = types.SimpleNamespace(file_name=self.file_name, get_cphd_bytes=lambda: self._xml,
-                                                  cphd_version=self.cphd_version, cphd_header=self.cphd_header)
-        self._tree = ET.fromstring(self._xml)
-        self.cphd_meta = _xmlmeta.parse(self._tree, SPEC)
-        d = self.cphd_meta.Data
-        self._channels = (d.ArraySize if self.v03 else d.Channels) or []
-        self._ids = [str(i) for i in range(len(self._channels))] if self.v03 else [c.Identifier for c in self._channels]
-        self._pvp = {}
+            self._xml = f.read(n)
+            f.seek(off + n)
+            if not self.v03 and f.read(2) != TERMINATOR:
+                raise ValueError(f'no section terminator after the XML block ({n} bytes at byte {off}): its size or '
+                                 'offset in the header is wrong')
+            self.cphd_header = types.SimpleNamespace(**kv)
+            self.cphd_details = types.SimpleNamespace(file_name=self.file_name, get_cphd_bytes=lambda: self._xml,
+                                                      cphd_version=self.cphd_version, cphd_header=self.cphd_header)
+            self._tree = _xmlmeta.fromstring(self._xml, 'CPHD XML block')
+            if _local(self._tree) != 'CPHD':
+                raise ValueError(f'the XML block holds a {_local(self._tree)} document, not CPHD')
+            self.cphd_meta = _xmlmeta.parse(self._tree, SPEC)
+            d = self.cphd_meta.Data
+            if d is None:
+                raise ValueError('the CPHD XML has no Data block')
+            self._channels = (d.ArraySize if self.v03 else d.Channels) or []
+            self._ids = [str(i) for i in range(len(self._channels))] if self.v03 else \
+                [str(c.Identifier) for c in self._channels]
+            self._pvp = {}
+            self._check_layout()
+
+    def _check_blocks(self, kv, hlen, size):
+        """The header's blocks {name: (offset, size)}: every key present and a whole number, every block of positive
+        size after the header and within the file, the blocks in the standard's order without overlap."""
+        names = (('XML', 'XML_BYTE_OFFSET', 'XML_DATA_SIZE'), ('PVP', 'VB_BYTE_OFFSET', 'VB_DATA_SIZE'),
+                 ('SIGNAL', 'CPHD_BYTE_OFFSET', 'CPHD_DATA_SIZE')) if self.v03 else \
+                (('XML', 'XML_BLOCK_BYTE_OFFSET', 'XML_BLOCK_SIZE'),
+                 ('SUPPORT', 'SUPPORT_BLOCK_BYTE_OFFSET', 'SUPPORT_BLOCK_SIZE'),
+                 ('PVP', 'PVP_BLOCK_BYTE_OFFSET', 'PVP_BLOCK_SIZE'),
+                 ('SIGNAL', 'SIGNAL_BLOCK_BYTE_OFFSET', 'SIGNAL_BLOCK_SIZE'))
+        blocks, end, last = {}, hlen, 'header'
+        for name, ko, ks in names:
+            if name == 'SUPPORT' and ko not in kv and ks not in kv:
+                continue
+            for k in (ko, ks):
+                if k not in kv:
+                    raise ValueError(f'the CPHD {self.cphd_version} header has no {k}')
+                if not isinstance(kv[k], int):
+                    raise ValueError(f'CPHD header {k} is not a whole number: {kv[k]!r}')
+            off, n = kv[ko], kv[ks]
+            if n <= 0 or off < 0 or off + n > size:
+                raise ValueError(f'CPHD header: the {name} block ({ks} {n} bytes at {ko} {off}) is not within the '
+                                 f'file ({size} bytes): truncated file, or a wrong header')
+            if off < end:
+                raise ValueError(f'CPHD header: the {name} block starts at byte {off}, inside the {last} '
+                                 f'(which ends at byte {end})')
+            blocks[name], end, last = (off, n), off + n, f'{name} block'
+        return blocks
+
+    def _check_layout(self):
+        """The XML's array sizes against the header's blocks: the per-vector parameters and the samples of every
+        channel within their blocks, and the blocks no larger or smaller than the arrays make them."""
+        d, ch = self.cphd_meta.Data, self._channels
+        if not ch:
+            raise ValueError('the CPHD XML lists no channels')
+
+        def count(c, k, name):
+            v = getattr(c, name)
+            if not isinstance(v, (int, float)) or isinstance(v, bool) or v != int(v) or v < (1 if name.startswith('Num') else 0):
+                raise ValueError(f'CPHD channel {k}: {name} is {v!r}')
+            return int(v)
+        nv = [count(c, k, 'NumVectors') for k, c in enumerate(ch)]
+        ns = [count(c, k, 'NumSamples') for k, c in enumerate(ch)]
+        nb = d.NumBytesVBP if self.v03 else d.NumBytesPVP
+        if not isinstance(nb, (int, float)) or nb != int(nb) or nb < 8 or int(nb) % 8:
+            raise ValueError(f'CPHD Data.{"NumBytesVBP" if self.v03 else "NumBytesPVP"} is {nb!r}: a positive multiple of 8')
+        nb = int(nb)
+        self.pvp_dtype()                                     # the parameters' formats and places within a vector
+        psize, ssize = self._blocks['PVP'][1], self._blocks['SIGNAL'][1]
+        if self.v03:
+            if str(d.SampleType) not in _SIGNAL03:
+                raise ValueError(f'CPHD 0.3 Data.SampleType {d.SampleType!r}: one of {", ".join(_SIGNAL03)}')
+            isz = 2 * np.dtype(_SIGNAL03[str(d.SampleType)]).itemsize
+            pv, sg = [(sum(nv[:k]) * nb, nv[k] * nb) for k in range(len(ch))], \
+                [(sum(a * b for a, b in zip(nv[:k], ns[:k])) * isz, nv[k] * ns[k] * isz) for k in range(len(ch))]
+        else:
+            pv = [(count(c, k, 'PVPArrayByteOffset'), nv[k] * nb) for k, c in enumerate(ch)]
+            sg = None
+            if self.compression is None:
+                if str(d.SignalArrayFormat) not in _SIGNAL:
+                    raise ValueError(f'CPHD Data.SignalArrayFormat {d.SignalArrayFormat!r}: CI2, CI4 or CF8')
+                isz = 2 * np.dtype(_SIGNAL[str(d.SignalArrayFormat)]).itemsize
+                sg = [(count(c, k, 'SignalArrayByteOffset'), nv[k] * ns[k] * isz) for k, c in enumerate(ch)]
+        for what, arrays, size in (('per-vector parameters', pv, psize), ('samples', sg, ssize)):
+            if arrays is None:
+                continue
+            for k, (off, n) in enumerate(arrays):
+                if off + n > size:
+                    raise ValueError(f'CPHD channel {k}: its {what} ({nv[k]} vectors'
+                                     + (f' x {ns[k]} samples' if what == 'samples' else '')
+                                     + f', {n} bytes at offset {off}) run past their block of {size} bytes')
+            if sum(n for _, n in arrays) != size:
+                raise ValueError(f'CPHD: the {what} of the channels take {sum(n for _, n in arrays)} bytes, their '
+                                 f'block in the header has {size}')
 
     def _index(self, index):
         if isinstance(index, str):
             if index not in self._ids:
-                raise KeyError(f'channel {index!r} not among {self._ids}')
+                raise ValueError(f'{self.file_name}: channel {index!r} not among {self._ids}')
             return self._ids.index(index)
         if not 0 <= int(index) < len(self._channels):
-            raise IndexError(f'channel {index} out of range: the file has {len(self._channels)} channels')
+            raise ValueError(f'{self.file_name}: channel {index} out of range: the file has {len(self._channels)} '
+                             'channels')
         return int(index)
 
     def _child(self, name):
@@ -258,12 +370,12 @@ class Reader:
             raise ValueError(f'{self.file_name}: the signal block is compressed (SignalCompressionID '
                              f'{self.compression!r}), in a format its producer defines; FastSAR reads plain samples only')
         if self.v03:
-            raw = _SIGNAL03[str(d.SampleType)]
+            raw = _SIGNAL03[str(d.SampleType)]                 # (checked on opening)
             before = sum(int(a.NumVectors) * int(a.NumSamples) for a in ch[:c])
             off = h.CPHD_BYTE_OFFSET + before * 2 * np.dtype(raw).itemsize
         else:
             if str(d.SignalArrayFormat) not in _SIGNAL:
-                raise ValueError(f'SignalArrayFormat {d.SignalArrayFormat!r}: CI2, CI4 or CF8')
+                raise ValueError(f'{self.file_name}: SignalArrayFormat {d.SignalArrayFormat!r}: CI2, CI4 or CF8')
             raw = _SIGNAL[str(d.SignalArrayFormat)]
             off = h.SIGNAL_BLOCK_BYTE_OFFSET + int(ch[c].SignalArrayByteOffset)
         return np.memmap(self.file_name, dtype=raw, mode='r', offset=off,
@@ -292,7 +404,8 @@ class Reader:
             identifier = sizes[int(identifier)].Identifier
         sz = next((s for s in sizes if s.Identifier == str(identifier)), None)
         if sz is None:
-            raise KeyError(f'support array {identifier!r} not among {[s.Identifier for s in sizes]}')
+            raise ValueError(f'{self.file_name}: support array {identifier!r} not among '
+                             f'{[s.Identifier for s in sizes]}')
         fmt = None
         sa = self._child('SupportArray')
         for e in (sa if sa is not None else ()):
@@ -300,13 +413,21 @@ class Reader:
             if 'Identifier' in kids and kids['Identifier'].text.strip() == str(identifier) and 'ElementFormat' in kids:
                 fmt = kids['ElementFormat'].text
         if fmt is None:
-            raise ValueError(f'support array {identifier!r} has no ElementFormat in the SupportArray block')
+            raise ValueError(f'{self.file_name}: support array {identifier!r} has no ElementFormat in the '
+                             'SupportArray block')
         dt = format_dtype(fmt)
         if dt.itemsize != int(sz.BytesPerElement):
-            raise ValueError(f'support array {identifier!r}: format {fmt!r} takes {dt.itemsize} bytes per element, '
+            raise ValueError(f'{self.file_name}: support array {identifier!r}: format {fmt!r} takes {dt.itemsize} '
+                             'bytes per element, '
                              f'BytesPerElement says {sz.BytesPerElement}')
-        a = np.memmap(self.file_name, dtype=dt, mode='r', offset=self.cphd_header.SUPPORT_BLOCK_BYTE_OFFSET
-                      + int(sz.ArrayByteOffset), shape=(int(sz.NumRows), int(sz.NumCols)))
+        if 'SUPPORT' not in self._blocks:
+            raise ValueError(f'{self.file_name}: the header has no support block for support array {identifier!r}')
+        off, n = int(sz.ArrayByteOffset), int(sz.NumRows) * int(sz.NumCols) * dt.itemsize
+        if off < 0 or n <= 0 or off + n > self._blocks['SUPPORT'][1]:
+            raise ValueError(f'{self.file_name}: support array {identifier!r} ({n} bytes at offset {off}) is not '
+                             f"within the support block of {self._blocks['SUPPORT'][1]} bytes")
+        a = np.memmap(self.file_name, dtype=dt, mode='r', offset=self._blocks['SUPPORT'][0] + off,
+                      shape=(int(sz.NumRows), int(sz.NumCols)))
         return np.array(a).astype(format_dtype(fmt, '='))
 
 
