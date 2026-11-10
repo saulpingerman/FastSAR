@@ -107,6 +107,29 @@ def _mode_type(r, m, notes):
     return None
 
 
+def _cphd1_samples(r, m, channel):
+    """The signal array of one channel of a CPHD 1.x file as it lies in the file: (a read-only memory map [P, K, 2]
+    of the real and imaginary parts in the file's big-endian sample type, AmpSF per vector as float32 or None), or
+    None where the bytes are not the samples (a compressed signal block) and the reader of sarpy is used. Reading
+    through the map on all cores is some ten times faster than sarpy's conversion on one."""
+    try:
+        raw = {'CI2': '>i1', 'CI4': '>i2', 'CF8': '>f4'}[str(m.Data.SignalArrayFormat)]
+        comp = getattr(m.Data, 'SignalCompressionID', None)
+        if comp not in (None, '') or not hasattr(r, 'cphd_header') or not hasattr(r, 'cphd_details'):
+            return None
+        ch = m.Data.Channels[channel]
+        P, K = int(ch.NumVectors), int(ch.NumSamples)
+        off = int(r.cphd_header.SIGNAL_BLOCK_BYTE_OFFSET) + int(ch.SignalArrayByteOffset)
+        sig = np.memmap(r.cphd_details.file_name, dtype=raw, mode='r', offset=off, shape=(P, K, 2))
+        amp = r.read_pvp_variable('AmpSF', channel)
+    except (KeyError, AttributeError, TypeError, ValueError, OSError):
+        return None
+    if amp is not None:
+        amp = np.asarray(amp, np.float64)
+        amp = None if np.all(amp == 1.0) else amp.astype(np.float32)
+    return sig, amp
+
+
 def _cphd03_channel(r, m, arrays, channel):
     """CPHD 0.3 per-vector parameters and samples of one channel, read at the offsets the 0.3 layout gives:
     channel c's vector block starts NumBytesVBP times the vectors of the channels before it into the vector-based
@@ -347,9 +370,22 @@ def read_cphd(cphd, sicd=None, channel=0, meta=False, regrid_tol=1e-3, drop_flag
     # read in pulse blocks into one complex64 array; every later step works in place on blocks of rows, so the
     # reader needs about the history's complex64 size (a 16.5 GB ICEYE file needed over 128 GB with whole-array steps)
     S = np.empty((P, K), np.complex64)
-    for p0 in range(0, P, 2048):
-        p1 = min(P, p0 + 2048)
-        S[p0:p1] = read_rows(p0, p1)
+    direct = None if v03 else _cphd1_samples(r, m, channel)
+    if direct is not None:                      # the file's own bytes, converted on all cores
+        sig, amp = direct
+        Sv = S.view(np.float32).reshape(P, K, 2)
+
+        def rows(sl):
+            Sv[sl] = sig[sl]
+            if amp is not None:
+                Sv[sl] *= amp[sl, None, None]
+        from .patches import _rows
+        _rows(rows, P, int(max(1, min(256, (1 << 21) // max(K, 1)))))
+        del sig
+    else:
+        for p0 in range(0, P, 2048):
+            p1 = min(P, p0 + 2048)
+            S[p0:p1] = read_rows(p0, p1)
     notes = (['CPHD 0.3 file'] if v03 else []) + ref_note
     coll = m.CollectionInfo if v03 else m.CollectionID
     sgn = phase_sign

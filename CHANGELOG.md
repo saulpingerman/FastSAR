@@ -43,6 +43,9 @@ was published on PyPI.
 
 ### Changed
 
+- `read_cphd` reads the samples of a CPHD 1.x file from the file's own bytes on all cores (sarpy still parses the
+  header and metadata, and reads compressed signal blocks). The samples are identical; reading an 8.7 GB Umbra
+  collection takes 3.5 s where it took 5.9 s, and a 9.2 GB Capella collection 6.8 s where it took 13.0 s (48 cores).
 - `products.sicd_meta` arranges the SICD array as the view from above for either look side: rows along range away
   from the radar and row x column upward. For a collection whose grid axis e2 points away from the radar (a
   left-looking pass on track axes) the columns are now reversed with respect to 0.1.8, which wrote the mirror
