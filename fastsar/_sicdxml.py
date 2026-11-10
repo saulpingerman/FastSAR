@@ -235,8 +235,8 @@ def _arp(sm, t, order=0):
 
 
 def weight_function(name, parameters=None, size=WEIGHT_SIZE):
-    """Samples of a named aperture weighting (Grid.Row/Col.WgtType) across the processed band, peak about 1, or None
-    for a window without a closed form here (UNIFORM needs none). TAYLOR: NBAR and SLL (dB, either sign)."""
+    """Samples of a named aperture weighting (Grid.Row/Col.WgtType) across the processed band, peak about 1 (512;
+    32 ones for UNIFORM), or None for a name without a closed form here. TAYLOR: NBAR and SLL (dB, either sign)."""
     from scipy.signal import windows
     name = str(name).upper()
     p = parameters or {}
@@ -250,6 +250,14 @@ def weight_function(name, parameters=None, size=WEIGHT_SIZE):
         except ValueError:
             a = 0.54
         return windows.general_hamming(size, a, sym=True)
+    if name == 'KAISER':
+        try:
+            beta = float(next(iter(p.values()))) if p else 14.0
+        except ValueError:
+            beta = 14.0
+        return windows.kaiser(size, beta, sym=True)
+    if name == 'UNIFORM':
+        return np.ones(32)
     return None
 
 
@@ -558,6 +566,7 @@ def ground_to_image(sm, coords, tolerance=1e-4, max_iterations=20):
         diff = c - _to_plane(r, rdot, a, v, g, ugpn)
         miss = np.linalg.norm(diff, axis=1)
         g = g + diff
-        if not np.nanmax(miss) > tolerance:
+        left = miss[np.isfinite(miss)]
+        if left.size == 0 or left.max() <= tolerance:
             break
     return rc.reshape(shape + (2,)), miss.reshape(shape), np.full(shape, it, np.int16) if shape else it

@@ -41,7 +41,7 @@ Changelog = "https://github.com/saulpingerman/FastSAR/blob/main/CHANGELOG.md"
 fastsar-doctor = "fastsar.doctor:main"
 [project.optional-dependencies]
 cuda = ["cupy-cuda12x>=13"]
-io = ["sarpy>=1.3.64"]
+io = []    # kept so that "fastsar[io]" still installs: CPHD, SICD and SIDD files need no extra package
 tpu = ["jax[tpu]>=0.6.2"]
 geo = ["rasterio>=1.4.4"]
 raw = ["h5py>=3.10"]

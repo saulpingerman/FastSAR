@@ -1,5 +1,5 @@
 """Read a collection from CPHD (frequency domain) and, optionally, the image grid of the matching SICD, into the
-arrays form_image takes. Needs sarpy.
+arrays form_image takes. The CPHD and SICD files are parsed by fastsar._cphdxml and fastsar._sicdxml.
 
     col = fastsar.io.read_cphd('x_CPHD.cphd', sicd='x_SICD.nitf')
     img = fastsar.form_image(**col)
@@ -286,9 +286,8 @@ def _assemble(S, tx, rcv, srp, f0, df, notes, sicd, meta, info):
     cur_ref = ref if not fixed_ref else ref0           # the range each pulse is compensated to from here on
     origin = s0
     if sicd is not None:
-        _deps.require('sarpy')
-        from sarpy.io.complex.converter import open_complex
-        sm = open_complex(sicd).sicd_meta
+        from . import _sicdxml
+        sm = _sicdxml.read(sicd)
         if sm.Grid.Type not in ('RGAZIM', 'PLANE', 'XRGYCR', 'XCTYAT'):
             raise ValueError(f'the SICD grid is {sm.Grid.Type}, not a plane: read without sicd and form its pixels with '
                              'fastsar.backproject(S, ..., io.sicd_points(sicd, rows, cols, meta))')
@@ -1078,12 +1077,11 @@ def sicd_points(sicd, rows, cols, meta, hae=None):
     by the SICD's own model onto the surface at height hae above the ellipsoid (default: the SCP's). Any grid type,
     including range / zero-Doppler grids, which are not planes; backproject onto these points forms the image on the
     vendor's pixels."""
-    _deps.require('sarpy')
-    from sarpy.io.complex.converter import open_complex
-    sm = sicd if not isinstance(sicd, str) else open_complex(sicd).sicd_meta
+    from . import _sicdxml
+    sm = _sicdxml.read(sicd)
     rows, cols = np.broadcast_arrays(np.asarray(rows, np.float64), np.asarray(cols, np.float64))
     h = float(sm.GeoData.SCP.LLH.HAE) if hae is None else float(hae)
-    ecf = np.asarray(sm.project_image_to_ground(np.stack([rows.ravel(), cols.ravel()], 1), projection_type='HAE', hae0=h))
+    ecf = sm.project_image_to_ground(np.stack([rows.ravel(), cols.ravel()], 1), projection_type='HAE', hae0=h)
     return ecf_to_local(ecf.reshape(rows.shape + (3,)), meta)
 
 
