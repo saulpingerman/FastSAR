@@ -365,14 +365,14 @@ def _threads(work, items):
 def _apply(img, phi):
     """img with the phase phi [nx] (rad, FFT order) removed from its azimuth spectrum, complex64, on the device of
     img: ifft(fft(img, axis=0) * exp(-1j * phi)[:, None], axis=0), exact zeros of img kept. Column blocks: on the
-    host one thread per block of about 4 MB, on a GPU blocks of 1 GB, in JAX equal blocks of at most 2 GB through
-    one jitted kernel (the last block overlaps its neighbor so that every block has the same shape)."""
+    host one thread per block of about 4 MB, on a GPU blocks of 1 GB, in JAX equal blocks of at most 2 GB (less on a device with little memory: _xp.jax_block) through
+    one jitted kernel, fewer where the device's memory is small (the last block overlaps its neighbor so that every block has the same shape)."""
     nx, ny = img.shape
     q = np.exp(-1j * np.asarray(phi, np.float64)).astype(np.complex64)
     k = _xp.kind(img)
     if k == 'jax':
         import jax.numpy as jnp
-        f, w = _jit('fixed'), int(min(ny, max(1, _BLOCK['jax'] // nx)))
+        f, w = _jit('fixed'), int(min(ny, max(1, min(_BLOCK['jax'], _xp.jax_block() // 64) // nx)))
         parts = [f(img[:, j:j + w], q) for j in range(0, ny - w + 1, w)]
         if ny % w:
             parts.append(f(img[:, ny - w:], q)[:, w - ny % w:])

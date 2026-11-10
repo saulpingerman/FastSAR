@@ -30,7 +30,7 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
-from . import resample
+from . import _xp, resample
 
 BLOCK = 1 << 24            # samples of an oversampled block of lines (complex64: 128 MB, and a few times it in flight)
 BLOCK_ROWS = 1 << 27       # float32 values of a block of lines in flight in the blocks path (window table, selects)
@@ -46,6 +46,12 @@ def _path():
     if v not in ('auto', 'blocks', 'gather'):
         raise ValueError(f"FASTSAR_RESAMPLE_JAX must be 'blocks', 'gather' or 'auto', got {v!r}")
     return ('blocks' if jax.devices()[0].platform == 'tpu' else 'gather') if v == 'auto' else v
+
+
+def _samples(limit, share):
+    """The samples of a block of lines: `limit` (BLOCK, BLOCK_ROWS), less where the device's memory is small
+    (_xp.jax_block() bytes at `share` bytes a sample)."""
+    return int(max(1, min(limit, _xp.jax_block() // share)))
 
 
 def _split(rows):
@@ -348,7 +354,7 @@ def _plan_blocks(pos, posx, L, n, tab, pad, guard, n2, real):
     R = -(-(W + taps - 1) // STRIDE) * STRIDE
     N = max(-(-pad * n2 // STRIDE) * STRIDE, R)
     per = (1 if real else 2) * (N // STRIDE * R + nblk * B * (W + 2 * taps))
-    nb = int(max(1, min(L, BLOCK_ROWS // per, BLOCK // max(pad * n2, pos.m))))
+    nb = int(max(1, min(L, _samples(BLOCK_ROWS, 8) // per, _samples(BLOCK, 64) // max(pad * n2, pos.m))))
     return dict(B=B, W=W, R=R, nb=nb, D=tuple(cat([d[k] for d in D]) for k in range(4)), w0=np.clip(cat(w0), 0, N - R),
                 Dx=tuple(cat([d[k] for d in Dx]) for k in range(4)) if posx is not None else None,
                 kink=span[4].astype(np.float32))
@@ -376,7 +382,7 @@ def _pass(src, pos, m, axis, kernel, taps, pad, mask=None):
     L, n = (src.shape[0], src.shape[1]) if axis == 1 else (src.shape[1], src.shape[0])
     tab, pad, guard, n2 = resample._plan(n, kernel, taps, pad)
     tabd = jnp.asarray(tab * np.float32(pad))
-    nb = int(max(1, min(L, BLOCK // max(pad * n2, m))))
+    nb = int(max(1, min(L, _samples(BLOCK, 64) // max(pad * n2, m))))
     knots = isinstance(pos, resample.KnotMap)
     mode = 'knots' if knots else 'device' if isinstance(pos, jax.Array) else 'split'
     J = M = None
@@ -485,7 +491,7 @@ def deramp(img, d0, a, b, u0, r0, k):
     cols = (wrap(py), f32(pj), f32(q1j), f32(q2j), j.astype(np.int32))
     rows, cols = tuple(jnp.asarray(v) for v in rows), tuple(jnp.asarray(v) for v in cols)
     img = img.astype(jnp.complex64)
-    nb = int(max(1, min(nx, BLOCK // ny)))
+    nb = int(max(1, min(nx, _samples(BLOCK, 64) // ny)))
     step = _jit(_deramp_step, ('nb',))
     out = jnp.zeros((nx, ny), jnp.complex64)
     for s in _starts(nx, nb):

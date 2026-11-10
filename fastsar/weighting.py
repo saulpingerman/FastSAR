@@ -143,6 +143,41 @@ def _sva_jax(jnp, N, axes, joint, x):
     return x
 
 
+def _sva_rows(jnp, N, axes, joint, nb, H, out, x, a):
+    """Rows a ... a + nb of _sva_jax(x), written into out: the passes run on those rows and H more on each side
+    (N for every pass along axis 0, rows beyond the image being zero), which is all that the rows kept depend on."""
+    from jax import lax
+    n0, n1 = x.shape
+    m = nb + 2 * H
+    s = jnp.clip(a - H, 0, n0 - m)                                   # the slab's rows, moved inside the image
+    slab = lax.dynamic_slice(x, (s, 0), (m, n1))
+    row = jnp.arange(m, dtype=jnp.int32) + (a - H - s)               # where each row of the slab is in the slice read
+    two = jnp.concatenate([slab, slab])
+    slab = lax.dynamic_slice(two, (jnp.mod(a - H - s, m), 0), (m, n1))
+    slab = jnp.where(((row >= 0) & (row < m))[:, None], slab, 0)
+    return lax.dynamic_update_slice(out, _sva_jax(jnp, N, axes, joint, slab)[H:H + nb], (a, 0))
+
+
+def _sva_blocks(x, N, axes, joint):
+    """sva of a JAX image: whole when it is small, else in blocks of rows sized to _xp.jax_block() (the same
+    values: a row's result depends on N rows on each side for every pass along axis 0)."""
+    import functools
+    import jax
+    import jax.numpy as jnp
+    if 'jax' not in _DEVICE:
+        _DEVICE['jax'] = jax.jit(functools.partial(_sva_jax, jnp), static_argnums=(0, 1, 2))
+        _DEVICE['rows'] = jax.jit(functools.partial(_sva_rows, jnp), static_argnums=(0, 1, 2, 3, 4), donate_argnums=(5,))
+    n0, n1 = x.shape
+    H = N * sum(1 for ax in axes if ax == 0 and N < n0)
+    nb = int(max(1, _xp.jax_block() // (n1 * 8 * (6 + 2 * len(axes)))) - 2 * H)      # arrays of a slab in flight
+    if nb < 1 or nb + 2 * H >= n0:
+        return _DEVICE['jax'](N, axes, joint, x)
+    out = jnp.zeros((n0, n1), jnp.complex64)
+    for a in list(range(0, n0 - nb + 1, nb)) + ([n0 - nb] if n0 % nb else []):
+        out = _DEVICE['rows'](N, axes, joint, nb, H, out, x, np.int32(a))
+    return out
+
+
 def sva(img, oversample=2, *, axes=(1, 0), joint=True, inplace=False):
     """Spatially variant apodization of a complex image sampled at `oversample` times its Nyquist rate on the axes
     treated (an integer: 2 for an image at spacings of half the reciprocal of its bandwidth), one axis after the
@@ -166,12 +201,7 @@ def sva(img, oversample=2, *, axes=(1, 0), joint=True, inplace=False):
     if kind == 'cupy':
         return _sva_cupy(x, N, axes, bool(joint), inplace)
     if kind == 'jax':
-        if 'jax' not in _DEVICE:
-            import functools
-            import jax
-            import jax.numpy as jnp
-            _DEVICE['jax'] = jax.jit(functools.partial(_sva_jax, jnp), static_argnums=(0, 1, 2))
-        return _DEVICE['jax'](N, axes, bool(joint), x.astype('complex64'))
+        return _sva_blocks(x.astype('complex64'), N, axes, bool(joint))
     if x.dtype != np.complex64:
         x, inplace = x.astype(np.complex64), True
     if not axes:

@@ -9,7 +9,7 @@ image crosses to the host once, at the end.
 """
 import numpy as np
 
-__all__ = ['kind', 'module', 'fft', 'host', 'device']
+__all__ = ['kind', 'module', 'fft', 'host', 'device', 'jax_block']
 
 
 def kind(a):
@@ -48,9 +48,29 @@ def fft(a):
     return f
 
 
+def jax_block():
+    """Bytes of temporary arrays a stage after formation may hold on JAX's device at a time, beside the image and
+    its result: FASTSAR_JAX_BLOCK_MB if set, else a sixteenth of the device's memory (1 GB where the device does
+    not report it; a 16 GB TPU reports it), at most 2 GB. The stages cut the image into blocks of rows, columns or
+    pixels that fit, each through one compiled program per block shape."""
+    import os
+    mb = os.environ.get('FASTSAR_JAX_BLOCK_MB', '').strip()
+    if mb:
+        if not float(mb) > 0:
+            raise ValueError(f'FASTSAR_JAX_BLOCK_MB must be positive, got {mb!r}')
+        return int(float(mb) * (1 << 20))
+    import jax
+    try:
+        limit = (jax.devices()[0].memory_stats() or {}).get('bytes_limit')
+    except Exception:                                              # a device without statistics
+        limit = None
+    return int(min(2 << 30, limit // 16)) if limit else 1 << 30
+
+
 def host(a):
     """a as a NumPy array (a copy from the device, or a itself). A complex array on a TPU crosses as its two real
-    planes: a TPU hands a complex array to the host some sixty times slower than a real one of the same size."""
+    planes, in blocks of rows of at most jax_block() bytes: a TPU hands a complex array to the host some thirty
+    times slower than a real one of the same size."""
     k = kind(a)
     if k == 'cupy':
         return a.get()
@@ -58,7 +78,9 @@ def host(a):
         import jax.numpy as jnp
         out = np.empty(a.shape, a.dtype)
         v = out.view(out.real.dtype).reshape(a.shape + (2,))
-        v[..., 0], v[..., 1] = np.asarray(jnp.real(a)), np.asarray(jnp.imag(a))
+        step = int(max(1, min(a.shape[0], jax_block() // max(a[:1].nbytes, 1))))
+        for i in range(0, a.shape[0], step):
+            v[i:i + step, ..., 0], v[i:i + step, ..., 1] = np.asarray(jnp.real(a[i:i + step])), np.asarray(jnp.imag(a[i:i + step]))
         return out
     return np.asarray(a)
 

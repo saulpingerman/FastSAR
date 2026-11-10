@@ -135,3 +135,27 @@ def test_keystone_keeps_a_rectangle():
     lost2, band2 = weighting.keystone(S, ant, fmin, df, scp, e1)
     assert abs(band2[0] + band2[1]) < 1e-12 and abs(band2[1] - min(band[1], -band[0])) < 1e-12 and lost2 > lost
     assert np.abs((S != 0).astype(int) - (np.abs(ka) <= fmin * 299792458.0 / (2 * fmin) * band2[1] * (1 + 1e-3))).sum() <= P
+
+
+def test_sva_jax_in_row_blocks(monkeypatch):
+    """A JAX image larger than the device's block budget is apodized in blocks of rows with the rows each pass
+    along axis 0 reaches: the values of the whole-image program exactly, zeros and edges included, for every order
+    of the axes, and through one compiled program."""
+    jnp = pytest.importorskip('jax.numpy')
+    from fastsar import weighting
+    rng = np.random.default_rng(21)
+    x = (rng.normal(size=(301, 257)) + 1j * rng.normal(size=(301, 257))).astype(np.complex64)
+    x[:40, :50] = 0
+    x[100] = 0
+    for axes in ((1, 0), (0, 1), (0,), (1,), (0, 0, 1)):
+        for joint, N in ((True, 2), (False, 3), (True, 400)):
+            monkeypatch.delenv('FASTSAR_JAX_BLOCK_MB', raising=False)
+            ref = np.asarray(weighting.sva(jnp.asarray(x), N, axes=axes, joint=joint))
+            assert not ref[:40, :50].any() and (N > 300 or not np.array_equal(ref, x))
+            for mb in ('0.4', '0.07'):                              # 15 rows a block with their halo, and 3
+                monkeypatch.setenv('FASTSAR_JAX_BLOCK_MB', mb)
+                got = weighting.sva(jnp.asarray(x), N, axes=axes, joint=joint)
+                assert np.array_equal(np.asarray(got), ref), (axes, joint, N, mb)
+    size = weighting._DEVICE['rows']._cache_size()                  # 21 blocks of rows, one program
+    weighting.sva(jnp.asarray(x[::-1].copy()), 2)
+    assert size > 0 and weighting._DEVICE['rows']._cache_size() == size

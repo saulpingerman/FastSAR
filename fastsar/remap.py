@@ -78,6 +78,30 @@ def _jit(step, *static):
     return _JIT[key]
 
 
+def _blocked(step, x, valid, *static):
+    """f(*args) -> the results of step(jnp, *static, block of x, block of valid, *args) for the blocks of a JAX image
+    taken as one line of pixels, or None when the image is one block. A block holds _xp.jax_block() bytes at 48 a
+    pixel and a multiple of 2^14 pixels, so that _psum's partial sums are the whole image's; the last holds the
+    rest (one compilation for each of the two sizes)."""
+    n = x.size
+    c = max(1, _xp.jax_block() // 48 // 16384) * 16384
+    if n <= c:
+        return None
+    key = (step, 'blocks') + static
+    if key not in _JIT:
+        import jax
+        import jax.numpy as jnp
+        from jax import lax
+
+        def block(x, valid, a, *args, size):
+            cut = lambda v: lax.dynamic_slice(v.reshape(-1), (a,), (size,))
+            return step(jnp, *static, cut(x), None if valid is None else cut(valid), *args)
+        _JIT[key] = jax.jit(block, static_argnames='size')
+    if valid is not None and valid.shape != x.shape:
+        valid = _xp.module(x).broadcast_to(valid.reshape(valid.shape + (1,) * (x.ndim - valid.ndim)), x.shape)
+    return lambda *args: [_JIT[key](x, valid, np.int32(a), *args, size=min(c, n - a)) for a in range(0, n, c)]
+
+
 def _args(x, valid):
     """x and the mask as arrays where x lives (the mask boolean, of x's shape)."""
     if _xp.kind(x) != 'numpy':
@@ -105,6 +129,11 @@ def _on_device(step, x):
 
 def _apply(step, dtype, x, valid, *args):
     """The array a step gives, where x lives. dtype: of the result (for the host's output array)."""
+    if _xp.kind(x) == 'jax':
+        parts = _blocked(step, x, valid)
+        if parts is not None:
+            import jax.numpy as jnp
+            return jnp.concatenate(parts(*args)).reshape(x.shape)
     if _xp.kind(x) != 'numpy':
         return _on_device(step, x)(x, valid, *args)
     if x.ndim == 0:
@@ -121,9 +150,12 @@ def _reduce(step, x, valid, *args):
     """The statistics of a step that returns (partial sums, minimum, maximum): the sums as Python floats (added in
     float64 on the host), the minimum and maximum as float32 (None where the step has none)."""
     if _xp.kind(x) != 'numpy':
-        s, lo, hi = _on_device(step, x)(x, valid, *args)
-        return [float(_xp.host(v).astype(np.float64).sum()) for v in s], \
-            *(None if v is None else _f(_xp.host(v)) for v in (lo, hi))
+        parts = _blocked(step, x, valid) if _xp.kind(x) == 'jax' else None
+        parts = [_on_device(step, x)(x, valid, *args)] if parts is None else parts(*args)
+        sums = [float(np.concatenate([np.ravel(_xp.host(p[0][i])) for p in parts]).astype(np.float64).sum())
+                for i in range(len(parts[0][0]))]
+        return sums, *(None if parts[0][j] is None else _f(fn([_xp.host(p[j]) for p in parts]))
+                       for j, fn in ((1, np.min), (2, np.max)))
     x, valid = np.atleast_1d(x), (None if valid is None else np.atleast_1d(valid))
     parts = {}
 
@@ -244,7 +276,11 @@ def _hist(x, valid, lut, amp=True):
     k, nb = _xp.kind(x), _TOP if lut is None else _SLOTS * _TOP
     if k == 'jax':
         import jax.numpy as jnp
-        return np.asarray(_jit(_hist_jax, bool(amp))(x, valid, None if lut is None else jnp.asarray(lut)), np.int64)
+        lut = None if lut is None else jnp.asarray(lut)
+        parts = _blocked(_hist_jax, x, valid, bool(amp))
+        if parts is not None:
+            return sum(np.asarray(h, np.int64) for h in parts(lut))
+        return np.asarray(_jit(_hist_jax, bool(amp))(x, valid, lut), np.int64)
     if k == 'cupy':
         import cupy as cp
         name = ('amp' if amp else 'val') + ('1' if lut is None else '2')
@@ -306,8 +342,9 @@ def _order(x, valid, amp=True):
     pixels, where x lives."""
     if _xp.kind(x) == 'jax' and _jax_statistics() == 'count':
         import jax.numpy as jnp
-        below = _jit(_below_jax, bool(amp))
-        return _ranks_count(lambda thr: np.asarray(below(x, valid, jnp.asarray(thr)), np.int64), _count(x, valid))
+        parts, whole = _blocked(_below_jax, x, valid, bool(amp)), _jit(_below_jax, bool(amp))
+        below = (lambda thr: [whole(x, valid, thr)]) if parts is None else parts
+        return _ranks_count(lambda thr: sum(np.asarray(c, np.int64) for c in below(jnp.asarray(thr))), _count(x, valid))
     return _ranks(lambda lut: _hist(x, valid, lut, amp))
 
 
