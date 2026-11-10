@@ -35,6 +35,27 @@ A moving-beam collection (stripmap, sliding spotlight) is formed on the ground p
 The slant plane, autofocus, apodization and the quality areas apply to spotlight collections: asking for one of
 them on a moving-beam collection raises a `ValueError`.
 
+## Speed
+
+The stages after formation take the image as a NumPy, CuPy or JAX array and run where it lives, so a GPU or TPU
+run keeps the image on the device from formation until the file is written. Seconds for the default products of
+two collections, from the CPHD file on disk (in the page cache) to the product file, second run:
+
+| Collection, product | Processor | Read | Form | After formation | Write | Total |
+|---|---|---|---|---|---|---|
+| Umbra spotlight, slant SICD, 51 Mpx | Nvidia RTX PRO 6000 | 0.73 | 1.75 | 0.07 | 0.26 | 2.8 |
+| | 48 CPU cores | 0.75 | 17.5 | 1.1 | 0.21 | 19.6 |
+| Umbra spotlight, ground SIDD, 91 Mpx | Nvidia RTX PRO 6000 | 0.75 | 1.57 | 0.21 | 0.15 | 2.7 |
+| | 48 CPU cores | 0.74 | 17.3 | 3.6 | 0.69 | 22.2 |
+| Capella spotlight, slant SICD, 220 Mpx | Nvidia RTX PRO 6000 | 1.14 | 3.75 | 0.33 | 1.09 | 6.3 |
+| | 48 CPU cores | 1.14 | 37.6 | 6.3 | 0.94 | 46.0 |
+| Capella spotlight, ground SIDD, 429 Mpx | Nvidia RTX PRO 6000 | 1.14 | 3.48 | 0.91 | 0.56 | 6.1 |
+| | 48 CPU cores | 1.16 | 35.4 | 17.8 | 3.6 | 57.9 |
+
+"After formation" is the baseband step, quadratic autofocus, the resampling to the slant plane and, for the SIDD,
+apodization, detection and the projection to the ground; the SIDD's write includes the remap. The CPHD files are
+8.7 GB (Umbra) and 9.2 GB (Capella).
+
 ## Planes
 
 FastSAR forms every spotlight image on a ground plane, where backprojection is exact for any track. A planar

@@ -81,9 +81,10 @@ was published on PyPI.
   that declares a document type or entities is refused. A SICD's root element is found however far into its segment
   it starts.
 - `io.read_sicd(path, native=True)` converts AMP8I_PHS8I pixels to complex through the SICD's amplitude table.
-- `read_cphd` reads the samples of a CPHD 1.x file from the file's own bytes on all cores, and conjugates and checks them on all cores. The
-  samples are identical; reading an 8.7 GB Umbra collection takes 2.1 s where it took 5.9 s, and a 9.2 GB Capella
-  collection 3.6 s where it took 13.0 s (48 cores, file in the page cache).
+- `read_cphd` reads the samples of a CPHD 1.x file from the file's own bytes on all cores, and conjugates and checks them on all cores. The samples agree with 0.1.8's to float32 rounding (2e-7 of the largest), the conversion, the check for
+  empty and non-finite samples and the phase ramps along frequency being compiled passes over the rows. Reading
+  an 8.7 GB Umbra collection takes 0.74 s where it took 5.9 s, and a 9.2 GB Capella collection 1.14 s where it
+  took 13.0 s (48 cores, file in the page cache).
 - `products.sicd_meta` arranges the SICD array as the view from above for either look side: rows along range away
   from the radar and row x column upward. For a collection whose grid axis e2 points away from the radar (a
   left-looking pass on track axes) the columns are now reversed with respect to 0.1.8, which wrote the mirror
