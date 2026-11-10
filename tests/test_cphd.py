@@ -286,6 +286,22 @@ def test_form_cphd_moving_srp():
         refp = acc.reshape(ii.shape)
         check(bad, f'target {n}: form_cphd against the direct sum ({2 * H} x {2 * H} pixels)', rel_db(img[i - H:i + H, j - H:j + H], refp), -46)
     assert not bad, 'FAILED: ' + '; '.join(bad)
+    # process_cphd on a moving beam: the same image on the ground plane, as a SICD and as a SIDD laid out shadows
+    # down; the slant plane, autofocus, apodization and the quality areas are for spotlight collections
+    # (nothing is written here: this module's stand-in replaces sarpy)
+    po = fastsar.process_cphd('strip.cphd', backend='cpu', extent=(60.0, 50.0))
+    assert po['mode'] == 'moving' and po['plane'] == 'ground' and po['weighting'] == 'taylor' and po['autofocus'] is None
+    assert po['image'].shape == img.shape and np.abs(po['image'] - img).max() < 2e-3 * np.abs(img).max()    # another patch size
+    ps = fastsar.process_cphd('strip.cphd', backend='cpu', extent=(60.0, 50.0), product='sidd')
+    from fastsar import sidd
+    lay = sidd.shadows_down(ps)
+    pix = sidd.to_display(ps)
+    assert pix.dtype == np.uint8 and pix.shape == lay['image'].shape and pix.max() > 200
+    los = io.ecf_to_local(ecf(np.zeros((1, 3))), meta)[0] - io.ecf_to_local(ecf(ant_l[P // 2:P // 2 + 1]), meta)[0]
+    assert lay['row'] @ los > 0 and np.cross(lay['row'], lay['col'])[2] > 0.99 and abs(lay['angle']) < 1.0
+    for kw in (dict(plane='slant'), dict(weighting='sva'), dict(autofocus='quadratic'), dict(area='black')):
+        with pytest.raises(ValueError, match='moving beam'):
+            fastsar.process_cphd('strip.cphd', backend='cpu', extent=(60.0, 50.0), **kw)
 
 
 def test_mode_outside_enumeration(spot):

@@ -41,7 +41,7 @@ def _choice(name, value, allowed):
 
 
 def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None, autofocus=None, weighting=None,
-                 remap='nrl', remap_args=None, spacing=None, sicd=None, mode='auto', backend='auto',
+                 remap='nrl', remap_args=None, spacing=None, extent=None, sicd=None, mode='auto', backend='auto',
                  precision='float32', shadows_down=True, nesz_db=None, scene_sigma0_db=-10.0, height=None, channel=0,
                  troposphere=None, reader_options=None, target_db=-40.0):
     """Form the image of a CPHD collection and write it as a SICD or a SIDD (see the module docstring).
@@ -59,6 +59,9 @@ def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None
         reciprocal of the bandwidth for a complex product (half of it with 'sva'), 0.7 of the finer ground
         resolution for a SIDD. Without a spacing or a vendor sicd, a spotlight uses the central part of the
         aperture that makes the azimuth resolution the ground range resolution (form_cphd's aperture='auto').
+    extent: the tasked area's sides in meters about the scene center, for a collection that states no image area
+        (and in place of the one it states): (across, along) the line of sight for a spotlight, (along, across)
+        the track for a moving beam.
     sicd: the vendor's SICD (path, .xml or sarpy SICDType), whose footprint is then the tasked area.
     nesz_db, scene_sigma0_db: the noise level of the quality areas when the files give none (fastsar.rgiqe).
     mode, backend, precision, height, channel, troposphere, reader_options, target_db: form_cphd's.
@@ -78,6 +81,8 @@ def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None
     if not (isinstance(area, str) and area in ('tasked', 'tasked_quality', 'black')) and not (
             isinstance(area, (int, float, np.integer, np.floating)) and not isinstance(area, bool)):
         raise ValueError(f"area must be 'tasked', 'tasked_quality', 'black' or an RNIIRS, got {area!r}")
+    if extent is not None and (np.size(extent) != 2 or np.min(extent) <= 0):
+        raise ValueError(f'extent must be two positive lengths in meters, got {extent!r}')
     if spacing is not None and (np.size(spacing) not in (1, 2) or np.min(spacing) <= 0):
         raise ValueError(f'spacing must be one or two positive lengths in meters, got {spacing!r}')
     timing, st = {}, {}
@@ -112,10 +117,13 @@ def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None
         band = (g['fmin'], g['fmin'] + (K - 1) * g['df'])
         c, e1, e2 = g['center'], g['e1'], g['e2']
         fr = planes.slant_frame(g['meta'], c, g['pulses'])
-        if g['corners'] is None:
-            raise ValueError('the collection gives no image area: give the vendor sicd')
-        d = g['corners'] - c
-        b = np.array([(d @ e1).min(), (d @ e1).max(), (d @ e2).min(), (d @ e2).max()])
+        if extent is not None:
+            b = np.array([-extent[0], extent[0], -extent[1], extent[1]], np.float64) / 2
+        elif g['corners'] is None:
+            raise ValueError('the collection gives no image area: give an extent or the vendor sicd')
+        else:
+            d = g['corners'] - c
+            b = np.array([(d @ e1).min(), (d @ e1).max(), (d @ e2).min(), (d @ e2).max()])
         kept = None
         if wt == 'sva':
             lost, kept = _weighting.keystone(g['S'], g['ant'], g['fmin'], g['df'], c, fr['e1'], symmetric=False)
@@ -150,6 +158,7 @@ def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None
 
     out = form_cphd(cphd, sicd, mode=mode, backend=backend, channel=channel, height=height, precision=precision,
                     target_db=target_db, troposphere=troposphere, reader_options=reader_options, axes='auto',
+                    extent=extent,
                     aperture='auto' if spacing is None else 'full', _plan=plan)
     lap('form')
     timing['read'] = st['read'] - st['start']                        # the file, to the phase history in memory
