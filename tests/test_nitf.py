@@ -50,13 +50,25 @@ def scene(tmp_path_factory):
     out = fastsar.form_cphd(str(tmp / 'a.cphd'), backend='cpu', spacing=0.4, height=351.0)
     sm, a = products.sicd_meta(out)
     a = np.ascontiguousarray(a, np.complex64)
-    sarpy_sicd(tmp / 'sarpy_sicd.nitf', sm.to_xml_bytes(), a)
-    sicd_xml = _nitf.read(tmp / 'sarpy_sicd.nitf').xml('SICD')[0]
+    # sarpy writes the XML as it serializes the metadata it parsed, and its parsing renormalizes unit vectors, so
+    # one pass can move a number by a unit in the last place: the XML is passed through until sarpy returns it
+    # unchanged, and the files compared below then carry the same bytes
+    sicd_xml = sm.to_xml_bytes()
+    for _ in range(8):
+        sarpy_sicd(tmp / 'sarpy_sicd.nitf', sicd_xml, a)
+        last, sicd_xml = sicd_xml, _nitf.read(tmp / 'sarpy_sicd.nitf').xml('SICD')[0]
+        if sicd_xml == last:
+            break
+    assert sicd_xml == last
     sidd.write_sidd(str(tmp / 'first.nitf'), out)
     first = _nitf.read(tmp / 'first.nitf')
     sidd_xml, d = first.xml('SIDD')[0], np.array(first.pixels())
-    sarpy_sidd(tmp / 'sarpy_sidd.nitf', sidd_xml, d, sicd_xml)
-    sidd_xml = _nitf.read(tmp / 'sarpy_sidd.nitf').xml('SIDD')[0]            # as sarpy serializes it
+    for _ in range(8):
+        sarpy_sidd(tmp / 'sarpy_sidd.nitf', sidd_xml, d, sicd_xml)
+        last, sidd_xml = sidd_xml, _nitf.read(tmp / 'sarpy_sidd.nitf').xml('SIDD')[0]
+        if sidd_xml == last:
+            break
+    assert sidd_xml == last and _nitf.read(tmp / 'sarpy_sidd.nitf').xml('SICD')[0] == sicd_xml
     return SimpleNamespace(tmp=tmp, a=a, sicd_xml=sicd_xml, d=d, sidd_xml=sidd_xml)
 
 

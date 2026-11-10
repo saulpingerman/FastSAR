@@ -264,7 +264,7 @@ def sicd_meta(out):
     los = (scp - apc[m]) / np.linalg.norm(scp - apc[m])
     kr, kc = (2 * 0.5 * (f0 + f1) / C * (los @ u) for u in (urow, ucol))
     win = tuple(None if w == 'uniform' else w for w in (out.get('window') or (None, None)))
-    width = {'taylor': 1.184, 'hann': 1.441, None: 0.886, 'sva': 0.886}           # 3 dB width times bandwidth
+    width = {'taylor': 1.184, 'hann': 1.441, None: 0.8859, 'sva': 0.8859}         # 3 dB width times bandwidth
     base = bool(out.get('baseband'))
     sup = out.get('support') if base else None      # the spectrum's limits along e1 and e2, on the SICD's axes
     flip = lambda lim, sgn: None if lim is None else tuple(sgn * v for v in lim)[::sgn]

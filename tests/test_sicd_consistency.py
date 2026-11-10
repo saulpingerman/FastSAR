@@ -56,7 +56,9 @@ def check(out, name):
         else:
             wraps.append(False)
             assert k1 == pytest.approx(dk - bw / 2, abs=1e-9) and k2 == pytest.approx(dk + bw / 2, abs=1e-9)
-        assert ax.ImpRespWid * bw == pytest.approx({'TAYLOR': 1.184, 'HANNING': 1.441}.get(ax.WgtType.WindowName, 0.886))
+        # the width follows the stated band for every weighting (a uniform aperture: 0.8859 / ImpRespBW to 1e-4)
+        assert ax.ImpRespWid * bw == pytest.approx({'TAYLOR': 1.184, 'HANNING': 1.441}.get(ax.WgtType.WindowName, 0.8859),
+                                                   rel=5e-5)
     # shadows down the rows, the view from above, and the processed times within the collection
     los = sm.GeoData.SCP.ECF.get_array() - sm.SCPCOA.ARPPos.get_array()
     urow, ucol = g.Row.UVectECF.get_array(), g.Col.UVectECF.get_array()
