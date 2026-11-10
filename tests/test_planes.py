@@ -180,3 +180,114 @@ def test_to_ground(scene):
             assert abs(m['i'] - ie) < tol and abs(m['j'] - je) < tol, (kernel, k, m['i'] - ie, m['j'] - je)
     with pytest.raises(ValueError):
         planes.to_ground(out, g['origin'], g['e1'], g['e2'], px, n)
+
+
+DEVICES = [pytest.param('cupy', marks=pytest.mark.cuda), 'jax']
+
+
+def _close(got, ref, lib, tol, rms, flips=0):
+    """A device result against the CPU's: the same kind of array as the input, the same zeros (but `flips` pixels at
+    the edge of a mask), and differences under tol (largest) and rms of the largest sample."""
+    from fastsar import _xp
+    assert _xp.kind(got) == lib
+    got = _xp.host(got)
+    assert got.dtype == ref.dtype and got.shape == ref.shape
+    same = (got == 0) == (ref == 0)
+    assert np.count_nonzero(~same) <= flips
+    d, s = np.abs(got - ref)[same], np.abs(ref).max()
+    assert d.max() < tol * s and np.sqrt((d ** 2).mean()) < rms * s, (d.max() / s, np.sqrt((d ** 2).mean()) / s)
+
+
+def _product(nx, ny, spx, spy, r0, turn, squint, wavelength=0.031):
+    """A ground-plane product without its image: a track at range r0 and 35 degrees of grazing, squinted, and axes
+    along the line of sight turned by `turn` (deg), the scene center at pixel (nx // 2, 2 ny // 5)."""
+    t = np.linspace(-1.5, 1.5, 301)
+    gr, sq = np.radians(35.0), np.radians(squint)
+    scp = np.array([30.0, -20.0, 5.0])
+    los = np.array([np.cos(gr) * np.sin(sq), np.cos(gr) * np.cos(sq), -np.sin(gr)])
+    ant = scp - r0 * los + t[:, None] * np.array([7500.0, 300.0, -20.0])
+    c, s = np.cos(np.radians(turn)), np.sin(np.radians(turn))
+    e2 = np.array([c * los[0] - s * los[1], s * los[0] + c * los[1], 0.0]) / np.hypot(los[0], los[1])
+    e1 = np.cross(e2, [0.0, 0.0, 1.0])
+    fc = C / wavelength
+    return dict(meta=dict(tx=ant, rcv=ant, tx_time=t), origin=scp - (nx // 2) * spx * e1 - (2 * ny // 5) * spy * e2,
+                e1=e1, e2=e2, spx=spx, spy=spy, band=(fc - 1e8, fc + 1e8), plane='ground', scp=scp)
+
+
+@pytest.mark.parametrize('lib', DEVICES)
+def test_on_device(lib, need):
+    """deramp, to_slant (margin and mask) and to_ground on a CuPy and on a JAX image give the CPU's results. CuPy
+    computes positions and phases in double as the CPU does; JAX in float32 about exact integers, which moves a
+    sample in a hundred to the next row of the interpolation table (5e-4 of the largest sample)."""
+    xp, tol, rms, flips = (need('cupy'), 5e-6, 5e-6, 0) if lib == 'cupy' else (need('jax.numpy'), 2e-3, 2e-4, 2)
+    nx, ny = 520, 610
+    rng = np.random.default_rng(6)
+    ref = _product(nx, ny, 0.5, 0.35, 10e3, 0.0, 20.0)
+    ref['image'] = (rng.normal(size=(nx, ny)) + 1j * rng.normal(size=(nx, ny))).astype(np.complex64)
+    dev = dict(ref, image=xp.asarray(ref['image']))
+    planes.deramp(ref), planes.deramp(dev)
+    assert dev['baseband']
+    _close(dev['image'], ref['image'], lib, 5e-6, 5e-6)
+    valid = np.ones((nx, ny), bool)
+    valid[: nx // 3, : ny // 2] = False
+    sl, sd = (planes.to_slant(o, (0.45, 0.25), margin=24, valid=valid) for o in (ref, dev))
+    assert 0.1 < (sl['image'] == 0).mean() < 0.9
+    _close(sd['image'], sl['image'], lib, tol, rms, flips)
+    sl, sd = (planes.to_slant(o, (0.45, 0.25)) for o in (ref, dev))
+    _close(sd['image'], sl['image'], lib, tol, rms, flips)
+    g = sl['ground']
+    bk, bd = (planes.to_ground(o, g['origin'], g['e1'], g['e2'], (g['spx'], g['spy']), g['shape']) for o in (sl, sd))
+    assert bk['image'].shape == (nx, ny)
+    _close(bd['image'], bk['image'], lib, tol, rms)
+    det, dd = dict(sl, image=np.abs(sl['image']) ** 2), dict(sd, image=abs(sd['image']) ** 2)
+    for kernel in ('cubic', 'sinc'):
+        bk, bd = (planes.to_ground(o, g['origin'], g['e1'], g['e2'], 0.3, (800, 700), kernel=kernel) for o in (det, dd))
+        assert bk['image'].dtype == np.float32
+        _close(bd['image'], bk['image'], lib, tol, rms)
+    planes.deramp(ref, sign=+1), planes.deramp(dev, sign=+1)
+    assert not dev['baseband']
+    _close(dev['image'], ref['image'], lib, 5e-6, 5e-6)
+
+
+@pytest.mark.parametrize('lib', DEVICES)
+@pytest.mark.parametrize('turn, squint', [(0.0, 12.0), (33.0, -20.0)])
+def test_deramp_phase_on_device(lib, need, turn, squint):
+    """The phase deramp applies on a device against the CPU's in float64, over 12 km at 600 km and 31 mm: JAX works
+    in float32 (a TPU has no fast float64), where the range itself holds to 0.03 m, 12 rad."""
+    from fastsar import _xp
+    xp = need('cupy') if lib == 'cupy' else need('jax.numpy')
+    nx, ny, spx, spy = 1200, 1500, 10.0, 8.0
+    assert nx * spx == ny * spy == 12e3
+    out = _product(nx, ny, spx, spy, 600e3, turn, squint)
+    ref = planes.deramp(dict(out, image=np.ones((nx, ny), np.complex128)))
+    dev = planes.deramp(dict(out, image=xp.ones((nx, ny), xp.complex64)))
+    err = np.angle(_xp.host(dev['image']) * np.conj(ref['image']))
+    assert np.abs(err).max() < (1e-6 if lib == 'cupy' else 1e-3), np.abs(err).max()
+
+
+@pytest.mark.parametrize('lib', DEVICES)
+def test_blocks_on_device(lib, need, monkeypatch):
+    """Device memory that holds a few lines at a time gives the same image: many blocks, the last one short (CuPy)
+    or moved back to keep its size (JAX), on an image that is a view."""
+    if lib == 'cupy':
+        xp, tol, rms, flips = need('cupy'), 5e-6, 5e-6, 0
+        from fastsar import resample_cuda
+        monkeypatch.setattr(resample_cuda, '_free', lambda: 12 << 20)
+    else:
+        xp, tol, rms, flips = need('jax.numpy'), 2e-3, 2e-4, 2
+        from fastsar import resample_jax
+        monkeypatch.setattr(resample_jax, 'BLOCK', 1 << 16)
+    nx, ny = 310, 270
+    rng = np.random.default_rng(7)
+    ref = _product(nx, ny, 0.5, 0.35, 10e3, 0.0, -15.0)
+    ref['image'] = (rng.normal(size=(nx, ny)) + 1j * rng.normal(size=(nx, ny))).astype(np.complex64)
+    dev = dict(ref, image=xp.asarray(np.ascontiguousarray(ref['image'].T)).T)
+    planes.deramp(ref), planes.deramp(dev)
+    _close(dev['image'], ref['image'], lib, 5e-6, 5e-6)
+    valid = np.ones((nx, ny), bool)
+    valid[: nx // 3, : ny // 2] = False
+    sl, sd = (planes.to_slant(o, (0.45, 0.25), margin=10, valid=valid) for o in (ref, dev))
+    _close(sd['image'], sl['image'], lib, tol, rms, flips)
+    g = sl['ground']
+    bk, bd = (planes.to_ground(o, g['origin'], g['e1'], g['e2'], (g['spx'], g['spy']), g['shape']) for o in (sl, sd))
+    _close(bd['image'], bk['image'], lib, tol, rms)

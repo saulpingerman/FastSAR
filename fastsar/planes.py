@@ -22,10 +22,14 @@ azimuth positions of the slant grid, which leaves a spectrum that is a rectangle
 along e2 to the slant ranges (resample.warp: FFT oversampling by two and a Kaiser sinc). sampling gives the
 spacings this takes from the exact spectrum of the collection at points of the scene. to_ground is the reverse,
 for complex images or, with a cubic kernel, detected ones.
+
+Devices. deramp, to_slant and to_ground work where the image is: a NumPy array on the host, a CuPy array on its
+GPU (kernels in double: resample_cuda), a JAX array on JAX's device (float32 throughout, as a TPU needs:
+resample_jax), and the product holds an array of the same kind. The maps are computed on the host at the knots.
 """
 import numpy as np
 
-from . import resample
+from . import _xp, resample
 
 C = 299792458.0
 
@@ -170,7 +174,8 @@ def _slant_axes(fr, hz, h=1.0):
 def deramp(out, sign=-1):
     """Bring a ground-plane spotlight image to baseband, in place: multiplied by exp(sign j 4 pi fc (R - R0) / c),
     R each pixel's range to the COA antenna position, R0 the scene center's, fc the center frequency. out['baseband']
-    records it (products.sicd_meta reads it); sign=+1 puts the carrier back."""
+    records it (products.sicd_meta reads it); sign=+1 puts the carrier back. A JAX image is replaced in out by the
+    new array (computed in float32, to under 1e-3 rad: resample_jax.deramp)."""
     from .patches import _rows
     if bool(out.get('baseband')) == (sign < 0):
         return out
@@ -178,6 +183,14 @@ def deramp(out, sign=-1):
     img = out['image']
     fr = _frame(out)
     k = sign * 4 * np.pi * 0.5 * (out['band'][0] + out['band'][1]) / C
+    dev = resample._device(img)
+    if dev is not None:
+        if _xp.kind(img) == 'cupy':
+            dev.deramp(img, o - fr['arp'], spx * e1, spy * e2, fr['r0'], k)
+        else:
+            out['image'] = dev.deramp(img, o - fr['scp'], spx * e1, spy * e2, fr['e2'], fr['r0'], k)
+        out['baseband'] = sign < 0
+        return out
     w = (o - fr['arp'])[:, None] + (np.arange(ny) * spy)[None] * e2[:, None]          # [3, ny]: row 0 less the antenna
 
     def work(sl):
@@ -261,10 +274,17 @@ def to_slant(out, spacing, bounds=None, *, margin=0, valid=None, taps=8, knots=3
     # pass 2, along e2 at each slant row: the y index of the ground point of slant pixel (i, j)
     G = slant_to_ground(fr, ((ak - i0) * sa)[:, None], ((rk - j0) * sr)[None], hz) - o       # [nak, nrk, 3]
     pos1 = resample.KnotMap(ak, rk, (G @ e2) / spy, nr)
-    img = resample.warp(out['image'], pos0, pos1, (na, nr), taps=taps)
-    if mg > 0 or valid is not None:
+    dev = resample._device(out['image'])
+    masked = mg > 0 or valid is not None
+    if dev is not None:
         posx = resample.KnotMap(ak, rk, (G @ e1) / spx, nr)
-        v = None if valid is None else np.asarray(valid, bool)
+        mask = (posx, (mg, nx - 1 - mg), (mg, ny - 1 - mg), valid) if masked else None
+        img = dev.warp(out['image'], pos0, pos1, (na, nr), taps=taps, mask=mask)
+    else:
+        img = resample.warp(out['image'], pos0, pos1, (na, nr), taps=taps)
+    if masked and dev is None:
+        posx = resample.KnotMap(ak, rk, (G @ e1) / spx, nr)
+        v = None if valid is None else np.asarray(_xp.host(valid), bool)
 
         def mask(sl):
             x, y = posx(sl), pos1(sl)
@@ -295,7 +315,8 @@ def to_ground(out, origin, e1, e2, spacing, shape, *, kernel=None, taps=8, pad=N
     -> the product dict on the ground plane (plane 'ground')."""
     if out.get('plane') != 'slant':
         raise ValueError('to_ground takes a slant-plane image')
-    img = np.asarray(out['image'])
+    dev = resample._device(out['image'])
+    img = out['image'] if dev is not None else np.asarray(out['image'])
     na, nr = img.shape
     o, e1, e2 = (np.asarray(v, np.float64) for v in (origin, e1, e2))
     spx, spy = (float(v) for v in np.broadcast_to(np.asarray(spacing, np.float64), (2,)))
@@ -318,6 +339,8 @@ def to_ground(out, origin, e1, e2, spacing, shape, *, kernel=None, taps=8, pad=N
     pos1 = resample.KnotMap(yk, xk, ground_to_slant(fr, g)[0] / sa + i0, nx)
     kw = dict(kernel=kernel, pad=pad) if kernel != 'sinc' else dict(kernel='sinc', taps=taps, pad=pad)
     res = {k: v for k, v in out.items() if k not in ('image', 'scp_pixel', 'ground', 'support', 'bandwidth')}
-    res.update(image=resample.warp(img.T, pos0, pos1, (ny, nx), **kw).T, origin=o, e1=e1, e2=e2, spx=spx, spy=spy,
+    img = dev.warp(img, pos0, pos1, (ny, nx), transposed=True, **kw) if dev is not None else \
+        resample.warp(img.T, pos0, pos1, (ny, nx), **kw).T
+    res.update(image=img, origin=o, e1=e1, e2=e2, spx=spx, spy=spy,
                plane='ground', scp=scp)
     return res

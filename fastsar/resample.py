@@ -8,8 +8,14 @@ are smooth functions of the output position runs as two such passes (Catmull and
 axis 0 at each source column, the second along axis 1 at each output row.
 
 Samples outside the source are zero, and an output position outside the source gives zero.
+
+The image may be a NumPy array, a CuPy array (resample_cuda: the same kernel in CUDA, positions in double) or a JAX
+array (resample_jax: float32 and int32 only, as a TPU needs); the result is where the image is. Knot maps and
+tables stay on the host: the positions of the samples are evaluated on the device.
 """
 import numpy as np
+
+from . import _xp
 
 __all__ = ['kernel_table', 'lines', 'warp', 'KnotMap']
 
@@ -58,11 +64,20 @@ class KnotMap:
         self.j0 = np.clip(np.searchsorted(self.ok, j, 'right') - 1, 0, len(self.ok) - 2)
         self.wj = (j - self.ok[self.j0]) / (self.ok[self.j0 + 1] - self.ok[self.j0])
 
-    def __call__(self, sl):
+    def cells(self, sl):
+        """The knot interval [len(sl)] of each line of sl (the index of its lower knot) and the weight of the upper."""
         i = np.arange(sl.start, sl.stop, dtype=np.float64)
         i0 = np.clip(np.searchsorted(self.lk, i, 'right') - 1, 0, len(self.lk) - 2)
-        wi = ((i - self.lk[i0]) / (self.lk[i0 + 1] - self.lk[i0]))[:, None]
-        rows = self.v[i0] * (1 - wi) + self.v[i0 + 1] * wi                          # [L, b]
+        return i0, (i - self.lk[i0]) / (self.lk[i0 + 1] - self.lk[i0])
+
+    def rows(self, sl):
+        """The positions [len(sl), b] of the lines of sl at the output knots."""
+        i0, wi = self.cells(sl)
+        wi = wi[:, None]
+        return self.v[i0] * (1 - wi) + self.v[i0 + 1] * wi
+
+    def __call__(self, sl):
+        rows = self.rows(sl)
         return rows[:, self.j0] * (1 - self.wj) + rows[:, self.j0 + 1] * self.wj
 
 
@@ -116,22 +131,52 @@ def lines(src, pos, m=None, *, kernel='sinc', taps=8, pad=None, out=None):
     pos: [L, m] source positions in samples, or a function of a slice of lines returning [len, m] (KnotMap), with
     m then given. Complex input gives complex64, real input float32. pad: FFT oversampling before the kernel
     (default 2 for 'sinc', 1 for 'cubic' and 'linear'); guard zeros at both ends keep the periodic FFT from wrapping
-    one end of a line into the other. Lines run in blocks on all cores."""
-    src = np.asarray(src)
+    one end of a line into the other. Lines run in blocks on all cores.
+    src on a device (a CuPy or a JAX array) gives the result there; pos is then a KnotMap (evaluated on the device),
+    a function or an array on the host, or an array on the device; out is for NumPy and CuPy arrays only."""
+    dev = _device(src)
+    if dev is None:
+        src = np.asarray(src)
     if src.ndim != 2:
         raise ValueError(f'src must be 2-D, got shape {src.shape}')
     real = not np.iscomplexobj(src)
     if not callable(pos):
-        pos = np.asarray(pos)
+        if dev is None or _xp.kind(pos) == 'numpy':
+            pos = np.asarray(pos)
         if pos.ndim != 2 or pos.shape[0] != src.shape[0]:
             raise ValueError(f'pos must be [{src.shape[0]}, m], got shape {pos.shape}')
-        m, arr, pos = pos.shape[1], pos, (lambda sl: np.asarray(arr[sl], np.float64))
+        m, arr = pos.shape[1], pos
+        if dev is None:
+            pos = lambda sl: np.asarray(arr[sl], np.float64)
     if m is None:
         raise ValueError('m (output samples per line) is required when pos is a function')
+    if dev is not None:
+        return dev.lines(src, pos, int(m), kernel=kernel, taps=taps, pad=pad, out=out)
     if out is None:
         out = np.empty((src.shape[0], int(m)), np.float32 if real else np.complex64)
     _run(src.__getitem__, out.__setitem__, src.shape[0], src.shape[1], real, pos, int(m), kernel, taps, pad)
     return out
+
+
+def _device(src):
+    """The module that resamples where src lives (resample_cuda, resample_jax), None for the host."""
+    k = _xp.kind(src)
+    if k == 'cupy':
+        from . import resample_cuda as dev
+    elif k == 'jax':
+        from . import resample_jax as dev
+    else:
+        dev = None
+    return dev
+
+
+def _plan(n, kernel, taps, pad):
+    """The table, the oversampling, the guard zeros at each end of a line of n and the FFT length, for every path."""
+    from scipy import fft
+    tab = kernel_table(kernel, taps)
+    pad = (2 if kernel == 'sinc' else 1) if pad is None else int(pad)
+    guard = tab.shape[1] if pad == 1 else 16
+    return tab, pad, guard, fft.next_fast_len(n + 2 * guard) if pad > 1 else n + 2 * guard
 
 
 _LIB = []
@@ -162,12 +207,8 @@ def _lib():
 
 def _run(get, put, L, n, real, pos, m, kernel, taps, pad, block_bytes=64 << 20):
     """lines() on line blocks read by get(slice) -> [len, n] and written by put(slice, [len, m])."""
-    from scipy import fft
     from .patches import _rows, _ncpu
-    tab = kernel_table(kernel, taps)
-    pad = (2 if kernel == 'sinc' else 1) if pad is None else int(pad)
-    guard = tab.shape[1] if pad == 1 else 16
-    n2 = fft.next_fast_len(n + 2 * guard) if pad > 1 else n + 2 * guard
+    tab, pad, guard, n2 = _plan(n, kernel, taps, pad)
     lib = _lib()
     if lib is None:
         chunk = int(max(1, min(256, (1 << 20) // (8 * max(pad * n2, m)))))
@@ -205,12 +246,17 @@ def warp(src, pos0, pos1, shape, *, kernel='sinc', taps=8, pad=None):
     Pass 2, along axis 1 at each output row i: out[i, k] = mid[i, pos1[i, k]], with pos1 [m0, m1] (or a function of
     a slice of rows): the axis-1 source position of output pixel (i, k).
     The source must be band limited along axis 0 at each column and the intermediate along axis 1; a spectrum
-    that wraps along axis 1 before pass 1 (a sheared support on a critically sampled grid) is resolved by it."""
-    src = np.asarray(src)
+    that wraps along axis 1 before pass 1 (a sheared support on a critically sampled grid) is resolved by it.
+    src on a device (a CuPy or a JAX array) gives the result there, as lines does."""
+    dev = _device(src)
+    if dev is None:
+        src = np.asarray(src)
     if src.ndim != 2:
         raise ValueError(f'src must be 2-D, got shape {src.shape}')
     n0, n1 = src.shape
     m0, m1 = int(shape[0]), int(shape[1])
+    if dev is not None:
+        return dev.warp(src, pos0, pos1, (m0, m1), kernel=kernel, taps=taps, pad=pad)
     real = not np.iscomplexobj(src)
     f0 = pos0 if callable(pos0) else (lambda sl: np.asarray(pos0[sl], np.float64))
     mid = np.empty((m0, n1), np.float32 if real else np.complex64)

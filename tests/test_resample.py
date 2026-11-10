@@ -104,3 +104,64 @@ def test_warp_sheared_lattice_with_wrapped_spectrum():
     p1 = resample.KnotMap(i1.astype(float), j1.astype(float), pos1[np.ix_(i1, j1)], m1)
     out2 = resample.warp(src, p0, p1, (m0, m1), taps=12)
     assert _db(out2 - ref, ref) < -38.0
+
+
+DEVICES = [pytest.param('cupy', marks=pytest.mark.cuda), 'jax']
+
+
+def _device(lib, need):
+    """The array module of a device library, and the largest and rms differences from the CPU result that its
+    positions allow, relative to the largest sample: CuPy's are the CPU's (double); JAX's are float32 about an exact
+    integer, which moves a sample in a hundred to the next row of the table."""
+    return (need('cupy'), 3e-6, 3e-6) if lib == 'cupy' else (need('jax.numpy'), 2e-3, 2e-4)
+
+
+def _same(got, ref, lib, tol, rms):
+    from fastsar import _xp
+    assert _xp.kind(got) == lib
+    got = _xp.host(got)
+    assert got.dtype == ref.dtype and got.shape == ref.shape
+    assert np.array_equal(got == 0, ref == 0)
+    d, s = np.abs(got - ref), np.abs(ref).max()
+    assert d.max() < tol * s and np.sqrt((d ** 2).mean()) < rms * s, (d.max() / s, np.sqrt((d ** 2).mean()) / s)
+
+
+@pytest.mark.parametrize('lib', DEVICES)
+def test_lines_on_device(lib, need):
+    xp, tol, rms = _device(lib, need)
+    rng = np.random.default_rng(4)
+    src = (rng.normal(size=(150, 331)) + 1j * rng.normal(size=(150, 331))).astype(np.complex64)
+    pos = rng.random((150, 257)) * 345 - 7                                         # some outside, at both ends
+    pos[:, :3] = [0.0, 330.0, 17.0]
+    _same(resample.lines(xp.asarray(src), pos), resample.lines(src, pos), lib, tol, rms)
+    got = resample.lines(xp.asarray(src), lambda sl: pos[sl], 257, taps=12)
+    _same(got, resample.lines(src, pos, taps=12), lib, tol, rms)
+    for kernel in ('cubic', 'sinc'):                                               # real lines: float32
+        _same(resample.lines(xp.asarray(src.real), pos, kernel=kernel), resample.lines(src.real, pos, kernel=kernel),
+              lib, tol, rms)
+    # positions on the device: float32 ones for JAX, which hold a 300-sample line to 2e-5 sample
+    got = resample.lines(xp.asarray(src), xp.asarray(pos[:, 3:]))
+    _same(got, resample.lines(src, pos[:, 3:]), lib, 5 * tol, 5 * rms)
+
+
+@pytest.mark.parametrize('lib', DEVICES)
+def test_warp_on_device(lib, need):
+    xp, tol, rms = _device(lib, need)
+    rng = np.random.default_rng(5)
+    n0, n1, m0, m1 = 300, 260, 281, 310
+    src = (rng.normal(size=(n0, n1)) + 1j * rng.normal(size=(n0, n1))).astype(np.complex64)
+    lk, ok = np.linspace(0, n1 - 1, 9), np.linspace(0, m0 - 1, 11)
+    p0 = resample.KnotMap(lk, ok, 1.09 * ok[None] + 0.03 * lk[:, None] + 1e-4 * lk[:, None] * ok[None] - 7.3, m0)
+    lk, ok = np.linspace(0, m0 - 1, 10), np.linspace(0, m1 - 1, 12)
+    p1 = resample.KnotMap(lk, ok, 0.87 * ok[None] + 0.02 * lk[:, None] - 5.6, m1)
+    for s, kw in ((src, {}), (src.real, dict(kernel='cubic')), (src.imag, dict(kernel='sinc', pad=3))):
+        ref = resample.warp(s, p0, p1, (m0, m1), **kw)
+        assert (ref == 0).any() and (ref != 0).mean() > 0.8
+        _same(resample.warp(xp.asarray(s), p0, p1, (m0, m1), **kw), ref, lib, tol, rms)
+        # the transposed warp of the device modules (planes.to_ground): no transposed copy of the image
+        st = xp.asarray(np.ascontiguousarray(s.T))
+        got = resample._device(st).warp(st, p0, p1, (m0, m1), transposed=True, **kw)
+        _same(got, np.ascontiguousarray(ref.T), lib, tol, rms)
+    # full maps as arrays give what the knot maps give
+    ref = resample.warp(src, p0(slice(0, n1)), p1(slice(0, m0)), (m0, m1))
+    _same(resample.warp(xp.asarray(src), p0(slice(0, n1)), p1(slice(0, m0)), (m0, m1)), ref, lib, tol, rms)
