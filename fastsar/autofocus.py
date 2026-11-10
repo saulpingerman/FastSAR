@@ -161,6 +161,7 @@ def autofocus(S, ant, fmin, df, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 1
 _MODES = ('quadratic', 'pga', 'spatially_variant', 'spatially_variant_pga')
 _JIT = {}
 _BLOCK = dict(numpy=1 << 19, cupy=1 << 27, jax=1 << 28)     # samples per column block when a correction is applied
+MIN_SIG = 10.0                                              # least significance of a correlation peak (_peaks)
 
 
 def _ft(a, kind='fft', workers=-1):
@@ -272,11 +273,13 @@ def _contrast(a, axes=None):
     return np.where(m1 > 0, np.sqrt(np.maximum(m2 - m1 * m1, 0.0)) / np.where(m1 > 0, m1, 1.0), 0.0)
 
 
-def _peaks(X, n, up=8):
-    """Lag (samples, fractional) and height of the largest value of each circular cross-correlation whose rfft is
-    X [nb, n // 2 + 1], within n / 4 of zero lag: a grid `up` times finer, then a parabola through its top three."""
+def _peaks(X, n, up=8, workers=1):
+    """Lag (samples, fractional), height and significance of the largest value of each circular cross-correlation
+    whose rfft is X [nb, n // 2 + 1], within n / 4 of zero lag: a grid `up` times finer, then a parabola through its
+    top three. The significance is the height above the median of the searched lags (whole samples) in units of
+    their robust standard deviation (1.4826 times the median absolute deviation). workers: host FFT threads."""
     L = n * up
-    xc = _sfft.irfft(X, L, axis=1) * up
+    xc = _sfft.irfft(X, L, axis=1, workers=workers) * up
     h = (n // 4) * up
     idx = np.concatenate([np.arange(0, h + 1), np.arange(L - h, L)])
     i = idx[np.argmax(xc[:, idx], axis=1)]
@@ -284,45 +287,60 @@ def _peaks(X, n, up=8):
     y0, y1, y2 = xc[r, (i - 1) % L], xc[r, i], xc[r, (i + 1) % L]
     den = y0 - 2 * y1 + y2
     frac = np.where(den < 0, 0.5 * (y0 - y2) / np.where(den < 0, den, 1.0), 0.0)
-    return (np.where(i >= L // 2, i - L, i) + frac) / up, y1
+    w = xc[:, idx[::up]]
+    med = np.median(w, axis=1)
+    sd = 1.4826 * np.median(np.abs(w - med[:, None]), axis=1)
+    sig = np.where(sd > 0, (y1 - med) / np.where(sd > 0, sd, 1.0), 0.0)
+    return (np.where(i >= L // 2, i - L, i) + frac) / up, y1, sig
 
 
-def _map_drift(A, band, iterations, tol, workers=-1):
+def _map_drift(A, band, iterations, tol, workers=-1, c0=0.0, pool=False, G=None, contrast=True):
     """Iterated map drift on A [n, nb, m] complex64 (on its device): nb independent sets of m columns, one quadratic
     coefficient each. Each iteration removes the estimate so far, forms the detected images of the lower and upper
     half bands, measures the shift d (samples) of the upper against the lower at the peak of their cross-correlation
     summed over the m columns, and adds  -pi hf d / sep  to the coefficient (a quadratic c v^2 moves the two looks
-    apart by c sep / (pi hf) samples). Stops when every set's update is below tol. workers: host FFT threads.
-    -> dict(c [nb] rad at the band edge, corr [nb] the correlation coefficient at the peak, step [nb] the last
-    update, iterations, before, after [nb]: the contrast of each set as given and with its estimate removed)."""
+    apart by c sep / (pi hf) samples). Stops when every set's update is below tol. workers: host FFT threads; c0:
+    the coefficient every set starts from (rad); pool: one coefficient for all sets together (the correlations
+    summed over the sets too; the results then have one entry); G: fft(A, axis=0) if at hand; contrast: False to
+    skip before and after.
+    -> dict(c [nb] rad at the band edge, corr [nb] the correlation coefficient at the peak, sig [nb] the peak's
+    significance (_peaks), step [nb] the last update, iterations, G, before, after [nb]: the contrast of each set
+    as given and with its estimate removed)."""
     xp = _xp.module(A)
     f0, hf, sep = band
     n, nb = A.shape[:2]
     v = _offsets(n, f0, hf)
     dn, up = (xp.asarray(k.astype(np.float32))[:, None, None] for k in ((v < 0) & (v >= -1), (v >= 0) & (v <= 1)))
     jitted = _xp.kind(A) == 'jax'                                   # an iteration as one compiled program
-    G = _jit('fft0')(A) if jitted else _ft(A, 'fft', workers)
+    if G is None:
+        G = _jit('fft0')(A) if jitted else _ft(A, 'fft', workers)
     quad = lambda c: xp.asarray(np.exp(-1j * c[None, :] * v[:, None] ** 2).astype(np.complex64))[:, :, None]
-    c, corr, step = np.zeros(nb), np.zeros(nb), np.zeros(nb)
+    c = np.full(nb, float(c0))
     for it in range(max(1, int(iterations))):
         if jitted:
             xr, xi, ea, eb = (_xp.host(t) for t in _jit('drift')(G, quad(c), dn, up))
-            X, ee = (xr + 1j * xi).T.astype(np.complex128), ea.astype(np.float64) * eb.astype(np.float64)
+            X = (xr + 1j * xi).T.astype(np.complex128)
         else:
             Gq = G * quad(c)
             a, b = xp.abs(_ft(Gq * dn, 'ifft', workers)) ** 2, xp.abs(_ft(Gq * up, 'ifft', workers)) ** 2
             a, b = a - a.mean(0, keepdims=True), b - b.mean(0, keepdims=True)
             X = _xp.host((xp.conj(_ft(a, 'rfft', workers)) * _ft(b, 'rfft', workers)).sum(-1)).T.astype(np.complex128)
-            ee = _xp.host((a * a).sum((0, 2))).astype(np.float64) * _xp.host((b * b).sum((0, 2))).astype(np.float64)
-        d, pk = _peaks(X, n)
+            ea, eb = _xp.host((a * a).sum((0, 2))), _xp.host((b * b).sum((0, 2)))
+        ea, eb = ea.astype(np.float64), eb.astype(np.float64)
+        if pool:
+            X, ea, eb = X.sum(0, keepdims=True), ea.sum(keepdims=True), eb.sum(keepdims=True)
+        ee = ea * eb
+        d, pk, sig = _peaks(X, n, workers=workers)
         corr = np.where(ee > 0, pk / np.sqrt(np.where(ee > 0, ee, 1.0)), 0.0)
         step = np.where(ee > 0, -np.pi * hf / sep * d, 0.0)
         c = c + step
         if np.all(np.abs(step) < tol):
             break
-    after = _jit('undo')(G, quad(c)) if jitted else _ft(G * quad(c), 'ifft', workers)
-    return dict(c=c, corr=corr, step=step, iterations=it + 1, before=_contrast(A, (0, 2)),
-                after=_contrast(after, (0, 2)))
+    out = dict(c=c[:len(step)], corr=corr, sig=np.where(ee > 0, sig, 0.0), step=step, iterations=it + 1, G=G)
+    if contrast:
+        after = _jit('undo')(G, quad(c)) if jitted else _ft(G * quad(c), 'ifft', workers)
+        out.update(before=_contrast(A, (0, 2)), after=_contrast(after, (0, 2)))
+    return out
 
 
 def _jit(name):
@@ -352,7 +370,11 @@ def _jit(name):
         def contrast(a, axes):                      # _contrast's two means
             p = jnp.abs(a) ** 2
             return p.mean(axes), (p * p).mean(axes)
-        _JIT.update(fixed=jax.jit(fixed), strip=jax.jit(strip), drift=jax.jit(drift),
+
+        def colsums(blk):                           # _colsums of a block
+            p = jnp.real(blk) ** 2 + jnp.imag(blk) ** 2
+            return (p > 0).sum(0), p.sum(0), (p * p).sum(0)
+        _JIT.update(fixed=jax.jit(fixed), strip=jax.jit(strip), drift=jax.jit(drift), colsums=jax.jit(colsums),
                     contrast=jax.jit(contrast, static_argnums=1), fft0=jax.jit(lambda a: jnp.fft.fft(a, axis=0)),
                     undo=jax.jit(lambda G, q: jnp.fft.ifft(G * q, axis=0)))
     return _JIT[name]
@@ -361,6 +383,88 @@ def _jit(name):
 def _threads(work, items):
     with ThreadPoolExecutor(min(len(items), os.cpu_count() or 1) or 1) as ex:
         list(ex.map(work, items))
+
+
+def _jax_width(nx, ny):
+    """Columns per block of a JAX image [nx, ny] (see _apply)."""
+    return int(min(ny, max(1, min(_BLOCK['jax'], _xp.jax_block() // 64) // nx)))
+
+
+def _colsums(img):
+    """Per column of img [nx, ny]: the number of nonzero samples, the sum of their intensity and the sum of its
+    square -> host float64 [3, ny]. Computed on the device of img in the column blocks of _apply; only the sums
+    come to the host."""
+    nx, ny = img.shape
+    out, k = np.zeros((3, ny)), _xp.kind(img)
+    if k == 'jax':
+        f, w = _jit('colsums'), _jax_width(nx, ny)
+        for j in list(range(0, ny - w + 1, w)) + ([ny - w] if ny % w else []):
+            out[:, j:j + w] = [_xp.host(t) for t in f(img[:, j:j + w])]
+        return out
+    xp = _xp.module(img)
+    w = int(max(1 if k == 'cupy' else 4, _BLOCK[k] // nx))
+
+    def work(j):
+        blk = img[:, j:j + w]
+        p = blk.real ** 2 + blk.imag ** 2
+        out[0, j:j + w] = _xp.host(xp.count_nonzero(p, axis=0))
+        out[1, j:j + w] = _xp.host(p.sum(0, dtype=xp.float64))
+        p *= p
+        out[2, j:j + w] = _xp.host(p.sum(0, dtype=xp.float64))
+    if k == 'cupy':
+        for j in range(0, ny, w):
+            work(j)
+    else:
+        _threads(work, range(0, ny, w))
+    return out
+
+
+def _gain(sb, sa, sets=16):
+    """The guard's measure, from the column sums (_colsums) of an image before (sb) and after (sa) a correction.
+    The contrast is std / mean of the intensity over the samples that are nonzero before, of the whole image and
+    of each of `sets` contiguous sets of columns (parts of the scene).
+    -> (contrast of the image before, after; the standard error of the log of their ratio, by the jackknife that
+    leaves out one set at a time; the median over the sets of log(after / before) of their own contrasts; its
+    standard error, 1.2533 * 1.4826 * the median absolute deviation / sqrt(sets). With fewer than four sets that
+    hold data the last three are 0, the log ratio of the whole image and 0)."""
+    def con(n, s1, s2):
+        n = np.maximum(n, 1.0)
+        m1, m2 = s1 / n, s2 / n
+        return np.where(m1 > 0, np.sqrt(np.maximum(m2 - m1 * m1, 0.0)) / np.where(m1 > 0, m1, 1.0), 0.0)
+    cuts = np.unique(np.round(np.linspace(0, sb.shape[1], min(int(sets), sb.shape[1]) + 1)).astype(np.int64))[:-1]
+    n, b1, b2, a1, a2 = (np.add.reduceat(t, cuts) for t in (sb[0], sb[1], sb[2], sa[1], sa[2]))
+    cb, ca = float(con(n.sum(), b1.sum(), b2.sum())), float(con(n.sum(), a1.sum(), a2.sum()))
+    kb, ka = con(n, b1, b2), con(n, a1, a2)
+    ok = (kb > 0) & (ka > 0)
+    if ok.sum() < 4:
+        return cb, ca, 0.0, (float(np.log(ca / cb)) if cb > 0 and ca > 0 else 0.0), 0.0
+    rest = lambda t: t.sum() - t[ok]                                # the image without one set
+    jb, ja = con(rest(n), rest(b1), rest(b2)), con(rest(n), rest(a1), rest(a2))
+    th = np.log(np.maximum(ja, 1e-300) / np.maximum(jb, 1e-300))
+    k = int(ok.sum())
+    g = np.log(ka[ok] / kb[ok])
+    med = float(np.median(g))
+    return (cb, ca, float(np.sqrt((k - 1) / k * ((th - th.mean()) ** 2).sum())), med,
+            float(1.2533 * 1.4826 * np.median(np.abs(g - med)) / np.sqrt(k)))
+
+
+def _keep(img, out, info, guard, sb=None, z=2.0):
+    """Measure a corrected image `out` against `img` (_gain; sb: the column sums of img if at hand), record in info
+    contrast_before, contrast_after, gain (the log of their ratio), gain_std, part_gain (the median gain of the
+    sets of columns) and part_gain_std, and decide. With guard the correction is kept only if the contrast of the
+    whole image rose, the median gain of the parts is not below -z times its standard error, and one of the two
+    gains is at least z times its standard error. -> out, or img with info['reason'] set."""
+    cb, ca, se, med, mse = _gain(_colsums(img) if sb is None else sb, _colsums(out))
+    d = float(np.log(ca / cb)) if cb > 0 and ca > 0 else 0.0
+    info.update(contrast_before=cb, contrast_after=ca, gain=d, gain_std=se, part_gain=med, part_gain_std=mse)
+    if guard and not ca > cb:
+        return _skip(img, info, 'the correction lowers the contrast of the image')
+    if guard and med < -z * mse:
+        return _skip(img, info, 'the correction lowers the contrast of most parts of the image')
+    if guard and not (d >= z * se or (med > 0 and med >= z * mse)):
+        return _skip(img, info, 'the contrast gain is within its scatter over the parts of the image')
+    info.update(applied=True, reason=None)
+    return out
 
 
 def _apply(img, phi):
@@ -374,7 +478,7 @@ def _apply(img, phi):
     k = _xp.kind(img)
     if k == 'jax':
         import jax.numpy as jnp
-        f, w = _jit('fixed'), int(min(ny, max(1, min(_BLOCK['jax'], _xp.jax_block() // 64) // nx)))
+        f, w = _jit('fixed'), _jax_width(nx, ny)
         parts = [f(img[:, j:j + w], q) for j in range(0, ny - w + 1, w)]
         if ny % w:
             parts.append(f(img[:, ny - w:], q)[:, w - ny % w:])
@@ -407,7 +511,8 @@ def _skip(img, info, reason, **kw):
     return img
 
 
-def quadratic(img, *, iterations=6, lines=0.3, tol=0.02, guard=True, max_lines=1024, band_db=30.0):
+def quadratic(img, *, iterations=6, lines=0.3, tol=0.02, guard=True, max_lines=1024, band_db=30.0, subsets=8,
+              min_significance=MIN_SIG):
     """Estimate and remove a quadratic azimuth phase error by map drift.
 
     img [nx, ny]: complex baseband image, axis 0 azimuth (a slant-plane image, or a ground-plane image on axes along
@@ -424,16 +529,33 @@ def quadratic(img, *, iterations=6, lines=0.3, tol=0.02, guard=True, max_lines=1
     converted to c and removed, and this repeats until an update is below tol (rad at the band edge) or
     `iterations` is reached. The transforms of the estimate and of the correction run on the device of img.
 
-    guard: keep the correction only if the contrast (std / mean of the intensity of the kept columns) did not
-    drop; otherwise the input is returned as it came with info['applied'] = False. An estimate below tol is not
-    applied either.
+    guard: the estimate is applied only if it passes two tests, and otherwise the input is returned as it came with
+    info['applied'] = False and info['reason'].
+    Consistency, before anything is applied: the kept columns are cut into `subsets` equal contiguous sets (parts
+    of the scene; the estimate uses the columns of the sets) and each gives its own estimate. The sets whose
+    correlation peak stands min_significance robust standard deviations above the other lags count; at least half
+    of them (and four) must, and so must the peak of all columns together. With s the robust scatter of their
+    estimates (1.4826 times the median absolute deviation about the median) and sigma = s / sqrt(sets) the
+    uncertainty of c, the estimate must lie within 3 sigma + tol of their median, |c| must be at least 3 sigma,
+    and at most a quarter of the sets may lie more than 4.5 s + tol from the median: a scene whose parts ask for
+    different corrections (relief, moving surfaces, one dominant reflector) gets none.
+    Result: the contrast (std / mean of the intensity over the nonzero samples) is measured on every column of
+    the image as given and as corrected, for the whole image and for 16 contiguous sets of columns. The contrast of
+    the whole image must rise; the median over the sets of the log ratio of their contrasts must not be below
+    minus twice its standard error (from the scatter of the sets); and either that median or the log ratio of the
+    whole image must be at least twice its standard error (for the whole image: the jackknife over the sets).
+    Without guard an estimate of at least tol is applied as it is. An estimate below tol is never applied.
 
     -> (img2 complex64 [nx, ny] in the same place as img; phi [nx] float64 on the host: the phase removed (rad) per
     bin of the axis-0 FFT in fftfreq order, c v^2 inside the band and zero outside (all zero when nothing was
     applied), so that img2 = ifft(fft(img, axis=0) * exp(-1j * phi)[:, None], axis=0) with the zeros of img put
-    back; info: dict(edge_rad: c, the estimate in radians at the band edge; band: (f0, hf); iterations;
-    correlation: the correlation coefficient of the two looks at the peak; lines: columns used; contrast_before,
-    contrast_after; applied; reason: why not, or None)).
+    back; info: dict(edge_rad: c, the estimate in radians at the band edge, whether applied or not; edge_rad_std:
+    sigma (None when the sets were not estimated); subsets: the sets' estimates (rad) and subset_significance
+    theirs; significance and correlation: of the peak of all columns (correlation coefficient of the two looks);
+    band: (f0, hf); iterations; lines: columns used; contrast_before, contrast_after: of the whole image, as given
+    and with the estimate removed (equal when no correction was evaluated); gain, gain_std: the log of their ratio
+    and its standard error; part_gain, part_gain_std: the median log contrast ratio of the sets of columns and its
+    standard error; applied; reason: why not, or None)).
 
     Phase history. A phase error phi_p on pulse p (row p of the phase history multiplied by exp(1j * phi_p)) shows
     up with the same sign and scale at the pulse's azimuth frequency bin b_p (pulse_bins): phi[b_p mod nx] estimates
@@ -444,57 +566,98 @@ def quadratic(img, *, iterations=6, lines=0.3, tol=0.02, guard=True, max_lines=1
     pulse index has cubic and higher terms in t, which this function leaves and image_autofocus(img, 'pga') removes."""
     _check(img)
     nx = img.shape[0]
-    info = dict(edge_rad=0.0, band=None, iterations=0, correlation=0.0, lines=0, contrast_before=0.0,
-                contrast_after=0.0, applied=False, reason=None)
+    info = dict(edge_rad=0.0, edge_rad_std=None, subsets=None, subset_significance=None, significance=0.0, band=None,
+                iterations=0, correlation=0.0, lines=0, contrast_before=0.0, contrast_after=0.0, gain=0.0,
+                gain_std=0.0, part_gain=0.0, part_gain_std=0.0, applied=False, reason=None)
     sel = _select(img, lines, max_lines, band_db)
     if sel is None:
         return _skip(img, info, 'the image holds no data'), np.zeros(nx), info
     cols, band = sel
-    est = _map_drift(cols[:, None, :], band, iterations, tol)
+    k = min(int(subsets), cols.shape[1] // 4)
+    if k >= 4:                                                      # the sets: equal, contiguous, in column order
+        A = cols[:, :k * (cols.shape[1] // k)].reshape(nx, k, cols.shape[1] // k)
+    else:
+        A = cols[:, None, :]
+    m = int(A.shape[1] * A.shape[2])
+    est = _map_drift(A, band, iterations, tol, pool=True, contrast=False)
     c = float(est['c'][0])
+    sb = _colsums(img)
     info.update(edge_rad=c, band=band[:2], iterations=est['iterations'], correlation=float(est['corr'][0]),
-                lines=int(cols.shape[1]), contrast_before=float(est['before'][0]),
-                contrast_after=float(est['before'][0]))
+                significance=float(est['sig'][0]), lines=m)
+    info['contrast_before'] = info['contrast_after'] = _gain(sb, sb)[0]
     if abs(c) < tol:
         return _skip(img, info, 'the estimate is below tol'), np.zeros(nx), info
-    if guard and not est['after'][0] >= est['before'][0]:
-        return _skip(img, info, 'the correction lowers the contrast'), np.zeros(nx), info
+    if guard:
+        if k < 4:
+            return _skip(img, info, 'too few columns to check the estimate'), np.zeros(nx), info
+        sub = _map_drift(A, band, iterations, tol, c0=c, G=est['G'], contrast=False)
+        ok = np.isfinite(sub['c']) & (sub['sig'] >= min_significance)
+        info.update(subsets=sub['c'], subset_significance=sub['sig'])
+        if est['sig'][0] < min_significance or ok.sum() < max(4, (k + 1) // 2):
+            why = 'the correlation peak is not significant in enough parts of the image'
+            return _skip(img, info, why), np.zeros(nx), info
+        med = float(np.median(sub['c'][ok]))
+        dev = np.abs(sub['c'][ok] - med)
+        s = 1.4826 * float(np.median(dev))
+        sigma = s / np.sqrt(ok.sum())
+        info['edge_rad_std'] = sigma
+        far = np.count_nonzero(dev > 4.5 * s + tol)
+        if abs(c - med) > 3 * sigma + tol or abs(c) < 3 * sigma or far > ok.sum() // 4:
+            return _skip(img, info, 'the parts of the image disagree on the estimate'), np.zeros(nx), info
     v = _offsets(nx, band[0], band[1])
     phi = np.where(np.abs(v) <= 1, c * v ** 2, 0.0)
-    info.update(applied=True, contrast_after=float(est['after'][0]))
-    return _apply(img, phi), phi, info
+    out = _keep(img, _apply(img, phi), info, guard, sb)
+    return out, (phi if info['applied'] else np.zeros(nx)), info
 
 
 def _pga_columns(cols, band, kw):
     """pga on host columns [n, m] whose band is first moved to the center of the spectrum (pga integrates its
-    gradient across centered bins) -> (phi [n] in FFT order, zero outside the band; contrast before, after)."""
+    gradient across centered bins) -> (phi [n] in FFT order, zero outside the band; contrast before, after;
+    iterations run)."""
     n = cols.shape[0]
     k0 = int(round(band[0] * n))
     ramp = np.exp(-2j * np.pi * k0 * np.arange(n) / n)[:, None]
-    g, ph, _ = pga(cols * ramp, **kw)
+    g, ph, hist = pga(cols * ramp, **kw)
     phi = np.roll(np.fft.ifftshift(ph), k0)
-    return np.where(np.abs(_offsets(n, band[0], band[1])) <= 1, phi, 0.0), float(_contrast(cols)), float(_contrast(g))
+    phi = np.where(np.abs(_offsets(n, band[0], band[1])) <= 1, phi, 0.0)
+    return phi, float(_contrast(cols)), float(_contrast(g)), len(hist)
 
 
 def _pga_global(img, *, lines=0.3, guard=True, max_lines=1024, band_db=30.0, **pga_kwargs):
     """Global phase error of any shape: the existing pga on the columns _select keeps (copied to the host), applied
-    like quadratic's phase. pga_kwargs go to pga, which uses every column it is given. -> (img2, info)"""
+    like quadratic's phase. pga_kwargs go to pga, which uses every column it is given.
+    guard: as quadratic's. Consistency: pga is run again on each contiguous half of the columns (as many iterations
+    as the estimate took, at least three), and the rms over the band (|v| <= 0.9, constant and linear terms
+    removed) of the estimate must be at least three times rms_rad_std, half the rms of the difference of the two
+    halves' estimates. Result: quadratic's test on the contrast of the whole image. -> (img2, info)"""
     _check(img)
     nx = img.shape[0]
-    info = dict(band=None, lines=0, rms_rad=0.0, contrast_before=0.0, contrast_after=0.0, applied=False, reason=None,
-                phi=np.zeros(nx))
+    info = dict(band=None, lines=0, rms_rad=0.0, rms_rad_std=None, contrast_before=0.0, contrast_after=0.0, gain=0.0,
+                gain_std=0.0, part_gain=0.0, part_gain_std=0.0, applied=False, reason=None, phi=np.zeros(nx))
     sel = _select(img, lines, max_lines, band_db)
     if sel is None:
         return _skip(img, info, 'the image holds no data'), info
     cols, band = sel
-    phi, before, after = _pga_columns(_xp.host(cols), band, dict(pga_kwargs, lines=1.0))
-    inb = np.abs(_offsets(nx, band[0], band[1])) <= 1
-    info.update(band=band[:2], lines=int(cols.shape[1]), rms_rad=float(np.sqrt(np.mean(phi[inb] ** 2))),
-                contrast_before=before, contrast_after=before)
-    if guard and not after >= before:
-        return _skip(img, info, 'the correction lowers the contrast'), info
-    info.update(applied=True, contrast_after=after, phi=phi)
-    return _apply(img, phi), info
+    cols, kw = _xp.host(cols), dict(pga_kwargs, lines=1.0)
+    m = cols.shape[1]
+    phi, _, _, its = _pga_columns(cols, band, kw)
+    v = _offsets(nx, band[0], band[1])
+    inb, mid = np.abs(v) <= 1, np.abs(v) <= 0.9
+    sb = _colsums(img)
+    info.update(band=band[:2], lines=int(m), rms_rad=float(np.sqrt(np.mean(phi[inb] ** 2))))
+    info['contrast_before'] = info['contrast_after'] = _gain(sb, sb)[0]
+    if guard:
+        if m < 4:
+            return _skip(img, info, 'too few columns to check the estimate'), info
+        kw['iterations'] = max(3, its)                              # halves that disagree need not converge
+        half = [_pga_columns(cols[:, sl], band, kw)[0] for sl in (slice(0, m // 2), slice(m // 2, m))]
+        info['rms_rad_std'] = float(0.5 * _detrend((half[0] - half[1])[mid], v[mid]).std())
+        if _detrend(phi[mid], v[mid]).std() < 3 * info['rms_rad_std']:
+            return _skip(img, info, 'the parts of the image disagree on the estimate'), info
+    out = _keep(img, _apply(img, phi), info, guard, sb)
+    if info['applied']:
+        info['phi'] = phi
+    return out, info
 
 
 def _starts(n, size, step):
@@ -625,9 +788,10 @@ def spatially_variant(img, *, block=512, overlap=0.5, method='quadratic', order=
     correction a long impulse response, which a strip cuts. Exact zeros stay exact zeros. The blur must be short
     compared with the block.
 
-    guard: keep the result only if the contrast of the image (every few columns) did not drop; otherwise, or when
-    no block gives an estimate or the fitted phase stays below tol everywhere, the input is returned as it came
-    with info['applied'] = False.
+    guard: keep the result only if it passes quadratic's test on the contrast of the whole image and of its parts
+    (every column is measured, before and after); otherwise, or when no block gives an estimate or the fitted
+    phase stays below tol everywhere, the input is returned as it came with info['applied'] = False and
+    info['reason'].
 
     -> (img2 complex64 [nx, ny] in the same place as img; info: dict(method; band: (f0, hf) cycles per pixel;
     block: (rows, columns); powers: the power of v of each coefficient; positions [nb, 2] (pixels);
@@ -635,7 +799,7 @@ def spatially_variant(img, *, block=512, overlap=0.5, method='quadratic', order=
     the robust iterations, zero for dropped blocks; terms: [(a, b)] for the monomials x^a y^b, x and y being the
     pixel coordinates along axes 0 and 1 scaled to -1 .. 1 across the image; coefficients [nt, nc]; rms [nc]:
     weighted rms of the fit residual (rad); edge_rad: (min, max) over the scene of the fitted v^2 coefficient;
-    contrast_before, contrast_after; applied; reason))."""
+    contrast_before, contrast_after, gain, gain_std, part_gain, part_gain_std: as quadratic's; applied; reason))."""
     _check(img)
     if method not in ('quadratic', 'pga'):
         raise ValueError("method must be 'quadratic' or 'pga'")
@@ -650,7 +814,8 @@ def spatially_variant(img, *, block=512, overlap=0.5, method='quadratic', order=
     powers = (2,) if method == 'quadratic' else tuple(range(2, max(2, int(poly)) + 1))
     info = dict(method=method, band=None, block=(B0, B1), powers=powers, positions=np.zeros((0, 2)),
                 estimates=np.zeros((0, len(powers))), weights=np.zeros(0), terms=[], coefficients=None, rms=None,
-                edge_rad=(0.0, 0.0), contrast_before=0.0, contrast_after=0.0, applied=False, reason=None)
+                edge_rad=(0.0, 0.0), contrast_before=0.0, contrast_after=0.0, gain=0.0, gain_std=0.0, part_gain=0.0,
+                part_gain_std=0.0, applied=False, reason=None)
     sel = _select(img, 1.0, max_lines, band_db)
     if sel is None:
         return _skip(img, info, 'the image holds no data'), info
@@ -696,7 +861,7 @@ def spatially_variant(img, *, block=512, overlap=0.5, method='quadratic', order=
             if np.count_nonzero(blk) < max(1, min_fill * blk.size):
                 return
             blk = blk[:, np.any(blk != 0, axis=0)]
-            phi, before, after = _pga_columns(blk, band, kw)
+            phi, before, after, _ = _pga_columns(blk, band, kw)
             if after >= max(before, min_contrast) and np.all(np.isfinite(phi)):
                 est[n], wt[n] = (Pv @ phi[inb])[2:], after
         for n in range(len(cen)):                                   # pga holds the interpreter lock: no threads
@@ -714,8 +879,8 @@ def spatially_variant(img, *, block=512, overlap=0.5, method='quadratic', order=
     c2 = np.stack([fit(i)[0] for i in range(len(st0))])
     info.update(weights=wf, terms=terms, coefficients=coef, edge_rad=(float(c2.min()), float(c2.max())),
                 rms=np.sqrt((wf[:, None] * res ** 2).sum(0) / max(wf.sum(), 1e-300)))
-    sg = max(1, ny // 1024)
-    info['contrast_before'] = info['contrast_after'] = float(_contrast(img[:, ::sg]))
+    sb = _colsums(img)
+    info['contrast_before'] = info['contrast_after'] = _gain(sb, sb)[0]
     if max(np.abs(fit(i)).sum(0).max() for i in range(len(st0))) < tol:
         return _skip(img, info, 'the fitted phase is below tol'), info
     # correction: strips along azimuth, cross-faded
@@ -731,11 +896,7 @@ def spatially_variant(img, *, block=512, overlap=0.5, method='quadratic', order=
     roll = 0.5 * (1 + np.cos(np.pi * np.clip((np.abs(vb) - 1) / max(0.5 / hf - 1, 1e-9), 0, 1)))
     V = np.stack([vb ** p * roll for p in powers]).astype(np.float32)
     out = _apply_strips(img, st0, B0, (n - B0) // 2, win, V, lambda i: fit(i).astype(np.float32))
-    after = float(_contrast(out[:, ::sg]))
-    if guard and not after >= info['contrast_before']:
-        return _skip(img, info, 'the correction lowers the contrast'), info
-    info.update(applied=True, contrast_after=after)
-    return out, info
+    return _keep(img, out, info, guard, sb), info
 
 
 def image_autofocus(img, mode, **kw):
@@ -745,7 +906,8 @@ def image_autofocus(img, mode, **kw):
     'pga': one phase error of any shape for the image, estimated by pga on the columns quadratic would use (kw:
     lines, guard, max_lines, band_db, and pga's own keywords) and applied like quadratic's (axis-0 transform,
     occupied band only, zeros kept). info: dict(phi [nx] (rad, fftfreq order, as quadratic's), band, lines, rms_rad,
-    contrast_before, contrast_after, applied, reason).
+    rms_rad_std (None without guard), contrast_before, contrast_after, gain, gain_std, part_gain, part_gain_std,
+    applied, reason).
     'spatially_variant': spatially_variant(img, **kw).   'spatially_variant_pga': the same with method='pga'.
     None or False: img itself and dict(mode=None, applied=False)."""
     if mode is None or mode is False:

@@ -265,7 +265,32 @@ Pixels that are exactly zero stay exactly zero, and columns that are mostly zero
 - `'spatially_variant_pga'`: the same with a per-block PGA estimate reduced to the coefficients of the second
   to fourth powers of azimuth frequency.
 
-With `guard=True` a result is kept only if the contrast did not drop; otherwise `info['applied']` is `False`.
+**The guard.** With `guard=True` (the default) a correction is applied only if it passes two tests; otherwise the
+image comes back as it was given, with `info['applied'] = False` and the cause in `info['reason']`.
+
+- *The parts of the image agree.* For `'quadratic'` the columns of the estimate are cut into eight contiguous
+  sets, each set gives its own coefficient, and the sets whose correlation peak is significant are compared. With
+  `sigma` the uncertainty of the estimate from their scatter (`info['edge_rad_std']`), the estimate must lie
+  within `3 sigma` of their median, be at least `3 sigma` itself, and at most a quarter of the sets may be
+  outliers. For `'pga'` the two halves of the columns are estimated separately and the rms of the estimate must be
+  at least three times `info['rms_rad_std']`, half the rms of their difference. A scene whose parts ask for
+  different corrections gets none from a global mode: relief seen from a curved track (a scatterer above or below
+  the focus plane is defocused in proportion to its height), moving water, or one reflector that dominates the
+  estimate.
+- *The image gains.* The contrast (std / mean of the intensity over the nonzero pixels) is measured on every
+  column of the image before and after the correction, on the device that holds it, for the whole image and for
+  16 contiguous sets of columns. The contrast of the whole image must rise. The median over the sets of the log
+  of their contrast ratio (`info['part_gain']`) must not be below minus twice its standard error
+  (`info['part_gain_std']`, from the scatter of the sets), so that a gain of one bright part of the scene at the
+  cost of most of it does not count. And one of the two gains, that median or the log ratio of the whole image
+  (`info['gain']`, with `info['gain_std']` from a jackknife over the sets), must be at least twice its standard
+  error. All four modes take this test.
+
+`info` reports the estimate whether it was applied or not (`edge_rad` and `edge_rad_std`, the sets' own estimates
+in `subsets`; `rms_rad` and `rms_rad_std` for `'pga'`), `contrast_before` and `contrast_after` of the whole image
+(equal when no correction was evaluated), the gains and their standard errors, `applied` and `reason`. With
+`guard=False` the estimate is applied as it is and the same measurements are reported. `process_cphd` records in
+the product the mode that was applied, or none.
 
 **Device arrays.** `img` may be a NumPy, CuPy or JAX array; the result is a complex64 array of the same kind
 on the same device. The correction of the full image and the map-drift estimate run on the device; PGA
@@ -281,7 +306,9 @@ print(info['applied'], info['edge_rad'], info['contrast_before'], info['contrast
 img, info = autofocus.image_autofocus(out['image'], 'spatially_variant', block=512, order=2)
 ```
 
-**Limitations.** Map drift needs point-like scatterers or texture; uniform clutter gives no estimate. The
+**Limitations.** Map drift needs point-like scatterers or texture; uniform clutter gives no estimate. A global
+mode corrects one error for the whole image: where the error changes over the scene by more than its mean, the
+guard declines and a spatially variant mode is the one to ask for. The
 global modes apply a circular correction, so a strip as long as the blur at each azimuth end of the image is
 contaminated. The blur must be much shorter than the block of the spatially variant modes, and a response cut
 by a zero region cannot be restored. Along azimuth the spatially variant correction blends neighbouring

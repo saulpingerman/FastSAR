@@ -301,6 +301,120 @@ def test_dispatch_and_errors():
     assert info['applied'] and set(af.__all__) >= {'pga', 'autofocus', 'quadratic', 'spatially_variant', 'image_autofocus'}
 
 
+def _con(a):
+    """Contrast of an image: std / mean of its intensity."""
+    p = np.abs(np.asarray(a, np.complex128)) ** 2
+    return float(p.std() / p.mean())
+
+
+def _relief(seed, nx=768, ny=512, c=2.5):
+    """A scene whose two halves in range carry quadratic errors -c and +c (rad at the band edge), as relief does on
+    a curved track -> (focused, defocused)."""
+    foc, v, _ = _scene(nx, ny, 0.5, npt=200, seed=seed)
+    cj = np.where(np.arange(ny) < ny // 2, -c, c)
+    return foc, _defocus(foc, np.where((np.abs(v) <= 1)[:, None], cj[None, :] * v[:, None] ** 2, 0.0))
+
+
+@pytest.mark.parametrize('seed', [11, 12, 13])
+def test_guard_parts_disagree(seed):
+    """One coefficient for a scene whose halves ask for opposite ones sharpens one half and blurs the other
+    further: the global modes apply nothing and say why, the spatially variant mode corrects both halves."""
+    foc, img = _relief(seed)
+    h = img.shape[1] // 2
+    forced, _, fi = af.quadratic(img, guard=False)                    # the estimate as it is
+    assert fi['applied'] and abs(abs(fi['edge_rad']) - 2.5) < 0.2 and fi['edge_rad_std'] is None
+    assert min(_con(forced[:, :h]) / _con(img[:, :h]), _con(forced[:, h:]) / _con(img[:, h:])) < 0.8
+    for mode in ('quadratic', 'pga'):
+        out, info = af.image_autofocus(img, mode)
+        assert out is img and not info['applied'] and 'disagree' in info['reason'], (mode, info['reason'])
+        assert info['contrast_after'] == info['contrast_before'] == pytest.approx(_con(img), rel=1e-4)
+    out, phi, info = af.quadratic(img)
+    assert not phi.any() and abs(info['edge_rad'] - fi['edge_rad']) < 1e-6          # the estimate is still reported
+    sub = info['subsets']
+    assert len(sub) == 8 and (sub < -2).sum() >= 3 and (sub > 2).sum() >= 3
+    assert info['subset_significance'].min() > af.MIN_SIG
+    assert info['significance'] > af.MIN_SIG and af.image_autofocus(img, 'pga')[1]['rms_rad_std'] > 0.2
+    out, info = af.spatially_variant(img, block=256)
+    assert info['applied'] and info['contrast_after'] == pytest.approx(_con(out), rel=1e-4)
+    assert min(_con(out[:, :h]) / _con(img[:, :h]), _con(out[:, h:]) / _con(img[:, h:])) > 1.2
+    assert info['part_gain'] > 2 * info['part_gain_std'] > 0 and info['gain'] > 2 * info['gain_std'] > 0
+
+
+def test_guard_whole_image():
+    """The columns the estimate reads carry a real quadratic error and agree on it, but the brightest reflectors of
+    the image, in columns it does not read, are in focus: the correction would lower the contrast of the image,
+    which is measured on every column, and is not applied."""
+    nx, ny = 768, 1024
+    foc, v, _ = _scene(nx, ny, 0.5, npt=150, seed=21)
+    img = _defocus(foc, _quad(v, 1.5))
+    read = np.unique(np.round(np.linspace(0, ny - 1, ny // 4)).astype(np.int64))
+    cols = np.setdiff1d(np.arange(ny), read)[np.linspace(0, ny - len(read) - 1, 9).astype(int)[1:-1]]
+    bright = np.zeros((nx, ny), complex)
+    bright[np.linspace(150, nx - 150, len(cols)).astype(int), cols] = 150.0
+    img = img + np.fft.ifft(np.fft.fft(bright, axis=0) * (np.abs(v) <= 1)[:, None], axis=0).astype(np.complex64)
+    forced, _, fi = af.quadratic(img, guard=False, max_lines=ny // 4)
+    assert fi['applied'] and abs(fi['edge_rad'] - 1.5) < 0.1 and _con(forced) < 0.9 * _con(img)
+    assert fi['contrast_before'] == pytest.approx(_con(img), rel=1e-4)                # reported as measured
+    assert fi['contrast_after'] == pytest.approx(_con(forced), rel=1e-4)
+    out, phi, info = af.quadratic(img, max_lines=ny // 4)
+    assert out is img and not info['applied'] and not phi.any() and 'lowers the contrast' in info['reason']
+    assert abs(info['edge_rad'] - 1.5) < 0.1 and info['edge_rad_std'] < 0.05          # a consistent estimate
+    assert info['contrast_after'] < 0.9 * info['contrast_before'] and info['gain'] < 0
+    assert info['part_gain'] > 2 * info['part_gain_std']                              # most of the image gains
+    # one reflector that gains while the rest of the image loses: the contrast of the image rises, the median of
+    # its parts falls
+    foc, v, _ = _scene(512, 256, 0.5, npt=60, seed=22)
+    one = np.zeros((512, 256), complex)
+    one[200, 100] = 400.0
+    img = foc + _defocus(np.fft.ifft(np.fft.fft(one, axis=0) * (np.abs(v) <= 1)[:, None], axis=0), _quad(v, 2.0))
+    info = {}
+    out = af._keep(img, af._apply(img, _quad(v, 2.0)), info, True)
+    assert out is img and not info['applied'] and 'most parts' in info['reason']
+    assert info['contrast_after'] > info['contrast_before'] and info['part_gain'] < -2 * info['part_gain_std']
+    info = {}
+    assert af._keep(img, af._apply(img, _quad(v, 2.0)), info, False) is not img and info['applied']
+
+
+def test_guard_no_structure():
+    """Speckle alone: the two looks do not correlate, whatever the largest value of their cross-correlation gives is
+    not an estimate, and nothing is applied."""
+    rng = np.random.default_rng(23)
+    noise = (rng.standard_normal((1024, 512)) + 1j * rng.standard_normal((1024, 512))).astype(np.complex64)
+    out, phi, info = af.quadratic(noise)
+    assert out is noise and not info['applied'] and not phi.any() and 'not significant' in info['reason']
+    assert info['significance'] < af.MIN_SIG and info['subset_significance'].max() < af.MIN_SIG
+
+
+@pytest.mark.parametrize('lib', _backends())
+def test_guard_devices(lib):
+    """The guard's sums are taken on the device and agree with the host's; a refused correction returns the array
+    it was given."""
+    foc, img = _relief(11)
+    img[:30] = 0
+    if lib == 'cupy':
+        import cupy as xp
+    elif lib == 'jax':
+        import jax.numpy as xp
+    else:
+        xp = np
+    dev = xp.asarray(img)
+    ref = af._colsums(img)
+    for size in (1 << 30, 100 * img.shape[0]):                        # one block of columns, and several
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(af, '_BLOCK', dict(numpy=size, cupy=size, jax=size))
+            got = af._colsums(dev)
+            assert got.shape == (3, img.shape[1]) and np.array_equal(got[0], ref[0])
+            assert np.abs(got / ref - 1).max() < 1e-4
+    for mode in ('quadratic', 'pga'):
+        out, info = af.image_autofocus(dev, mode)
+        assert out is dev and not info['applied'] and 'disagree' in info['reason'], mode
+    out, info = af.image_autofocus(dev, 'spatially_variant', block=256)
+    rinfo = af.image_autofocus(img, 'spatially_variant', block=256)[1]
+    assert info['applied'] and af._xp.kind(out) == lib
+    for k in ('contrast_before', 'contrast_after', 'gain', 'gain_std', 'part_gain', 'part_gain_std'):
+        assert info[k] == pytest.approx(rinfo[k], rel=1e-3, abs=1e-5), k
+
+
 def _collect(squint):
     col = sim.make_collect(res=0.5, scene=170.0, r0=10e3, graze_deg=35.0)
     y = col.ant[:, 1] / np.ptp(col.ant[:, 1])
