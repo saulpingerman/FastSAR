@@ -1,12 +1,25 @@
 """Spatially variant apodization and the keystone trim (fastsar.weighting), on synthetic images with a rectangular
 spectrum at twice Nyquist: sidelobes removed with the unweighted main lobe kept, two close targets still resolved,
-zeros and edges, the options; and the trim's rectangle of spatial frequencies."""
+zeros and edges, the options, the same image on a GPU (CuPy) and as a JAX array; and the trim's rectangle of spatial
+frequencies."""
 import numpy as np
 import pytest
 
-from fastsar import weighting
+from fastsar import _xp, weighting
 
 n = 256
+
+
+@pytest.fixture(params=[pytest.param('cupy', marks=pytest.mark.cuda), 'jax'])
+def device(request):
+    """(kind, put): put(a) is the NumPy array a as a CuPy array (needs a GPU), or as a JAX array on JAX's CPU
+    device, which runs the code a TPU runs."""
+    if request.param == 'cupy':
+        import cupy
+        return 'cupy', cupy.asarray
+    jnp = pytest.importorskip('jax.numpy')
+    request.getfixturevalue('jax_cpu')
+    return 'jax', jnp.asarray
 
 
 def scene(pts, os=2):
@@ -71,6 +84,37 @@ def test_zeros_edges_and_options():
             weighting.sva(x, bad)
     with pytest.raises(ValueError, match='complex'):
         weighting.sva(np.abs(x))
+
+
+def test_devices(device):
+    """A CuPy or JAX image gives the NumPy result where the image is: CuPy to the bit, JAX to the rounding of the
+    products in a weight (a few units in the last place of the brightest pixel, over three passes)."""
+    kind, put = device
+    x = scene([(100.3, 140.6, 1.0 + 0.5j), (4.0, 3.0, 1.0)])
+    x[:, :60], x[200:] = 0, 0                                               # unprocessed: stays 0
+    cases = (dict(), dict(joint=False), dict(axes=(0,)), dict(oversample=3, axes=(1, 0, 1)), dict(oversample=300),
+             dict(axes=()))
+    for kw in cases:
+        ref = weighting.sva(x, **kw)
+        y = weighting.sva(put(x), **kw)
+        assert _xp.kind(y) == kind and y.dtype == np.complex64 and y.shape == x.shape, kw
+        y = _xp.host(y)
+        assert np.abs(y - ref).max() <= 1e-5 * np.abs(ref).max() and not y[x == 0].any(), kw
+        assert kind != 'cupy' or np.array_equal(y, ref), kw
+    ref = weighting.sva(x)
+    assert np.abs(_xp.host(weighting.sva(put(x).T, axes=(0, 1))) - ref.T).max() <= 1e-6      # not contiguous
+    w = put(x)
+    y = weighting.sva(w, inplace=True)
+    if kind == 'cupy':                                                      # written into the image
+        assert y is w and np.array_equal(_xp.host(w), ref)
+        assert np.array_equal(_xp.host(weighting.sva(put(x.astype(np.complex128)))), ref)
+        w = put(x)
+        assert weighting.sva(w, axes=(0,), inplace=True) is w
+        assert np.array_equal(_xp.host(w), weighting.sva(x, axes=(0,)))
+    else:                                                                   # a JAX array cannot be: a new one
+        assert y is not w and np.array_equal(_xp.host(w), x) and np.abs(_xp.host(y) - ref).max() <= 1e-6
+    with pytest.raises(ValueError, match='complex'):
+        weighting.sva(put(np.abs(x)))
 
 
 def test_keystone_keeps_a_rectangle():

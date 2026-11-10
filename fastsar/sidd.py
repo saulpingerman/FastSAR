@@ -16,12 +16,15 @@ The product dict is form_cphd's: image [n1, n2] with pixel (i, j) at origin + i 
 frame of meta (io.local_to_ecf), e1 and e2 orthonormal, and the antenna track in meta. Pixels that are exactly 0
 are taken as unprocessed (a tasked area inside a rectangular array): they stay 0, and they are left out of the
 statistics a remap draws from the image.
+
+The image may be on a device (a CuPy or JAX array, fastsar._xp): shadows_down, orient and to_display then work
+there and return device arrays, and write_sidd remaps on the device and brings only the display values to the host.
 """
 import os
 
 import numpy as np
 
-from . import _deps
+from . import _deps, _xp
 from . import remap as _remap
 
 __all__ = ['shadows_down', 'orient', 'to_display', 'write_sidd']
@@ -32,6 +35,11 @@ _SPECIFICATION = {2: ('2.0', '2019-05-31T00:00:00Z'), 3: ('3.0', '2021-11-30T00:
 
 def _unit(v):
     return v / np.linalg.norm(v)
+
+
+def _array(a):
+    """a itself when it is on a device, else as a NumPy array."""
+    return np.asarray(a) if _xp.kind(a) == 'numpy' else a
 
 
 def _frame(out):
@@ -55,7 +63,7 @@ def _frame(out):
 
 def _layout(out, transpose, flip_rows, flip_cols):
     """The image of a product laid out by a transform, with the geometry of the result."""
-    img = np.asarray(out['image'])
+    img = _array(out['image'])
     e1, e2, n, g = _frame(out)
     tr = dict(transpose=bool(transpose), flip_rows=bool(flip_rows), flip_cols=bool(flip_cols))
     (row, rs, nr), (col, cs, nc) = (e1, out['spx'], img.shape[0]), (e2, out['spy'], img.shape[1])
@@ -101,10 +109,10 @@ def shadows_down(out):
 
 def orient(array, transform):
     """An array on the product's grid [n1, n2, ...] laid out as shadows_down laid the image out (transform: its
-    'transform' entry). A view."""
-    a = np.asarray(array)
+    'transform' entry). A view (of a JAX array, a copy when an axis is flipped)."""
+    a = _array(array)
     if transform['transpose']:
-        a = np.swapaxes(a, 0, 1)
+        a = _xp.module(a).swapaxes(a, 0, 1)
     if transform['flip_rows']:
         a = a[::-1]
     if transform['flip_cols']:
@@ -114,23 +122,23 @@ def orient(array, transform):
 
 def _valid(out, valid):
     """The mask of processed pixels [n1, n2]: the argument, else out['valid'], else the pixels that are not exactly
-    0. None when every pixel is valid."""
-    img = np.asarray(out['image'])
+    0. None when every pixel is valid. Where the image is."""
+    img = _array(out['image'])
     v = valid if valid is not None else out.get('valid')
-    v = (img != 0) if v is None else np.asarray(v, bool)
+    v = (img != 0) if v is None else _xp.module(img).asarray(v, bool)
     if v.shape != img.shape:
         raise ValueError(f'valid mask {v.shape} does not match the image {img.shape}')
-    return None if v.all() else v
+    return None if bool(v.all()) else v
 
 
 def _display(out, remap, valid, args):
-    """uint8 display values on the product's own grid, and the valid mask (None: all)."""
-    img = np.asarray(out['image'])
+    """uint8 display values on the product's own grid, and the valid mask (None: all), both where the image is."""
+    img = _array(out['image'])
     v = _valid(out, valid)
     if img.dtype == np.uint8:
         return img, v
     if callable(remap):
-        d = np.asarray(remap(img, valid=v, **args))
+        d = _array(remap(img, valid=v, **args))
     else:
         if remap not in _remap.REMAPS or remap == 'linear':
             names = sorted(k for k in _remap.REMAPS if k != 'linear')
@@ -147,11 +155,14 @@ def to_display(out, remap='nrl', valid=None, shadows_down=True, **remap_args):
 
     remap: a name of fastsar.remap.REMAPS other than 'linear' ('nrl', 'density', 'brighter', 'darker',
     'highcontrast', 'pedf', 'log'; the remaps of the NGA MATLAB SAR Toolbox), with its parameters as keywords
-    (to_display(out, 'nrl', a=1.0, c=220.0)), or a function f(image, valid=mask) -> uint8. Complex pixels are
+    (to_display(out, 'nrl', a=1.0, c=220.0)), or a function f(image, valid=mask) -> uint8 (given the image and
+    the mask where the image is, a device array for a device image). Complex pixels are
     detected by the remap; a uint8 image is taken as display values already. valid: the pixels [n1, n2] (the
     product's own grid) that enter the remap's statistics, the others coming out 0; default out['valid'] if the
     product has one, else every pixel that is not exactly 0. shadows_down False keeps the product's own layout
-    (rows along e1, columns along e2)."""
+    (rows along e1, columns along e2). An image on a device (a CuPy or JAX array) is remapped there, and the
+    display values are an array of the same kind (a remap's statistics as fastsar.remap computes them there, which
+    can move a value on a rounding boundary by one count)."""
     d, _ = _display(out, remap, valid, remap_args)
     return orient(d, (_shadows_down(out) if shadows_down else _layout(out, False, False, False))['transform'])
 
@@ -159,9 +170,11 @@ def to_display(out, remap='nrl', valid=None, shadows_down=True, **remap_args):
 def _hull(v):
     """Vertices [k, 2] (row, col) of the convex hull of the True pixels of a mask, clockwise as SIDD counts it
     (in the plane x = row, y = col) from the vertex of least row, then least column. The bounding rectangle of the
-    True pixels when the hull has fewer than 3 or more than 100 vertices. The mask has a True pixel."""
-    rows = np.flatnonzero(v.any(1))
-    lo, hi = v.argmax(1)[rows], v.shape[1] - 1 - v[:, ::-1].argmax(1)[rows]
+    True pixels when the hull has fewer than 3 or more than 100 vertices. The mask has a True pixel; it may be on a
+    device, from where only its rows' first and last True columns come to the host."""
+    rows, lo, hi = (_xp.host(a) for a in (v.any(1), v.argmax(1), v.shape[1] - 1 - v[:, ::-1].argmax(1)))
+    rows = np.flatnonzero(rows)
+    lo, hi = lo[rows], hi[rows]
     r0, r1, c0, c1 = rows[0], rows[-1], lo.min(), hi.max()
     pts = sorted(set(zip(rows.tolist(), lo.tolist())) | set(zip(rows.tolist(), hi.tolist())))
 
@@ -195,7 +208,8 @@ def write_sidd(path, out, *, remap='nrl', remap_args=None, valid=None, shadows_d
 
     The pixels are to_display's (remap, remap_args (a dict of the remap's parameters), valid and shadows_down as
     there). A uint8 image is written as it is, and remap then only names, in the metadata, the remap that made
-    it. The product must lie on the ground plane: SIDD's plane projection could describe a slant-plane image, but
+    it. An image on a device (a CuPy or JAX array) is remapped there, and its display values alone are copied to the
+    host. The product must lie on the ground plane: SIDD's plane projection could describe a slant-plane image, but
     a display product is a ground product, and a slant-plane one (out['plane'] == 'slant') is refused.
 
     Metadata. Measurement: a plane projection (reference point at the center pixel, the sample spacings, the row
@@ -239,7 +253,7 @@ def write_sidd(path, out, *, remap='nrl', remap_args=None, valid=None, shadows_d
     meta = out['meta']
     data, v = _display(out, remap, valid, dict(remap_args or {}))
     lay = _shadows_down(out) if shadows_down else _layout(out, False, False, False)
-    data = np.ascontiguousarray(orient(data, lay['transform']))
+    data = np.ascontiguousarray(_xp.host(orient(data, lay['transform'])))
     rows, cols = data.shape
 
     def ecf(rc):                                                   # pixel coordinates [..., 2] (row, col) -> ECF
@@ -253,7 +267,12 @@ def write_sidd(path, out, *, remap='nrl', remap_args=None, valid=None, shadows_d
     def outline(r0, r1, c0, c1):                                   # the outer corners of pixels [r0, r1) x [c0, c1)
         return [[r0 - 0.5, c0 - 0.5], [r0 - 0.5, c1 - 0.5], [r1 - 0.5, c1 - 0.5], [r1 - 0.5, c0 - 0.5]]
     urow, ucol = lay['row'] @ meta['R'], lay['col'] @ meta['R']
-    sm = products.sicd_meta(out)[0] if sicd is None else sicd
+    if sicd is not None:
+        sm = sicd
+    elif _xp.kind(out['image']) == 'numpy':
+        sm = products.sicd_meta(out)[0]
+    else:                                                          # the metadata need the image's shape alone
+        sm = products.sicd_meta(dict(out, image=np.broadcast_to(np.complex64(0), np.shape(out['image']))))[0]
     # Measurement
     ref = (rows // 2, cols // 2)
     t_coa = float(sm.SCPCOA.SCPTime) if sm.SCPCOA is not None and sm.SCPCOA.SCPTime is not None \

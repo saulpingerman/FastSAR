@@ -1,7 +1,8 @@
 """The display layout and SIDD products (fastsar.sidd), on a simulated spotlight collection written as CPHD
 (sim.write_cphd) and formed by form_cphd, flown both ways so that the scene lies to the right of the track and to
 the left: the shadows-down layout against the simulator's own frame, the remapped display, a SIDD round trip
-through sarpy whose own projection is compared with the targets' true positions, and the options of write_sidd.
+through sarpy whose own projection is compared with the targets' true positions, the options of write_sidd, and
+the same products with their image on a GPU (CuPy) or as a JAX array.
 Needs sarpy; the consistency check needs sarkit (Python 3.11 or later)."""
 import itertools
 import sys
@@ -11,7 +12,7 @@ import numpy as np
 import pytest
 
 import fastsar
-from fastsar import io, products, quality, remap, sidd, sim
+from fastsar import _xp, io, products, quality, remap, sidd, sim
 
 pytestmark = pytest.mark.needs('sarpy')
 
@@ -22,6 +23,18 @@ lat0, lon0, h0, heading, graze, spacing = 40.7934, -77.8600, 351.0, 30.0, 35.0, 
 # columns.
 TG = np.array([[0.0, 0.0, 0.0], [20.0, 0.0, 0.0], [0.0, 15.0, 0.0], [-18.0, -22.0, 0.0], [12.0, -9.0, 0.0]])
 LAYOUTS = [dict(transpose=t, flip_rows=r, flip_cols=c) for t, r, c in itertools.product((False, True), repeat=3)]
+
+
+@pytest.fixture(params=[pytest.param('cupy', marks=pytest.mark.cuda), 'jax'])
+def device(request):
+    """(kind, put): put(a) is the NumPy array a as a CuPy array (needs a GPU), or as a JAX array on JAX's CPU
+    device, which runs the code a TPU runs."""
+    if request.param == 'cupy':
+        import cupy
+        return 'cupy', cupy.asarray
+    jnp = pytest.importorskip('jax.numpy')
+    request.getfixturevalue('jax_cpu')
+    return 'jax', jnp.asarray
 
 
 def find_peaks(a, guard=6):
@@ -286,6 +299,56 @@ def test_write_sidd_options(scene):
             sidd.write_sidd(str(path), out, **kw)
     with pytest.raises(ValueError, match='slant'):
         sidd.write_sidd(str(path), dict(out, plane='slant'))
+
+
+def test_devices(scene, device):
+    """A product whose image is a CuPy or JAX array: the layout and the display values come back as arrays of that
+    kind, the display values the host's but for values on a rounding boundary (one count at most, on at most one
+    pixel in 1,000), and write_sidd writes those pixels with the host product's metadata."""
+    kind, put = device
+    out = scene.out['left']
+    img = out['image']
+    dev = dict(out, image=put(img))
+    tr = sidd.shadows_down(out)['transform']
+
+    def close(got, want, what):
+        d = np.abs(np.asarray(got).astype(int) - want)
+        assert got.dtype == np.uint8 and d.max() <= 1 and np.count_nonzero(d) <= 1e-3 * d.size, (what, d.max())
+    lay = sidd.shadows_down(dev)
+    assert _xp.kind(lay['image']) == kind and lay['transform'] == tr
+    assert np.array_equal(_xp.host(lay['image']), sidd.orient(img, tr))
+    i, j = np.mgrid[:img.shape[0], :img.shape[1]]
+    disk = (i - 150) ** 2 + (j - 170) ** 2 <= 120 ** 2
+    cut = dict(out, image=np.where(disk, img, 0))
+    cases = {'nrl': (dev, out, {}), 'own layout': (dev, out, dict(shadows_down=False)),
+             'density': (dev, out, dict(remap='density')), 'parameters': (dev, out, dict(remap='nrl', a=0.8, c=200.0)),
+             'zeros': (dict(cut, image=put(cut['image'])), cut, {}), 'mask': (dev, out, dict(valid=disk)),
+             'device mask': (dict(dev, valid=put(disk)), dict(out, valid=disk), {}),
+             'function': (dev, out, dict(remap=lambda x, valid=None: remap.log(x, valid=valid, span_db=40.0)))}
+    for name, (a, b, kw) in cases.items():
+        d = sidd.to_display(a, **kw)
+        assert _xp.kind(d) == kind, name
+        close(_xp.host(d), sidd.to_display(b, **kw), name)
+        if name in ('zeros', 'mask', 'device mask'):
+            assert not _xp.host(d)[~sidd.orient(disk, tr)].any(), name
+    d = put(sidd.to_display(out, shadows_down=False))                     # display values already
+    assert sidd.to_display(dict(out, image=d), shadows_down=False) is d
+    with pytest.raises(ValueError, match='valid mask'):
+        sidd.to_display(dev, valid=disk[:-1])
+    # the files: the pixels, and the metadata of the host product's file (but for the time of writing)
+    for name, a, b, kw in (('whole', dev, out, {}), ('zeros', dict(cut, image=put(cut['image'])), cut, {}),
+                           ('density', dev, out, dict(remap='density', shadows_down=False, version=2))):
+        paths = [scene.tmp / f'{kind}_{k}.nitf' for k in ('device', 'host')]
+        sidd.write_sidd(str(paths[0]), a, **kw)
+        sidd.write_sidd(str(paths[1]), b, **kw)
+        (_, sd, pix), (_, sh, want) = (read_sidd(p) for p in paths)
+        close(pix, want, name)
+        assert np.array_equal(sd.Measurement.ValidData.get_array(dtype=np.int64),
+                              sh.Measurement.ValidData.get_array(dtype=np.int64)), name
+        assert len(sd.Measurement.ValidData.get_array()) > 4 if name == 'zeros' else 4
+        for part in ('Measurement', 'GeoData', 'Display', 'ExploitationFeatures'):
+            assert getattr(sd, part).to_xml_string() == getattr(sh, part).to_xml_string(), (name, part)
+    assert sidd._hull(put(sidd.orient(disk, tr))).tolist() == sidd._hull(sidd.orient(disk, tr)).tolist()
 
 
 def test_polygon_and_corner_fields():
