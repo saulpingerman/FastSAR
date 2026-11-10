@@ -194,16 +194,21 @@ def write_sicd(path, img, template=None, transpose=None):
 
 
 def sicd_meta(out):
-    """SICD metadata (sarpy SICDType) for a form_cphd output, and its image arranged as the SICD array [rows, cols].
+    """SICD metadata (sarpy SICDType) for a form_cphd output, or a slant-plane image (planes.to_slant), and its image
+    arranged as the SICD array [rows, cols].
 
-    Rows run along range away from the radar (e2 or -e2) and columns along e1 (the direction of motion); the
-    scene center point is the grid's center pixel. Grid.Type PLANE on the ground plane of the grid, ImageFormAlgo
+    Rows run along range away from the radar (e2 or -e2) and columns along e1 or against it, whichever makes the
+    array the view from above (row x column upward: the left of the image is the left of an observer at the radar,
+    for either look side); the scene center point is the grid's center pixel, or the product's own (scp,
+    scp_pixel). Grid.Type PLANE on the ground plane of the grid, or the slant plane (plane 'slant'), ImageFormAlgo
     OTHER, the aperture position as a polynomial in time fitted to the pulses (degree 5 at most), and one center of
     aperture time for the whole image (the mid-aperture pulse's): SICD's projection of a pixel is then the
-    range-Doppler model of geolocate and locate. Impulse response bandwidths and widths are nominal (the data's
-    spatial frequency support, and the 3 dB width that support and the window give), and the image keeps
-    backprojection's phase: the band of each axis is centered at its spatial frequency, KCtr, modulo the sampling
-    rate. There is no radiometric calibration (see the module docstring)."""
+    range-Doppler model of geolocate and locate, and for a slant-plane image the map of fastsar.planes. Impulse
+    response bandwidths and widths are nominal (the data's spatial frequency support, and the 3 dB width that
+    support and the window give). An image as formed keeps backprojection's phase: the band of each axis is
+    centered at its spatial frequency, KCtr, modulo the sampling rate. A baseband image (planes.deramp) has its
+    band where its support entry says, or centered at zero. There is no radiometric calibration (see the module
+    docstring)."""
     from datetime import datetime, timezone
     _deps.require('sarpy')
     from sarpy.io.complex.sicd_elements.SICD import SICDType
@@ -224,15 +229,17 @@ def sicd_meta(out):
     nx, ny = img.shape
     R = np.asarray(meta['R'], np.float64)
     e1, e2 = np.asarray(out['e1'], np.float64), np.asarray(out['e2'], np.float64)
-    i0, j0 = nx // 2, ny // 2
+    i0, j0 = (int(v) for v in out['scp_pixel']) if out.get('scp_pixel') is not None else (nx // 2, ny // 2)
     scp_l = np.asarray(out['origin'], np.float64) + i0 * out['spx'] * e1 + j0 * out['spy'] * e2
     ant = 0.5 * (np.asarray(meta['tx'], np.float64) + np.asarray(meta['rcv'], np.float64))
     t = np.asarray(meta['tx_time'], np.float64)
-    m = len(t) // 2
+    p0, p1 = (int(v) for v in (out.get('pulses') or (0, len(t))))     # the pulses used
+    m = (p0 + p1) // 2
     away = (scp_l - ant[m]) @ e2 > 0               # e2 points away from the radar: rows follow it
-    a = img.T if away else img.T[::-1]
+    # rows along range away from the radar, columns so that row x column is upward (e1 x e2 is)
+    a = img.T[:, ::-1] if away else img.T[::-1]
     srow = 1 if away else -1
-    urow, ucol = srow * e2 @ R, e1 @ R
+    urow, ucol = srow * e2 @ R, -srow * e1 @ R
     scp = local_to_ecf(scp_l, meta)
     # aperture position against time
     deg = int(min(5, len(t) - 1))
@@ -246,21 +253,34 @@ def sicd_meta(out):
     los = (scp - apc[m]) / np.linalg.norm(scp - apc[m])
     kr, kc = (2 * 0.5 * (f0 + f1) / C * (los @ u) for u in (urow, ucol))
     bw_c, bw_r = out['bandwidth']
-    win = out.get('window') or (None, None)
-    width = {'taylor': 1.184, 'hann': 1.441, None: 0.886}           # 3 dB width times bandwidth
+    win = tuple(None if w == 'uniform' else w for w in (out.get('window') or (None, None)))
+    width = {'taylor': 1.184, 'hann': 1.441, None: 0.886, 'sva': 0.886}           # 3 dB width times bandwidth
+    base = bool(out.get('baseband'))
+    sup = out.get('support') if base else None      # the spectrum's limits along e1 and e2, on the SICD's axes
+    sup_r, sup_c = (None, None) if sup is None else (
+        tuple(srow * v for v in sup[1])[::srow], tuple(-srow * v for v in sup[0])[::-srow])
 
-    def axis(u, ss, bw, kctr, w):
+    def axis(u, ss, bw, kctr, w, lim):
         bw = min(bw, 1.0 / ss)
         wgt = {None: WgtTypeType(WindowName='UNIFORM'), 'hann': WgtTypeType(WindowName='HANNING'),
-               'taylor': WgtTypeType(WindowName='TAYLOR', Parameters={'NBAR': '4', 'SLL': '-35'})}[w]
-        dk = (kctr * ss + 0.5) % 1.0 / ss - 0.5 / ss              # the band's center in the sampled image
+               'taylor': WgtTypeType(WindowName='TAYLOR', Parameters={'NBAR': '4', 'SLL': '-35'}),
+               'sva': WgtTypeType(WindowName='SVA')}[w]             # apodized after formation: no one aperture weighting
+        if lim is not None:                                         # the band as measured from the collection
+            k1, k2 = max(lim[0], -0.5 / ss), min(lim[1], 0.5 / ss)
+            dk = 0.5 * (k1 + k2)
+        else:                                                       # its center in the sampled image, nominal width
+            dk = 0.0 if base else (kctr * ss + 0.5) % 1.0 / ss - 0.5 / ss
+            k1, k2 = dk - bw / 2, dk + bw / 2
         return DirParamType(UVectECF=u, SS=ss, ImpRespWid=width[w] / bw, Sgn=-1, ImpRespBW=bw, KCtr=kctr,
-                            DeltaK1=dk - bw / 2, DeltaK2=dk + bw / 2, DeltaKCOAPoly=[[dk]], WgtType=wgt)
+                            DeltaK1=k1, DeltaK2=k2, DeltaKCOAPoly=[[dk]], WgtType=wgt)
     pol = meta.get('polarization')
     pol = f'{pol[0]}:{pol[1]}' if pol else 'UNKNOWN'
     mode = str(meta.get('mode') or '').upper()
     if mode not in ('SPOTLIGHT', 'STRIPMAP', 'DYNAMIC STRIPMAP'):
         mode = 'SPOTLIGHT' if out.get('mode') == 'spotlight' else 'DYNAMIC STRIPMAP'
+    focus = out.get('autofocus')                  # the mode process_cphd ran, or form_cphd's phase-history estimate
+    focus = ('SV' if 'variant' in str(focus) else 'GLOBAL') if focus else (
+        'GLOBAL' if out.get('phase_error') is not None else 'NO')
     sm = SICDType(
         CollectionInfo=CollectionInfoType(CollectorName=meta.get('collector') or 'UNKNOWN',
                                           CoreName=meta.get('core_name') or 'UNKNOWN', CollectType='MONOSTATIC',
@@ -268,10 +288,12 @@ def sicd_meta(out):
         ImageCreation=ImageCreationType(Application=f'FastSAR {__version__}',
                                         DateTime=np.datetime64(datetime.now(timezone.utc).replace(tzinfo=None), 'us')),
         ImageData=ImageDataType(PixelType='RE32F_IM32F', NumRows=ny, NumCols=nx, FirstRow=0, FirstCol=0,
-                                FullImage=(ny, nx), SCPPixel=(j0 if away else ny - 1 - j0, i0)),
+                                FullImage=(ny, nx),
+                                SCPPixel=(j0, nx - 1 - i0) if away else (ny - 1 - j0, i0)),
         GeoData=GeoDataType(EarthModel='WGS_84', SCP=SCPType(ECF=scp)),
-        Grid=GridType(ImagePlane='GROUND', Type='PLANE', TimeCOAPoly=[[float(t[m])]],
-                      Row=axis(urow, out['spy'], bw_r, kr, win[1]), Col=axis(ucol, out['spx'], bw_c, kc, win[0])),
+        Grid=GridType(ImagePlane='SLANT' if out.get('plane') == 'slant' else 'GROUND', Type='PLANE',
+                      TimeCOAPoly=[[float(t[m])]], Row=axis(urow, out['spy'], bw_r, kr, win[1], sup_r),
+                      Col=axis(ucol, out['spx'], bw_c, kc, win[0], sup_c)),
         Timeline=TimelineType(CollectStart=np.datetime64(str(meta.get('start')).rstrip('Z'), 'us'),
                               CollectDuration=float(t[-1])),
         Position=PositionType(ARPPoly=arp),
@@ -279,10 +301,10 @@ def sicd_meta(out):
                                             TxPolarization=pol[0] if pol != 'UNKNOWN' else 'OTHER',
                                             RcvChannels=[ChanParametersType(TxRcvPolarization=pol, index=1)]),
         ImageFormation=ImageFormationType(RcvChanProc=RcvChanProcType(NumChanProc=1, ChanIndices=[1]),
-                                          TxRcvPolarizationProc=pol, TStartProc=float(t[0]), TEndProc=float(t[-1]),
+                                          TxRcvPolarizationProc=pol, TStartProc=float(t[p0]), TEndProc=float(t[p1 - 1]),
                                           TxFrequencyProc=TxFrequencyProcType(MinProc=f0, MaxProc=f1),
                                           ImageFormAlgo='OTHER', STBeamComp='NO', ImageBeamComp='NO',
-                                          AzAutofocus='GLOBAL' if out.get('phase_error') is not None else 'NO',
+                                          AzAutofocus=focus,
                                           RgAutofocus='NO'))
     sm.derive()
     sm.define_geo_image_corners(override=True)

@@ -29,27 +29,31 @@ from . import resample
 
 C = 299792458.0
 
-__all__ = ['coa', 'slant_frame', 'ground_to_slant', 'slant_to_ground', 'sampling', 'deramp', 'to_slant', 'to_ground']
+__all__ = ['coa', 'slant_frame', 'ground_to_slant', 'slant_to_ground', 'sampling', 'support', 'deramp', 'to_slant',
+           'to_ground']
 
 
 def _unit(v):
     return v / np.linalg.norm(v)
 
 
-def coa(meta):
+def coa(meta, pulses=None):
     """Center of aperture: the mid-aperture pulse's time (s), and the antenna's position and velocity then (local
-    frame), from the polynomial fit of position against time that products.sicd_meta writes as ARPPoly."""
+    frame), from the polynomial fit of position against time that products.sicd_meta writes as ARPPoly. pulses:
+    (first, last + 1) of the pulses the image used (form_cphd's output entry), default all of them."""
     ant = 0.5 * (np.asarray(meta['tx'], np.float64) + np.asarray(meta['rcv'], np.float64))
     t = np.asarray(meta['tx_time'], np.float64)
-    m, tc = len(t) // 2, 0.5 * (t[0] + t[-1])
+    lo, hi = (0, len(t)) if pulses is None else pulses
+    m, tc = (int(lo) + int(hi)) // 2, 0.5 * (t[0] + t[-1])
     fit = [np.polynomial.Polynomial.fit(t - tc, ant[:, k], int(min(5, len(t) - 1))) for k in range(3)]
     return float(t[m]), np.array([f(t[m] - tc) for f in fit]), np.array([f.deriv()(t[m] - tc) for f in fit])
 
 
-def slant_frame(meta, scp):
+def slant_frame(meta, scp, pulses=None):
     """The slant plane at the scene center point scp [3] (local): dict(scp, arp, vel, t (COA), r0 (range of the
-    SCP), e1 (azimuth), e2 (range, the line of sight), normal (e1 x e2, upward), v1, v2 (the velocity along e1, e2))."""
-    t, arp, vel = coa(meta)
+    SCP), e1 (azimuth), e2 (range, the line of sight), normal (e1 x e2, upward), v1, v2 (the velocity along e1, e2)).
+    pulses: as coa's."""
+    t, arp, vel = coa(meta, pulses)
     scp = np.asarray(scp, np.float64)
     r0 = float(np.linalg.norm(scp - arp))
     e2 = (scp - arp) / r0
@@ -131,6 +135,38 @@ def sampling(fr, ant, band, points, e1, e2):
     return dict(bx=full(kx), by=full(kx * (grx / gry) + ky), ba=full(ka), br=full(kr), ba_min=full(ka[:, :, 0]))
 
 
+def _frame(out):
+    return slant_frame(out['meta'], _scp(out), out.get('pulses'))
+
+
+def _used(out):
+    """The antenna positions [P, 3] (local) of the pulses an image used."""
+    ant = 0.5 * (np.asarray(out['meta']['tx'], np.float64) + np.asarray(out['meta']['rcv'], np.float64))
+    lo, hi = out.get('pulses') or (0, len(ant))
+    return ant[int(lo):int(hi)]
+
+
+def support(fr, ant, band, d1, d2):
+    """The baseband spectrum at the scene center along two directions of the ground d1, d2 [3] (an image's axes;
+    for a slant image the ground displacement of a meter of azimuth and of range): pulse p at frequency f lies at
+    (2 f / c) u_p - (2 fc / c) u_coa, u the unit vector from the antenna to the scene center.
+    -> dict(k1, k2: (least, greatest) spatial frequency along each (cycles/m), over the pulses and the band;
+    k1_mid, k1_min: the same along d1 at the center frequency and at the first frequency alone)."""
+    u = fr['scp'] - np.asarray(ant, np.float64)
+    u /= np.linalg.norm(u, axis=1, keepdims=True)
+    f = np.array([band[0], 0.5 * (band[0] + band[1]), band[1]], np.float64)
+    K = (2 / C) * (f[None, :, None] * u[:, None, :] - f[1] * fr['e2'])                     # [p, 3, 3]
+    k1, k2 = K @ np.asarray(d1, np.float64), K @ np.asarray(d2, np.float64)
+    lim = lambda k: (float(k.min()), float(k.max()))
+    return dict(k1=lim(k1), k2=lim(k2), k1_mid=lim(k1[:, 1]), k1_min=lim(k1[:, 0]))
+
+
+def _slant_axes(fr, hz, h=1.0):
+    """The ground displacement [3] of a meter of azimuth and of a meter of range at the scene center."""
+    return ((slant_to_ground(fr, h, 0.0, hz) - slant_to_ground(fr, -h, 0.0, hz)) / (2 * h),
+            (slant_to_ground(fr, 0.0, h, hz) - slant_to_ground(fr, 0.0, -h, hz)) / (2 * h))
+
+
 def deramp(out, sign=-1):
     """Bring a ground-plane spotlight image to baseband, in place: multiplied by exp(sign j 4 pi fc (R - R0) / c),
     R each pixel's range to the COA antenna position, R0 the scene center's, fc the center frequency. out['baseband']
@@ -140,7 +176,7 @@ def deramp(out, sign=-1):
         return out
     nx, ny, o, e1, e2, spx, spy = _grid(out)
     img = out['image']
-    fr = slant_frame(out['meta'], _scp(out))
+    fr = _frame(out)
     k = sign * 4 * np.pi * 0.5 * (out['band'][0] + out['band'][1]) / C
     w = (o - fr['arp'])[:, None] + (np.arange(ny) * spy)[None] * e2[:, None]          # [3, ny]: row 0 less the antenna
 
@@ -183,14 +219,16 @@ def to_slant(out, spacing, bounds=None, *, margin=0, valid=None, taps=8, knots=3
 
     -> a product dict as form_cphd's, on the slant plane: image [na, nr] complex64 (azimuth, range), origin, e1
     (azimuth), e2 (range), spx, spy (azimuth and range spacing), plane 'slant', scp (the scene center point, the
-    ground image's), scp_pixel, baseband True, and the ground image's other entries."""
+    ground image's), scp_pixel, baseband True, support (the spectrum's limits along azimuth and range at the scene
+    center, cycles/m: planes.support), bandwidth (along azimuth at the center frequency, and along range), and the
+    ground image's other entries."""
     from .patches import _rows
     if out.get('plane', 'ground') != 'ground':
         raise ValueError('to_slant takes a ground-plane image')
     deramp(out)
     nx, ny, o, e1, e2, spx, spy = _grid(out)
     scp = _scp(out)
-    fr = slant_frame(out['meta'], scp)
+    fr = _frame(out)
     hz = float(o[2])
     if abs(e1[2]) > 1e-9 or abs(e2[2]) > 1e-9:
         raise ValueError('to_slant takes an image on a horizontal plane of the local frame')
@@ -235,9 +273,11 @@ def to_slant(out, spacing, bounds=None, *, margin=0, valid=None, taps=8, knots=3
                 ok &= v[np.clip(np.rint(x), 0, nx - 1).astype(np.intp), np.clip(np.rint(y), 0, ny - 1).astype(np.intp)]
             img[sl][~ok] = 0
         _rows(mask, na, int(max(1, min(64, (1 << 17) // nr))))
+    sup = support(fr, _used(out), out['band'], *_slant_axes(fr, hz))
     res = {k: v for k, v in out.items() if k not in ('image', 'valid')}
     res.update(image=img, origin=scp - i0 * sa * fr['e1'] - j0 * sr * fr['e2'], e1=fr['e1'], e2=fr['e2'], spx=sa, spy=sr,
-               plane='slant', scp=scp, scp_pixel=(i0, j0), baseband=True,
+               plane='slant', scp=scp, scp_pixel=(i0, j0), baseband=True, support=(sup['k1'], sup['k2']),
+               bandwidth=(sup['k1_mid'][1] - sup['k1_mid'][0], sup['k2'][1] - sup['k2'][0]),
                ground=dict(origin=o, e1=e1, e2=e2, spx=spx, spy=spy, shape=(nx, ny), margin=mg))
     return res
 
@@ -261,7 +301,7 @@ def to_ground(out, origin, e1, e2, spacing, shape, *, kernel=None, taps=8, pad=N
     spx, spy = (float(v) for v in np.broadcast_to(np.asarray(spacing, np.float64), (2,)))
     nx, ny = (int(v) for v in shape)
     scp = np.asarray(out['scp'], np.float64)
-    fr = slant_frame(out['meta'], scp)
+    fr = _frame(out)
     (i0, j0), sa, sr, hz = out['scp_pixel'], float(out['spx']), float(out['spy']), float(o[2])
     if kernel is None:
         kernel = 'cubic' if np.isrealobj(img) else 'sinc'
@@ -277,7 +317,7 @@ def to_ground(out, origin, e1, e2, spacing, shape, *, kernel=None, taps=8, pad=N
     g = o + (xk * spx)[None, :, None] * e1 + (yk * spy)[:, None, None] * e2                  # [nyk, nxk, 3]
     pos1 = resample.KnotMap(yk, xk, ground_to_slant(fr, g)[0] / sa + i0, nx)
     kw = dict(kernel=kernel, pad=pad) if kernel != 'sinc' else dict(kernel='sinc', taps=taps, pad=pad)
-    res = {k: v for k, v in out.items() if k not in ('image', 'scp_pixel', 'ground')}
+    res = {k: v for k, v in out.items() if k not in ('image', 'scp_pixel', 'ground', 'support', 'bandwidth')}
     res.update(image=resample.warp(img.T, pos0, pos1, (ny, nx), **kw).T, origin=o, e1=e1, e2=e2, spx=spx, spy=spy,
                plane='ground', scp=scp)
     return res

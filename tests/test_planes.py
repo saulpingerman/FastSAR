@@ -62,7 +62,7 @@ def scene(request, tmp_path_factory):
         return dict(spacing=(0.96 / got['b']['bx'], 0.96 / got['b']['by']), bounds=(-85, 85, -85, 85))
     out = fastsar.form_cphd(path, axes='los', window=False, backend='cpu', _plan=plan)
     tg = io.ecf_to_local(sim.to_ecf(TG, LAT, LON, H0, HEADING), out['meta'])
-    return dict(out=out, b=got['b'], tg=tg, left=left, fr=planes.slant_frame(out['meta'], planes._scp(out)))
+    return dict(out=out, b=got['b'], tg=tg, left=left, fr=planes._frame(out))
 
 
 def test_los_axes(scene):
