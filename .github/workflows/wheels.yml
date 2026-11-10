@@ -1,0 +1,125 @@
+name: wheels
+
+# Platform wheels with prebuilt CPU kernels (setup.py, [tool.cibuildwheel] in pyproject.toml), built and tested,
+# and kept as workflow artifacts. Nothing is published from here.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wheels-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: wheel, ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {name: linux-x86_64, os: ubuntu-latest}
+          - {name: linux-aarch64, os: ubuntu-24.04-arm}
+          - {name: macos-arm64, os: macos-latest}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4.4.0
+      # builds in the manylinux_2_28 image (Linux) or on the runner (macOS), repairs the tag with auditwheel or
+      # delocate, and runs tests/wheel_check.py on the installed wheel where the compiler is present
+      - uses: pypa/cibuildwheel@f9b966cfadf4109556cadc5bb39ddb72d0ce664e   # v4.3.5
+      - run: ls -l wheelhouse
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9   # v7.0.2
+        with:
+          name: wheel-${{ matrix.name }}
+          path: wheelhouse/*.whl
+          if-no-files-found: error
+
+  sdist:
+    name: source distribution
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4.4.0
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e   # v6
+      - run: uv python install 3.12
+      - run: uv build --sdist
+      - run: uvx twine check dist/*
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9   # v7.0.2
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  # each Linux wheel in a clean container with no compiler (python:slim has none), on the oldest and the newest
+  # Python: the prebuilt kernels must serve every image formation path; then with g++ installed: the native build
+  test-linux:
+    name: no compiler, ${{ matrix.name }}, Python ${{ matrix.python }}
+    needs: build
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        name: [linux-x86_64, linux-aarch64]
+        python: ['3.10', '3.13']
+        include:
+          - {name: linux-x86_64, os: ubuntu-latest}
+          - {name: linux-aarch64, os: ubuntu-24.04-arm}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4.4.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333   # v8.0.2
+        with:
+          name: wheel-${{ matrix.name }}
+          path: wheelhouse
+      - name: without a compiler
+        run: |
+          docker run --rm -e JAX_PLATFORMS=cpu -e CUDA_VISIBLE_DEVICES= \
+            -v "$PWD/wheelhouse:/wheelhouse:ro" -v "$PWD/tests:/checks:ro" python:${{ matrix.python }}-slim bash -ec '
+              pip install --no-cache-dir /wheelhouse/*.whl
+              cd /tmp
+              python /checks/wheel_check.py --no-compiler --expect prebuilt
+              python -m fastsar.doctor --no-probe
+              python -m fastsar.doctor --no-probe | grep -q "cpu    ready    prebuilt kernels"'
+      - name: with a compiler
+        run: |
+          docker run --rm -e JAX_PLATFORMS=cpu -e CUDA_VISIBLE_DEVICES= \
+            -v "$PWD/wheelhouse:/wheelhouse:ro" -v "$PWD/tests:/checks:ro" python:${{ matrix.python }}-slim bash -ec '
+              apt-get update -q && apt-get install -y -q --no-install-recommends g++
+              pip install --no-cache-dir /wheelhouse/*.whl
+              cd /tmp
+              python /checks/wheel_check.py --expect native
+              python -m fastsar.doctor --no-probe
+              python -m fastsar.doctor --no-probe | grep -q "CPU kernels: native build"'
+
+  # macOS has no containers: the compiler is hidden by a PATH that holds only the environment's bin directory
+  test-macos:
+    name: no compiler, macos-arm64
+    needs: build
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4.4.0
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e   # v6
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333   # v8.0.2
+        with:
+          name: wheel-macos-arm64
+          path: wheelhouse
+      - run: uv python install 3.12
+      - run: uv venv --python 3.12 wheel-env
+      - run: uv pip install --python wheel-env/bin/python wheelhouse/*.whl
+      - name: without a compiler
+        run: |
+          cd "$RUNNER_TEMP"
+          env -i HOME="$HOME" PATH="$GITHUB_WORKSPACE/wheel-env/bin" JAX_PLATFORMS=cpu \
+            python "$GITHUB_WORKSPACE/tests/wheel_check.py" --no-compiler --expect prebuilt
+          env -i HOME="$HOME" PATH="$GITHUB_WORKSPACE/wheel-env/bin" python -m fastsar.doctor --no-probe
+      - name: with a compiler
+        run: |
+          cd "$RUNNER_TEMP"
+          JAX_PLATFORMS=cpu "$GITHUB_WORKSPACE/wheel-env/bin/python" "$GITHUB_WORKSPACE/tests/wheel_check.py" --expect native
+          "$GITHUB_WORKSPACE/wheel-env/bin/python" -m fastsar.doctor --no-probe

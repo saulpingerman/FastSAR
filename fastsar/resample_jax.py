@@ -87,7 +87,7 @@ def _step(out, src, a, P, J, M, tab, *, axis, mode, nb, pad, guard, n2):
     elif mode == 'split':
         ib, ff = P
     else:
-        p = lax.dynamic_slice(P[0], (a, 0), (nb, P[0].shape[1])).astype(jnp.float32)
+        p = resample._snap(lax.dynamic_slice(P[0], (a, 0), (nb, P[0].shape[1])).astype(jnp.float32), n, jnp)
         ib, ff = _floor(jnp.zeros(p.shape, jnp.int32), p)
     ok = _within(ib, ff, 0, n - 1)
     if M is not None:
@@ -159,6 +159,7 @@ def _pass(src, pos, m, axis, kernel, taps, pad, mask=None):
         else:
             q = np.clip(np.nan_to_num(np.asarray(pos(sl) if callable(pos) else pos[sl], np.float64), nan=-2.0 ** 30),
                         -2.0 ** 30, 2.0 ** 30)
+            q = resample._snap(q, n)
             ib = np.floor(q)
             P = (jnp.asarray(ib.astype(np.int32)), jnp.asarray((q - ib).astype(np.float32)))
         if mask is not None:

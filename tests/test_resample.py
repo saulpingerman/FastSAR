@@ -36,6 +36,32 @@ def test_lines_outside_is_zero_and_samples_are_kept():
     assert np.abs(out[:, 5:305] - src).max() < 2e-3 * np.abs(src).max()            # integer positions return the samples
 
 
+@pytest.mark.parametrize('path', ['kernel', 'numpy'])
+def test_positions_within_rounding_of_an_end_are_on_it(path, monkeypatch):
+    """A map that reaches an end of a line exactly lands some 1e-16 to either side of it in float64 (on which side
+    depends on the compiler's fused multiply-adds): such a position gives the end sample, on every path and at
+    every instruction-set level of the kernel. A position a millionth of a sample outside gives zero."""
+    if path == 'numpy':
+        monkeypatch.setattr(resample, '_LIB', [None])
+    rng = np.random.default_rng(6)
+    n = 331
+    src = (rng.normal(size=(2, n)) + 1j * rng.normal(size=(2, n))).astype(np.complex64)
+    pos = np.tile([-9e-16, 0.0, -1e-6, n - 1.0, n - 1 + 2e-13, n - 1 + 1e-6, 17.0], (2, 1))
+    for s in (src, src.real):
+        out = resample.lines(s, pos)
+        assert np.array_equal(out[:, 0], out[:, 1]) and np.array_equal(out[:, 4], out[:, 3])
+        assert np.all(out[:, [0, 3, 6]] != 0) and np.all(out[:, [2, 5]] == 0)
+    # the knot map of test_warp_on_device: 0.87 k + 0.02 i - 5.6 is 0 at (19, 6) and (106, 4), -9e-16 and -4e-16 in float64
+    m0, m1 = 281, 310
+    lk, ok = np.linspace(0, m0 - 1, 10), np.linspace(0, m1 - 1, 12)
+    p1 = resample.KnotMap(lk, ok, 0.87 * ok[None] + 0.02 * lk[:, None] - 5.6, m1)
+    assert -1e-14 < p1(slice(19, 20))[0, 6] < 0 and -1e-14 < p1(slice(106, 107))[0, 4] < 0
+    mid = (rng.normal(size=(m0, 260)) + 1j * rng.normal(size=(m0, 260))).astype(np.complex64)
+    out = resample.lines(mid, p1, m1)
+    assert out[19, 6] != 0 and out[106, 4] != 0 and out[19, 5] == 0 and out[106, 3] == 0
+    assert abs(out[19, 6] - mid[19, 0]) < 2e-3 * np.abs(mid).max()
+
+
 def test_real_cubic_and_linear():
     x = np.linspace(0, 6, 400)
     src = np.stack([np.sin(x), x ** 2]).astype(np.float32)

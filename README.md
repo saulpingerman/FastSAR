@@ -25,10 +25,15 @@ a float64 backprojection at 64 times oversampling, the open-source codes to the 
 
 ## Install
 
-Linux on x86-64 or 64-bit ARM and macOS on Apple silicon, Python 3.10 to 3.13. The CPU kernels compile on first
-use: with `g++` and OpenMP on Linux (GCC 12 or later on ARM; Debian and Ubuntu: `apt install g++`), with Apple's clang on macOS (the command
-line tools, `xcode-select --install`, which also serve the Metal backend of `ExactFormer` on Apple GPUs); the
-GPU backend needs an Nvidia driver for CUDA 12 or later and the `tpu` extra a Cloud TPU VM.
+Linux on x86-64 or 64-bit ARM and macOS on Apple silicon, Python 3.10 to 3.13. The wheels for these platforms
+carry the CPU kernels prebuilt, so the CPU backend needs no compiler: on x86-64 at three instruction-set levels
+(x86-64-v2, x86-64-v3 with AVX2, x86-64-v4 with AVX-512), of which the best one the processor runs is loaded. Where
+a C++ compiler is present the kernels are compiled on first use for the exact processor instead: `g++` with OpenMP
+on Linux (GCC 12 or later on ARM; Debian and Ubuntu: `apt install g++`), Apple's clang on macOS (the command line
+tools, `xcode-select --install`, which also serve the Metal backend of `ExactFormer` on Apple GPUs). Other
+platforms (Linux with musl such as Alpine, other processors) have no wheel: pip installs the source distribution
+there, which has no prebuilt kernels, so the CPU backend needs the compiler. The GPU backend needs an
+Nvidia driver for CUDA 12 or later and the `tpu` extra a Cloud TPU VM.
 
 ```bash
 pip install fastsar                  # CPU, Nvidia GPU, and the CPHD, SICD and SIDD files (no other package)
@@ -43,12 +48,12 @@ CuPy where its wheels exist. An environment that already holds another CuPy buil
 `--no-deps` and its dependencies by hand, since two CuPy wheels cannot share an environment.
 
 What a machine needs beyond pip's packages depends on its hardware. After installing, `python -m fastsar.doctor`
-reports which backends are ready (the C++ compiler for the CPU kernels, CuPy for the GPU's CUDA version, the TPU
-build of JAX, the readers' packages) and prints the command that installs each missing piece;
+reports which backends are ready (the CPU kernels in use, prebuilt or built by the C++ compiler; CuPy for the GPU's
+CUDA version; the TPU build of JAX; the readers' packages) and prints the command that installs each missing piece;
 `python -m fastsar.doctor --install` runs the pip commands among them.
 
 From a clone: `pip install -e ".[cuda,io]"` or `uv sync`. The CUDA tensor-core kernels (float16, and float32 on compute capability 8.0 and later) need `nvcc` from the CUDA toolkit; without it float32 runs on the CUDA cores, more slowly. On the CPU set
-`OMP_NUM_THREADS=<physical cores> OMP_PLACES=cores OMP_PROC_BIND=close`. Importing `fastsar` sets
+`OMP_NUM_THREADS=<physical cores> OMP_PLACES=cores OMP_PROC_BIND=close` (the prebuilt kernels read `OMP_NUM_THREADS` only). Importing `fastsar` sets
 `XLA_PYTHON_CLIENT_PREALLOCATE=false` unless it is already set, so that JAX does not reserve most of a GPU's memory
 before the CUDA kernels run ([performance.md](https://github.com/saulpingerman/FastSAR/blob/main/docs/performance.md#environment-variables)).
 

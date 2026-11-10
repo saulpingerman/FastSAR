@@ -5,10 +5,11 @@
     python -m fastsar.doctor --json
 
 pip installs FastSAR with NumPy, SciPy and JAX. The rest depends on the machine and cannot be chosen by pip: the
-C++ compiler that builds the CPU kernels on first use (a system package), CuPy for the CUDA version of an Nvidia
-GPU's driver, the TPU build of JAX, and the readers' packages. check() looks at the processor, the compiler, the
-GPU, the TPU and the installed packages, and lists what is missing with the command that installs it. Commands
-that need the system's package manager are printed, never run.
+C++ compiler that builds the CPU kernels for the exact processor on first use (a system package; without one the
+prebuilt kernels of a platform wheel run), CuPy for the CUDA version of an Nvidia GPU's driver, the TPU build of
+JAX, and the readers' packages. check() looks at the processor, the compiler, the kernels, the GPU, the TPU and the
+installed packages, and lists what is missing with the command that installs it. Commands that need the system's
+package manager are printed, never run.
 """
 import importlib.util
 import json
@@ -66,7 +67,7 @@ def _compiler():
         cxx, omp_c, omp_l = _build.compiler()
     except RuntimeError:
         cxx, omp_c, omp_l = 'clang++', [], []
-    path = shutil.which(cxx)
+    path = shutil.which(cxx) if _build.compiler_found(cxx) else None
     out = dict(command=cxx, found=path is not None, version=None, openmp=None, install=None)
     if path is None:
         if sys.platform == 'darwin':
@@ -87,6 +88,41 @@ def _compiler():
                 out['install'] = next((c.replace('g++', 'g++ libgomp1') if 'apt' in tool else c.replace('gcc-c++', 'gcc-c++ libgomp')
                                        for tool, c in _SYSTEM if shutil.which(tool)), 'install the OpenMP runtime (libgomp)')
     return out
+
+
+def _kernels(cc):
+    """Where each CPU kernel's shared object comes from on this machine, given the compiler found (cc):
+    dict(mode (FASTSAR_KERNELS, '' when unset), levels (the CPU's instruction-set levels, best first), prebuilt (what
+    the installation carries, or None), families: name -> dict(what, path 'native', 'prebuilt' or None, level,
+    text: 'native build', 'prebuilt (x86-64-v3)' or the reason there is no object))."""
+    from . import _build
+    try:
+        st = _build.status()
+    except ValueError as e:                                         # FASTSAR_KERNELS is neither native nor prebuilt
+        return dict(mode=os.environ.get('FASTSAR_KERNELS'), levels=[], prebuilt=None, families={}, error=str(e))
+    native = cc['found'] and cc['openmp'] is not False
+    fam = {}
+    for name, k in st['kernels'].items():
+        if k['used']:
+            path, level = k['used']['path'], k['used']['level']
+        elif st['mode'] != 'prebuilt' and native:
+            path, level = 'native', None
+        elif st['mode'] != 'native' and k['prebuilt']:
+            path, level = 'prebuilt', k['prebuilt']
+        else:
+            path, level = None, None
+        text = 'native build' if path == 'native' else f'prebuilt ({level})' if path else \
+            ('none: ' + ('no C++ compiler' if st['mode'] == 'native' or not k['why'] else k['why']))
+        fam[name] = dict(what=k['what'], path=path, level=level, text=text)
+    return dict(mode=st['mode'], levels=st['levels'], prebuilt=st['prebuilt'], families=fam)
+
+
+def _beyond(cpu, levels):
+    """The vector extension of this CPU that the prebuilt levels in use leave unused, or None."""
+    for ext, covered in (('AVX-512', ('x86-64-v4',)), ('AVX2', ('x86-64-v4', 'x86-64-v3')), ('SVE', ())):
+        if ext in cpu['simd']:
+            return None if all(lv in covered for lv in levels) else ext
+    return None
 
 
 def _nvidia():
@@ -114,18 +150,30 @@ def _tpu():
 def check(probe=True):
     """Look at the machine. probe: also ask CuPy and JAX for their devices (imports them, a few seconds).
 
-    -> dict(fastsar (version), python, cpu, compiler, nvidia, tpu, packages (name -> installed), backends (name ->
-    dict(ok, why)), todo (a list of dict(what, command, pip: whether --install may run it)))."""
+    -> dict(fastsar (version), python, cpu, compiler, kernels (see _kernels), nvidia, tpu, packages (name ->
+    installed), backends (name -> dict(ok, why)), todo (a list of dict(what, command, pip: whether --install may run
+    it)), hints (the same, for what is optional: a compiler where the prebuilt kernels leave speed unused))."""
     from . import __version__
     cpu, cc, nv, tpu = _cpu(), _compiler(), _nvidia(), _tpu()
     pk = {m: _has(m) for m in ('numpy', 'scipy', 'jax', 'cupy') + tuple(m for m, _, _ in _OPTIONAL)}
-    todo, backends = [], {}
+    todo, hints, backends = [], [], {}
     supported = (sys.platform == 'darwin' or sys.platform.startswith('linux')) and cpu['machine'] in ('x86_64', 'AMD64', 'aarch64', 'arm64')
+    kern = _kernels(cc)
+    pre = sorted({k['level'] for k in kern['families'].values() if k['path'] == 'prebuilt'})
     # cpu
     if not supported:
         backends['cpu'] = dict(ok=False, why=f"the C++ kernels are for Linux and macOS on x86-64 or 64-bit ARM; use backend='jax' here")
+    elif pre and all(k['path'] for k in kern['families'].values()):
+        why = 'no C++ compiler' if not cc['found'] else f"{cc['command']} cannot link OpenMP programs" if cc['openmp'] is False else None
+        backends['cpu'] = dict(ok=True, why=f"prebuilt kernels ({', '.join(pre)})" + (f'; {why}' if why else f"; FASTSAR_KERNELS={kern['mode']}"))
+        more = _beyond(cpu, pre)
+        if why and more:
+            hints.append(dict(what=f'a C++ compiler would make the CPU backend faster on this machine: the prebuilt kernels use '
+                                   f"{', '.join(pre)}, a native build also uses {more}", command=cc['install'], pip=False))
     elif not cc['found']:
-        backends['cpu'] = dict(ok=False, why=f"no C++ compiler ({cc['command']}): the kernels are compiled on first use")
+        backends['cpu'] = dict(ok=False, why=f"no C++ compiler ({cc['command']}) and " + (
+            'FASTSAR_KERNELS=native' if kern['mode'] == 'native' else 'no prebuilt kernels for this processor in this '
+            'installation (the platform wheels carry them)'))
         todo.append(dict(what='a C++ compiler for the CPU kernels', command=cc['install'], pip=False))
     elif cc['openmp'] is False:
         backends['cpu'] = dict(ok=False, why=f"{cc['command']} cannot link OpenMP programs")
@@ -189,8 +237,8 @@ def check(probe=True):
     for mod, extra, use in _OPTIONAL:
         if not pk[mod]:
             todo.append(dict(what=f'{mod} ({use})', command=f'{sys.executable} -m pip install "fastsar[{extra}]"', pip=True))
-    return dict(fastsar=__version__, python=platform.python_version(), cpu=cpu, compiler=cc, nvidia=nv, tpu=tpu,
-                packages=pk, backends=backends, todo=todo)
+    return dict(fastsar=__version__, python=platform.python_version(), cpu=cpu, compiler=cc, kernels=kern, nvidia=nv,
+                tpu=tpu, packages=pk, backends=backends, todo=todo, hints=hints)
 
 
 def report(c):
@@ -199,6 +247,13 @@ def report(c):
              f"{c['cpu']['cores']} cores", '', 'Backends:']
     for name, b in c['backends'].items():
         lines.append(f"  {name:6s} {'ready  ' if b['ok'] else 'missing'}  {b['why']}")
+    k = c.get('kernels') or {}
+    if k.get('families'):
+        texts = sorted({f['text'] for f in k['families'].values()})
+        if len(texts) == 1:
+            lines += ['', f"CPU kernels: {texts[0]}" + (f" (FASTSAR_KERNELS={k['mode']})" if k['mode'] else '')]
+        else:
+            lines += ['', 'CPU kernels:'] + [f"  {f['what']:26s} {f['text']}" for f in k['families'].values()]
     lines += ['', 'Packages: ' + ', '.join(f"{m} {'yes' if ok else 'no'}" for m, ok in c['packages'].items())]
     if c['todo']:
         lines += ['', 'To complete the installation:']
@@ -207,6 +262,8 @@ def report(c):
             lines += ['', 'python -m fastsar.doctor --install runs the pip commands above.']
     else:
         lines += ['', 'Nothing is missing.']
+    if c.get('hints'):
+        lines += ['', 'Optional:'] + [f"  {t['what']}:\n      {t['command']}" for t in c['hints']]
     return '\n'.join(lines)
 
 

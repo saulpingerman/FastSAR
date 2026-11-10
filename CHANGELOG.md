@@ -3,6 +3,40 @@
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The date of a version is the day it
 was published on PyPI.
 
+## [Unreleased]
+
+### Added
+
+- Platform wheels with prebuilt CPU kernels for Linux x86-64, Linux 64-bit ARM and macOS on Apple silicon: the CPU
+  backend runs on a machine with no C++ compiler. On x86-64 the kernels are carried at the levels x86-64-v2,
+  x86-64-v3 (AVX2) and x86-64-v4 (AVX-512), and the best one the processor runs is loaded. The prebuilt objects
+  need no OpenMP runtime: their loops run on threads kept between calls (`par.hpp`), and `OMP_NUM_THREADS` sets
+  their number. Where a compiler is present the kernels are still compiled on first use for the exact processor.
+- `FASTSAR_KERNELS=native` or `prebuilt` forces one of the two, with no fallback to the other; `FASTSAR_KERNEL_LEVEL` selects one prebuilt level,
+  for tests ([docs/performance.md](docs/performance.md#cpu-kernels-native-and-prebuilt)).
+- `python -m fastsar.doctor` reports the kernels in use ("native build" or "prebuilt (x86-64-v3)"; the `kernels`
+  entry of `--json`), and says when a compiler would let the CPU backend use vector extensions that the prebuilt
+  level leaves out (`hints`).
+- `.github/workflows/wheels.yml` builds the wheels with cibuildwheel and tests each one in a container without a
+  compiler and with one (`tests/wheel_check.py`).
+
+### Fixed
+
+- `resample.lines` and `warp`: a position within 1e-9 sample outside an end of a line is taken as the end, on the
+  CPU, CUDA and JAX paths. A map that reaches the end exactly lands some 1e-16 to either side of it in float64, and
+  the side depended on whether the kernel was compiled with fused multiply-adds, so an edge pixel could be zero on
+  one processor and not on another.
+
+### Changed
+
+- With a compiler present but unable to build a kernel (no OpenMP runtime, GCC before 12 on ARM), an installation
+  from a platform wheel now falls back to the prebuilt kernel instead of raising. Without prebuilt kernels the
+  error is as before, and also says that the installation carries none.
+- The CPU backend is reported as ready by the doctor on a machine without a compiler when the installation
+  carries prebuilt kernels.
+- Building a wheel with `FASTSAR_PREBUILT=1` gives a platform wheel (`py3-none-<platform>`); without it the wheel
+  is pure and holds the kernel sources only, as before.
+
 ## [0.2.0] - unreleased
 
 ### Added
