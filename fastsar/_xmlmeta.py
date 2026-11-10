@@ -11,7 +11,7 @@
 
 Conventions. Element names are the XML's own local names (namespaces are dropped on parsing and the root's is
 restored on writing). A Spec (one per format) names what the tree alone cannot tell: which leaves are text whatever
-they look like, which are integers, which children repeat (and so read as lists), and aliases, the plural names
+they look like, which are integers (by name, or as 'Parent/Name'), which children repeat (and so read as lists), and aliases, the plural names
 under which a list is also reached (Data.Channels for the Channel elements of a CPHD's Data block). Leaves not named
 in the Spec read as bool ('true', 'false'), else float where the text parses as one, else str."""
 import copy as _copy
@@ -47,9 +47,10 @@ def parse(xml, spec=None):
     ns = e.tag[1:].split('}')[0] if e.tag.startswith('{') else None
     for x in e.iter():
         x.tag = _local(x.tag)
-        if any(k.startswith('{') for k in x.attrib):
-            for k in [k for k in x.attrib if k.startswith('{')]:
-                del x.attrib[k]                 # schema-location hints and the like
+        for k in [k for k in x.attrib if k.startswith('{')]:
+            v = x.attrib.pop(k)
+            if 'XMLSchema-instance' not in k:   # schema-location hints are dropped; others read by local name
+                x.attrib.setdefault(_local(k), v)
     n = Node(e, spec or _PLAIN)
     object.__setattr__(n, '_ns', ns)
     return n
@@ -90,7 +91,7 @@ class Node:
         sp = self._spec
         if c.tag in sp.text:
             return t
-        if c.tag in sp.ints:
+        if c.tag in sp.ints or f'{self._e.tag}/{c.tag}' in sp.ints:
             try:
                 return int(t)
             except ValueError:
@@ -156,6 +157,9 @@ class Node:
                 return np.array([float(c.text) for c in e], dtype)
         if tags and all(len(c) == 0 for c in e):
             return np.array([float(c.text) for c in e], dtype)
+        if tags and len(set(tags)) == 1 and all('index' in c.attrib for c in e):      # ICP, Vertex, IACP: [n, 2]
+            kids = sorted(e, key=lambda c: int(str(c.get('index')).split(':')[0]))
+            return np.array([Node(c, self._spec).get_array(dtype) for c in kids])
         raise TypeError(f'{e.tag} is neither a vector nor a polynomial element')
 
     def __getitem__(self, i):
