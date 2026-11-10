@@ -45,6 +45,26 @@ rectangle in azimuth and ground range, and then along the line of sight. Each pa
 and applies an 8-tap Kaiser sinc from a table. `planes.sampling` gives the pixel spacings the ground image needs
 from the collection's own spectrum at points of the scene; `process_cphd` uses 0.96 of their reciprocal.
 
+### Forming on the ground, or on the slant plane and projecting
+
+A ground-plane product can be made two ways: formed on the ground directly, or formed on a planar slant grid and
+projected to the ground. The two were compared on an Nvidia RTX PRO 6000 with the unweighted image of two
+collections over their tasked areas, the slant grid being the rectangle that covers the same ground.
+
+| Collection | Aperture | Ground, direct | Slant, then projection | Agreement of the two (coherence in 32 x 32 pixel blocks, median) |
+|---|---|---|---|---|
+| Umbra spotlight, 22 Mpx on the ground | 1.0 degree, 5,202 pulses | 2.7 s | 2.9 s + 1.0 s | 0.9995 |
+| Capella spotlight, 152 Mpx on the ground | 2.3 degrees, 33,073 pulses | 5.8 s | 12.9 s + 4.4 s | 0.45 |
+
+Direct formation is the cheaper one, for two reasons. The projection is a second pass over the image, and the
+slant rectangle that covers a ground rectangle is larger than it wherever the collection is squinted (2.3 and 1.4
+times the pixels here). It is also the exact one. Backprojection onto a plane is exact for the points of that
+plane, and a ground scatterer is not on the slant plane: its range history equals that of its slant-plane image
+point only on a straight track. Over the Umbra aperture the difference is small. Over the longer Capella aperture
+the slant-formed image no longer matches the ground-formed one (amplitude correlation 0.56). FastSAR therefore
+forms on the ground plane always, and derives the slant-plane product from it by the range and range-rate map,
+which is exact at the center of aperture for any track.
+
 A ground-plane SICD is the image as formed, at baseband, on axes along the line of sight. Its rows run along
 ground range away from the radar whatever the squint.
 
