@@ -182,7 +182,19 @@ def test_to_ground(scene):
         planes.to_ground(out, g['origin'], g['e1'], g['e2'], px, n)
 
 
-DEVICES = [pytest.param('cupy', marks=pytest.mark.cuda), 'jax']
+DEVICES = [pytest.param('cupy', marks=pytest.mark.cuda), 'jax', 'jax-matmul', 'jax-matmul3']
+
+
+@pytest.fixture
+def jax_path(monkeypatch):
+    """resample_jax's interpolation for a device name: 'jax' the gather path, 'jax-matmul' the matrix products a
+    TPU runs, 'jax-matmul3' those with the three bfloat16 parts a TPU's products need."""
+    def choose(lib):
+        if lib.startswith('jax'):
+            monkeypatch.setenv('FASTSAR_RESAMPLE_JAX', 'matmul' if 'matmul' in lib else 'gather')
+            monkeypatch.setenv('FASTSAR_RESAMPLE_SPLIT', '1' if lib.endswith('3') else '0')
+        return lib.split('-')[0]
+    return choose
 
 
 def _close(got, ref, lib, tol, rms, flips=0):
@@ -215,10 +227,11 @@ def _product(nx, ny, spx, spy, r0, turn, squint, wavelength=0.031):
 
 
 @pytest.mark.parametrize('lib', DEVICES)
-def test_on_device(lib, need):
+def test_on_device(lib, need, jax_path):
     """deramp, to_slant (margin and mask) and to_ground on a CuPy and on a JAX image give the CPU's results. CuPy
     computes positions and phases in double as the CPU does; JAX in float32 about exact integers, which moves a
     sample in a hundred to the next row of the interpolation table (5e-4 of the largest sample)."""
+    lib = jax_path(lib)
     xp, tol, rms, flips = (need('cupy'), 5e-6, 5e-6, 0) if lib == 'cupy' else (need('jax.numpy'), 2e-3, 2e-4, 2)
     nx, ny = 520, 610
     rng = np.random.default_rng(6)
@@ -267,9 +280,10 @@ def test_deramp_phase_on_device(lib, need, turn, squint):
 
 
 @pytest.mark.parametrize('lib', DEVICES)
-def test_blocks_on_device(lib, need, monkeypatch):
+def test_blocks_on_device(lib, need, monkeypatch, jax_path):
     """Device memory that holds a few lines at a time gives the same image: many blocks, the last one short (CuPy)
     or moved back to keep its size (JAX), on an image that is a view."""
+    lib = jax_path(lib)
     if lib == 'cupy':
         xp, tol, rms, flips = need('cupy'), 5e-6, 5e-6, 0
         from fastsar import resample_cuda
@@ -278,6 +292,7 @@ def test_blocks_on_device(lib, need, monkeypatch):
         xp, tol, rms, flips = need('jax.numpy'), 2e-3, 2e-4, 2
         from fastsar import resample_jax
         monkeypatch.setattr(resample_jax, 'BLOCK', 1 << 16)
+        monkeypatch.setattr(resample_jax, 'BLOCK_MM', 1 << 19)
     nx, ny = 310, 270
     rng = np.random.default_rng(7)
     ref = _product(nx, ny, 0.5, 0.35, 10e3, 0.0, -15.0)

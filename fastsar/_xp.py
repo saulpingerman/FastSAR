@@ -49,10 +49,26 @@ def fft(a):
 
 
 def host(a):
-    """a as a NumPy array (a copy from the device, or a itself)."""
-    if kind(a) == 'cupy':
+    """a as a NumPy array (a copy from the device, or a itself). A complex array on a TPU crosses as its two real
+    planes: a TPU hands a complex array to the host some sixty times slower than a real one of the same size."""
+    k = kind(a)
+    if k == 'cupy':
         return a.get()
+    if k == 'jax' and a.ndim and 'complex' in str(a.dtype) and _on_tpu(a):
+        import jax.numpy as jnp
+        out = np.empty(a.shape, a.dtype)
+        v = out.view(out.real.dtype).reshape(a.shape + (2,))
+        v[..., 0], v[..., 1] = np.asarray(jnp.real(a)), np.asarray(jnp.imag(a))
+        return out
     return np.asarray(a)
+
+
+def _on_tpu(a):
+    """Whether the JAX array a lives on a TPU."""
+    try:
+        return next(iter(a.devices())).platform == 'tpu'
+    except (AttributeError, StopIteration):                        # a tracer
+        return False
 
 
 def device(a, backend):

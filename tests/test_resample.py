@@ -106,7 +106,19 @@ def test_warp_sheared_lattice_with_wrapped_spectrum():
     assert _db(out2 - ref, ref) < -38.0
 
 
-DEVICES = [pytest.param('cupy', marks=pytest.mark.cuda), 'jax']
+DEVICES = [pytest.param('cupy', marks=pytest.mark.cuda), 'jax', 'jax-matmul', 'jax-matmul3']
+
+
+@pytest.fixture
+def jax_path(monkeypatch):
+    """Choose resample_jax's interpolation for a device name: 'jax' the gather path, 'jax-matmul' the matrix
+    products a TPU runs, 'jax-matmul3' those with the three bfloat16 parts a TPU's products need."""
+    def choose(lib):
+        if lib.startswith('jax'):
+            monkeypatch.setenv('FASTSAR_RESAMPLE_JAX', 'matmul' if 'matmul' in lib else 'gather')
+            monkeypatch.setenv('FASTSAR_RESAMPLE_SPLIT', '1' if lib.endswith('3') else '0')
+        return lib.split('-')[0]
+    return choose
 
 
 def _device(lib, need):
@@ -127,7 +139,8 @@ def _same(got, ref, lib, tol, rms):
 
 
 @pytest.mark.parametrize('lib', DEVICES)
-def test_lines_on_device(lib, need):
+def test_lines_on_device(lib, need, jax_path):
+    lib = jax_path(lib)
     xp, tol, rms = _device(lib, need)
     rng = np.random.default_rng(4)
     src = (rng.normal(size=(150, 331)) + 1j * rng.normal(size=(150, 331))).astype(np.complex64)
@@ -145,7 +158,8 @@ def test_lines_on_device(lib, need):
 
 
 @pytest.mark.parametrize('lib', DEVICES)
-def test_warp_on_device(lib, need):
+def test_warp_on_device(lib, need, jax_path):
+    lib = jax_path(lib)
     xp, tol, rms = _device(lib, need)
     rng = np.random.default_rng(5)
     n0, n1, m0, m1 = 300, 260, 281, 310
@@ -165,3 +179,121 @@ def test_warp_on_device(lib, need):
     # full maps as arrays give what the knot maps give
     ref = resample.warp(src, p0(slice(0, n1)), p1(slice(0, m0)), (m0, m1))
     _same(resample.warp(xp.asarray(src), p0(slice(0, n1)), p1(slice(0, m0)), (m0, m1)), ref, lib, tol, rms)
+
+
+def _affine(L, m, n, rng, slope=1.07):
+    """A knot map of L lines of m samples into lines of n: a slope, a shear and a little curvature, inside the line."""
+    lk, ok = np.linspace(0, L - 1, 5), np.unique(np.round(np.linspace(0, m - 1, m // 32 + 2)))
+    v = 40 + slope * ok[None] + 0.31 * lk[:, None] + 3e-5 * (ok[None] - m / 2) ** 2 + 1e-4 * lk[:, None] * ok[None]
+    assert v.min() > 30 and v.max() < n - 30
+    return resample.KnotMap(lk, ok, v + rng.random(), m)
+
+
+@pytest.mark.parametrize('split', ['0', '1'])
+@pytest.mark.parametrize('band, taps, floor', [(0.5, 8, -58.0), (0.96, 8, -55.0), (0.96, 12, -65.0)])
+def test_matmul_band_limited(band, taps, floor, split, need, monkeypatch):
+    """The matrix-product path of resample_jax against the band-limited signal itself, and against the CPU kernel."""
+    jnp = need('jax.numpy')
+    from fastsar import resample_jax
+    monkeypatch.setenv('FASTSAR_RESAMPLE_JAX', 'matmul')
+    monkeypatch.setenv('FASTSAR_RESAMPLE_SPLIT', split)
+    rng = np.random.default_rng(11)
+    f, a = _tones(rng, band)
+    L, n, m = 6, 4096, 3000
+    ev = lambda x: (a * np.exp(2j * np.pi * f * np.asarray(x)[..., None])).sum(-1)
+    src = np.stack([(1 + l) * ev(np.arange(n) + 0.25 * l) for l in range(L)]).astype(np.complex64)
+    km = _affine(L, m, n, rng)
+    pos = km(slice(0, L))
+    ref = np.stack([(1 + l) * ev(pos[l] + 0.25 * l) for l in range(L)])
+    assert resample_jax._plan_mm(km, None, L, n, resample.kernel_table('sinc', taps), 2, 16, 4200, False, True)
+    got = np.asarray(resample.lines(jnp.asarray(src), km, m, taps=taps))
+    assert got.dtype == np.complex64 and _db(got - ref, ref) < floor, _db(got - ref, ref)
+    cpu = resample.lines(src, km, m, taps=taps)
+    d, s = np.abs(got - cpu), np.abs(cpu).max()
+    assert d.max() < 2e-3 * s and np.sqrt((d ** 2).mean()) < 2e-4 * s
+    # real lines: the cubic kernel on a smooth line, the sinc on the real part
+    x = np.linspace(0, 40, n)
+    smooth = np.stack([np.sin(x + l) for l in range(L)]).astype(np.float32)
+    got = np.asarray(resample.lines(jnp.asarray(smooth), km, m, kernel='cubic'))
+    assert got.dtype == np.float32
+    assert np.abs(got - np.stack([np.sin(pos[l] * (x[1] - x[0]) + l) for l in range(L)])).max() < 1e-5
+    got = np.asarray(resample.lines(jnp.asarray(src.real), km, m, taps=taps))
+    assert _db(got - ref.real, ref.real) < floor
+
+
+def test_matmul_zeros_mask_and_fallback(need, monkeypatch):
+    """Outside the source and outside a mask the matrix-product path gives exact zeros where the gather path does;
+    maps it cannot take (arrays of positions, knots closer than a block, a map that is not smooth) run the gather
+    path, with its result."""
+    jnp = need('jax.numpy')
+    from fastsar import resample_jax
+    rng = np.random.default_rng(12)
+    n0, n1, m0, m1 = 200, 180, 230, 260
+    src = (rng.normal(size=(n0, n1)) + 1j * rng.normal(size=(n0, n1))).astype(np.complex64)
+    lk, ok = np.linspace(0, n1 - 1, 7), np.linspace(0, m0 - 1, 8)
+    p0 = resample.KnotMap(lk, ok, 0.9371 * ok[None] + 0.2013 * lk[:, None] - 21.03, m0)     # leaves the source at both ends
+    lk, ok = np.linspace(0, m0 - 1, 6), np.linspace(0, m1 - 1, 9)
+    p1 = resample.KnotMap(lk, ok, 0.8137 * ok[None] + 0.0519 * lk[:, None] - 9.07, m1)
+    px = resample.KnotMap(lk, ok, 0.9033 * lk[:, None] - 0.1017 * ok[None] + 3.01, m1)    # no position on a tie
+    valid = rng.random((n0, n1)) > 0.2
+    out = {}
+    for path in ('gather', 'matmul'):
+        monkeypatch.setenv('FASTSAR_RESAMPLE_JAX', path)
+        out[path] = [np.asarray(resample_jax.warp(jnp.asarray(src), p0, p1, (m0, m1), mask=mk))
+                     for mk in (None, (px, (10, n0 - 11), (12, n1 - 13), None), (px, (10, n0 - 11), (12, n1 - 13), valid))]
+    for k, (g, mm) in enumerate(zip(out['gather'], out['matmul'])):
+        same = (g == 0) == (mm == 0)                    # a position within 1e-5 of a mask's edge may fall either way
+        assert 0.05 < (g == 0).mean() < 0.95 and np.count_nonzero(~same) <= (0, 2, 2)[k], (k, np.count_nonzero(~same))
+        assert np.abs(g - mm)[same].max() < 2e-3 * np.abs(g).max()
+    calls = []
+    plan = resample_jax._plan_mm
+    monkeypatch.setattr(resample_jax, '_plan_mm', lambda *a: calls.append(plan(*a)) or calls[-1])
+    pos = p1(slice(0, m0))
+    dense = resample.KnotMap(np.arange(m0, dtype=float), np.arange(m1, dtype=float), pos, m1)   # a knot at every sample
+    back = resample.KnotMap(np.array([0.0, m0 - 1]), np.array([0.0, 100.0, m1 - 1]), np.array([[5.0, 150, 20], [9.0, 150, 30]]), m1)
+    wild = resample.KnotMap(np.array([0.0, m0 - 1]), np.array([0.0, 8.0, m1 - 1]), np.array([[5.0, 175, 6], [9.0, 170, 30]]), m1)
+    mid = jnp.asarray((rng.normal(size=(m0, n1)) + 1j * rng.normal(size=(m0, n1))).astype(np.complex64))
+    ref = np.asarray(resample.lines(mid, p1, m1))
+    assert calls[-1] is not None
+    for q in (pos, dense):
+        n = len(calls)
+        got = np.asarray(resample.lines(mid, q, m1))
+        assert all(c is None for c in calls[n:]) and np.abs(got - ref).max() < 2e-3 * np.abs(ref).max()
+    for q, taken in ((back, True), (wild, False)):          # a map that turns back is taken, a jump of 20 samples is not
+        monkeypatch.setenv('FASTSAR_RESAMPLE_JAX', 'gather')
+        ref = np.asarray(resample.lines(mid, q, m1))
+        monkeypatch.setenv('FASTSAR_RESAMPLE_JAX', 'matmul')
+        got = np.asarray(resample.lines(mid, q, m1))
+        assert (calls[-1] is not None) == taken and np.abs(got - ref).max() < 2e-3 * np.abs(ref).max()
+        assert np.array_equal(got == 0, ref == 0) and (taken or np.array_equal(got, ref))
+
+
+def test_matmul_compiles_once_per_shape(need, monkeypatch):
+    """A second image of the same shape on a map of the same kind runs the compiled step: one compilation a pass."""
+    jnp = need('jax.numpy')
+    from fastsar import resample_jax
+    monkeypatch.setenv('FASTSAR_RESAMPLE_JAX', 'matmul')
+    monkeypatch.setattr(resample_jax, 'BLOCK_MM', 1 << 19)                      # several blocks of lines a pass
+    rng = np.random.default_rng(13)
+    L, n, m = 150, 900, 640
+    step = lambda: resample_jax._JIT[resample_jax._step_mm]._cache_size()
+    sizes = []
+    for k in range(3):
+        src = (rng.normal(size=(L, n)) + 1j * rng.normal(size=(L, n))).astype(np.complex64)
+        km = _affine(L, m, n, rng)
+        got = np.asarray(resample.lines(jnp.asarray(src), km, m))
+        cpu = resample.lines(src, km, m)
+        assert np.abs(got - cpu).max() < 2e-3 * np.abs(cpu).max()
+        sizes.append(step())
+    assert sizes[1] == sizes[0] and sizes[2] == sizes[0], sizes
+
+
+def test_fastsar_resample_jax_is_checked(need, monkeypatch):
+    need('jax.numpy')
+    from fastsar import resample_jax
+    monkeypatch.setenv('FASTSAR_RESAMPLE_JAX', 'fast')
+    with pytest.raises(ValueError):
+        resample_jax._path()
+    monkeypatch.delenv('FASTSAR_RESAMPLE_JAX')
+    import jax
+    assert resample_jax._path() == ('matmul' if jax.devices()[0].platform == 'tpu' else 'gather')
