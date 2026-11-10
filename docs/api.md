@@ -5,6 +5,13 @@
 
 ## `fastsar`
 
+- `process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None, autofocus=None, weighting=None,
+  remap='nrl', remap_args=None, spacing=None, sicd=None, mode='auto', backend='auto', precision='float32',
+  shadows_down=True, nesz_db=None, scene_sigma0_db=-10.0, height=None, channel=0, troposphere=None,
+  reader_options=None, target_db=-40.0)`: from a CPHD file to a SICD or SIDD
+  ([product-options.md](product-options.md)). Returns the product dict (`form_cphd`'s entries on the product's
+  grid) with `product`, `area`, `weighting`, `autofocus`, `autofocus_info`, `timing` (seconds per stage) and, when
+  written, `path` and `metadata`.
 - `form_cphd(cphd, sicd=None, *, mode='auto', backend='auto', window=True, spacing=None, channel=0, patch=1024,
   azimuth_fraction=0.8, extent=None, height=None, precision='float32', target_db=-40.0, info=None,
   autofocus=False, troposphere=None, reader_options=None)`: the image of a CPHD file ([processing-chain.md](processing-chain.md#2-form)).
@@ -100,6 +107,28 @@ the CPU), `'auto'`. Precision: `'float32'`, `'float16'` (CUDA, JAX),
 - `write_geotiff(path, data, transform, crs='EPSG:4326', nodata=nan)`: [rows, cols] or [bands, rows, cols].
 
 SICD needs sarpy; GeoTIFFs, DEMs and map projections other than `EPSG:4326` need rasterio.
+
+## `fastsar.planes`, `fastsar.resample`, `fastsar.weighting`
+
+- `planes.to_slant(out, spacing, bounds=None, *, margin=0, valid=None, taps=8, knots=32)`: a ground-plane image on
+  axes along the line of sight resampled to the slant plane; `planes.to_ground(out, origin, e1, e2, spacing, shape,
+  *, kernel=None, taps=8, pad=None, knots=32)` the reverse. `planes.deramp(out, sign=-1)` brings an image to
+  baseband in place. `planes.slant_frame`, `ground_to_slant`, `slant_to_ground`: the slant plane and the closed-form
+  maps. `planes.sampling`, `planes.support`: the spectrum of the image from the collection's geometry.
+- `resample.lines(src, pos, m=None, *, kernel='sinc', taps=8, pad=None, out=None)` and `resample.warp(src, pos0,
+  pos1, shape, ...)`: band-limited interpolation along one axis and two-pass warps, with positions given exactly or
+  as a `resample.KnotMap`.
+- `weighting.sva(img, oversample=2, *, axes=(1, 0), joint=True, inplace=False)`: spatially variant apodization.
+  `weighting.keystone(S, ant, fmin, df, scp, e1, symmetric=True)`: the phase history trimmed to a rectangle of
+  slant-plane spatial frequencies.
+
+## `fastsar.sidd`, `fastsar.remap`
+
+- `sidd.write_sidd(path, out, *, remap='nrl', remap_args=None, valid=None, shadows_down=True, version=3,
+  product_name=None, classification='UNCLASSIFIED', sicd=None)`, `sidd.to_display(out, remap='nrl', valid=None,
+  shadows_down=True, **remap_args)`, `sidd.shadows_down(out)`, `sidd.orient(array, transform)`.
+- `remap.remap(x, name='nrl', **kw)` and the named remaps `density`, `brighter`, `darker`, `highcontrast`, `pedf`,
+  `nrl`, `log`, `linear`.
 
 ## `fastsar.autofocus`
 

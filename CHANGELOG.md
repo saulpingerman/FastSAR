@@ -11,6 +11,39 @@ was published on PyPI.
   added to `Fx0`, and `ref_freq=0.0` asserts that the producer wrote absolute frequencies despite the flag. Such files
   are still refused without it, and the refusal now reports the file's `Fx0` range. From `form_cphd`, pass
   `reader_options=dict(ref_freq=0.0)`.
+- `process_cphd(cphd, output, product=, area=, plane=, autofocus=, weighting=, remap=)`: from a CPHD file to a SICD
+  or a SIDD on disk, with the processed area, the image plane, the autofocus, the sidelobe weighting and the
+  display remap as options ([docs/product-options.md](docs/product-options.md)). The defaults are the tasked area
+  and a slant-plane SICD with Taylor weighting and quadratic autofocus; a SIDD defaults to the ground plane,
+  spatially variant apodization and the NRL remap. `form_cphd` and its defaults are unchanged.
+- Slant-plane products (`fastsar.planes`). A spotlight image is formed on the ground plane on axes along the line
+  of sight (`form_cphd(axes='los')`), brought to baseband exactly (`planes.deramp`) and resampled to the slant
+  plane of a SICD with `Grid.Type` PLANE (`planes.to_slant`), by two one-dimensional passes of band-limited
+  interpolation (`fastsar.resample`). `planes.to_ground` goes the other way. `products.sicd_meta` and `write_sicd`
+  take the slant-plane and baseband products.
+- Processed area by image quality (`fastsar.rgiqe`): the radar generalized image quality equation on the
+  collection's own antenna pattern and noise level gives the region at least as good as the tasked area, the
+  region above a given RNIIRS, or everything with a signal-to-noise ratio of at least 1. Pixels of the rectangular
+  product outside the area are 0.
+- Autofocus on the image (`autofocus.image_autofocus`): a global quadratic phase error by map drift, phase
+  gradient autofocus, and a spatially variant correction estimated on overlapping blocks.
+- Spatially variant apodization (`weighting.sva`) on the slant plane at twice Nyquist, with the trim of the phase
+  history that makes the spectrum a rectangle (`weighting.keystone`).
+- SIDD output (`sidd.write_sidd`, SIDD 3.0 or 2.0 through sarpy) and the display layout (`sidd.shadows_down`,
+  `sidd.to_display`): range increases down the rows and the view is the one from above, for either look side.
+- The remaps of the NGA MATLAB SAR Toolbox (`fastsar.remap`: `nrl`, `density`, `brighter`, `darker`,
+  `highcontrast`, `pedf`, `log`, `linear`), checked against the toolbox run in Octave.
+- The stages after formation (baseband, autofocus, resampling, apodization, remap) take the image as a NumPy,
+  CuPy or JAX array and run where it lives, so a GPU or TPU run keeps the image on the device until it is written.
+- `form_cphd(..., axes='los' | 'auto', aperture='auto' | 'square' | 'full')`, and the grid's geometry in its
+  output (`plane`, `axes`, `center`, `height`, `graze`, `pulses`).
+
+### Changed
+
+- `products.sicd_meta` arranges the SICD array as the view from above for either look side: rows along range away
+  from the radar and row x column upward. For a collection whose grid axis e2 points away from the radar (a
+  left-looking pass on track axes) the columns are now reversed with respect to 0.1.8, which wrote the mirror
+  image there. `TStartProc` and `TEndProc` are those of the pulses used.
 
 ### Fixed
 
