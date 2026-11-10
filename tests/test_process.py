@@ -62,7 +62,7 @@ def test_sicd(cphd, plane):
     f = d / f'{plane}.nitf'
     o = fastsar.process_cphd(str(d / 'c.cphd'), str(f), plane=plane, autofocus=False, backend='cpu')
     assert o['plane'] == plane and o['product'] == 'sicd' and o['weighting'] == 'taylor' and o['path'] == str(f)
-    assert o['image'].dtype == np.complex64 and o['baseband'] and {'form', 'baseband', 'write'} <= set(o['timing'])
+    assert o['image'].dtype == np.complex64 and o['baseband'] and {'read', 'form', 'baseband', 'write'} <= set(o['timing'])
     sm, pix, off, pslr = read_sicd(f, ecf)
     assert sm.Grid.ImagePlane == plane.upper() and sm.Grid.Type == 'PLANE' and sm.Grid.Row.WgtType.WindowName == 'TAYLOR'
     assert np.abs(off).max() < 0.05                                  # pixels: sarpy's projection is the product's

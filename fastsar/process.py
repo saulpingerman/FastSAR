@@ -27,7 +27,7 @@ import time
 
 import numpy as np
 
-from . import planes, weighting as _weighting
+from . import _xp, planes, weighting as _weighting
 
 __all__ = ['process_cphd']
 
@@ -66,7 +66,9 @@ def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None
     -> the product dict (form_cphd's entries on the product's grid: image, origin, e1, e2, spx, spy, plane, meta,
     notes, ...), with product, area, weighting, autofocus (the mode run), autofocus_info, timing (seconds of each
     stage), and, when written, path and metadata (the sarpy SICDType or SIDDType)."""
+    from .api import _backend
     from .cphd import form_cphd
+    backend = _backend(backend)
     _choice('product', product, ('sicd', 'sidd'))
     _choice('plane', plane, (None, 'slant', 'ground'))
     _choice('weighting', weighting, (None, 'taylor', 'uniform', 'sva'))
@@ -80,6 +82,7 @@ def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None
         raise ValueError(f'spacing must be one or two positive lengths in meters, got {spacing!r}')
     timing, st = {}, {}
     t0 = time.perf_counter()
+    st['start'] = t0
 
     def lap(name):
         nonlocal t0
@@ -89,6 +92,7 @@ def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None
 
     def plan(g):
         """The formation grid, from the geometry form_cphd read: the area's bounds and the sampling its spectrum asks."""
+        st['read'] = time.perf_counter()
         spot = g['mode'] == 'spotlight'
         pl = plane or ('slant' if product == 'sicd' and spot else 'ground')
         wt = weighting or ('sva' if product == 'sidd' and spot else 'taylor')
@@ -145,17 +149,21 @@ def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None
                     target_db=target_db, troposphere=troposphere, reader_options=reader_options, axes='auto',
                     aperture='auto' if spacing is None else 'full', _plan=plan)
     lap('form')
+    timing['read'] = st['read'] - st['start']                        # the file, to the phase history in memory
+    timing['form'] -= timing['read']
+    out['image'] = _xp.device(out['image'], backend)                 # the stages that follow run where it lives
     out.update(product=product, area=area, weighting=st['weighting'], autofocus=None, autofocus_info=None)
     if st['spot']:
         out = _spotlight(out, st, product, area, spacing, lap)
     out['timing'] = timing
+    if output is not None and product == 'sidd':                     # remapped where the image lives
+        from .sidd import write_sidd
+        out['metadata'] = write_sidd(output, out, remap=remap, remap_args=remap_args, shadows_down=shadows_down)
+    out['image'] = _xp.host(out['image'])
+    if output is not None and product == 'sicd':
+        from .products import write_sicd
+        out['metadata'] = write_sicd(output, out)
     if output is not None:
-        if product == 'sicd':
-            from .products import write_sicd
-            out['metadata'] = write_sicd(output, out)
-        else:
-            from .sidd import write_sidd
-            out['metadata'] = write_sidd(output, out, remap=remap, remap_args=remap_args, shadows_down=shadows_down)
         out['path'] = output
         lap('write')
     return out
@@ -194,7 +202,8 @@ def _spotlight(out, st, product, area, spacing, lap):
     valid = None if st['valid'] is None else _mask(out, st, area)
     if not st['via_slant']:                                          # a ground-plane SICD: the image as formed
         if valid is not None:
-            out['image'][~valid] = 0
+            xp = _xp.module(out['image'])
+            out['image'] = xp.where(xp.asarray(valid), out['image'], 0)
         out['bandwidth'] = (s['bx'], s['by'])
         lap('mask')
         return out
@@ -218,16 +227,16 @@ def _spotlight(out, st, product, area, spacing, lap):
         k0, ramp = 0.5 * (st['kept'][0] + st['kept'][1]), None
         if abs(k0) > 0.002 * (st['kept'][1] - st['kept'][0]):
             a = (np.arange(sl['image'].shape[0]) - sl['scp_pixel'][0]) * sl['spx']
-            ramp = np.exp(-2j * np.pi * k0 * a).astype(np.complex64)[:, None]
-            sl['image'] *= ramp
+            ramp = _xp.module(sl['image']).asarray(np.exp(-2j * np.pi * k0 * a).astype(np.complex64)[:, None])
+            sl['image'] = sl['image'] * ramp
         sl['image'] = _weighting.sva(sl['image'], 2, inplace=True)
         if ramp is not None and product == 'sicd':
-            sl['image'] *= np.conj(ramp)
+            sl['image'] = sl['image'] * ramp.conj()
         lap('sva')
     if product == 'sicd':
         return sl
     # a SIDD: detected on the slant plane, projected to square ground pixels on axes along the line of sight
-    sl['image'] = np.abs(sl['image'])
+    sl['image'] = _xp.module(sl['image']).abs(sl['image'])
     lap('detect')
     res = 0.886 / max(s['bx'], s['by'])
     px = float(spacing) if spacing is not None and np.size(spacing) == 1 else (0.7 * res if spacing is None else None)
@@ -237,7 +246,7 @@ def _spotlight(out, st, product, area, spacing, lap):
     shape = (int(np.ceil((b[1] - b[0]) / px)) + 1, int(np.ceil((b[3] - b[2]) / px)) + 1)
     o = ground['origin'] + mg * ground['spx'] * ground['e1'] + mg * ground['spy'] * ground['e2']
     g = planes.to_ground(sl, o, ground['e1'], ground['e2'], px, shape)
-    np.maximum(g['image'], 0, out=g['image'])
+    g['image'] = _xp.module(g['image']).maximum(g['image'], 0)
     g['bandwidth'] = (s['bx'], s['by'])
     lap('to_ground')
     return g

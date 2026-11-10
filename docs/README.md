@@ -3,6 +3,7 @@
 Using FastSAR:
 
 - [Processing chain](processing-chain.md): from a CPHD file to products
+- [Product options](product-options.md): area, plane, autofocus, weighting, SICD and SIDD output
 - [API reference](api.md)
 - [Real data](real-data.md): the CPHD reader, Umbra, Capella and ICEYE collections, NISAR, Sentinel-1 and ALOS
   PALSAR raw data
