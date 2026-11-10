@@ -180,14 +180,15 @@ def _mask(out, st, area):
     nx, ny, o, e1, e2, spx, spy = planes._grid(out)
     ki, kj = planes._knots(nx, max(8, int(50.0 / spx))), planes._knots(ny, max(8, int(50.0 / spy)))
     pts = o + (ki * spx)[:, None, None] * e1 + (kj * spy)[None, :, None] * e2
-    m, _ = rgiqe.area_mask(rad, pts, area, bw_area, n, tasked=tasked)
-    f = np.asarray(m, np.float64)
+    m, info = rgiqe.area_mask(rad, pts, area, bw_area, n, tasked=tasked)
+    # the margin over the threshold where the model gives it (a smooth boundary between the nodes), else the mask
+    f = np.asarray(info['level'], np.float64) if info.get('level') is not None else np.asarray(m, np.float64) - 0.5
     from .resample import KnotMap
     km = KnotMap(ki, kj, f, ny)
     valid = np.empty((nx, ny), bool)
 
     def work(sl):
-        valid[sl] = km(sl) >= 0.5
+        valid[sl] = km(sl) >= 0
     _rows(work, nx, 256)
     return valid
 
