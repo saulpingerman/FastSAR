@@ -3,7 +3,7 @@
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The date of a version is the day it
 was published on PyPI.
 
-## [0.2.0] - unreleased
+## [0.2.0] - 2026-11-10
 
 ### Added
 
