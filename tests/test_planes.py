@@ -182,17 +182,15 @@ def test_to_ground(scene):
         planes.to_ground(out, g['origin'], g['e1'], g['e2'], px, n)
 
 
-DEVICES = [pytest.param('cupy', marks=pytest.mark.cuda), 'jax', 'jax-matmul', 'jax-matmul3']
+DEVICES = [pytest.param('cupy', marks=pytest.mark.cuda), 'jax', 'jax-blocks']
 
 
 @pytest.fixture
 def jax_path(monkeypatch):
-    """resample_jax's interpolation for a device name: 'jax' the gather path, 'jax-matmul' the matrix products a
-    TPU runs, 'jax-matmul3' those with the three bfloat16 parts a TPU's products need."""
+    """resample_jax's interpolation for a device name: 'jax' the gather path, 'jax-blocks' the path a TPU runs."""
     def choose(lib):
         if lib.startswith('jax'):
-            monkeypatch.setenv('FASTSAR_RESAMPLE_JAX', 'matmul' if 'matmul' in lib else 'gather')
-            monkeypatch.setenv('FASTSAR_RESAMPLE_SPLIT', '1' if lib.endswith('3') else '0')
+            monkeypatch.setenv('FASTSAR_RESAMPLE_JAX', 'blocks' if 'blocks' in lib else 'gather')
         return lib.split('-')[0]
     return choose
 
@@ -292,7 +290,7 @@ def test_blocks_on_device(lib, need, monkeypatch, jax_path):
         xp, tol, rms, flips = need('jax.numpy'), 2e-3, 2e-4, 2
         from fastsar import resample_jax
         monkeypatch.setattr(resample_jax, 'BLOCK', 1 << 16)
-        monkeypatch.setattr(resample_jax, 'BLOCK_MM', 1 << 19)
+        monkeypatch.setattr(resample_jax, 'BLOCK_ROWS', 1 << 18)
     nx, ny = 310, 270
     rng = np.random.default_rng(7)
     ref = _product(nx, ny, 0.5, 0.35, 10e3, 0.0, -15.0)

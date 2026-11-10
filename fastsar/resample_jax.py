@@ -12,16 +12,16 @@ Blocks. Lines run in blocks of one size through one jitted step per pass, which 
 and a pass compiles once.
 
 Two interpolations. 'gather' reads each tap of each output sample with an indexed load, as the CPU and CUDA kernels
-do. A TPU does such loads slowly (about 1e8 a second) and matrix products fast, so 'matmul' works on blocks of B
-consecutive output samples of a line, for positions given as a knot map: the oversampled samples a block needs
-are one window of the line (one slice per block: the host sends its start), the sample left of each position is
-a row of a one-hot matrix [B, window], and the product of that matrix with the window shifted by each tap
-returns the taps of every sample of the block. The weights are a polynomial in the table's phase (fitted to the
-table, which it reproduces to 1e-7), evaluated at the phase the table would be read at. The product is exact: on a
-TPU, whose matrix unit multiplies bfloat16, the window goes in as three bfloat16 parts that add up to the float32
-sample and the one-hot matrix as bfloat16; elsewhere both are float32. FASTSAR_RESAMPLE_JAX=matmul|gather chooses;
-the default is matmul on a TPU and gather on JAX's other devices. Positions given as arrays, a knot map with more
-than one knot inside a block, and maps that are not smooth (a window above WINDOW samples) take the gather path.
+do. A TPU does such loads slowly (about 1e8 a second, and a slice of a line at a row and a column index slower
+still), but it looks up whole rows of a table quickly and its elementwise work is fast. 'blocks' therefore works
+on blocks of B consecutive output samples of a line, for positions given as a knot map: the oversampled samples a
+block needs are one window of the line; the windows that start at every 8th sample are laid out as the rows of a
+table and each block reads its row (the host sends where it starts); each sample then moves its taps to the front
+of the window by one select per bit of its offset in it. The weights are a polynomial in the table's phase (fitted
+to the table, which it reproduces to 1e-7), evaluated at the phase the table would be read at. Nothing is rounded
+that the gather path does not round. FASTSAR_RESAMPLE_JAX=blocks|gather chooses; the default is blocks on a TPU
+and gather on JAX's other devices, where it is the faster. Positions given as arrays, a knot map with more than
+one knot inside a block, and maps that are not smooth (a window above WINDOW samples) take the gather path.
 """
 import os
 
@@ -33,25 +33,19 @@ from jax import lax
 from . import resample
 
 BLOCK = 1 << 24            # samples of an oversampled block of lines (complex64: 128 MB, and a few times it in flight)
-BLOCK_MM = 1 << 28         # elements of a block's shifted windows in the matmul path (bfloat16 on a TPU: 512 MB)
-WINDOW = 96                # the widest window (oversampled samples) of an output block the matmul path takes
-MASK_WINDOW = 1024         # the most pixels of a mask in a block's window; above it the mask is read sample by sample
+BLOCK_ROWS = 1 << 27       # float32 values of a block of lines in flight in the blocks path (window table, selects)
+WINDOW = 120               # the widest window (oversampled samples) of an output block the blocks path takes
+STRIDE = 8                 # samples between the starts of the windows in the table
+SPAN = 40                  # oversampled samples a block of output samples may span: sets the block size
 PHASES = 2048              # of resample.kernel_table
 
 
 def _path():
-    """'matmul' or 'gather': FASTSAR_RESAMPLE_JAX, else matmul on a TPU and gather on JAX's other devices."""
+    """'blocks' or 'gather': FASTSAR_RESAMPLE_JAX, else blocks on a TPU and gather on JAX's other devices."""
     v = os.environ.get('FASTSAR_RESAMPLE_JAX', 'auto').strip().lower() or 'auto'
-    if v not in ('auto', 'matmul', 'gather'):
-        raise ValueError(f"FASTSAR_RESAMPLE_JAX must be 'matmul', 'gather' or 'auto', got {v!r}")
-    return ('matmul' if jax.devices()[0].platform == 'tpu' else 'gather') if v == 'auto' else v
-
-
-def _exact_products():
-    """Whether a float32 matrix product is exact for a one-hot factor on this device: not on a TPU (bfloat16
-    products), where FASTSAR_RESAMPLE_SPLIT=0|1 overrides for tests."""
-    v = os.environ.get('FASTSAR_RESAMPLE_SPLIT', '')
-    return v == '0' if v in ('0', '1') else jax.devices()[0].platform != 'tpu'
+    if v not in ('auto', 'blocks', 'gather'):
+        raise ValueError(f"FASTSAR_RESAMPLE_JAX must be 'blocks', 'gather' or 'auto', got {v!r}")
+    return ('blocks' if jax.devices()[0].platform == 'tpu' else 'gather') if v == 'auto' else v
 
 
 def _split(rows):
@@ -104,7 +98,58 @@ def _oversample(z, pad, n2, real):
     return jnp.fft.ifft(G, axis=1)
 
 
-def _step(out, src, a, P, J, M, tab, *, axis, mode, nb, pad, guard, n2):
+def _fast_len(n):
+    """The least length of at least n that is 32 times 1, 3, 5, 7, 9 or 15 times a power of two: a TPU transforms
+    a length that 32 does not divide some ten times slower."""
+    return min(next(v for v in (32 * o << k for k in range(32)) if v >= n) for o in (1, 3, 5, 7, 9, 15))
+
+
+_KERNELS = {}
+
+
+def _kernels(n2, pad, real):
+    """The transforms [pad - 1, Lf or Lf // 2 + 1] (two float32 arrays: real and imaginary part), at a fast length
+    Lf >= 2 n2, of the kernels that give the samples of _oversample between the given ones: sample pad k + r of the
+    zero-padded transform of length n2 is the circular convolution of the line with the inverse transform of
+    exp(2 pi j f r / (pad n2)) over the signed frequencies f (cos(pi r / pad) at the Nyquist bin), a real kernel of
+    period n2, laid out here over (-n2, n2) so that a transform of length Lf convolves with it. Divided by pad, as
+    _oversample's values are."""
+    key = (n2, pad, real)
+    if key not in _KERNELS:
+        if len(_KERNELS) > 16:
+            _KERNELS.clear()
+        Lf, f = _fast_len(2 * n2), np.fft.fftfreq(n2) * n2
+        t = np.arange(-(n2 - 1), n2)
+        K = []
+        for r in range(1, pad):
+            D = np.exp(2j * np.pi * f * r / (pad * n2))
+            if n2 % 2 == 0:
+                D[n2 // 2] = np.cos(np.pi * r / pad)
+            ext = np.zeros(Lf)
+            ext[t % Lf] = np.fft.ifft(D).real[t % n2]
+            K.append((np.fft.rfft(ext) if real else np.fft.fft(ext)) / pad)
+        K = np.stack(K)
+        _KERNELS[key] = (K.real.astype(np.float32), K.imag.astype(np.float32))
+    return tuple(jnp.asarray(v) for v in _KERNELS[key])
+
+
+def _oversampled(u, pad, n2, real, K):
+    """_oversample(u, pad, n2, real), by the transforms of the line itself (K None) or, with K = _kernels(n2, pad,
+    real), by convolutions through transforms of K's length: the same samples to rounding."""
+    if K is None:
+        return _oversample(u, pad, n2, real)
+    Kc = lax.complex(K[0], K[1])
+    if real:
+        Lf = 2 * (Kc.shape[1] - 1)
+        F = jnp.fft.rfft(u, n=Lf, axis=1)
+        parts = [jnp.fft.irfft(F * Kc[r], n=Lf, axis=1)[:, :n2] for r in range(pad - 1)]
+    else:
+        F = jnp.fft.fft(u, n=Kc.shape[1], axis=1)
+        parts = [jnp.fft.ifft(F * Kc[r], axis=1)[:, :n2] for r in range(pad - 1)]
+    return jnp.stack([u * (1.0 / pad)] + parts, -1).reshape(u.shape[0], pad * n2)
+
+
+def _step(out, src, a, P, J, M, tab, K, *, axis, mode, nb, pad, guard, n2):
     """Lines a ... a + nb of a pass (resample_cuda._pass's conventions), written into out. mode 'knots': P, J as
     _knot's; 'split': P = (integer part, remainder) [nb, m] from the host; 'device': P = (pos [L, m],) on the device.
     M: None, or (Px, limits [xlo, xhi, ylo, yhi], valid [nx, ny] or None), warp's mask with Px as P."""
@@ -133,7 +178,7 @@ def _step(out, src, a, P, J, M, tab, *, axis, mode, nb, pad, guard, n2):
             ok = ok & jnp.take(valid.reshape(-1), at, mode='clip')
     u = jnp.pad(z, ((0, 0), (guard, n2 - n - guard)))
     if pad > 1:
-        u = _oversample(u, pad, n2, real)
+        u = _oversampled(u, pad, n2, real, K)
     taps, nphase = tab.shape[1], tab.shape[0] - 1
     q = jnp.where(ok, ff, 0) * pad
     fl = jnp.floor(q)
@@ -191,21 +236,29 @@ def _blocks(pos, sl, span):
         c.min(0), c.max(0)
 
 
-def _split3(x):
-    """float32 x as three bfloat16 arrays whose sum (in float32) is x."""
-    f, b = jnp.float32, jnp.bfloat16
-    h = x.astype(b)
-    r = x - h.astype(f)
-    m = r.astype(b)
-    return h, m, (r - m.astype(f)).astype(b)
+def _windows(u, w0, R):
+    """u [nb, N] (N a multiple of STRIDE), w0 [nb, nblk] (int32, multiples of STRIDE, w0 + R <= N; R a multiple of
+    STRIDE) -> [nb, nblk, R]: u[l, w0[l, b] : w0[l, b] + R], each read as one row of the table of the windows
+    that start at every STRIDE-th sample."""
+    nb, N = u.shape
+    c = u.reshape(nb, N // STRIDE, STRIDE)
+    nrow = (N - R) // STRIDE + 1
+    tab = jnp.concatenate([c[:, i:nrow + i] for i in range(R // STRIDE)], -1).reshape(nb * nrow, R)
+    return tab.at[jnp.arange(nb, dtype=jnp.int32)[:, None] * nrow + w0 // STRIDE].get(mode='promise_in_bounds')
 
 
-def _windows(u, w0, W):
-    """u [nb, N], w0 [nb, nblk] (int32, 0 <= w0 <= N - W) -> [nb, nblk, W]: u[l, w0[l, b] : w0[l, b] + W], one
-    slice per block."""
-    idx = jnp.stack([jnp.broadcast_to(jnp.arange(u.shape[0], dtype=jnp.int32)[:, None], w0.shape), w0], -1)
-    dn = lax.GatherDimensionNumbers(offset_dims=(2,), collapsed_slice_dims=(0,), start_index_map=(0, 1))
-    return lax.gather(u, idx, dn, slice_sizes=(1, W), mode='promise_in_bounds')
+def _front(g, rel, W, taps):
+    """g [..., 1, R] (windows), rel [..., B, 1] (int32, 0 <= rel < W, rel + taps <= R) -> [..., B, taps]:
+    g[..., rel : rel + taps], by one select per bit of rel: after the select of a bit the offset left is below it."""
+    bit = 1 << max(W - 1, 1).bit_length() - 1
+    while bit:
+        nw = bit + taps - 1
+        lo, hi = g[..., :nw], g[..., bit:bit + nw]
+        lo, hi = (jnp.pad(v, [(0, 0)] * (v.ndim - 1) + [(0, nw - v.shape[-1])]) if v.shape[-1] < nw else v
+                  for v in (lo, hi))
+        g = jnp.where(rel & bit != 0, hi, lo)
+        bit >>= 1
+    return g
 
 
 def _at(D, kink, B):
@@ -216,12 +269,10 @@ def _at(D, kink, B):
     return _floor(base[..., None], jnp.clip(f, -2.0 ** 24, 2.0 ** 24))
 
 
-def _step_mm(out, src, a, D, w0, kink, M, coef, *, axis, nb, m, pad, guard, n2, B, W, exact, Wv=None):
-    """Lines a ... a + nb of a pass by matrix products, written into out. D, kink: _blocks' and _span's; w0 [nb, nblk]:
-    the first oversampled sample of each block's window of W + taps - 1; coef: _poly's, times pad; M: None or (Dx,
-    limits, valid, v0), warp's mask; exact: float32 products are exact here (else three bfloat16 parts). Wv: None
-    (the mask read sample by sample), or the size of each block's window of the mask, whose first pixel is
-    v0 [nb, nblk, 2]: the nearest pixel of each sample is then the product of two one-hot matrices with the window."""
+def _step_blocks(out, src, a, D, w0, kink, M, coef, K, *, axis, nb, m, pad, guard, n2, B, W, R):
+    """Lines a ... a + nb of a pass by blocks of B output samples, written into out. D, kink: _blocks' and _span's;
+    w0 [nb, nblk]: the first oversampled sample of each block's window of R, the first taps of its samples starting
+    less than W after it; coef: _poly's, times pad; M: None or (Dx, limits, valid), warp's mask; K: _oversampled's."""
     real = not jnp.iscomplexobj(src)
     if axis == 1:
         n = src.shape[1]
@@ -232,55 +283,38 @@ def _step_mm(out, src, a, D, w0, kink, M, coef, *, axis, nb, m, pad, guard, n2, 
     taps, nblk = coef.shape[1], w0.shape[1]
     ib, ff = _at(D, kink, B)
     ok = _within(ib, ff, 0, n - 1)
-    mm = jnp.float32 if exact else jnp.bfloat16
     if M is not None:
-        Dx, lim, valid, v0 = M
+        Dx, lim, valid = M
         ix, fx = _at(Dx, kink, B)
         ok = ok & _within(ix, fx, lim[0], lim[1]) & _within(ib, ff, lim[2], lim[3])
         if valid is not None:
             nx, ny = valid.shape
-            ax, ay = jnp.clip(_rint(ix, fx), 0, nx - 1), jnp.clip(_rint(ib, ff), 0, ny - 1)
-            if Wv is None:
-                ok = ok & jnp.take(valid.reshape(-1), ax * ny + ay, mode='clip')
-            else:
-                dn = lax.GatherDimensionNumbers(offset_dims=(2, 3), collapsed_slice_dims=(), start_index_map=(0, 1))
-                V = lax.gather(valid.astype(mm), v0, dn, slice_sizes=Wv, mode='promise_in_bounds')    # [nb, nblk, Wx, Wy]
-                hot = lambda i, i0, w: (jnp.clip(i - i0[..., None], 0, w - 1)[..., None]
-                                        == jnp.arange(w, dtype=jnp.int32)).astype(mm)
-                rows = jnp.einsum('lbjx,lbxy->lbjy', hot(ax, v0[..., 0], Wv[0]), V, preferred_element_type=jnp.float32)
-                ok = ok & ((rows * hot(ay, v0[..., 1], Wv[1]).astype(jnp.float32)).sum(-1) > 0.5)
-    Wg = W + taps - 1
+            at = jnp.clip(_rint(ix, fx), 0, nx - 1) * ny + jnp.clip(_rint(ib, ff), 0, ny - 1)
+            ok = ok & jnp.take(valid.reshape(-1), at, mode='clip')
     u = jnp.pad(z, ((0, 0), (guard, n2 - n - guard)))
     if pad > 1:
-        u = _oversample(u, pad, n2, real)
-    if u.shape[1] < Wg:
-        u = jnp.pad(u, ((0, 0), (0, Wg - u.shape[1])))
+        u = _oversampled(u, pad, n2, real, K)
+    N = max(-(-u.shape[1] // STRIDE) * STRIDE, R)
+    u = jnp.pad(u, ((0, 0), (0, N - u.shape[1])))
     q = jnp.where(ok, ff, 0) * pad
     fl = jnp.floor(q)
     i0 = (jnp.where(ok, ib, 0) + guard) * pad + fl.astype(jnp.int32) - (taps // 2 - 1)
-    E = (jnp.clip(i0 - w0[..., None], 0, W - 1)[..., None] == jnp.arange(W, dtype=jnp.int32)).astype(mm)
-    parts = []
-    for ch in ((u,) if real else (jnp.real(u), jnp.imag(u))):
-        win = _windows(ch, w0, Wg)
-        parts.extend((win,) if exact else _split3(win))
-    U = jnp.stack([p[..., t:t + W] for t in range(taps) for p in parts], -1)       # [nb, nblk, W, taps * parts]
-    G = jnp.einsum('lbjw,lbwc->lbjc', E, U, preferred_element_type=jnp.float32)   # [nb, nblk, B, taps * parts]
-    G = G.reshape(nb, nblk, B, taps, 1 if real else 2, len(parts) // (1 if real else 2))
-    G = G[..., 0] if exact else G[..., 2] + G[..., 1] + G[..., 0]
+    rel = jnp.clip(i0 - w0[..., None], 0, W - 1)[..., None]                            # [nb, nblk, B, 1]
     t = jnp.rint((q - fl) * PHASES) * (2.0 / PHASES) - 1.0
     w = jnp.broadcast_to(coef[0], t.shape + (taps,))
     for c in coef[1:]:
         w = w * t[..., None] + c
-    o = (G * w[..., None]).sum(3)
-    o = o[..., 0] if real else lax.complex(o[..., 0], o[..., 1])
+    o = [(_front(_windows(ch, w0, R)[:, :, None, :], rel, W, taps) * w).sum(-1)
+         for ch in ((u,) if real else (jnp.real(u), jnp.imag(u)))]
+    o = o[0] if real else lax.complex(o[0], o[1])
     o = jnp.where(ok, o, 0).reshape(nb, nblk * B)[:, :m]
     return lax.dynamic_update_slice(out, o, (a, 0)) if axis == 1 else lax.dynamic_update_slice(out, o.T, (0, a))
 
 
-def _plan_mm(pos, posx, L, n, tab, pad, guard, n2, real, exact, vshape=None):
-    """The matmul path's plan of a pass on a knot map, or None when the map does not suit it: dict(B, W (_step_mm's),
-    nb (lines a step), D, w0, kink (the host arrays of _step_mm for all the lines), Dx (the mask's map, when posx is
-    given), Wv, v0 (the windows of a mask of shape vshape, when they are small enough))."""
+def _plan_blocks(pos, posx, L, n, tab, pad, guard, n2, real):
+    """The blocks path's plan of a pass on a knot map, or None when the map does not suit it: dict(B, W, R
+    (_step_blocks'), nb (lines a step), D, w0, kink (the host arrays of _step_blocks for all the lines), Dx (the
+    mask's map, when posx is given))."""
     taps = tab.shape[1]
     with np.errstate(invalid='ignore', divide='ignore'):
         sp = np.nanmedian(np.abs(np.diff(pos.v, axis=1) / np.diff(pos.ok))) * pad
@@ -288,46 +322,36 @@ def _plan_mm(pos, posx, L, n, tab, pad, guard, n2, real, exact, vshape=None):
         return None
     span = None
     for B in (32, 16, 8, 4):
-        if B * sp + 4 <= 40 or B == 4:
+        if B * sp + 4 <= SPAN or B == 4:
             span = _span(pos, B)
             if span is not None:
                 break
     if span is None:
         return None
-    nblk, N = len(span[0]), max(pad * n2, 1)
-    # whole pass on the host first: the window is one size for every block of lines
-    step = 4096
-    D, Dx, w0, v0, W, Wv = [], [], [], [], 0, np.zeros(2, np.int64)
-    for a in range(0, L, step):
-        sl = slice(a, min(L, a + step))
+    nblk, off = len(span[0]), guard * pad - (taps // 2 - 1) - 1
+    # the whole pass on the host first: the window is one size for every block of lines
+    D, Dx, w0, W = [], [], [], 0
+    for a in range(0, L, 4096):
+        sl = slice(a, min(L, a + 4096))
         d, lo, hi = _blocks(pos, sl, span)
         a0, a1 = (np.floor(np.clip(v, 0, n - 1) * pad) for v in (lo, hi))
-        W = max(W, int((a1 - a0).max()) + 3)
+        start = (a0 + off) // STRIDE * STRIDE                       # where the window starts: on the table's stride
+        W = max(W, int((a1 + off + 3 - start).max()))
         if W > WINDOW:
             return None
         D.append(d)
-        w0.append((a0 + (guard * pad - (taps // 2 - 1) - 1)).astype(np.int32))
+        w0.append(start.astype(np.int32))
         if posx is not None:
-            dx, xlo, xhi = _blocks(posx, sl, span)
-            Dx.append(dx)
-            if vshape is not None:                                  # the nearest pixels of a block, and one more around
-                r = [[np.floor(np.clip(v, 0, k - 1) + 0.5) for v in c] for c, k in zip(((xlo, xhi), (lo, hi)), vshape)]
-                Wv = np.maximum(Wv, [int((c[1] - c[0]).max()) + 3 for c in r])
-                v0.append(np.stack([r[0][0] - 1, r[1][0] - 1], -1).astype(np.int32))
-    W = -(-max(W, 4) // 4) * 4
+            Dx.append(_blocks(posx, sl, span)[0])
     cat = lambda parts: np.concatenate(parts) if len(parts) > 1 else parts[0]
-    D, w0 = tuple(cat([d[k] for d in D]) for k in range(4)), cat(w0)
-    w0 = np.clip(w0, 0, max(N, W + taps - 1) - (W + taps - 1))
-    Dx = tuple(cat([d[k] for d in Dx]) for k in range(4)) if posx is not None else None
-    mwin = None
-    if v0:
-        Wv = tuple(int(-(-w // 4) * 4) for w in Wv)
-        if Wv[0] * Wv[1] <= MASK_WINDOW and Wv[0] <= vshape[0] and Wv[1] <= vshape[1]:
-            mwin = Wv, np.clip(cat(v0), 0, np.array(vshape) - Wv)
-    per = nblk * W * taps * (1 if real else 2) * (1 if exact else 3)
-    nb = int(max(1, min(L, BLOCK_MM // per, BLOCK // max(pad * n2, pos.m))))
-    return dict(B=B, W=W, nb=nb, D=D, Dx=Dx, w0=w0, kink=span[4].astype(np.float32), Wv=mwin and mwin[0],
-                v0=mwin and mwin[1].astype(np.int32))
+    W = -(-W // 4) * 4
+    R = -(-(W + taps - 1) // STRIDE) * STRIDE
+    N = max(-(-pad * n2 // STRIDE) * STRIDE, R)
+    per = (1 if real else 2) * (N // STRIDE * R + nblk * B * (W + 2 * taps))
+    nb = int(max(1, min(L, BLOCK_ROWS // per, BLOCK // max(pad * n2, pos.m))))
+    return dict(B=B, W=W, R=R, nb=nb, D=tuple(cat([d[k] for d in D]) for k in range(4)), w0=np.clip(cat(w0), 0, N - R),
+                Dx=tuple(cat([d[k] for d in Dx]) for k in range(4)) if posx is not None else None,
+                kink=span[4].astype(np.float32))
 
 
 _JIT = {}
@@ -367,21 +391,20 @@ def _pass(src, pos, m, axis, kernel, taps, pad, mask=None):
         valid = None if valid is None else jnp.asarray(valid).astype(bool)
     out = jnp.zeros((L, m) if axis == 1 else (m, L), dt)
     plan = None
-    if knots and _path() == 'matmul':
-        exact = _exact_products()
-        plan = _plan_mm(pos, posx if mask is not None else None, L, n, tab, pad, guard, n2, real, exact,
-                        valid.shape if mask is not None and valid is not None else None)
+    # on a TPU (wherever the blocks path is chosen) a length that 32 does not divide is transformed at a fast one
+    K = _kernels(n2, pad, real) if pad > 1 and n2 % 32 and _path() == 'blocks' else None
+    if knots and _path() == 'blocks':
+        plan = _plan_blocks(pos, posx if mask is not None else None, L, n, tab, pad, guard, n2, real)
     if plan is not None:
-        step = _jit(_step_mm, ('axis', 'nb', 'm', 'pad', 'guard', 'n2', 'B', 'W', 'exact', 'Wv'))
+        step = _jit(_step_blocks, ('axis', 'nb', 'm', 'pad', 'guard', 'n2', 'B', 'W', 'R'))
         coef, kink, nb = jnp.asarray(_poly(tab) * np.float32(pad)), jnp.asarray(plan['kink']), plan['nb']
         for a in _starts(L, nb):
             sl = slice(a, a + nb)
             D = tuple(jnp.asarray(v[sl]) for v in plan['D'])
             if mask is not None:
-                M = (tuple(jnp.asarray(v[sl]) for v in plan['Dx']), lim, valid,
-                     None if plan['v0'] is None else jnp.asarray(plan['v0'][sl]))
-            out = step(out, src, np.int32(a), D, jnp.asarray(plan['w0'][sl]), kink, M, coef, axis=axis, nb=nb, m=m,
-                       pad=pad, guard=guard, n2=n2, B=plan['B'], W=plan['W'], exact=exact, Wv=plan['Wv'])
+                M = (tuple(jnp.asarray(v[sl]) for v in plan['Dx']), lim, valid)
+            out = step(out, src, np.int32(a), D, jnp.asarray(plan['w0'][sl]), kink, M, coef, K, axis=axis, nb=nb, m=m,
+                       pad=pad, guard=guard, n2=n2, B=plan['B'], W=plan['W'], R=plan['R'])
         return out
     step = _jit(_step, ('axis', 'mode', 'nb', 'pad', 'guard', 'n2'))
     for a in _starts(L, nb):
@@ -397,7 +420,7 @@ def _pass(src, pos, m, axis, kernel, taps, pad, mask=None):
             P = (jnp.asarray(ib.astype(np.int32)), jnp.asarray((q - ib).astype(np.float32)))
         if mask is not None:
             M = (tuple(jnp.asarray(v) for v in _split(posx.rows(sl))), lim, valid)
-        out = step(out, src, np.int32(a), P, J, M, tabd, axis=axis, mode=mode, nb=nb, pad=pad, guard=guard, n2=n2)
+        out = step(out, src, np.int32(a), P, J, M, tabd, K, axis=axis, mode=mode, nb=nb, pad=pad, guard=guard, n2=n2)
     return out
 
 
