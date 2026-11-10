@@ -112,7 +112,7 @@ def _local(e):
 
 def pvp_dtype(pvp, nbytes, order='>'):
     """The structured dtype of one vector of a CPHD 1.x file, from the XML's PVP element (an ElementTree element,
-    with or without namespaces) and Data.NumBytesPVP."""
+    with or without namespaces) and Data.NumBytesPVP. Fields in the XML's order, each at its own offset."""
     names, formats, offsets = [], [], []
 
     def walk(e):
@@ -127,9 +127,7 @@ def pvp_dtype(pvp, nbytes, order='>'):
                 walk(c)
     for c in pvp:
         walk(c)
-    k = np.argsort(offsets, kind='stable')
-    return np.dtype(dict(names=[names[i] for i in k], formats=[formats[i] for i in k],
-                         offsets=[offsets[i] for i in k], itemsize=int(nbytes)))
+    return np.dtype(dict(names=names, formats=formats, offsets=offsets, itemsize=int(nbytes)))
 
 
 def vbp_dtype(vp, nbytes, order='>'):

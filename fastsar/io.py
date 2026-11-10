@@ -416,7 +416,7 @@ def read_cphd(cphd, sicd=None, channel=0, meta=False, regrid_tol=1e-3, drop_flag
         # one compiled pass on all cores: byte order, scale, conjugation, the check for non-finite and empty rows
         sig, amp = direct
         loaded = np.zeros(P, np.uint8)
-        _lib().cphd_load(sig.ctypes.data, {'>i1': 1, '>i2': 2, '>f4': 4}[sig.dtype.str], P, K,
+        _lib().cphd_load(sig.ctypes.data, sig.dtype.itemsize, P, K,
                          None if amp is None else amp.ctypes.data, 0, None, None, S.ctypes.data, loaded.ctypes.data)
         del sig
     elif direct is not None:                    # the file's own bytes, converted on all cores
