@@ -212,7 +212,7 @@ def test_jax_in_blocks(statistics, monkeypatch):
         return out
     monkeypatch.delenv('FASTSAR_JAX_BLOCK_MB', raising=False)
     ref = run()
-    for mb in ('0.9', '0.76'):                                      # blocks of 2^14 pixels: 5, the last short, and 4
+    for mb in ('3.6', '3.04'):                                      # blocks of 2^14 pixels: 5, the last short, and 4
         monkeypatch.setenv('FASTSAR_JAX_BLOCK_MB', mb)
         assert remap._blocked(remap._nrl_u8, jnp.asarray(x), None) is not None
         assert all(np.array_equal(g, r) for g, r in zip(run(), ref))
@@ -240,3 +240,24 @@ def test_small_gpu_gives_the_same_values(monkeypatch):
         assert not got[~valid].any(), k
     assert np.array_equal(_xp.host(remap.linear(cp.asarray(x), valid=cp.asarray(valid))), lin)
     assert np.array_equal(_xp.host(remap.amplitude_to_density(cp.asarray(x), valid=cp.asarray(valid))), dens)
+
+
+def test_host_image_through_jax(monkeypatch):
+    """The per-pixel step of a remap of a host image on JAX's device, in blocks (process_cphd's, for an image the
+    device cannot hold): a host array with the display values of the image on the device; nrl's exactly (its
+    statistics are order statistics), the others' but for a value on a rounding boundary."""
+    jnp = pytest.importorskip('jax.numpy')
+    x = np.abs(speckle((301, 257))).astype(np.float32)
+    valid = x != 0
+    for mb in (None, '3.6'):
+        if mb:
+            monkeypatch.setenv('FASTSAR_JAX_BLOCK_MB', mb)
+        for name in NAMES:
+            for v in (None, valid):
+                ref = np.asarray(remap.REMAPS[name](jnp.asarray(x), valid=None if v is None else jnp.asarray(v)))
+                with remap._via_jax():
+                    got = remap.REMAPS[name](x, valid=v)
+                assert isinstance(got, np.ndarray) and got.dtype == np.uint8
+                d = np.abs(got.astype(int) - ref)
+                assert d.max() <= (0 if name == 'nrl' else 1) and np.count_nonzero(d) <= 1e-3 * d.size, name
+    assert not remap._VIA

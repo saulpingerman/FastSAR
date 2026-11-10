@@ -23,6 +23,7 @@ Defaults: the tasked area; a SICD on the slant plane with Taylor weighting and q
 ground plane, spatially variant apodization and the NRL remap. A moving-beam collection (stripmap, sliding
 spotlight) is formed on the ground plane on axes along the track, without autofocus or apodization.
 """
+import contextlib
 import time
 
 import numpy as np
@@ -99,13 +100,15 @@ def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None
     t0 = time.perf_counter()
     st['start'] = t0
 
-    cuda = backend == 'cuda'
+    cuda, jaxdev = backend == 'cuda', backend in ('jax', 'tpu')
 
-    def lap(name):
+    def lap(name, image=None):
         nonlocal t0
         if cuda:                                                     # the stage's kernels have run
             import cupy
             cupy.cuda.Stream.null.synchronize()
+        elif _xp.kind(image) == 'jax':                               # and the stage's programs, whose result this is
+            image.block_until_ready()
         t1 = time.perf_counter()
         timing[name] = timing.get(name, 0.0) + t1 - t0
         t0 = t1
@@ -185,23 +188,29 @@ def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None
     lap('form')
     timing['read'] = st['read'] - st['start']                        # the file, to the phase history in memory
     timing['form'] -= timing['read']
-    if not cuda:                                                     # the stages that follow run where it lives;
-        out['image'] = _xp.device(out['image'], backend)             # on a GPU, where _cuda_place finds room
+    if not cuda and not jaxdev:                                      # the stages that follow run where it lives;
+        out['image'] = _xp.device(out['image'], backend)             # on a device, where its plan finds room
     out.update(product=product, area=area, weighting=st['weighting'], autofocus=None, autofocus_info=None)
     tight = False
     try:
         if st['spot']:
-            out, tight = _spotlight(out, st, product, area, spacing, lap, cuda)
+            out, tight = _spotlight(out, st, product, area, spacing, lap, cuda, jaxdev)
         elif cuda and product == 'sidd':                             # a moving beam: the remap alone is the device's
             place, tight = _cuda_place(out, dict(ground=out['image'].nbytes, display=out['image'].size))
             if place['ground'] == 'device':
+                out['image'] = _xp.device(out['image'], backend)
+        elif jaxdev and product == 'sidd':
+            if _jax_place(out, dict(ground=out['image'].nbytes, display=out['image'].size))['ground'] == 'device':
                 out['image'] = _xp.device(out['image'], backend)
         out['timing'] = timing
         if product == 'sidd':
             out.update(remap=remap, remap_args=dict(remap_args or {}), shadows_down=bool(shadows_down))
         if output is not None and product == 'sidd':                 # remapped where the image lives
             from .sidd import write_sidd
-            out['metadata'] = write_sidd(output, out, remap=remap, remap_args=remap_args, shadows_down=shadows_down)
+            from .remap import _via_jax
+            # an image the JAX device could not hold is on the host: its remap crosses the device in blocks
+            with _via_jax() if jaxdev and _xp.kind(out['image']) == 'numpy' else contextlib.nullcontext():
+                out['metadata'] = write_sidd(output, out, remap=remap, remap_args=remap_args, shadows_down=shadows_down)
         out['image'] = _xp.host(out['image'])
     except Exception as e:
         if not cuda or type(e).__name__ != 'OutOfMemoryError':
@@ -268,6 +277,43 @@ def _cuda_place(out, sizes, **stages):
     return plan['place'], tight
 
 
+def _jax_place(out, sizes, **stages):
+    """Where the images of the product live while the stages after formation run on JAX's device (memory.cuda_plan
+    with the JAX path's accounting, on _xp.jax_budget()) -> place. A device that does not report its memory (JAX on
+    a CPU) holds them all. A note says so when the device cannot."""
+    budget = _xp.jax_budget()
+    if budget is None:
+        return dict.fromkeys(('ground', 'mid', 'slant', 'detected', 'ground_mid', 'product'), 'device')
+    plan = memory.cuda_plan(sizes, budget, joined=True, **stages)
+    if not plan['fits']:
+        names = dict(ground='the image as formed', mid='the intermediate image of the slant resampling',
+                     slant='the slant image', detected='the detected slant image',
+                     ground_mid='the intermediate image of the ground projection', product='the product image')
+        out['notes'].append(
+            f"the JAX device has {plan['budget'] / 1e9:.1f} GB for the stages after formation, which take "
+            f"{plan['need'] / 1e9:.1f} GB with every image of this product on it: kept on the host and passed "
+            'through the device in blocks: ' + ', '.join(names[k] for k, v in plan['place'].items() if v == 'host'))
+    return plan['place']
+
+
+def _detect_jax(img, where):
+    """The amplitude (float32) of a complex image on the host or on JAX's device, as an array on the device
+    (where='device') or the host, through the device in blocks of rows unless both are there."""
+    import jax
+    import jax.numpy as jnp
+    from . import resample_jax as rj
+    if _xp.kind(img) == 'jax' and where == 'device':
+        return jnp.abs(img)
+    n0, n1 = img.shape
+    nb = _xp.jax_rows(n0, 24 * n1, 'detection on the JAX device')
+    if _detect_jax not in rj._JIT:
+        rj._JIT[_detect_jax] = jax.jit(jnp.abs)
+    lines, out = rj._source(img), rj._Sink(where, n0, n1, nb, 1, np.float32)
+    for a in rj._starts(n0, nb):
+        out.put(a, rj._JIT[_detect_jax](lines(a, nb)))
+    return out.done()
+
+
 def _detect(img, where):
     """The amplitude (float32) of a complex image on the host or a CUDA device, as an array on the device
     (where='device') or the host, through the device in blocks of rows unless both are there."""
@@ -288,7 +334,7 @@ def _detect(img, where):
     return out
 
 
-def _spotlight(out, st, product, area, spacing, lap, cuda):
+def _spotlight(out, st, product, area, spacing, lap, cuda, jaxdev=False):
     s, wt, mg = st['sampling'], st['weighting'], st['margin']
     out['window'] = (wt, wt)
     nx, ny = out['image'].shape
@@ -309,7 +355,7 @@ def _spotlight(out, st, product, area, spacing, lap, cuda):
         b = st['bounds']
         shape = (int(np.ceil((b[1] - b[0]) / px)) + 1, int(np.ceil((b[3] - b[2]) / px)) + 1)
     place, tight, release = None, False, lambda: None
-    if cuda:
+    if cuda or jaxdev:
         sizes = dict(ground=8 * nx * ny, valid=0 if st['valid'] is None else nx * ny)
         if st['via_slant']:
             na, nr = planes._slant_shape(sp, planes._slant_bounds(out, mg))[1]
@@ -317,18 +363,26 @@ def _spotlight(out, st, product, area, spacing, lap, cuda):
             if product == 'sidd':
                 sizes.update(detected=4 * na * nr, ground_mid=4 * na * shape[1], product=4 * shape[0] * shape[1],
                              display=shape[0] * shape[1])
+    if jaxdev:
+        place = _jax_place(out, sizes, autofocus=bool(st['autofocus']), sva=wt == 'sva')
+        if place['ground'] == 'device':
+            out['image'] = _xp.device(out['image'], 'jax')
+    elif cuda:
         place, tight = _cuda_place(out, sizes, autofocus=bool(st['autofocus']), sva=wt == 'sva')
         if tight:
             release = memory.cuda_release
         if place['ground'] == 'device':
             out['image'] = _xp.device(out['image'], 'cuda')
-    planes.deramp(out, _cuda=cuda)
-    lap('baseband')
+    planes.deramp(out, _cuda=cuda, _jax=jaxdev)
+    lap('baseband', out['image'])
     if st['autofocus']:
         from .autofocus import image_autofocus
         try:
             try:
-                out['image'], info = image_autofocus(out['image'], st['autofocus'])
+                from .autofocus import _via_jax
+                # an image on the host with a JAX backend: its global estimate and correction cross the device
+                with _via_jax() if jaxdev and _xp.kind(out['image']) == 'numpy' else contextlib.nullcontext():
+                    out['image'], info = image_autofocus(out['image'], st['autofocus'])
             except Exception as e:                                   # the device held the image, not the correction
                 if _xp.kind(out['image']) != 'cupy' or type(e).__name__ != 'OutOfMemoryError':
                     raise
@@ -344,7 +398,7 @@ def _spotlight(out, st, product, area, spacing, lap, cuda):
             out['notes'].append(f'autofocus skipped: {e}')
         out.update(autofocus=st['autofocus'] if info.get('applied', True) else None, autofocus_info=info)
         release()
-        lap('autofocus')
+        lap('autofocus', out['image'])
     valid = None if st['valid'] is None else _mask(out, st, area)
     if not st['via_slant']:                                          # a ground-plane SICD: the image as formed
         if valid is not None and _xp.kind(out['image']) == 'cupy':
@@ -354,18 +408,18 @@ def _spotlight(out, st, product, area, spacing, lap, cuda):
             xp = _xp.module(out['image'])
             out['image'] = xp.where(xp.asarray(valid), out['image'], 0)
         out['bandwidth'] = (s['bx'], s['by_full'])
-        lap('mask')
+        lap('mask', out['image'])
         return out, tight
     if product == 'sicd' and spacing is not None and (sp[0] > 1.0001 / s['ba'] or sp[1] > 1.0001 / s['br']):
         out['notes'].append(f"spacing {sp[0]:.3f} x {sp[1]:.3f} m is coarser than the band of the data allows "
                             f"({1 / s['ba']:.3f} x {1 / s['br']:.3f} m): the image is aliased")
     ground = {k: out[k] for k in ('origin', 'e1', 'e2', 'spx', 'spy')}
     sl = planes.to_slant(out, sp, margin=mg, valid=valid,
-                         **(dict(_cuda=dict(mid=place['mid'], out=place['slant'])) if cuda else {}))
+                         **({'_cuda' if cuda else '_jax': dict(mid=place['mid'], out=place['slant'])} if place else {}))
     out['image'] = None                                              # the caller's dict too: the ground image is freed
     del out, valid
     release()
-    lap('to_slant')
+    lap('to_slant', sl['image'])
     if wt == 'sva':
         # apodization takes the band centered: where the aperture is not symmetric about the center of aperture,
         # the azimuth band is moved to zero for it and back
@@ -373,7 +427,11 @@ def _spotlight(out, st, product, area, spacing, lap, cuda):
         if abs(k0) > 0.002 * (st['kept'][1] - st['kept'][0]):
             a = (np.arange(sl['image'].shape[0]) - sl['scp_pixel'][0]) * sl['spx']
             ramp = np.exp(-2j * np.pi * k0 * a).astype(np.complex64)[:, None]
-        if cuda:                                                     # the ramps on the device, with the image's blocks
+        if jaxdev:                                                   # the ramps with the image's blocks, as below
+            img, sl['image'] = [sl['image']], None                   # given up: a device image is freed as its slabs go
+            sl['image'] = _weighting.sva(img, 2, _jax=(
+                ramp, ramp.conj() if ramp is not None and product == 'sicd' else None, place['slant']))
+        elif cuda:                                                   # the ramps on the device, with the image's blocks
             import cupy
             if ramp is not None:
                 ramp = (cupy.asarray(ramp), cupy.asarray(ramp.conj()) if product == 'sicd' else None)
@@ -386,19 +444,22 @@ def _spotlight(out, st, product, area, spacing, lap, cuda):
             if ramp is not None and product == 'sicd':
                 sl['image'] = sl['image'] * ramp.conj()
         release()
-        lap('sva')
+        lap('sva', sl['image'])
     if product == 'sicd':
         return sl, tight
     # a SIDD: detected on the slant plane, projected to square ground pixels on axes along the line of sight
-    sl['image'] = _detect(sl['image'], place['detected']) if cuda else _xp.module(sl['image']).abs(sl['image'])
+    if jaxdev:
+        sl['image'] = _detect_jax(sl['image'], place['detected'])
+    else:
+        sl['image'] = _detect(sl['image'], place['detected']) if cuda else _xp.module(sl['image']).abs(sl['image'])
     release()
-    lap('detect')
+    lap('detect', sl['image'])
     if px > res:
         sl['notes'].append(f'pixel {px:.3f} m is coarser than the resolution ({res:.3f} m): the detected image is not '
                            'filtered before it is resampled, and speckle aliases')
     o = ground['origin'] + mg * ground['spx'] * ground['e1'] + mg * ground['spy'] * ground['e2']
-    g = planes.to_ground(sl, o, ground['e1'], ground['e2'], px, shape,
-                         **(dict(_cuda=dict(mid=place['ground_mid'], out=place['product'])) if cuda else {}))
+    g = planes.to_ground(sl, o, ground['e1'], ground['e2'], px, shape, **(
+        {'_cuda' if cuda else '_jax': dict(mid=place['ground_mid'], out=place['product'])} if place else {}))
     del sl
     if _xp.kind(g['image']) == 'jax':
         g['image'] = _xp.module(g['image']).maximum(g['image'], 0)
@@ -406,5 +467,5 @@ def _spotlight(out, st, product, area, spacing, lap, cuda):
         _xp.module(g['image']).maximum(g['image'], 0, out=g['image'])
     g['bandwidth'] = (s['bx'], s['by'])
     release()
-    lap('to_ground')
+    lap('to_ground', g['image'])
     return g, tight

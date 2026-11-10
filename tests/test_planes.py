@@ -349,3 +349,57 @@ def test_small_gpu_gives_the_same_images(need, monkeypatch):
     monkeypatch.setenv('FASTSAR_CUDA_BLOCK_MB', '0.001')                 # not one line: said, with the sizes
     with pytest.raises(MemoryError, match='one line takes .* MB of device memory'):
         planes.to_slant(planes.deramp(dict(base, image=cp.asarray(img))), (0.45, 0.25))
+
+
+@pytest.mark.parametrize('path', ['gather', 'blocks'])
+def test_jax_images_on_the_host(path, need, monkeypatch):
+    """deramp, to_slant and to_ground through JAX's device for images on the host (process_cphd's placement when
+    the device cannot hold them): the source, the intermediate image and the result each on the host or on the
+    device give the on-device result, with its zeros, whatever the block budget."""
+    jnp = need('jax.numpy')
+    from fastsar import _xp
+    monkeypatch.setenv('FASTSAR_RESAMPLE_JAX', path)
+    nx, ny = 330, 290
+    rng = np.random.default_rng(41)
+    base = _product(nx, ny, 0.5, 0.35, 10e3, 0.0, 20.0)
+    img = (rng.normal(size=(nx, ny)) + 1j * rng.normal(size=(nx, ny))).astype(np.complex64)
+    valid = np.ones((nx, ny), bool)
+    valid[: nx // 3, : ny // 2] = False
+    ref = planes.deramp(dict(base, image=jnp.asarray(img)))
+    sl = planes.to_slant(dict(ref), (0.45, 0.25), margin=10, valid=valid)
+    g = sl['ground']
+    det = dict(sl, image=abs(sl['image']))
+    gd = planes.to_ground(dict(det), g['origin'], g['e1'], g['e2'], 0.3, (500, 440))
+
+    def same(got, want, kind):
+        assert _xp.kind(got) == kind
+        got, want = _xp.host(got), _xp.host(want)
+        assert got.dtype == want.dtype and np.array_equal(got == 0, want == 0)
+        assert np.abs(got - want).max() < 1e-5 * np.abs(want).max()
+    for mb in (None, '2'):
+        if mb:
+            monkeypatch.setenv('FASTSAR_JAX_BLOCK_MB', mb)
+        host = planes.deramp(dict(base, image=np.ascontiguousarray(img.T).T), _jax=True)       # a view, as a former's
+        same(host['image'], ref['image'], 'numpy')
+        for src in ('numpy', 'jax'):
+            for mid in ('host', 'device'):
+                for out in ('host', 'device'):
+                    kind = 'numpy' if out == 'host' else 'jax'
+                    o = dict(ref, image=_xp.host(ref['image']).copy() if src == 'numpy' else ref['image'])
+                    s2 = planes.to_slant(o, (0.45, 0.25), margin=10, valid=valid, _jax=dict(mid=mid, out=out))
+                    same(s2['image'], sl['image'], kind)
+                    assert o['image'] is None                        # given up, so that the device can free it
+                    o = dict(det, image=_xp.host(det['image']).copy() if src == 'numpy' else det['image'])
+                    g2 = planes.to_ground(o, g['origin'], g['e1'], g['e2'], 0.3, (500, 440),
+                                          _jax=dict(mid=mid, out=out))
+                    same(g2['image'], gd['image'], kind)
+
+
+def test_jax_line_too_long_for_the_device(need, monkeypatch):
+    """A device that cannot hold one line of a resampling says what the line takes and what there is."""
+    jnp = need('jax.numpy')
+    from fastsar import resample
+    monkeypatch.setenv('FASTSAR_JAX_BLOCK_MB', '0.01')
+    src = np.ones((4, 3000), np.complex64)
+    with pytest.raises(MemoryError, match='one line takes .* MB of device memory and 0.0 MB are available'):
+        resample.lines(jnp.asarray(src), np.tile(np.arange(100.0), (4, 1)))

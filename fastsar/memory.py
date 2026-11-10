@@ -256,7 +256,7 @@ def full_speed(plan, K, backend, isz=8):
     return 4 * groups + image, dict(history=0.0, first_level=groups, image=image)
 
 
-def cuda_plan(sizes, budget, *, autofocus=False, sva=False):
+def cuda_plan(sizes, budget, *, autofocus=False, sva=False, joined=False):
     """Where the images of a process_cphd product live while the stages after formation run on a CUDA device.
 
     sizes: bytes of the arrays the product goes through, by name, those it has among 'ground' (the image as
@@ -270,6 +270,13 @@ def cuda_plan(sizes, budget, *, autofocus=False, sva=False):
     ground image is there. Of the placements whose every stage fits, the one that moves the fewest bytes between
     host and device is taken (an array on the host crosses once for every stage that reads or writes it).
 
+    joined: the JAX path's accounting (a TPU). An array written on the device is made of blocks that are joined at
+    the end, so it is there twice for a moment, and the join of a complex one takes 0.4 of it more (measured on a
+    TPU v6e, which keeps complex numbers as two real arrays); autofocus and the display run in blocks whether the
+    image is on the device or on the host, the correction writing a new image. Of two placements that move the
+    same bytes the one that takes less of the device is taken: the last image of a complex product then goes to
+    the host block by block instead of being joined on the device and copied.
+
     -> dict(place: {name: 'device' or 'host'}, fits: everything is on the device, need: the bytes that takes,
     budget)."""
     import itertools
@@ -279,7 +286,9 @@ def cuda_plan(sizes, budget, *, autofocus=False, sva=False):
     reserve = budget / 8
     # (arrays read, arrays written, device bytes beside them, runs only where its input is)
     stages = [(('ground',), ('ground',), 0.0, False)]                                      # baseband
-    if autofocus:
+    if autofocus and joined:                                         # the image is kept for the guard, with its planes
+        stages.append((('ground',), ('ground',), size['ground'], False))
+    elif autofocus:
         stages.append((('ground',), (), size['ground'] + 4 * min(size['ground'], float(1 << 30)), True))
     if 'mid' in size:
         stages += [(('ground',), ('mid',), 0.0, False), (('mid',), ('slant',), valid, False)]
@@ -290,7 +299,7 @@ def cuda_plan(sizes, budget, *, autofocus=False, sva=False):
     if 'detected' in size:
         stages += [(('slant',), ('detected',), 0.0, False), (('detected',), ('ground_mid',), 0.0, False),
                    (('ground_mid',), ('product',), 0.0, False)]
-    if display:
+    if display and not joined:
         stages.append(((names[-1],), (), 3 * display, True))
 
     def need(dev):
@@ -298,7 +307,13 @@ def cuda_plan(sizes, budget, *, autofocus=False, sva=False):
         for read, written, extra, local in stages:
             if local and read[0] not in dev:
                 continue
-            worst = max(worst, sum(size[k] for k in set(read + written) if k in dev) + extra)
+            if joined:                                              # the array read, the blocks written and their join
+                made = sum((2.4 if k in ('ground', 'mid', 'slant') else 2.0) * size[k] for k in written if k in dev)
+                worst = max(worst, sum(size[k] for k in read if k in dev) + made + extra)
+            else:
+                worst = max(worst, sum(size[k] for k in set(read + written) if k in dev) + extra)
+        if joined and display and names[-1] in dev:
+            worst = max(worst, size[names[-1]] + 2 * display)
         return worst + reserve
 
     def moved(dev):
@@ -310,10 +325,14 @@ def cuda_plan(sizes, budget, *, autofocus=False, sva=False):
                 n += sum(size[k] for k in read + written if k not in dev)
         return n
     best = None
+    # megabytes moved (two sums of the same sizes in another order differ in their last digit), then the need
+    cost = (lambda dev: (round((moved(dev) + (size[names[-1]] if display and names[-1] not in dev else 0.0)) / 2 ** 20),
+                         need(dev))) if joined else moved
     for r in range(len(names), -1, -1):
         for dev in itertools.combinations(names, r):
-            if need(dev) <= budget and (best is None or moved(dev) < moved(best)):
+            if need(dev) <= budget and (best is None or cost(dev) < cost(best)):
                 best = dev
     best = () if best is None else best
-    return dict(place={k: 'device' if k in best else 'host' for k in names}, fits=len(best) == len(names),
+    return dict(place={k: 'device' if k in best else 'host' for k in names},
+                fits=need(tuple(names)) <= budget if joined else len(best) == len(names),
                 need=need(tuple(names)), budget=float(budget))

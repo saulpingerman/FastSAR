@@ -516,10 +516,34 @@ def test_jax_correction_in_column_blocks(monkeypatch):
     phi = 0.7 * np.linspace(-1, 1, 300) ** 2
     monkeypatch.delenv('FASTSAR_JAX_BLOCK_MB', raising=False)
     ref = np.asarray(af._apply(jnp.asarray(x), phi))
-    monkeypatch.setenv('FASTSAR_JAX_BLOCK_MB', '0.5')                # 27 columns a block
+    monkeypatch.setenv('FASTSAR_JAX_BLOCK_MB', '2')                  # 27 columns a block
     got = np.asarray(af._apply(jnp.asarray(x), phi))
     assert np.array_equal(got == 0, ref == 0) and not got[:40, :50].any() and not np.array_equal(got, x)
     assert np.abs(got - ref).max() < 1e-5 * np.abs(ref).max()
     monkeypatch.setenv('FASTSAR_JAX_BLOCK_MB', 'none')
     with pytest.raises(ValueError):
         af._apply(jnp.asarray(x), phi)
+
+
+def test_host_image_through_jax(monkeypatch):
+    """The global estimates and the correction of an image on the host through JAX's device in column blocks
+    (process_cphd's, for an image the device cannot hold): the estimate and the image of the on-device run."""
+    jnp = pytest.importorskip('jax.numpy')
+    rng = np.random.default_rng(32)
+    nx, ny = 512, 300
+    x = np.zeros((nx, ny), np.complex64)
+    x[rng.integers(40, nx - 40, 400), rng.integers(0, ny, 400)] = rng.normal(size=400) + 1j * rng.normal(size=400)
+    x += 0.02 * (rng.normal(size=x.shape) + 1j * rng.normal(size=x.shape)).astype(np.complex64)
+    v = np.fft.fftfreq(nx) * 2
+    bad = np.fft.ifft(np.fft.fft(x, axis=0) * np.exp(9j * v ** 2)[:, None], axis=0).astype(np.complex64)
+    bad[:20] = 0
+    for mode in ('quadratic', 'pga'):
+        monkeypatch.delenv('FASTSAR_JAX_BLOCK_MB', raising=False)
+        ref, info = af.image_autofocus(jnp.asarray(bad), mode)
+        monkeypatch.setenv('FASTSAR_JAX_BLOCK_MB', '2')              # 27 columns a block
+        with af._via_jax():
+            got, info2 = af.image_autofocus(bad.copy(), mode)
+        ref = np.asarray(ref)
+        assert isinstance(got, np.ndarray) and info['applied'] and info2['applied']
+        assert np.array_equal(got == 0, ref == 0) and np.abs(got - ref).max() < 1e-5 * np.abs(ref).max()
+    assert not af._VIA

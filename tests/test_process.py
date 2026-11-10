@@ -276,3 +276,49 @@ def test_errors(cphd):
                       (dict(plane='ground', weighting='sva'), 'slant plane')):
         with pytest.raises(ValueError, match=match):
             fastsar.process_cphd(p, backend='cpu', **kw)
+
+
+@pytest.mark.parametrize('kw', [dict(), dict(product='sidd'), dict(weighting='sva'), dict(plane='ground'),
+                                dict(product='sidd', autofocus=False, remap='log')],
+                         ids=['sicd', 'sidd', 'sva', 'ground', 'sidd-log'])
+def test_small_jax_device_gives_the_same_product(cphd, kw, monkeypatch, tmp_path):
+    """A JAX device with too little memory for the images of a product (FASTSAR_JAX_BLOCK_MB: a megabyte to count
+    on, or part of the product's need) gives the product of a device with room: the images stay on the host and
+    cross the device in blocks, a note says so, and the pixels are the same to float32 rounding, with the zeros
+    of the area."""
+    pytest.importorskip('jax')
+    from fastsar import memory
+    d, ecf = cphd
+    ext = 'sidd' if kw.get('product') == 'sidd' else 'sicd'
+    monkeypatch.delenv('FASTSAR_JAX_BLOCK_MB', raising=False)
+    ref = fastsar.process_cphd(str(d / 'c.cphd'), str(tmp_path / f'ref.{ext}'), backend='jax', **kw)
+    assert not any('JAX device has' in n for n in ref['notes'])
+    plans = []
+    plan = memory.cuda_plan
+    monkeypatch.setattr(memory, 'cuda_plan', lambda *a, **k: plans.append(plan(*a, **k)) or plans[-1])
+    need = None
+    for mb in (1.0, 0.45, 0.8):
+        if need is not None:                                         # some of the images on the device
+            mb = mb * need / 2 ** 20
+        monkeypatch.setenv('FASTSAR_JAX_BLOCK_MB', str(mb))
+        o = fastsar.process_cphd(str(d / 'c.cphd'), str(tmp_path / f'small.{ext}'), backend='jax', **kw)
+        need = plans[0]['need']
+        assert plans[-1]['budget'] == int(mb * 2 ** 20) and not plans[-1]['fits']
+        assert sum('JAX device has' in n and 'kept on the host' in n for n in o['notes']) == 1
+        assert [n for n in o['notes'] if 'JAX device has' not in n] == ref['notes']
+        assert o['image'].dtype == ref['image'].dtype and o['image'].shape == ref['image'].shape
+        e = np.abs(o['image'] - ref['image']) / np.abs(ref['image']).max()
+        assert e.max() < 1e-5, (mb, e.max())
+        # the zeros of the area are the same; apodization also nulls single pixels to rounding (1e-11 of the peak),
+        # which fall on zero or beside it
+        differ = (o['image'] == 0) != (ref['image'] == 0)
+        assert differ.sum() < 1e-4 * differ.size and (not differ.any() or e[differ].max() < 1e-8), (mb, differ.sum())
+        a, b = (np.fromfile(str(tmp_path / f'{k}.{ext}'), np.uint8) for k in ('small', 'ref'))
+        # the complex samples differ in their last bits (the transforms of other blocks of lines); display values
+        # on a rounding boundary by one count
+        assert a.size == b.size
+        assert ext == 'sicd' or np.count_nonzero(a != b) < (1e-3 if kw.get('remap') != 'log' else 1e-2) * a.size, mb
+    assert len({tuple(p['place'].values()) for p in plans}) >= min(2, len(plans[0]['place']))
+    monkeypatch.setenv('FASTSAR_JAX_BLOCK_MB', '0')
+    with pytest.raises(ValueError, match='FASTSAR_JAX_BLOCK_MB'):
+        fastsar.process_cphd(str(d / 'c.cphd'), backend='jax', **kw)

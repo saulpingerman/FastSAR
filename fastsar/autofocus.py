@@ -232,6 +232,9 @@ def _select(img, lines, max_lines, band_db):
     nx, ny = img.shape
     idx = np.unique(np.round(np.linspace(0, ny - 1, min(ny, int(max_lines)))).astype(np.int64))
     sub = img[:, idx].astype(xp.complex64)
+    if _VIA and xp is np:                                           # a host image, its estimate on JAX's device
+        import jax.numpy as xp
+        sub = xp.asarray(sub)
     p = xp.abs(sub) ** 2
     cnt, s, mx = (_xp.host(t).astype(np.float64) for t in ((p > 0).sum(0), p.sum(0), p.max(0)))
     ok = np.flatnonzero((cnt > 0) & (cnt >= 0.5 * cnt.max()) & (s > 0))
@@ -385,9 +388,32 @@ def _threads(work, items):
         list(ex.map(work, items))
 
 
+_VIA = []                # not empty: a NumPy image's corrections and column sums run on JAX's device (_via_jax)
+
+
+class _via_jax:
+    """with _via_jax(): the global estimates and the correction of an image on the host run on JAX's device, the
+    image crossing it in column blocks (process_cphd's, for an image the device cannot hold). The result is on the
+    host."""
+
+    def __enter__(self):
+        _VIA.append(1)
+
+    def __exit__(self, *exc):
+        _VIA.pop()
+
+
+def _columns(img):
+    """block(j, w) -> columns j ... j + w of an image on the device or on the host as a JAX array [nx, w]
+    (resample_jax._source: a device image is read through its real planes, a host one crosses block by block)."""
+    from .resample_jax import _source
+    lines = _source(img, 0)
+    return lambda j, w: lines(j, w).T
+
+
 def _jax_width(nx, ny):
-    """Columns per block of a JAX image [nx, ny] (see _apply)."""
-    return int(min(ny, max(1, min(_BLOCK['jax'], _xp.jax_block() // 64) // nx)))
+    """Columns per block of a JAX image [nx, ny] (see _apply). MemoryError when the device cannot hold one."""
+    return int(min(_xp.jax_rows(ny, 64 * nx, 'the autofocus correction on the JAX device'), max(1, _BLOCK['jax'] // nx)))
 
 
 def _colsums(img):
@@ -396,10 +422,10 @@ def _colsums(img):
     come to the host."""
     nx, ny = img.shape
     out, k = np.zeros((3, ny)), _xp.kind(img)
-    if k == 'jax':
-        f, w = _jit('colsums'), _jax_width(nx, ny)
+    if k == 'jax' or _VIA:
+        f, w, block = _jit('colsums'), _jax_width(nx, ny), _columns(img)
         for j in list(range(0, ny - w + 1, w)) + ([ny - w] if ny % w else []):
-            out[:, j:j + w] = [_xp.host(t) for t in f(img[:, j:j + w])]
+            out[:, j:j + w] = [_xp.host(t) for t in f(block(j, w))]
         return out
     xp = _xp.module(img)
     w = int(max(1 if k == 'cupy' else 4, _BLOCK[k] // nx))
@@ -476,12 +502,21 @@ def _apply(img, phi):
     nx, ny = img.shape
     q = np.exp(-1j * np.asarray(phi, np.float64)).astype(np.complex64)
     k = _xp.kind(img)
+    if k == 'numpy' and _VIA:                                       # through JAX's device, to a new host image
+        f, w, out, block = _jit('fixed'), _jax_width(nx, ny), np.empty((nx, ny), np.complex64), _columns(img)
+        last = None
+        for j in list(range(0, ny - w + 1, w)) + ([ny - w] if ny % w else []):
+            last, cur = (j, f(block(j, w), q)), last
+            if cur is not None:                                     # written while the next block is under way
+                _xp.to_host(out, (slice(None), slice(cur[0], cur[0] + w)), cur[1])
+        _xp.to_host(out, (slice(None), slice(last[0], last[0] + w)), last[1])
+        return out
     if k == 'jax':
         import jax.numpy as jnp
-        f, w = _jit('fixed'), _jax_width(nx, ny)
-        parts = [f(img[:, j:j + w], q) for j in range(0, ny - w + 1, w)]
+        f, w, block = _jit('fixed'), _jax_width(nx, ny), _columns(img)
+        parts = [f(block(j, w), q) for j in range(0, ny - w + 1, w)]
         if ny % w:
-            parts.append(f(img[:, ny - w:], q)[:, w - ny % w:])
+            parts.append(f(block(ny - w, w), q)[:, w - ny % w:])
         return parts[0] if len(parts) == 1 else jnp.concatenate(parts, axis=1)
     if k == 'cupy':
         import cupy as cp

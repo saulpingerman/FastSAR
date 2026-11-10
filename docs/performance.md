@@ -176,6 +176,22 @@ March spotlight through the device took 0.9 s, against 0.2 s on the device and 1
 but autofocus is moved to the CPU for lack of device memory. The January rows were timed while the machine ran
 other work.
 
+### The stages after formation on a TPU
+
+On the jax and tpu backends `process_cphd` plans in the same way from the device memory not in use (a TPU v5e has
+about 16 GB, a v6e about 31 GB; `FASTSAR_JAX_BLOCK_MB` overrides it). A stage writes an image on the device as
+blocks that are joined at the end, so the image is there twice for a moment (2.4 times for a complex one), and an
+image that does not fit stays on the host: its blocks are uploaded, and the finished blocks come back as real
+arrays. The baseband step, the autofocus estimate and correction, both resamplings, apodization, detection and the
+remap all take a host image this way, and a note in `out['notes']` names the images kept on the host. The pixels
+are those of a device with room to float32 rounding (the transforms run on other blocks of lines).
+
+A Capella spotlight collection whose slant image at twice Nyquist has 1,155 Mpx (9.2 GB), on a TPU v6e, second
+run, with the slant image on the host: the default SIDD (676 Mpx) in 45.5 s (formation 17.7 s, to the slant plane
+9.2 s, apodization 3.7 s, detection 1.5 s, to the ground 2.9 s, remap and file 8.4 s), and the apodized SICD in
+40.6 s, with 26 GB of the device in use at the peak. The resampling to the slant plane costs about 0.010 s per
+megapixel from 35 to 1,155 Mpx.
+
 ## Environment variables
 
 | Variable | Default | Effect |
@@ -200,7 +216,7 @@ other work.
 | `FASTSAR_RESAMPLE_JAX` | `blocks` on a TPU, `gather` on JAX's other devices | how `resample` interpolates a JAX image on a knot map (`planes.to_slant`, `planes.to_ground`): `gather` reads every tap with an indexed load, as the CPU and CUDA kernels do; `blocks` reads one window per block of output samples as a row of a table and moves the taps by selects, which a TPU does some fifty times faster |
 | `FASTSAR_REMAP_JAX` | `count` on a TPU, `histogram` on JAX's other devices | how the order statistics of a JAX image are found (`remap.nrl`, `remap.percentile`): from two histograms, or from counts of the pixels below thresholds; the same statistics either way |
 | `FASTSAR_CUDA_BLOCK_MB` | nine tenths of the free device memory, counting the unused blocks of CuPy's pool | megabytes of device memory the stages after formation count on, on the cuda backend: their blocks take a quarter of it at a time (at most 2048 MB), and `process_cphd` keeps on the host the images of a product that do not fit in it (see [Memory](#the-stages-after-formation-on-a-small-gpu)) |
-| `FASTSAR_JAX_BLOCK_MB` | a sixteenth of the device's memory, at most 2048 (1024 where the device does not report its memory) | megabytes of temporary arrays a stage after formation holds on JAX's device at a time; apodization, the remaps, the autofocus correction, the baseband step and the resampling cut the image into blocks that fit |
+| `FASTSAR_JAX_BLOCK_MB` | nine tenths of the device memory not in use, where the device reports it (a TPU; JAX on a CPU does not, and holds every image) | megabytes of JAX's device the stages after formation count on, on the jax and tpu backends: `process_cphd` keeps on the host the images of a product that do not fit (an image written on the device is there twice while its blocks are joined) and passes them through the device in blocks, with a note; a stage's own blocks take a quarter of it, at most 2048 (by default a sixteenth of the device's memory) |
 | `FASTSAR_FINAL` | `tc3` | `fp32` keeps the cuda float32 final stage on the CUDA cores instead of three bfloat16 tensor-core passes |
 
 Numeric settings out of range raise `ValueError`. The `FFBP_` prefix is a legacy name. `FASTSAR_CPU_BLOCKED` (`1`
