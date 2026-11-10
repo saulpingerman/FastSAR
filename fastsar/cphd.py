@@ -117,7 +117,8 @@ def form_cphd(cphd, sicd=None, *, mode='auto', backend='auto', window=True, spac
     axes: 'track' (e1 along the track, e2 across it) or, for a spotlight, 'los': e2 along the line of sight from the
         mid-aperture antenna position to the scene center, projected on the ground and pointing away from the radar,
         e1 = e2 x up across it (the axes fastsar.planes resamples from, and the ones on which range runs along a
-        grid axis whatever the squint); extent is then (across, along) the line of sight.
+        grid axis whatever the squint); extent is then (across, along) the line of sight. 'auto': 'los' for a
+        spotlight, 'track' for a moving beam.
     aperture: 'auto' (a spotlight without a sicd or a spacing: the central part of the aperture that makes the
         azimuth resolution the ground range resolution), 'square' (that part whatever else is given) or 'full'.
     -> dict(image [nx, ny] complex64, origin [3] (local, pixel (0, 0)), e1, e2 (unit axes, local), spx, spy, mode,
@@ -131,8 +132,8 @@ def form_cphd(cphd, sicd=None, *, mode='auto', backend='auto', window=True, spac
     from . import patches
     if mode not in ('auto', 'spotlight', 'moving'):
         raise ValueError("mode must be 'auto', 'spotlight' or 'moving'")
-    if axes not in ('track', 'los'):
-        raise ValueError("axes must be 'track' or 'los'")
+    if axes not in ('track', 'los', 'auto'):
+        raise ValueError("axes must be 'track', 'los' or 'auto'")
     if aperture not in ('auto', 'square', 'full'):
         raise ValueError("aperture must be 'auto', 'square' or 'full'")
     backend = _backend(backend)                       # before the file is read
@@ -163,6 +164,8 @@ def form_cphd(cphd, sicd=None, *, mode='auto', backend='auto', window=True, spac
     spot = mode == 'spotlight'
     if autofocus and not spot:
         raise ValueError('autofocus is implemented for spotlight collections only')
+    if axes == 'auto':
+        axes = 'los' if spot else 'track'
     if axes == 'los' and not spot:
         raise ValueError("axes='los' is for spotlight collections: a moving beam has no one line of sight")
     # ground-plane axes at the scene: e1 along track, e2 across, horizontal
@@ -219,6 +222,8 @@ def form_cphd(cphd, sicd=None, *, mode='auto', backend='auto', window=True, spac
     plan = {} if _plan is None else (_plan(dict(S=S, ant=ant, fmin=f0, df=df, center=center, e1=e1, e2=e2, graze=graze,
                                                 corners=corners, mode=mode, meta=meta, sicd=sm, notes=notes,
                                                 pulses=used)) or {})
+    if plan.get('window') is not None:
+        window = bool(plan['window'])
     if window:
         wk = _taylor(K)
         wp = _taylor(P) if spot else np.ones(P, np.float32)

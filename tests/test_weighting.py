@@ -79,10 +79,15 @@ def test_keystone_keeps_a_rectangle():
     ant = np.stack([np.full(P, -8e3), y, np.full(P, 5e3)], 1)
     scp, e1 = np.zeros(3), np.array([0.0, -1.0, 0.0])
     S = np.ones((P, K), np.complex64)
-    lost = weighting.keystone(S, ant, fmin, df, scp, e1)
+    lost, band = weighting.keystone(S, ant, fmin, df, scp, e1, symmetric=False)
     u = (scp - ant) / np.linalg.norm(scp - ant, axis=1, keepdims=True)
     ka = (fmin + df * np.arange(K))[None] * (u @ e1)[:, None]         # azimuth spatial frequency, times c / 2
     lo, hi = fmin * (u @ e1).min(), fmin * (u @ e1).max()
     inside = (ka >= lo - 1e-3 * abs(lo)) & (ka <= hi + 1e-3 * hi)
     assert np.array_equal(S != 0, inside) or (np.abs((S != 0).astype(int) - inside).sum() <= P)   # to within a sample a pulse
     assert S[:, 0].all() and 0.005 < lost < K * df / fmin and abs(lost - (S == 0).mean()) < 1e-12
+    assert np.allclose(band, (2 * lo / 299792458.0, 2 * hi / 299792458.0))
+    S = np.ones((P, K), np.complex64)                                  # the same width on both sides of zero
+    lost2, band2 = weighting.keystone(S, ant, fmin, df, scp, e1)
+    assert abs(band2[0] + band2[1]) < 1e-12 and abs(band2[1] - min(band[1], -band[0])) < 1e-12 and lost2 > lost
+    assert np.abs((S != 0).astype(int) - (np.abs(ka) <= fmin * 299792458.0 / (2 * fmin) * band2[1] * (1 + 1e-3))).sum() <= P

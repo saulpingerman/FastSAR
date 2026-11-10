@@ -21,6 +21,8 @@ import numpy as np
 
 __all__ = ['sva', 'keystone']
 
+C = 299792458.0
+
 
 def _pass(src, dst, axis, N, joint):
     """One apodization pass along `axis`, row blocks of src [n0, n1] into dst (along axis 0: another array)."""
@@ -99,21 +101,29 @@ def sva(img, oversample=2, *, axes=(1, 0), joint=True, inplace=False):
     return cur
 
 
-def keystone(S, ant, fmin, df, scp, e1):
+def keystone(S, ant, fmin, df, scp, e1, symmetric=True):
     """Trim a spotlight phase history S [P, K] (in place) to a rectangle of the slant plane's spatial frequencies.
 
     Pulse p at frequency f lies at the azimuth spatial frequency (2 f / c) s_p, s_p the component along the slant
     plane's azimuth axis e1 [3] of the unit vector from the antenna (ant [P, 3]) to the scene center scp [3]. The
     samples kept are those inside the azimuth band the first frequency spans, fmin * [min s, max s]: at frequency f
-    the pulses with f s_p in it. -> the fraction of the samples set to zero."""
+    the pulses with f s_p in it. symmetric: the band is cut to the same width on both sides of zero (the smaller
+    of the two), which centers it as apodization assumes.
+    -> the fraction of the samples set to zero, and the azimuth band kept (least, greatest; cycles/m)."""
     P, K = S.shape
     u = np.asarray(scp, np.float64)[None] - np.asarray(ant, np.float64)
     s = (u / np.linalg.norm(u, axis=1, keepdims=True)) @ np.asarray(e1, np.float64)
-    lim = np.where(s > 0, s.max(), s.min())
+    hi, lo = s.max(), s.min()
+    if symmetric:
+        hi = min(hi, -lo)
+        lo = -hi
+    lim = np.where(s > 0, hi, lo)
     with np.errstate(divide='ignore', invalid='ignore'):
         fcut = np.where(s != 0, fmin * lim / s, np.inf)              # the last frequency kept of each pulse
+    fcut = np.where(fcut < fmin, -np.inf, fcut)                       # a pulse outside the band at every frequency
     kcut = np.where(np.isfinite(fcut), np.floor((np.minimum(fcut, fmin + K * df) - fmin) / df + 1e-9), K - 1)
-    kcut = np.clip(kcut.astype(np.int64) + 1, 1, K)
+    kcut = np.where(np.isneginf(fcut), -1, kcut)
+    kcut = np.clip(kcut.astype(np.int64) + 1, 0, K)
     for p in np.nonzero(kcut < K)[0]:
         S[p, kcut[p]:] = 0
-    return float((K - kcut).sum() / (P * K))
+    return float((K - kcut).sum() / (P * K)), (2 * fmin / C * lo, 2 * fmin / C * hi)
