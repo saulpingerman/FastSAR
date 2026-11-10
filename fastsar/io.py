@@ -397,16 +397,21 @@ def read_cphd(cphd, sicd=None, channel=0, meta=False, regrid_tol=1e-3, drop_flag
             # collection focus and match the vendor's SICD (amplitude correlation 0.96 and 0.78) only without conjugation
             sgn = -1
             notes.append('Capella collection: SGN = +1 declared, phase taken as SGN = -1')
-    if sgn > 0:
-        np.conjugate(S, out=S)
     # pulses without valid positions or samples at the ends of the aperture are trimmed; an invalid interior
     # position is interpolated from its neighbors, and non-finite interior samples are zeroed
     posbad = ~np.isfinite(tx).all(1) | ~np.isfinite(rcv).all(1) | ~np.isfinite(srp).all(1)
     empty = np.zeros(P, bool)
-    for p0 in range(0, P, 2048):
-        blk = S[p0:p0 + 2048]
-        blk[~np.isfinite(blk)] = 0
-        empty[p0:p0 + 2048] = np.abs(blk).sum(1) == 0
+
+    def clean(sl):                              # in place, row blocks on all cores
+        blk = S[sl]
+        if sgn > 0:
+            np.conjugate(blk, out=blk)
+        nonfinite = ~np.isfinite(blk)
+        if nonfinite.any():
+            blk[nonfinite] = 0
+        empty[sl] = ~blk.view(np.float32).any(axis=1)
+    from .patches import _rows
+    _rows(clean, P, int(max(1, min(256, (1 << 21) // max(K, 1)))))
     bad = posbad | empty
     sig = pv('SIGNAL')
     flagged = np.zeros(P, bool) if sig is None else np.asarray(sig).ravel() == 0
