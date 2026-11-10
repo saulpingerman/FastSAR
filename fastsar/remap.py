@@ -178,12 +178,17 @@ def _amp(xp, x):
 def _psum(xp, a):
     """Sums of parts of a whose total, added in float64 on the host, is the sum of a: the float64 sum itself with
     NumPy and CuPy; with JAX, float32 sums of blocks of 128 values, then of blocks of 128 of those (a float32 sum
-    of 128 terms loses its last 3 or 4 bits at most, and the errors of many blocks average out)."""
+    of 128 terms loses its last 3 or 4 bits at most, and the errors of many blocks average out). Each block is
+    added by halves, pair by pair: a reduction's order of additions is the compiler's and changes with the shape
+    of the array, and the partial sums of an image taken in blocks (_blocked) must be the whole image's."""
     if xp.__name__ != 'jax.numpy':
         return a.sum(dtype=xp.float64)
     a = a.reshape(-1)
     for _ in range(2):
-        a = xp.pad(a, (0, -a.size % 128)).reshape(-1, 128).sum(1)
+        a = xp.pad(a, (0, -a.size % 128)).reshape(-1, 128)
+        while a.shape[1] > 1:
+            a = a[:, 0::2] + a[:, 1::2]
+        a = a[:, 0]
     return a
 
 

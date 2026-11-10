@@ -391,8 +391,10 @@ def test_collection(tmp_path):
 
 
 def test_jax_correction_in_column_blocks(monkeypatch):
-    """With little device memory the correction of a JAX image runs in narrower column blocks: the same values
-    exactly, zeros kept."""
+    """With little device memory the correction of a JAX image runs in narrower column blocks: the same image, its
+    zeros kept exactly. The values agree to float32 rounding and not to the bit: an FFT library transforms several
+    columns at a time in vector registers and the rest one by one, so a column's rounding depends on the width of
+    the block it is in (seen on AVX2 and ARM hosts, not on an AVX-512 one)."""
     jnp = pytest.importorskip('jax.numpy')
     rng = np.random.default_rng(31)
     x = (rng.normal(size=(300, 257)) + 1j * rng.normal(size=(300, 257))).astype(np.complex64)
@@ -402,7 +404,8 @@ def test_jax_correction_in_column_blocks(monkeypatch):
     ref = np.asarray(af._apply(jnp.asarray(x), phi))
     monkeypatch.setenv('FASTSAR_JAX_BLOCK_MB', '0.5')                # 27 columns a block
     got = np.asarray(af._apply(jnp.asarray(x), phi))
-    assert np.array_equal(got, ref) and not got[:40, :50].any() and not np.array_equal(got, x)
+    assert np.array_equal(got == 0, ref == 0) and not got[:40, :50].any() and not np.array_equal(got, x)
+    assert np.abs(got - ref).max() < 1e-5 * np.abs(ref).max()
     monkeypatch.setenv('FASTSAR_JAX_BLOCK_MB', 'none')
     with pytest.raises(ValueError):
         af._apply(jnp.asarray(x), phi)
