@@ -2,15 +2,16 @@
 import fnmatch
 import os
 import re
-import tomllib
 
 import fastsar
 
 
 def test_kernel_sources_are_package_data():
     here = os.path.dirname(os.path.abspath(fastsar.__file__))
-    with open(os.path.join(os.path.dirname(here), 'pyproject.toml'), 'rb') as fh:
-        globs = tomllib.load(fh)['tool']['setuptools']['package-data']['fastsar']
+    with open(os.path.join(os.path.dirname(here), 'pyproject.toml')) as fh:        # (tomllib is Python 3.11's)
+        block = re.search(r'\[tool\.setuptools\.package-data\]\s*\nfastsar\s*=\s*\[([^\]]*)\]', fh.read())
+    globs = re.findall(r'"([^"]+)"', block.group(1))
+    assert globs
     sources = [f for f in os.listdir(here) if f.endswith(('.cpp', '.hpp', '.mm', '.metal', '.cu'))]
     assert 'ffbp_cpu.cpp' in sources and 'par.hpp' in sources
     missing = [f for f in sources if not any(fnmatch.fnmatch(f, g) for g in globs)]
