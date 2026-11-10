@@ -29,7 +29,9 @@ Where the image lives. The image may be a NumPy array, a CuPy array or a JAX arr
 same place (fastsar._xp); from a device only scalars, partial sums and histogram counts cross to the host. On the
 host the image is taken in row blocks on the thread pool of fastsar.patches. The statistics are the host's on every
 device: the 99th percentile from the same order statistics, which two histogram passes over the bit patterns of the
-amplitudes find without a sort, and the means from float64 sums on a GPU. JAX works in single precision throughout,
+amplitudes find without a sort (on a TPU, which adds into indexed bins slowly, a search by counts of the pixels
+below thresholds: FASTSAR_REMAP_JAX=count|histogram), and the means from float64 sums on a GPU. JAX works in single
+precision throughout,
 as a TPU must: its sums are float32 sums over blocks of 128 pixels, and of 128 of those, whose few thousand partial
 sums are added in float64 on the host. A device's amplitude and logarithm differ from NumPy's in the last bit, so a
 display value on a rounding boundary can come out one count away: a few pixels in a million (one in 100,000 for
@@ -277,6 +279,69 @@ def _hist(x, valid, lut, amp=True):
     return h
 
 
+def _below_jax(xp, amp, x, valid, thr):
+    """The number (int32 [len(thr)]) of valid pixels whose key (_key, of the float32 amplitude, or of the value when
+    amp is False) is below each key of thr (uint32)."""
+    u = _key(xp, _amp(xp, x) if amp else x.astype(xp.float32))
+    return xp.stack([((u < thr[i]) if valid is None else (u < thr[i]) & valid).sum(dtype=xp.int32)
+                     for i in range(thr.shape[0])])
+
+
+def _jax_statistics():
+    """'count' or 'histogram', the way a JAX image's order statistics are found: FASTSAR_REMAP_JAX, else count on a
+    TPU (which adds into indexed bins slowly, about 1e8 pixels a second, and compares and sums fast) and histogram
+    on JAX's other devices."""
+    import os
+    v = os.environ.get('FASTSAR_REMAP_JAX', 'auto').strip().lower() or 'auto'
+    if v not in ('auto', 'count', 'histogram'):
+        raise ValueError(f"FASTSAR_REMAP_JAX must be 'count', 'histogram' or 'auto', got {v!r}")
+    if v == 'auto':
+        import jax
+        v = 'count' if jax.devices()[0].platform == 'tpu' else 'histogram'
+    return v
+
+
+def _order(x, valid, amp=True):
+    """n and take, as _ranks gives them, for the float32 amplitudes of x (amp False: its values) over the valid
+    pixels, where x lives."""
+    if _xp.kind(x) == 'jax' and _jax_statistics() == 'count':
+        import jax.numpy as jnp
+        below = _jit(_below_jax, bool(amp))
+        return _ranks_count(lambda thr: np.asarray(below(x, valid, jnp.asarray(thr)), np.int64), _count(x, valid))
+    return _ranks(lambda lut: _hist(x, valid, lut, amp))
+
+
+def _ranks_count(below, n, radix=16):
+    """_ranks without histograms, from counts alone: below(thr) -> the number of values whose key is under each key
+    of thr (uint32 [16] or [48]); n: the number of values. The keys are searched from the whole range down: a
+    range of keys that holds a rank asked for is cut in `radix` parts, the counts below the cuts say which parts
+    hold such ranks, and so on until a part is one key (8 passes for one group of neighboring ranks).
+    -> n, take(*ranges), as _ranks'."""
+    def take(*ranges):
+        cells, found = [(0, 1 << 32, 0, n)], []                    # keys a ... b - 1 hold the ranks ca ... cb - 1
+        while cells:
+            edges = [[a + (b - a) * i // min(radix, b - a) for i in range(1, min(radix, b - a))] for a, b, _, _ in cells]
+            flat = np.array([t for e in edges for t in e], np.uint32)
+            size = 16 if len(flat) <= 16 else 48                   # two compiled sizes; a short call is filled by repeats
+            cnt = np.concatenate([below(np.resize(flat[i:i + size], size))[:len(flat[i:i + size])]
+                                  for i in range(0, len(flat), size)])
+            cells, at, last = [], 0, cells
+            for (a, b, ca, cb), e in zip(last, edges):
+                es, cs = [a, *e, b], [ca, *cnt[at:at + len(e)].tolist(), cb]
+                at += len(e)
+                for i in range(len(es) - 1):
+                    if cs[i + 1] > cs[i] and any(cs[i] < hi and cs[i + 1] > lo for lo, hi in ranges):
+                        (found if es[i + 1] - es[i] == 1 else cells).append((es[i], es[i + 1], cs[i], cs[i + 1]))
+        found.sort()
+        keys, end = np.array([c[0] for c in found], np.uint32), np.array([c[3] for c in found], np.int64)
+        out = []
+        for lo, hi in ranges:
+            u = keys[np.searchsorted(end, np.arange(lo, hi), 'right')]
+            out.append(np.where(u >> 31 != 0, u & np.uint32(0x7fffffff), ~u).view(np.float32))
+        return out
+    return n, take
+
+
 def _ranks(hist):
     """Exact order statistics of float32 values from two passes of histograms, without a sort and with only the
     counts on the host. hist(lut) -> counts as _hist gives them. The first pass counts the values by the high half
@@ -331,7 +396,7 @@ def percentile(v, p, halfwidth=32):
     by a factor of about 3.7 per knot). v on a device (a CuPy or JAX array): taken as float32, its order statistics
     found there from histograms (they are the ones a sort gives); the result is a float32 scalar on the host."""
     if _xp.kind(v) != 'numpy':
-        n, take = _ranks(lambda lut: _hist(v, None, lut, amp=False))
+        n, take = _order(v, None, amp=False)
         if n == 0:
             raise ValueError('percentile of no values')
         t, lo, hi = _window(n, p, halfwidth)
@@ -482,7 +547,7 @@ def nrl(x, a=1.0, c=220.0, valid=None):
     maximum (255). a: scale of the 99th percentile; c: the output value where the logarithmic part starts."""
     f = _f
     x, valid = _args(x, valid)
-    n, take = _ranks(lambda lut: _hist(x, valid, lut))
+    n, take = _order(x, valid)
     if n == 0:
         raise ValueError('nrl remap of no pixels')
     t, lo, hi = _window(n, 99, 32)

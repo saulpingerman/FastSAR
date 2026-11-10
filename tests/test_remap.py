@@ -18,15 +18,16 @@ def ref():
     return dict(np.load(REF))
 
 
-@pytest.fixture(params=[pytest.param('cupy', marks=pytest.mark.cuda), 'jax'])
-def device(request):
+@pytest.fixture(params=[pytest.param('cupy', marks=pytest.mark.cuda), 'jax', 'jax-count'])
+def device(request, monkeypatch):
     """(kind, put): put(a) is the NumPy array a as a CuPy array (needs a GPU), or as a JAX array on JAX's CPU
-    device, which runs the code a TPU runs."""
+    device, with the order statistics from histograms ('jax') or from counts, as on a TPU ('jax-count')."""
     if request.param == 'cupy':
         import cupy
         return 'cupy', cupy.asarray
     jnp = pytest.importorskip('jax.numpy')
     request.getfixturevalue('jax_cpu')
+    monkeypatch.setenv('FASTSAR_REMAP_JAX', 'count' if request.param.endswith('count') else 'histogram')
     return 'jax', jnp.asarray
 
 
@@ -157,3 +158,34 @@ def test_devices(ref, device):
         assert remap.percentile(put(x.real.ravel()), 30) == remap.percentile(x.real.ravel(), 30)
     with pytest.raises(ValueError):
         remap.remap(put(x), 'gamma')
+
+
+def test_ranks_from_counts():
+    """Order statistics from counts below thresholds (a TPU's search) are the sorted values: neighboring ranks, the
+    ends, ties, negative values, infinities and NaN (last), and one value."""
+    rng = np.random.default_rng(8)
+    v = np.concatenate([rng.standard_normal(5000), np.full(40, 0.25), [0.0, -0.0, np.inf, -np.inf, np.nan, np.nan]]).astype(np.float32)
+    rng.shuffle(v)
+    calls = []
+
+    def below(thr):
+        calls.append(len(thr))
+        return np.array([np.count_nonzero(remap._key(np, v) < t) for t in thr], np.int64)
+    n, take = remap._ranks_count(below, v.size)
+    s = np.sort(v)
+    got = take((0, 1), (2500, 2564), (v.size - 4, v.size), (0, v.size))
+    assert n == v.size and all(np.array_equal(g, w, equal_nan=True) for g, w in zip(got, (s[:1], s[2500:2564], s[-4:], s)))
+    assert set(calls) <= {16, 48}
+    calls.clear()
+    assert np.array_equal(take((2500, 2564))[0], s[2500:2564]) and len(calls) < 150
+    one = np.array([3.5], np.float32)
+    assert remap._ranks_count(lambda thr: np.array([np.count_nonzero(remap._key(np, one) < t) for t in thr]), 1)[1]((0, 1))[0][0] == 3.5
+
+
+def test_fastsar_remap_jax_is_checked(monkeypatch):
+    pytest.importorskip('jax')
+    monkeypatch.setenv('FASTSAR_REMAP_JAX', 'sorted')
+    with pytest.raises(ValueError):
+        remap._jax_statistics()
+    monkeypatch.delenv('FASTSAR_REMAP_JAX')
+    assert remap._jax_statistics() in ('count', 'histogram')
