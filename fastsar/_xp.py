@@ -63,5 +63,7 @@ def device(a, backend):
         return cupy.asarray(a)
     if backend in ('jax', 'tpu'):
         import jax.numpy as jnp
-        return jnp.asarray(a)
+        # a private copy of a NumPy array: on its CPU device JAX may keep the host buffer, and the caller may go on
+        # to write it
+        return jnp.asarray(np.array(a) if kind(a) == 'numpy' else a)
     return host(a)

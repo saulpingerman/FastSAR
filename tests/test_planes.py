@@ -224,7 +224,8 @@ def test_on_device(lib, need):
     rng = np.random.default_rng(6)
     ref = _product(nx, ny, 0.5, 0.35, 10e3, 0.0, 20.0)
     ref['image'] = (rng.normal(size=(nx, ny)) + 1j * rng.normal(size=(nx, ny))).astype(np.complex64)
-    dev = dict(ref, image=xp.asarray(ref['image']))
+    # a copy: JAX before 0.7 can keep the host buffer of an array on its CPU device, and deramp writes ref's in place
+    dev = dict(ref, image=xp.asarray(ref['image'].copy()))
     planes.deramp(ref), planes.deramp(dev)
     assert dev['baseband']
     _close(dev['image'], ref['image'], lib, 5e-6, 5e-6)
