@@ -52,6 +52,79 @@ In `tests/test_planes.py` and `tests/test_process.py`, on a simulated collection
 and a curved track, flown to either side, each target falls within 0.05 pixel of the position sarpy's projection
 of the written SICD gives, on both planes, and its phase is within 0.05 rad of SICD's convention.
 
+## Processed area by image quality
+
+`fastsar.rgiqe` predicts the signal-to-noise ratio and the RNIIRS rating of the image a CPHD collection forms, at
+any ground point, and turns the prediction into the region worth processing. The radar generalized image quality
+equation rates an image by its information density:
+
+```
+RNIIRS = 3.4761 + 0.4357 log2(bandwidth_area * log2(1 + SNR))
+```
+
+`bandwidth_area` is the ground-plane area of the spatial-frequency support in cycles^2 / m^2 (range bandwidth times
+azimuth bandwidth times the cosine of the slope angle). Below a transition density the rating follows the tangent
+line through the origin. `rniirs`, `information_density`, `snr_to_rniirs` and `rniirs_to_snr` reproduce sarpy 2.1.1.
+
+`Radiometry` supplies the SNR. For a uniformly weighted image formed from N phase-history samples,
+
+```
+NESZ(x) = PN * bandwidth_area / (N * PTRef * G(x))
+SNR(x)  = sigma0 * G(x) / (NESZ_ref + sigma0 * sum_k G(x_k))
+```
+
+where PN is the noise power per sample, PTRef the per-sample power of a 1 m^2 target at the scene reference point,
+G(x) the two-way antenna gain relative to that point (averaged over the aperture, with the R^-4 spreading loss), and
+x_k the first two azimuth ambiguities of x on either side, whose echoes count as noise. Points whose echo falls
+outside the receive window TOA1..TOA2 get an SNR of zero. The reference sigma0 defaults to 0 dB for a co-polarized
+channel and -6.02 dB for a cross-polarized one, as in sarpy.
+
+### Noise level
+
+The level at the scene reference point comes from the first source available (`level_source`; `notes` lists what
+was assumed). A measurement reads 512 pulses and fits the noise floor in the extended delay swath beside the scene
+when the file saves one; otherwise it takes the lowest cell of a range-Doppler power map.
+
+1. `nesz_db` given by the caller (`'argument'`).
+2. The Radiometric block of a SICD of the same collection (`'sicd'`).
+3. PTRef and PNRef of the CPHD file (`'cphd'`).
+4. PTRef with the noise power measured from the phase history (`'cphd+measured'`).
+5. The measured clutter-to-noise ratio with an assumed mean scene sigma0, `scene_sigma0_db` (`'uncalibrated'`).
+
+### Areas
+
+`area_mask` returns a mask over a ground grid and `area_bounds` its bounding rectangle along two ground axes. Each
+area is the connected region around the scene reference point, joined with the tasked polygon:
+
+- `'tasked'`: the tasked polygon.
+- `'tasked_quality'`: where the RNIIRS is at least the tasked one (given, from the SICD, or the model's minimum).
+- a number: where the predicted RNIIRS is at least that number.
+- `'black'`: where the SNR is at least 1, with the range swath opened to the extended window TOAE1..TOAE2.
+
+### Example
+
+```python
+from fastsar import io, rgiqe
+data, meta = io.read_collection('collect.cphd', meta=True)
+rad = rgiqe.Radiometry('collect.cphd', meta)                  # see rad.level_source and rad.notes
+c = rad.ref_point[None]                                       # points are [n, 3] in the local frame of meta
+print(rad.nesz_db(c, bw_area, samples), rad.rniirs(c, bw_area, samples))
+lo1, hi1, lo2, hi2 = rgiqe.area_bounds(rad, 'black', c[0], e1, e2, bw_area, samples, tasked=corners)
+```
+
+### Limitations
+
+- The image is assumed uniformly weighted and not corrected for the antenna pattern.
+- Gain polynomials are trusted to 15 dB one-way below their peak; beyond that no area criterion is met.
+- An `'uncalibrated'` level rests on the assumed scene sigma0; a range-Doppler noise level is an upper bound.
+- Ambiguities assume a uniform scene and are placed with the mid-aperture geometry; range ambiguities are ignored.
+- A low RNIIRS threshold at a large bandwidth area needs an SNR below 1, and its area can exceed `'black'`.
+
+`process_cphd(..., area=)` takes the same four kinds. The image is formed over the bounding rectangle of the area
+on the ground axes, with one impulse response everywhere and a noise-equivalent sigma zero that rises toward the
+edges, and the pixels outside the area are set to 0. A file that describes no antenna pattern gives the signal no
+edge to follow, and only the tasked area can then be processed.
+
 ## Weighting and spatially variant apodization
 
 `'taylor'` applies a Taylor window (nbar 4, 35 dB) to the phase history along frequency and along pulses.
