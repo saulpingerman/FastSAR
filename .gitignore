@@ -21,6 +21,7 @@ htmlcov/
 # radar data and arrays
 *.npy
 *.npz
+!tests/data/*.npz
 *.cphd
 *.nitf
 *.ntf
