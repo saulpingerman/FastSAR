@@ -188,7 +188,7 @@ def _sicd_levels(sicd, notes):
 class Radiometry:
     """Signal-to-noise model of the image a CPHD collection forms.
 
-    cphd_path: the CPHD file (or an open sarpy reader of it). meta: the dict read_cphd or read_collection returned
+    cphd_path: the CPHD file (or an open reader of it: fastsar's own or sarpy's). meta: the dict read_cphd or read_collection returned
     for the same channel; ground points are given in its local frame (io.ecf_to_local, io.local_to_ecf). pulses: a
     slice (or (first, last + 1)) of meta's pulses when the image uses only some of them. channel: the channel index
     when meta does not carry one.
@@ -210,9 +210,8 @@ class Radiometry:
         if hasattr(cphd_path, 'cphd_meta'):
             r = cphd_path
         else:
-            _deps.require('sarpy')
-            from sarpy.io.phase_history.converter import open_phase_history
-            r = open_phase_history(str(cphd_path))
+            from .io import _open_cphd
+            r = _open_cphd(str(cphd_path))
         m = r.cphd_meta
         self.notes, self.meta = [], meta
         ch = int(meta.get('channel_index', channel))

@@ -154,10 +154,8 @@ def write_cphd(path, col, S, lat, lon, height=0.0, heading=0.0, speed=200.0, srp
     frame for a moving beam (S compensated to them), default the scene center. scene: side (m) of the square image
     area, default the extent the collection's frequency step leaves unambiguous. tropo: the two-way troposphere
     delay (s, one value or one per pulse) written as TDTropoSRP; S should already hold it (exp(-j 2 pi f tropo)).
-    Needs sarpy."""
-    _deps.require('sarpy')
-    from sarpy.io.phase_history.cphd1_elements.CPHD import CPHDType
-    from sarpy.io.phase_history.cphd import CPHDWriter1
+    The file is written by fastsar._cphdxml.write_cphd."""
+    from . import _cphdxml
     from .io import ecf_to_geodetic
     P, K = S.shape
     ant = np.asarray(col.ant, np.float64)
@@ -208,16 +206,14 @@ def write_cphd(path, col, S, lat, lon, height=0.0, heading=0.0, speed=200.0, srp
 <SRPCODTime>{g(0.5 * (t[0] + t[-1]))}</SRPCODTime><SRPDwellTime>{g(t[-1] - t[0])}</SRPDwellTime><Monostatic>{xyz('ARPPos', tx[m])}{xyz('ARPVel', vel[m])}
 <SideOfTrack>{geom.pop('SideOfTrack')}</SideOfTrack>{''.join(f'<{k}>{g(v)}</{k}>' for k, v in geom.items())}</Monostatic></ReferenceGeometry>
 </CPHD>"""
-    meta = CPHDType.from_xml_string(xml)
-    v = np.zeros(P, meta.PVP.get_vector_dtype())
+    v = np.zeros(P, _cphdxml.pvp_dtype(_cphdxml.ET.fromstring(xml).find('{http://api.nsgreg.nga.mil/schema/cphd/1.0.1}PVP'),
+                                       8 * off))
     v['TxTime'], v['TxPos'], v['TxVel'] = t, tx, vel
     v['RcvTime'], v['RcvPos'], v['RcvVel'] = t + 2 * rng / C, tx, vel
     v['SRPPos'], v['FX1'], v['FX2'], v['SC0'], v['SCSS'] = sr, fmin, fmax, fmin, col.df
     v['TOA1'], v['TOA2'] = -0.45 / col.df, 0.45 / col.df
     v['TDTropoSRP'] = tropo
-    with CPHDWriter1(path, meta, check_existence=False) as w:
-        w.write_file({pol: v}, {pol: np.asarray(S, np.complex64)})
-
+    _cphdxml.write_cphd(path, xml, [v], [np.asarray(S, np.complex64)])
 
 
 def raw_echoes(col, pos, amp, fs, chirp, r_near, n, lat, lon, height=0.0, heading=0.0, vel=None, troposphere=False):

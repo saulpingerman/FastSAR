@@ -53,9 +53,7 @@ def _image_area(cphd, meta):
     None)."""
     if 'image_area' in meta:                       # a reader that supplies the footprint itself (read_nisar)
         return meta['image_area'], meta.get('refpt')
-    _deps.require('sarpy')
-    from sarpy.io.phase_history.converter import open_phase_history
-    m = open_phase_history(cphd).cphd_meta
+    m = io._open_cphd(cphd).cphd_meta
     sc = getattr(m, 'SceneCoordinates', None)
     if sc is None:                                 # CPHD 0.3: the image area is four corners (latitude, longitude, height)
         ia3 = getattr(getattr(m, 'Global', None), 'ImageArea', None)
