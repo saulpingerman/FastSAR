@@ -56,8 +56,11 @@ def jax_block():
     import os
     mb = os.environ.get('FASTSAR_JAX_BLOCK_MB', '').strip()
     if mb:
-        if not float(mb) > 0:
-            raise ValueError(f'FASTSAR_JAX_BLOCK_MB must be positive, got {mb!r}')
+        try:
+            if not float(mb) > 0:
+                raise ValueError
+        except ValueError:
+            raise ValueError(f'FASTSAR_JAX_BLOCK_MB must be a positive number of megabytes, got {mb!r}') from None
         return int(float(mb) * (1 << 20))
     import jax
     try:

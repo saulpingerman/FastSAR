@@ -388,3 +388,21 @@ def test_collection(tmp_path):
     mp = _az_metrics(bad, tg, fr, out)
     assert info['applied'] and np.abs(mp[:, 0] / m0['ground'][:, 0] - 1).max() < 0.02
     assert np.abs(mp[:, 1] - m0['ground'][:, 1]).max() < 0.6, mp[:, 1] - m0['ground'][:, 1]
+
+
+def test_jax_correction_in_column_blocks(monkeypatch):
+    """With little device memory the correction of a JAX image runs in narrower column blocks: the same values
+    exactly, zeros kept."""
+    jnp = pytest.importorskip('jax.numpy')
+    rng = np.random.default_rng(31)
+    x = (rng.normal(size=(300, 257)) + 1j * rng.normal(size=(300, 257))).astype(np.complex64)
+    x[:40, :50] = 0
+    phi = 0.7 * np.linspace(-1, 1, 300) ** 2
+    monkeypatch.delenv('FASTSAR_JAX_BLOCK_MB', raising=False)
+    ref = np.asarray(af._apply(jnp.asarray(x), phi))
+    monkeypatch.setenv('FASTSAR_JAX_BLOCK_MB', '0.5')                # 27 columns a block
+    got = np.asarray(af._apply(jnp.asarray(x), phi))
+    assert np.array_equal(got, ref) and not got[:40, :50].any() and not np.array_equal(got, x)
+    monkeypatch.setenv('FASTSAR_JAX_BLOCK_MB', 'none')
+    with pytest.raises(ValueError):
+        af._apply(jnp.asarray(x), phi)
