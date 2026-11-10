@@ -35,6 +35,9 @@ was published on PyPI.
   `highcontrast`, `pedf`, `log`, `linear`), checked against the toolbox run in Octave.
 - The stages after formation (baseband, autofocus, resampling, apodization, remap) take the image as a NumPy,
   CuPy or JAX array and run where it lives, so a GPU or TPU run keeps the image on the device until it is written.
+- `python -m fastsar.doctor` (also the `fastsar-doctor` command): reports which backends this machine can run and
+  prints the command that installs each missing piece, from the C++ compiler of the CPU kernels to the CuPy build
+  for the GPU driver's CUDA version; `--install` runs the pip commands among them.
 - `form_cphd(..., axes='los' | 'auto', aperture='auto' | 'square' | 'full')`, and the grid's geometry in its
   output (`plane`, `axes`, `center`, `height`, `graze`, `pulses`).
 

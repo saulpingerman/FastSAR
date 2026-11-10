@@ -40,6 +40,11 @@ pip install "fastsar[raw]"           # raw: h5py for the NISAR raw reader
 pip install "fastsar[cuda,io,geo]"   # extras combine
 ```
 
+What a machine needs beyond pip's packages depends on its hardware. After installing, `python -m fastsar.doctor`
+reports which backends are ready (the C++ compiler for the CPU kernels, CuPy for the GPU's CUDA version, the TPU
+build of JAX, the readers' packages) and prints the command that installs each missing piece;
+`python -m fastsar.doctor --install` runs the pip commands among them.
+
 From a clone: `pip install -e ".[cuda,io]"` or `uv sync`. The CUDA tensor-core kernels (float16, and float32 on compute capability 8.0 and later) need `nvcc` from the CUDA toolkit; without it float32 runs on the CUDA cores, more slowly. On the CPU set
 `OMP_NUM_THREADS=<physical cores> OMP_PLACES=cores OMP_PROC_BIND=close`. Importing `fastsar` sets
 `XLA_PYTHON_CLIENT_PREALLOCATE=false` unless it is already set, so that JAX does not reserve most of a GPU's memory

@@ -125,6 +125,62 @@ on the ground axes, with one impulse response everywhere and a noise-equivalent 
 edges, and the pixels outside the area are set to 0. A file that describes no antenna pattern gives the signal no
 edge to follow, and only the tasked area can then be processed.
 
+## Autofocus on the image
+
+`fastsar.autofocus.image_autofocus(img, mode)` removes an azimuth phase error from a finished image, without
+the phase history, and returns `(img2, info)`.
+
+**Input convention.** `img` is a complex baseband spotlight image whose axis 0 is azimuth: a slant-plane image
+from `planes.to_slant`, or a ground-plane image formed with `axes='los'` after `planes.deramp`. The error model
+is one phase function of azimuth spatial frequency shared by all columns: the FFT along axis 0 of every column
+is multiplied by `exp(1j * phi(k))`. Only transforms along axis 0 are taken, so the spectrum along axis 1 may
+be wrapped or sheared. The occupied azimuth band is detected from the data, which covers oversampled images.
+Pixels that are exactly zero stay exactly zero, and columns that are mostly zero are left out of the estimate.
+
+**Modes.** `None` or `False` returns the image as it came.
+
+- `'quadratic'`: one quadratic error for the whole image, estimated by map drift (the shift between the
+  detected images of the two halves of the band). It is the fastest mode. `info['edge_rad']` is the
+  coefficient in radians at the band edge and `info['phi']` the phase removed per FFT bin. A phase error on
+  pulse `p` appears with the same sign and scale at that pulse's azimuth frequency.
+- `'pga'`: one error of any shape for the whole image, estimated by phase gradient autofocus on the brightest
+  columns. Use it when the error has cubic or higher terms; a quadratic in pulse index is such a case when the
+  collection is squinted or the track is curved. The constant and linear parts of the error are not estimated.
+- `'spatially_variant'`: the quadratic coefficient is estimated on overlapping blocks, fitted over the scene by
+  a low-order 2-D polynomial, and removed with a correction that follows range column by column and is
+  cross-faded along azimuth. Use it for wide scenes in which the defocus changes with position.
+- `'spatially_variant_pga'`: the same with a per-block PGA estimate reduced to the coefficients of the second
+  to fourth powers of azimuth frequency.
+
+With `guard=True` a result is kept only if the contrast did not drop; otherwise `info['applied']` is `False`.
+
+**Device arrays.** `img` may be a NumPy, CuPy or JAX array; the result is a complex64 array of the same kind
+on the same device. The correction of the full image and the map-drift estimate run on the device; PGA
+estimates run on the host from a subset of columns.
+
+```python
+import fastsar
+from fastsar import autofocus, planes
+
+out = planes.deramp(fastsar.form_cphd('scene_CPHD.cphd', axes='los', window=False))
+img, info = autofocus.image_autofocus(out['image'], 'quadratic')
+print(info['applied'], info['edge_rad'], info['contrast_before'], info['contrast_after'])
+img, info = autofocus.image_autofocus(out['image'], 'spatially_variant', block=512, order=2)
+```
+
+**Limitations.** Map drift needs point-like scatterers or texture; uniform clutter gives no estimate. The
+global modes apply a circular correction, so a strip as long as the blur at each azimuth end of the image is
+contaminated. The blur must be much shorter than the block of the spatially variant modes, and a response cut
+by a zero region cannot be restored. Along azimuth the spatially variant correction blends neighbouring
+strips: a coefficient that changes by more than about one radian per strip step leaves a residual, which a
+smaller block or a larger `overlap` reduces. The block PGA estimate is single-threaded and slow.
+
+`process_cphd(..., autofocus=)` runs these on the baseband ground image, before any resampling, and records the
+mode in the SICD (`AzAutofocus` GLOBAL or SV). In `tests/test_autofocus_image.py` a quadratic error of 2 to 40
+rad at the band edge is recovered within 0.5% on synthetic images, and a simulated collection with a quadratic
+error injected into its phase history returns to the error-free azimuth resolution within 0.7% and peak sidelobe
+within 0.3 dB.
+
 ## Weighting and spatially variant apodization
 
 `'taylor'` applies a Taylor window (nbar 4, 35 dB) to the phase history along frequency and along pulses.

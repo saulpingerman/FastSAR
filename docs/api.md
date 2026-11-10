@@ -122,6 +122,15 @@ SICD needs sarpy; GeoTIFFs, DEMs and map projections other than `EPSG:4326` need
   `weighting.keystone(S, ant, fmin, df, scp, e1, symmetric=True)`: the phase history trimmed to a rectangle of
   slant-plane spatial frequencies.
 
+## `fastsar.rgiqe`, `fastsar.doctor`
+
+- `rgiqe.Radiometry(cphd_path, meta, *, channel=0, pulses=None, nesz_db=None, sicd=None, sigma0_db=None,
+  scene_sigma0_db=-10.0)` with `gain_db`, `nesz_db`, `snr`, `rniirs`; `rgiqe.area_mask` and `rgiqe.area_bounds`;
+  `rgiqe.rniirs`, `information_density`, `snr_to_rniirs`, `rniirs_to_snr`
+  ([product-options.md](product-options.md#processed-area-by-image-quality)).
+- `python -m fastsar.doctor [--install] [--json]`, or `doctor.check()`: what this machine can run and the commands
+  that install what is missing.
+
 ## `fastsar.sidd`, `fastsar.remap`
 
 - `sidd.write_sidd(path, out, *, remap='nrl', remap_args=None, valid=None, shadows_down=True, version=3,
@@ -132,6 +141,11 @@ SICD needs sarpy; GeoTIFFs, DEMs and map projections other than `EPSG:4326` need
 
 ## `fastsar.autofocus`
 
+- `image_autofocus(img, mode, **kw)`: `(img2, info)` for a baseband image whose axis 0 is azimuth; mode
+  `'quadratic'`, `'pga'`, `'spatially_variant'`, `'spatially_variant_pga'` or `None`
+  ([product-options.md](product-options.md#autofocus-on-the-image)). `quadratic(img, *, iterations=6, lines=0.3,
+  tol=0.02, guard=True)` and `spatially_variant(img, *, block=512, overlap=0.5, method='quadratic', order=2,
+  guard=True)` are the modes themselves.
 - `autofocus(S, ant, fmin, df, nx, ny, spx, spy, e1, e2, rounds=2, pga_kwargs=None, **form_kwargs)`: returns
   `(image, phi)`, phi per pulse. `pga(img, ...)` works on an image in the polar-format convention; `deramp_phase`
   and `pulse_bins` support it.
