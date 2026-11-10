@@ -1,7 +1,7 @@
 """SIDD products and the display orientation, from a form_cphd output.
 
     disp = fastsar.sidd.to_display(out)                  # uint8, NRL remap, shadows down
-    fastsar.sidd.write_sidd('image.nitf', out)           # the same pixels as a SIDD (MONO8I NITF, needs sarpy)
+    fastsar.sidd.write_sidd('image.nitf', out)           # the same pixels as a SIDD (MONO8I NITF)
     view = fastsar.sidd.shadows_down(out)                # the reorientation alone, with its geometry
 
 A detected image is displayed with the radar at the top: range increases down the rows, so that shadows, which fall
@@ -24,13 +24,12 @@ import os
 
 import numpy as np
 
-from . import _deps, _xp
+from . import _xp
 from . import remap as _remap
 
 __all__ = ['shadows_down', 'orient', 'to_display', 'write_sidd']
 
 _UP = np.array([0.0, 0.0, 1.0])                                   # the local frame's vertical
-_SPECIFICATION = {2: ('2.0', '2019-05-31T00:00:00Z'), 3: ('3.0', '2021-11-30T00:00:00Z')}   # SIDD version and date
 
 
 def _unit(v):
@@ -204,7 +203,7 @@ def _igeolo(latlon):
 
 def write_sidd(path, out, *, remap='nrl', remap_args=None, valid=None, shadows_down=True, version=3,
                product_name=None, classification='UNCLASSIFIED', sicd=None):
-    """Write a form_cphd product as a SIDD: a detected, remapped 8-bit image (MONO8I) in a NITF. Needs sarpy.
+    """Write a form_cphd product as a SIDD: a detected, remapped 8-bit image (MONO8I) in a NITF 2.1 file.
 
     The pixels are to_display's (remap, remap_args (a dict of the remap's parameters), valid and shadows_down as
     there). A uint8 image is written as it is, and remap then only names, in the metadata, the remap that made
@@ -220,36 +219,26 @@ def write_sidd(path, out, *, remap='nrl', remap_args=None, valid=None, shadows_d
     and the shadow direction (DOWN when shadows point down the rows to within a degree, likewise UP, LEFT or RIGHT,
     else ARBITRARY). ExploitationFeatures: the collection geometry (azimuth, graze, slope, tilt, squint, Doppler
     cone angle), the shadow, layover, multipath and ground track directions and north in the pixel frame, and the
-    resolution, all as sarpy derives them from the SICD metadata of the same product. ProductCreation: FastSAR and
-    its version as the processor.
+    resolution, all from the SICD metadata of the same product by the standard's definitions. ProductCreation:
+    FastSAR and its version as the processor.
 
-    version: SIDD 3 or 2 (3 falls back to 2 with a sarpy that cannot write it). product_name: default the
-    collection's core name, else the file's name. classification: 'UNCLASSIFIED', or a sarpy
-    ProductClassificationType carrying the markings of anything else. sicd: the SICD metadata (sarpy SICDType) of
-    the complex image the product was made from; it supplies the collection information and geometry and is stored
-    in the file beside the SIDD. Default: products.sicd_meta(out), not stored.
+    version: SIDD 3 or 2. product_name: default the collection's core name, else the file's name. classification:
+    'UNCLASSIFIED', or a dict of the ISM markings of anything else (classification, ownerProducer, ...). sicd: the
+    SICD metadata (products.sicd_meta, or anything fastsar._sicdxml.read takes) of the complex image the product was
+    made from; it supplies the collection information and geometry and is stored in the file beside the SIDD.
+    Default: products.sicd_meta(out), not stored.
 
-    -> the sarpy SIDDType written."""
-    import importlib
+    -> the metadata written (fastsar._siddxml.SIDD: attribute access by the XML's element names)."""
     from datetime import datetime, timezone
-    _deps.require('sarpy')
-    from sarpy.io.product.sidd import SIDDWriter, SIDDWritingDetails
-    from . import __version__, products
+    from . import __version__, products, _nitf, _sicdxml, _siddxml
     from .io import local_to_ecf, ecf_to_geodetic
     if out.get('plane') == 'slant':
         raise ValueError('write_sidd writes ground-plane products; this one is on the slant plane '
                          "(out['plane'] == 'slant'): project it to the ground first")
     if version not in (2, 3):
         raise ValueError(f'SIDD version {version}: 2 or 3')
-    try:
-        importlib.import_module(f'sarpy.io.product.sidd{version}_elements.SIDD')
-    except ImportError:
-        if version == 2:
-            raise
-        version = 2
-    S, D, B, G, M, E, P = (importlib.import_module(f'sarpy.io.product.sidd{version}_elements.{m}') for m in
-                           ('SIDD', 'Display', 'blocks', 'GeoData', 'Measurement', 'ExploitationFeatures',
-                            'ProductCreation'))
+    now = datetime.now(timezone.utc)
+    marking = _siddxml.classification(classification, now.date().isoformat())       # refused before any work
     meta = out['meta']
     data, v = _display(out, remap, valid, dict(remap_args or {}))
     lay = _shadows_down(out) if shadows_down else _layout(out, False, False, False)
@@ -268,79 +257,36 @@ def write_sidd(path, out, *, remap='nrl', remap_args=None, valid=None, shadows_d
         return [[r0 - 0.5, c0 - 0.5], [r0 - 0.5, c1 - 0.5], [r1 - 0.5, c1 - 0.5], [r1 - 0.5, c0 - 0.5]]
     urow, ucol = lay['row'] @ meta['R'], lay['col'] @ meta['R']
     if sicd is not None:
-        sm = sicd
+        sm = _sicdxml.read(sicd)
     elif _xp.kind(out['image']) == 'numpy':
         sm = products.sicd_meta(out)[0]
     else:                                                          # the metadata need the image's shape alone
         sm = products.sicd_meta(dict(out, image=np.broadcast_to(np.complex64(0), np.shape(out['image']))))[0]
-    # Measurement
     ref = (rows // 2, cols // 2)
     t_coa = float(sm.SCPCOA.SCPTime) if sm.SCPCOA is not None and sm.SCPCOA.SCPTime is not None \
         else float(sm.Grid.TimeCOAPoly.get_array()[0, 0])
     poly = _hull(orient(v, lay['transform'])) if v is not None and v.any() else \
         np.array([[0, 0], [0, cols - 1], [rows - 1, cols - 1], [rows - 1, 0]])
-    arp = sm.Position.ARPPoly
-    measurement = M.MeasurementType(
-        PixelFootprint=(rows, cols), ValidData=[tuple(int(k) for k in p) for p in poly],
-        PlaneProjection=M.PlaneProjectionType(
-            ReferencePoint=B.ReferencePointType(ECEF=ecf(ref), Point=(float(ref[0]), float(ref[1]))),
-            SampleSpacing=(lay['row_ss'], lay['col_ss']), TimeCOAPoly=B.Poly2DType(Coefs=[[t_coa]]),
-            ProductPlane=M.ProductPlaneType(RowUnitVector=urow, ColUnitVector=ucol)),
-        ARPPoly=B.XYZPolyType(X=arp.X.get_array(), Y=arp.Y.get_array(), Z=arp.Z.get_array()))
-    # GeoData: the outer corners of the corner pixels (first row first column, then clockwise) and the valid data
-    geodata = G.GeoDataType(ImageCorners=latlon(outline(0, rows, 0, cols)), ValidData=latlon(poly))
-    # Display
     name = (remap if isinstance(remap, str) else getattr(remap, '__name__', 'custom')).upper()
     g = _frame(out)[3]                                             # shadows fall along range, away from the radar
     along = {'DOWN': g @ lay['row'], 'UP': -(g @ lay['row']), 'RIGHT': g @ lay['col'], 'LEFT': -(g @ lay['col'])}
     shadow = max(along, key=along.get)
     if along[shadow] < np.cos(np.radians(1.0)):
         shadow = 'ARBITRARY'
-
-    def bilinear(fname, op):
-        return B.FilterType(FilterName=fname, Operation=op, FilterBank=B.FilterBankType(
-            Predefined=B.PredefinedFilterType(DatabaseName='BILINEAR')))
-    display = D.ProductDisplayType(
-        PixelType='MONO8I', NumBands=1,
-        NonInteractiveProcessing=[D.NonInteractiveProcessingType(
-            ProductGenerationOptions=D.ProductGenerationOptionsType(DataRemapping=B.NewLookupTableType(
-                LUTName=name, Predefined=B.PredefinedLookupType(DatabaseName=name))),
-            RRDS=D.RRDSType(DownsamplingMethod='DECIMATE'), band=1)],
-        InteractiveProcessing=[D.InteractiveProcessingType(
-            GeometricTransform=D.GeometricTransformType(
-                Scaling=D.ScalingType(AntiAlias=bilinear('AntiAlias', 'CONVOLUTION'),
-                                      Interpolation=bilinear('Interpolation', 'CORRELATION')),
-                Orientation=D.OrientationType(ShadowDirection=shadow)),
-            SharpnessEnhancement=D.SharpnessEnhancementType(
-                ModularTransferFunctionEnhancement=bilinear('ModularTransferFunctionEnhancement', 'CONVOLUTION')),
-            DynamicRangeAdjustment=D.DynamicRangeAdjustmentType(AlgorithmType='NONE', BandStatsSource=1),
-            band=1)])
-    # ProductCreation
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
-    if isinstance(classification, P.ProductClassificationType):
-        marking = classification
-    elif str(classification).upper() in ('UNCLASSIFIED', 'U'):
-        marking = P.ProductClassificationType(classification='U', createDate=now.date().isoformat())
-    else:
-        raise ValueError(f'classification {classification!r}: UNCLASSIFIED, or a sarpy ProductClassificationType '
-                         f'with the markings')
     core = sm.CollectionInfo.CoreName if sm.CollectionInfo is not None else None
     if product_name is None:
         product_name = core if core and core != 'UNKNOWN' else os.path.splitext(os.path.basename(str(path)))[0]
-    creation = P.ProductCreationType(
-        ProcessorInformation=P.ProcessorInformationType(Application=f'FastSAR {__version__}',
-                                                        ProcessingDateTime=np.datetime64(now, 'us'), Site='Unknown'),
-        Classification=marking, ProductName=str(product_name), ProductClass='Detected Image')
-    sidd = S.SIDDType(ProductCreation=creation, GeoData=geodata, Display=display, Measurement=measurement,
-                      ExploitationFeatures=E.ExploitationFeaturesType.from_sicd(sm, urow, ucol))
-    # The NITF headers are sarpy's, but for two fields that sarpy 2.1.1 fills differently from the standard: the
-    # version and date of the SIDD specification in the XML segment's header, and the corner coordinates of each
-    # image segment, which sarpy truncates to the arcsecond where the standard rounds.
-    details = SIDDWritingDetails(sidd, sicd_meta=sicd)
-    header = details.des_managers[0].subheader.UserHeader
-    header.DESSHSV, header.DESSHSD = _SPECIFICATION[version]
-    for manager, box in zip(details.image_managers, details.image_segment_coordinates[0]):
-        manager.subheader.IGEOLO = _igeolo(latlon(outline(*box)))
-    with SIDDWriter(path, sidd_writing_details=details, check_existence=False) as w:
-        w.write_chip(data, start_indices=(0, 0))
-    return sidd
+    # GeoData: the outer corners of the corner pixels (first row first column, then clockwise) and the valid data
+    sd = _siddxml.build(dict(
+        application=f'FastSAR {__version__}', created=now.strftime('%Y-%m-%dT%H:%M:%S.%fZ'), classification=marking,
+        product_name=str(product_name), lut=name, shadow=shadow, corners=latlon(outline(0, rows, 0, cols)),
+        valid_ll=latlon(poly), ref_ecf=ecf(ref), ref_pixel=ref, spacing=(lay['row_ss'], lay['col_ss']), t_coa=t_coa,
+        urow=urow, ucol=ucol, rows=rows, cols=cols, arp=[getattr(sm.Position.ARPPoly, k).get_array() for k in 'XYZ'],
+        valid_rc=poly, sicd=sm), version)
+    # NITF: the XML segments (the SIDD, then the SICD it was made from when one is given), each image segment's
+    # corner coordinates rounded to the arcsecond
+    xmls = [(sd.to_xml_bytes(), 'SIDD', _siddxml.SPECIFICATION[version])]
+    if sicd is not None:
+        xmls.append((sm.to_xml_bytes(), 'SICD', _sicdxml.specification(sm)))
+    _nitf.write_sidd(path, data, xmls, corners=lambda r0, r1, c0, c1: latlon(outline(r0, r1, c0, c1)))
+    return sd

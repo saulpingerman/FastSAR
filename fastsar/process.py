@@ -62,13 +62,13 @@ def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None
     extent: the tasked area's sides in meters about the scene center, for a collection that states no image area
         (and in place of the one it states): (across, along) the line of sight for a spotlight, (along, across)
         the track for a moving beam.
-    sicd: the vendor's SICD (path, .xml or sarpy SICDType), whose footprint is then the tasked area.
+    sicd: the vendor's SICD (path, .xml or SICD metadata), whose footprint is then the tasked area.
     nesz_db, scene_sigma0_db: the noise level of the quality areas when the files give none (fastsar.rgiqe).
     mode, backend, precision, height, channel, troposphere, reader_options, target_db: form_cphd's.
 
     -> the product dict (form_cphd's entries on the product's grid: image, origin, e1, e2, spx, spy, plane, meta,
     notes, ...), with product, area, weighting, autofocus (the mode run), autofocus_info, timing (seconds of each
-    stage), and, when written, path and metadata (the sarpy SICDType or SIDDType). The image of a SIDD product is
+    stage), and, when written, path and metadata (fastsar._sicdxml.SICD or fastsar._siddxml.SIDD). The image of a SIDD product is
     the detected amplitude (float32) on the product's own grid; the remap and the layout are applied when the file
     is written, and fastsar.sidd.to_display(out, out['remap'], **out['remap_args']) gives the same display values."""
     from .api import _backend

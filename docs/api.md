@@ -17,7 +17,7 @@
   azimuth_fraction=0.8, extent=None, height=None, precision='float32', target_db=-40.0, info=None,
   autofocus=False, troposphere=None, reader_options=None, axes='track', aperture='auto')`: the image of a CPHD file ([processing-chain.md](processing-chain.md#2-form)).
   `mode`: `'auto'`, `'spotlight'`, `'moving'`. `troposphere`: passed to `read_cphd` (default: the delay the file
-  gives is removed; `'model'` removes a standard-atmosphere delay for files that give none). `sicd`: path, `.xml` or sarpy SICDType. `spacing`, `extent`: (along, across
+  gives is removed; `'model'` removes a standard-atmosphere delay for files that give none). `sicd`: path, `.xml` or SICD metadata. `spacing`, `extent`: (along, across
   track) in m. `height`: grid height above the ellipsoid. Returns a dict: `image` [nx, ny] complex64, `origin`
   (pixel (0, 0)), `e1`, `e2`, `spx`, `spy`, `mode`, `band` (first and last frequency), `bandwidth` (spatial
   frequency support along e1, e2), `window`, `phase_error` (or None), `meta` (from `read_cphd`), `notes`, and the
@@ -89,6 +89,8 @@ the CPU), `'auto'`. Precision: `'float32'`, `'float16'` (CUDA, JAX),
 - `troposphere_delay(tx, rcv, srp)`: two-way delay [P] (s) of a standard atmosphere at the scene reference point
   (Saastamoinen hydrostatic zenith delay, cosecant mapping); what `read_cphd(troposphere='model')` removes.
 - `sicd_points(sicd, rows, cols, meta, hae=None)`: local positions of SICD pixels on any grid type.
+- `read_sicd(path, native=False)`: the pixels (a memory map, or an array in memory in the machine's byte order)
+  and the metadata of a SICD file.
 - `local_to_ecf(points, meta)`, `ecf_to_local(points, meta)`, `ecf_to_geodetic(ecf)`, `geodetic_to_ecf(lat, lon,
   h)`: frame and WGS-84 conversions (degrees, meters).
 - `rereference(S, fmin, df, dref)`: moves each pulse's reference point by `dref` m of range.
@@ -109,7 +111,12 @@ the CPU), `'auto'`. Precision: `'float32'`, `'float16'` (CUDA, JAX),
   an image on a template SICD's grid. `sicd_meta(out)`: the metadata and the SICD-ordered array.
 - `write_geotiff(path, data, transform, crs='EPSG:4326', nodata=nan)`: [rows, cols] or [bands, rows, cols].
 
-SICD needs sarpy; GeoTIFFs, DEMs and map projections other than `EPSG:4326` need rasterio.
+`sicd_meta` and `write_sicd` return the SICD metadata as a light object over the SICD XML (`fastsar._sicdxml.SICD`):
+attribute access by the XML's element names (`sm.Grid.Row.SS`, `sm.ImageData.NumRows`, `sm.SCPCOA.GrazeAng`),
+`get_array()` on vectors and polynomials (`sm.GeoData.SCP.ECF.get_array()`), `None` for an absent element,
+`to_xml_bytes()`, and the SICD's projection (`project_image_to_ground`, `project_ground_to_image`). SICD, SIDD and
+CPHD files are read and written by FastSAR itself; GeoTIFFs, DEMs and map projections other than `EPSG:4326` need
+rasterio.
 
 ## `fastsar.planes`, `fastsar.resample`, `fastsar.weighting`
 

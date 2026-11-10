@@ -22,7 +22,6 @@ Azimuth band of a moving beam: the SICD's processed bandwidth (Grid.Col.ImpRespB
 `azimuth_fraction` (default 0.8) of the Doppler band the PRF samples, 2 v sin(theta) / lambda in [-PRF/2, PRF/2].
 """
 import numpy as np
-from . import _deps
 
 from . import io
 
@@ -35,17 +34,12 @@ def _taylor(n):
 
 
 def _sicd_meta(sicd):
+    """The vendor SICD's metadata (fastsar._sicdxml.SICD) from a path (NITF, or .xml: the metadata alone, as ICEYE
+    publishes it beside the image), XML, or a metadata object; None for None."""
     if sicd is None:
         return None
-    if not isinstance(sicd, str):
-        return sicd
-    _deps.require('sarpy')
-    if sicd.endswith('.xml'):                 # the SICD's metadata alone (ICEYE publishes it beside the image)
-        from sarpy.io.complex.sicd_elements.SICD import SICDType
-        with open(sicd) as fh:
-            return SICDType.from_xml_string(fh.read())
-    from sarpy.io.complex.converter import open_complex
-    return open_complex(sicd).sicd_meta
+    from . import _sicdxml
+    return _sicdxml.read(sicd)
 
 
 def _image_area(cphd, meta):
@@ -53,9 +47,7 @@ def _image_area(cphd, meta):
     None)."""
     if 'image_area' in meta:                       # a reader that supplies the footprint itself (read_nisar)
         return meta['image_area'], meta.get('refpt')
-    _deps.require('sarpy')
-    from sarpy.io.phase_history.converter import open_phase_history
-    m = open_phase_history(cphd).cphd_meta
+    m = io._open_cphd(cphd).cphd_meta
     sc = getattr(m, 'SceneCoordinates', None)
     if sc is None:                                 # CPHD 0.3: the image area is four corners (latitude, longitude, height)
         ia3 = getattr(getattr(m, 'Global', None), 'ImageArea', None)
@@ -100,7 +92,7 @@ def form_cphd(cphd, sicd=None, *, mode='auto', backend='auto', window=True, spac
               autofocus=False, troposphere=None, reader_options=None, axes='track', aperture='auto', _plan=None):
     """Form the image of a CPHD collection (see the module docstring).
 
-    cphd: path. sicd: the vendor's SICD (path, .xml metadata, or sarpy SICDType) for the footprint, spacing and
+    cphd: path. sicd: the vendor's SICD (path, .xml metadata, or SICD metadata) for the footprint, spacing and
     processed azimuth band, or None. mode: 'auto', 'spotlight' or 'moving' (stripmap, sliding spotlight, dynamic
     stripmap). backend: 'auto', 'cpu', 'cuda', 'tpu' or 'jax'. spacing: (along track, across track) in meters, or
     None. extent: (along track, across track) in meters around the scene center, overriding the footprint. height:

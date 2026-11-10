@@ -24,7 +24,6 @@ import os
 
 import numpy as np
 
-from . import _deps
 
 __all__ = ['rniirs', 'information_density', 'snr_to_rniirs', 'rniirs_to_snr', 'Radiometry', 'area_mask', 'area_bounds']
 
@@ -151,11 +150,10 @@ class _Pattern:
 
 
 def _sicd_meta(sicd):
-    if isinstance(sicd, (str, os.PathLike)):
-        _deps.require('sarpy')
-        from sarpy.io.complex.converter import open_complex
-        sicd = open_complex(str(sicd))
-    s = getattr(sicd, 'sicd_meta', sicd)
+    if isinstance(sicd, (str, bytes, os.PathLike)):
+        from . import _sicdxml
+        return _sicdxml.read(sicd)
+    s = getattr(sicd, 'sicd_meta', sicd)                 # a reader's metadata, or the metadata themselves
     return s[0] if isinstance(s, (tuple, list)) else s
 
 
@@ -188,10 +186,10 @@ def _sicd_levels(sicd, notes):
 class Radiometry:
     """Signal-to-noise model of the image a CPHD collection forms.
 
-    cphd_path: the CPHD file (or an open sarpy reader of it). meta: the dict read_cphd or read_collection returned
-    for the same channel; ground points are given in its local frame (io.ecf_to_local, io.local_to_ecf). pulses: a
-    slice (or (first, last + 1)) of meta's pulses when the image uses only some of them. channel: the channel index
-    when meta does not carry one.
+    cphd_path: the CPHD file (or an open reader of it: fastsar's own or sarpy's). meta: the dict read_cphd or
+    read_collection returned for the same channel; ground points are given in its local frame (io.ecf_to_local,
+    io.local_to_ecf). pulses: a slice (or (first, last + 1)) of meta's pulses when the image uses only some of them.
+    channel: the channel index when meta does not carry one.
 
     The noise level at the scene reference point comes from the first of: nesz_db (dB, given by the caller); sicd, a
     SICD of the same collection (path, reader or metadata) with a Radiometric block; the file's PTRef with PNRef;
@@ -210,9 +208,8 @@ class Radiometry:
         if hasattr(cphd_path, 'cphd_meta'):
             r = cphd_path
         else:
-            _deps.require('sarpy')
-            from sarpy.io.phase_history.converter import open_phase_history
-            r = open_phase_history(str(cphd_path))
+            from .io import _open_cphd
+            r = _open_cphd(str(cphd_path))
         m = r.cphd_meta
         self.notes, self.meta = [], meta
         ch = int(meta.get('channel_index', channel))

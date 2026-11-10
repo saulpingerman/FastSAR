@@ -1,6 +1,7 @@
 # Real data: CPHD, SICD and vendor collections
 
-Reading CPHD uses sarpy for the file's metadata (a dependency of FastSAR); the samples are read directly.
+CPHD (1.0.1, 1.1.0 and 0.3), SICD and SIDD files are read and written by FastSAR itself; no SAR-format library
+is needed. `io.read_sicd(path)` returns a SICD's pixels (a memory map) and its metadata.
 
 ## Reading CPHD
 

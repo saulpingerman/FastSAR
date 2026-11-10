@@ -31,7 +31,7 @@ line tools, `xcode-select --install`, which also serve the Metal backend of `Exa
 GPU backend needs an Nvidia driver for CUDA 12 or later and the `tpu` extra a Cloud TPU VM.
 
 ```bash
-pip install fastsar                  # CPU, Nvidia GPU, and the CPHD, SICD and SIDD files
+pip install fastsar                  # CPU, Nvidia GPU, and the CPHD, SICD and SIDD files (no other package)
 pip install "fastsar[tpu]"           # tpu: jax[tpu] for Cloud TPUs
 pip install "fastsar[geo]"           # geo: rasterio for GeoTIFFs and DEMs
 pip install "fastsar[raw]"           # raw: h5py for the NISAR raw reader

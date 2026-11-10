@@ -206,7 +206,8 @@ def test_write_sidd(scene, side):
     written = sidd.write_sidd(str(path), out)
     rd, sd, a = read_sidd(path)
     lay = sidd.shadows_down(out)
-    assert type(sd) is type(written) and type(sd).__module__.endswith('sidd3_elements.SIDD')
+    assert written.version == '3.0.0' and type(sd).__module__.endswith('sidd3_elements.SIDD')
+    assert written.Measurement.PixelFootprint.Row == sd.Measurement.PixelFootprint.Row
     assert a.dtype == np.uint8 and np.array_equal(a, sidd.to_display(out))
     # range runs down the rows and the view is from above, in the file as on the screen
     assert by_target(find_peaks(a))[1] < 1.0
@@ -259,7 +260,7 @@ def test_write_sidd_options(scene):
     # version 2, and the product's own layout
     written = sidd.write_sidd(str(path), out, version=2, shadows_down=False, remap='density', product_name='a name')
     rd, sd, a = read_sidd(path)
-    assert type(sd).__module__.endswith('sidd2_elements.SIDD') and type(sd) is type(written)
+    assert type(sd).__module__.endswith('sidd2_elements.SIDD') and written.version == '2.0.0'
     assert np.array_equal(a, remap.density(img)) and sd.ProductCreation.ProductName == 'a name'
     assert sd.Display.NonInteractiveProcessing[0].ProductGenerationOptions.DataRemapping.LUTName == 'DENSITY'
     assert sd.Display.InteractiveProcessing[0].GeometricTransform.Orientation.ShadowDirection == 'LEFT'

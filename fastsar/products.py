@@ -152,21 +152,20 @@ def write_geotiff(path, data, transform, crs='EPSG:4326', nodata=np.nan):
 
 
 def write_sicd(path, img, template=None, transpose=None):
-    """Write a complex image as a SICD. Needs sarpy.
+    """Write a complex image as a SICD (a NITF 2.1 file with the image as 32-bit floating point I and Q).
 
     write_sicd(path, out): form_cphd's output, with metadata built from it (sicd_meta).
-    write_sicd(path, img, template): img formed on the grid of the template SICD (path or sarpy SICDType;
+    write_sicd(path, img, template): img formed on the grid of the template SICD (path, .xml, or SICD metadata;
     read_cphd(..., sicd=template)), with the template's metadata; transpose as meta['sicd_transpose'] (default:
     when the template's rows run along range). ImageFormAlgo becomes OTHER and Grid.Type PLANE: the pixels are
-    backprojection's on the template's image plane, which carry each scatterer's phase."""
-    _deps.require('sarpy')
-    from sarpy.io.complex.converter import open_complex
-    from sarpy.io.complex.sicd import SICDWriter
+    backprojection's on the template's image plane, which carry each scatterer's phase.
+
+    -> the metadata written (fastsar._sicdxml.SICD, see sicd_meta)."""
+    from . import _nitf, _sicdxml
     if template is None:
         sm, a = sicd_meta(img)
     else:
-        sm = template if not isinstance(template, str) else open_complex(template).sicd_meta
-        sm = sm.copy()
+        sm = _sicdxml.read(template).copy()
         rows, cols = int(sm.ImageData.NumRows), int(sm.ImageData.NumCols)
         a = np.asarray(img)
         if transpose is None:
@@ -188,13 +187,17 @@ def write_sicd(path, img, template=None, transpose=None):
         sm.PFA = None
         sm.Grid.Type = 'PLANE'          # pixels on a plane, linear in its coordinates: the grid backprojection used
         sm.ImageData.PixelType = 'RE32F_IM32F'
-    with SICDWriter(path, sm, check_existence=False) as w:
-        w.write_chip(np.asarray(a, np.complex64), start_indices=(0, 0))
+    corners = sm.GeoData.ImageCorners
+    if corners is None:
+        _sicdxml.derive_corners(sm)
+        corners = sm.GeoData.ImageCorners
+    _nitf.write_sicd(path, a, sm.to_xml_bytes(), corners=corners.get_array(), spec=_sicdxml.specification(sm))
     return sm
 
 
 def sicd_meta(out):
-    """SICD metadata (sarpy SICDType) for a form_cphd output, or a slant-plane image (planes.to_slant), and its image
+    """SICD metadata (fastsar._sicdxml.SICD: attribute access by the XML's element names, as sm.Grid.Row.SS, and
+    the SICD's own projection) for a form_cphd output, or a slant-plane image (planes.to_slant), and its image
     arranged as the SICD array [rows, cols].
 
     Rows run along range away from the radar (e2 or -e2) and columns along e1 or against it, whichever makes the
@@ -210,18 +213,8 @@ def sicd_meta(out):
     band where its support entry says, or centered at zero. There is no radiometric calibration (see the module
     docstring)."""
     from datetime import datetime, timezone
-    _deps.require('sarpy')
-    from sarpy.io.complex.sicd_elements.SICD import SICDType
-    from sarpy.io.complex.sicd_elements.CollectionInfo import CollectionInfoType, RadarModeType
-    from sarpy.io.complex.sicd_elements.ImageCreation import ImageCreationType
-    from sarpy.io.complex.sicd_elements.ImageData import ImageDataType
-    from sarpy.io.complex.sicd_elements.GeoData import GeoDataType, SCPType
-    from sarpy.io.complex.sicd_elements.Grid import GridType, DirParamType, WgtTypeType
-    from sarpy.io.complex.sicd_elements.Timeline import TimelineType
-    from sarpy.io.complex.sicd_elements.Position import PositionType, XYZPolyType
-    from sarpy.io.complex.sicd_elements.RadarCollection import RadarCollectionType, TxFrequencyType, ChanParametersType
-    from sarpy.io.complex.sicd_elements.ImageFormation import ImageFormationType, RcvChanProcType, TxFrequencyProcType
     from .io import local_to_ecf
+    from . import _sicdxml
     from . import __version__
     C = 299792458.0
     meta = out['meta']
@@ -248,7 +241,7 @@ def sicd_meta(out):
     apc = local_to_ecf(ant, meta)
     coef = [np.polynomial.Polynomial.fit(t - tc, apc[:, k], deg).convert().coef for k in range(3)]
     shift = np.polynomial.Polynomial([-tc, 1.0])                      # poly(t - tc) -> poly in t
-    arp = XYZPolyType(*[np.polynomial.Polynomial(cf)(shift).coef for cf in coef])
+    arp = [np.polynomial.Polynomial(cf)(shift).coef for cf in coef]
     # spatial frequencies: (2 / lambda) along the line of sight from the mid-aperture antenna, projected on the axes
     f0, f1 = out['band']
     los = (scp - apc[m]) / np.linalg.norm(scp - apc[m])
@@ -262,18 +255,14 @@ def sicd_meta(out):
         tuple(srow * v for v in sup[1])[::srow], tuple(-srow * v for v in sup[0])[::-srow])
 
     def axis(u, ss, bw, kctr, w, lim):
-        bw = min(bw, 1.0 / ss)
-        wgt = {None: WgtTypeType(WindowName='UNIFORM'), 'hann': WgtTypeType(WindowName='HANNING'),
-               'taylor': WgtTypeType(WindowName='TAYLOR', Parameters={'NBAR': '4', 'SLL': '-35'}),
-               'sva': WgtTypeType(WindowName='SVA')}[w]             # apodized after formation: no one aperture weighting
+        bw = min(bw, 1.0 / ss)                      # 'sva': apodized after formation, no one aperture weighting
         if lim is not None:                                         # the band as measured from the collection
             k1, k2 = max(lim[0], -0.5 / ss), min(lim[1], 0.5 / ss)
             dk = 0.5 * (k1 + k2)
         else:                                                       # its center in the sampled image, nominal width
             dk = 0.0 if base else (kctr * ss + 0.5) % 1.0 / ss - 0.5 / ss
             k1, k2 = dk - bw / 2, dk + bw / 2
-        return DirParamType(UVectECF=u, SS=ss, ImpRespWid=width[w] / bw, Sgn=-1, ImpRespBW=bw, KCtr=kctr,
-                            DeltaK1=k1, DeltaK2=k2, DeltaKCOAPoly=[[dk]], WgtType=wgt)
+        return dict(u=u, ss=ss, wid=width[w] / bw, bw=bw, kctr=kctr, k1=k1, k2=k2, dk=dk, window=w)
     pol = meta.get('polarization')
     pol = f'{pol[0]}:{pol[1]}' if pol else 'UNKNOWN'
     mode = str(meta.get('mode') or '').upper()
@@ -282,33 +271,20 @@ def sicd_meta(out):
     focus = out.get('autofocus')                  # the mode process_cphd ran, or form_cphd's phase-history estimate
     focus = ('SV' if 'variant' in str(focus) else 'GLOBAL') if focus else (
         'GLOBAL' if out.get('phase_error') is not None else 'NO')
-    sm = SICDType(
-        CollectionInfo=CollectionInfoType(CollectorName=meta.get('collector') or 'UNKNOWN',
-                                          CoreName=meta.get('core_name') or 'UNKNOWN', CollectType='MONOSTATIC',
-                                          RadarMode=RadarModeType(ModeType=mode), Classification='UNCLASSIFIED'),
-        ImageCreation=ImageCreationType(Application=f'FastSAR {__version__}',
-                                        DateTime=np.datetime64(datetime.now(timezone.utc).replace(tzinfo=None), 'us')),
-        ImageData=ImageDataType(PixelType='RE32F_IM32F', NumRows=ny, NumCols=nx, FirstRow=0, FirstCol=0,
-                                FullImage=(ny, nx),
-                                SCPPixel=(j0, nx - 1 - i0) if away else (ny - 1 - j0, i0)),
-        GeoData=GeoDataType(EarthModel='WGS_84', SCP=SCPType(ECF=scp)),
-        Grid=GridType(ImagePlane='SLANT' if out.get('plane') == 'slant' else 'GROUND', Type='PLANE',
-                      TimeCOAPoly=[[float(t[m])]], Row=axis(urow, out['spy'], bw_r, kr, win[1], sup_r),
-                      Col=axis(ucol, out['spx'], bw_c, kc, win[0], sup_c)),
-        Timeline=TimelineType(CollectStart=np.datetime64(str(meta.get('start')).rstrip('Z'), 'us'),
-                              CollectDuration=float(t[-1])),
-        Position=PositionType(ARPPoly=arp),
-        RadarCollection=RadarCollectionType(TxFrequency=TxFrequencyType(Min=f0, Max=f1),
-                                            TxPolarization=pol[0] if pol != 'UNKNOWN' else 'OTHER',
-                                            RcvChannels=[ChanParametersType(TxRcvPolarization=pol, index=1)]),
-        ImageFormation=ImageFormationType(RcvChanProc=RcvChanProcType(NumChanProc=1, ChanIndices=[1]),
-                                          TxRcvPolarizationProc=pol, TStartProc=float(t[p0]), TEndProc=float(t[p1 - 1]),
-                                          TxFrequencyProc=TxFrequencyProcType(MinProc=f0, MaxProc=f1),
-                                          ImageFormAlgo='OTHER', STBeamComp='NO', ImageBeamComp='NO',
-                                          AzAutofocus=focus,
-                                          RgAutofocus='NO'))
-    sm.derive()
-    sm.define_geo_image_corners(override=True)
+    stamp = lambda d: d.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+    start = str(meta.get('start')).strip()
+    try:                                            # the collection start as SICD's date and time, to the microsecond
+        start = str(np.datetime64(start.rstrip('Z'), 'us')) + 'Z'
+    except ValueError:
+        pass
+    sm = _sicdxml.build(dict(
+        collector=meta.get('collector') or 'UNKNOWN', core_name=meta.get('core_name') or 'UNKNOWN', mode=mode,
+        application=f'FastSAR {__version__}', created=stamp(datetime.now(timezone.utc)), rows=ny, cols=nx,
+        scp_pixel=(j0, nx - 1 - i0) if away else (ny - 1 - j0, i0), scp=scp,
+        plane='SLANT' if out.get('plane') == 'slant' else 'GROUND', t_coa=float(t[m]),
+        row=axis(urow, out['spy'], bw_r, kr, win[1], sup_r), col=axis(ucol, out['spx'], bw_c, kc, win[0], sup_c),
+        start=start, duration=float(t[-1]), arp=arp, f0=f0, f1=f1, pol=pol, t0=float(t[p0]), t1=float(t[p1 - 1]),
+        autofocus=focus))
     return sm, a
 
 

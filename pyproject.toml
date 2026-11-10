@@ -12,8 +12,8 @@ license-files = ["LICENSE"]
 authors = [{name = "Paul Singerman"}]
 requires-python = ">=3.10"
 # CuPy with the CUDA runtime libraries is installed wherever its wheels run an Nvidia GPU out of the box (as the
-# deep-learning frameworks do), and sarpy reads and writes the CPHD, SICD and SIDD files
-dependencies = ["numpy>=2.2.6", "scipy>=1.15.3", "jax>=0.6.2", "sarpy>=1.3.64",
+# deep-learning frameworks do)
+dependencies = ["numpy>=2.2.6", "scipy>=1.15.3", "jax>=0.6.2",
                 "cupy-cuda12x[ctk]>=14; sys_platform == 'linux' and platform_machine == 'x86_64'"]
 keywords = ["synthetic aperture radar", "SAR", "backprojection", "image formation", "CPHD", "SICD", "GPU", "TPU"]
 classifiers = [
@@ -45,7 +45,7 @@ fastsar-doctor = "fastsar.doctor:main"
 [project.optional-dependencies]
 # cuda and io: part of the default installation since 0.2.0 (kept so that earlier install lines still work)
 cuda = ["cupy-cuda12x[ctk]>=14"]
-io = ["sarpy>=1.3.64"]
+io = []
 tpu = ["jax[tpu]>=0.6.2"]
 geo = ["rasterio>=1.4.4"]
 raw = ["h5py>=3.10"]

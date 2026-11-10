@@ -49,10 +49,11 @@ def test_gpu_without_cupy(monkeypatch, cuda, wheel):
 
 
 def test_no_gpu_and_optional_packages(monkeypatch):
-    c = machine(monkeypatch, missing=('sarpy', 'h5py'))
+    c = machine(monkeypatch, missing=('rasterio', 'h5py'))
     assert not c['backends']['cuda']['ok'] and not any('CuPy' in t['what'] for t in c['todo'])
     cmds = ' '.join(t['command'] for t in c['todo'])
-    assert 'fastsar[io]' in cmds and 'fastsar[raw]' in cmds and c['backends']['cpu']['ok']
+    assert 'fastsar[geo]' in cmds and 'fastsar[raw]' in cmds and 'fastsar[io]' not in cmds
+    assert c['backends']['cpu']['ok']
 
 
 def test_tpu_vm_without_the_tpu_build(monkeypatch):

@@ -23,16 +23,11 @@ def main():
     ap.add_argument('--size', type=int, default=512); ap.add_argument('--backend', default='cpu')
     ap.add_argument('--spacing', type=float, default=0.35)
     a = ap.parse_args()
-    from sarpy.io.complex.converter import open_complex
-    from sarpy.io.phase_history.converter import open_phase_history
     col, meta = io.read_cphd(a.cphd, meta=True)
     S, ant, f0, df = col['S'], col['ant'], col['fmin'], col['df']
     P, K = S.shape
-    srp = io.ecf_to_local(open_phase_history(a.cphd).read_pvp_variable('SRPPos', 0), meta)
-    lo, hi = meta['pulses']                      # the pulses read_cphd kept
-    srp = srp[lo:hi]
-    rd = open_complex(a.sicd)
-    sm = rd.sicd_meta
+    srp = meta['srp_pulses']                     # each kept pulse's scene reference point, local frame
+    vendor, sm = io.read_sicd(a.sicd)
     dsin = float(sm.Grid.Col.ImpRespBW) * C / (f0 + K / 2 * df) / 2      # processed spread of sin(look angle)
     d = np.gradient(ant, axis=0)
     d /= np.linalg.norm(d, axis=1, keepdims=True)
@@ -55,7 +50,8 @@ def main():
                               a.spacing, a.spacing, e1, e2, beam=beam, backend=a.backend)
     print(f'{nx} x {ny} ground pixels formed in {time.perf_counter() - t:.0f} s')
     ours = products.sample(img, np.stack([(pts - origin) @ e1 / a.spacing, (pts - origin) @ e2 / a.spacing], -1))
-    v = rd[r0:r0 + n, c0:c0 + n]
+    v = vendor[r0:r0 + n, c0:c0 + n]                                  # complex, or 16-bit I and Q bands
+    v = np.hypot(*np.moveaxis(v.astype(np.float32), -1, 0)) if v.ndim == 3 else np.abs(v)
     print(f'amplitude correlation with the vendor image: {np.corrcoef(np.abs(ours).ravel(), np.abs(v).ravel())[0, 1]:.3f}')
     np.save(a.out + '.npy', ours)
 

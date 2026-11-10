@@ -13,7 +13,8 @@ uv sync --group test            # the versions pinned in uv.lock, with the test 
 
 or, with pip, `pip install -e ".[io,test]"` (add `cuda` on a machine with an Nvidia GPU: `".[cuda,io,test]"`).
 The CPU backend needs a C++ compiler: `g++` with OpenMP on Linux (GCC 12 or later on ARM), Apple's clang on macOS. The `test` dependency group (and the `test` extra) holds pytest and the
-packages some tests need that are not dependencies of the library: `sarpy` (`tests/test_chain.py`), `finufft`
+packages some tests need that are not dependencies of the library: `sarpy` (the independent reader of the files
+FastSAR writes: `tests/test_chain.py`, `test_process.py`, `test_sidd.py`, `test_nitf.py`, `test_native_sicd.py`, `test_native_cphd.py`), `finufft`
 (`tests/test_insar.py`), `rasterio` (`products.write_geotiff`, `read_dem` and map projections other than
 latitude/longitude) and `sarkit` (consistency checks in `tests/test_chain.py`).
 

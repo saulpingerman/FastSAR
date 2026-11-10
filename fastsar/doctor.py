@@ -24,8 +24,7 @@ __all__ = ['check', 'report', 'main']
 _SYSTEM = (('apt-get', 'sudo apt-get install -y g++'), ('dnf', 'sudo dnf install -y gcc-c++'),
            ('yum', 'sudo yum install -y gcc-c++'), ('zypper', 'sudo zypper install -y gcc-c++'),
            ('pacman', 'sudo pacman -S --needed gcc'), ('apk', 'apk add g++'))
-_OPTIONAL = (('sarpy', 'io', 'CPHD and SICD files, SIDD output'), ('rasterio', 'geo', 'GeoTIFF output'),
-             ('h5py', 'raw', 'NISAR and other HDF5 raw data'))
+_OPTIONAL = (('rasterio', 'geo', 'GeoTIFF output'), ('h5py', 'raw', 'NISAR and other HDF5 raw data'))
 _TPU_INDEX = 'https://storage.googleapis.com/jax-releases/libtpu_releases.html'
 
 

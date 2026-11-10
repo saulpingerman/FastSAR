@@ -1,5 +1,5 @@
 """Read a collection from CPHD (frequency domain) and, optionally, the image grid of the matching SICD, into the
-arrays form_image takes. Needs sarpy.
+arrays form_image takes. The CPHD and SICD files are parsed by fastsar._cphdxml and fastsar._sicdxml.
 
     col = fastsar.io.read_cphd('x_CPHD.cphd', sicd='x_SICD.nitf')
     img = fastsar.form_image(**col)
@@ -86,41 +86,49 @@ def troposphere_delay(tx, rcv, srp):
     return out / C
 
 
+_MODES = ('SPOTLIGHT', 'STRIPMAP', 'DYNAMIC STRIPMAP')
+
+
+def _open_cphd(path):
+    """The reader of a CPHD file (fastsar._cphdxml.Reader): the one place the readers open a CPHD by path."""
+    from ._cphdxml import open_cphd
+    return open_cphd(path)
+
+
 def _mode_type(r, m, notes):
-    """CollectionID/RadarMode/ModeType: sarpy's value, or the XML's own text when the value is outside the CPHD
-    enumeration (sarpy then reports None; ICEYE's CPHD 1.1.0 files write EXPERIMENTAL)."""
+    """CollectionID/RadarMode/ModeType as the XML gives it, with a note when the value is outside the CPHD enumeration
+    (ICEYE's CPHD 1.1.0 files write EXPERIMENTAL). A reader that reports None for such a value has it taken from the
+    XML's own text."""
     coll = getattr(m, 'CollectionID', None) or getattr(m, 'CollectionInfo', None)       # 1.x, 0.3
     mode = getattr(getattr(coll, 'RadarMode', None), 'ModeType', None)
-    if mode is not None:
+    if mode is not None and str(mode) in _MODES:
         return mode
-    try:
-        import xml.etree.ElementTree as ET
-        root = ET.fromstring(r.cphd_details.get_cphd_bytes())
-        for e in root.iter():
-            if e.tag.split('}')[-1] == 'ModeType' and e.text and e.text.strip():
-                mode = e.text.strip()
-                notes.append(f'radar mode {mode!r} is outside the CPHD enumeration (SPOTLIGHT, STRIPMAP, DYNAMIC STRIPMAP); '
-                             'taken from the XML')
-                return mode
-    except Exception:
-        pass
-    return None
+    if mode is None:
+        try:
+            import xml.etree.ElementTree as ET
+            root = ET.fromstring(r.cphd_details.get_cphd_bytes())
+            for e in root.iter():
+                if e.tag.split('}')[-1] == 'ModeType' and e.text and e.text.strip():
+                    mode = e.text.strip()
+                    break
+        except Exception:
+            pass
+    if mode is not None:
+        notes.append(f'radar mode {mode!r} is outside the CPHD enumeration (SPOTLIGHT, STRIPMAP, DYNAMIC STRIPMAP); '
+                     'taken from the XML')
+    return mode
 
 
 def _cphd1_samples(r, m, channel):
     """The signal array of one channel of a CPHD 1.x file as it lies in the file: (a read-only memory map [P, K, 2]
     of the real and imaginary parts in the file's big-endian sample type, AmpSF per vector as float32 or None), or
-    None where the bytes are not the samples (a compressed signal block) and the reader of sarpy is used. Reading
-    through the map on all cores is some ten times faster than sarpy's conversion on one."""
+    None where the reader gives no such map (a compressed signal block, whose read then raises; a stand-in reader)
+    and read_chip is used. Reading through the map on all cores is some ten times faster than a conversion on
+    one."""
     try:
-        raw = {'CI2': '>i1', 'CI4': '>i2', 'CF8': '>f4'}[str(m.Data.SignalArrayFormat)]
-        comp = getattr(m.Data, 'SignalCompressionID', None)
-        if comp not in (None, '') or not hasattr(r, 'cphd_header') or not hasattr(r, 'cphd_details'):
+        if not hasattr(r, 'signal_map') or getattr(r, 'compression', None) is not None:
             return None
-        ch = m.Data.Channels[channel]
-        P, K = int(ch.NumVectors), int(ch.NumSamples)
-        off = int(r.cphd_header.SIGNAL_BLOCK_BYTE_OFFSET) + int(ch.SignalArrayByteOffset)
-        sig = np.memmap(r.cphd_details.file_name, dtype=raw, mode='r', offset=off, shape=(P, K, 2))
+        sig = r.signal_map(channel)
         amp = r.read_pvp_variable('AmpSF', channel)
     except (KeyError, AttributeError, TypeError, ValueError, OSError):
         return None
@@ -133,24 +141,16 @@ def _cphd1_samples(r, m, channel):
 def _cphd03_channel(r, m, arrays, channel):
     """CPHD 0.3 per-vector parameters and samples of one channel, read at the offsets the 0.3 layout gives:
     channel c's vector block starts NumBytesVBP times the vectors of the channels before it into the vector-based
-    block, and its samples after those channels' samples. (sarpy's 0.3 reader offsets channel c's vector block by c
-    vectors only, so for any channel but the first it returns the first channel's parameters shifted by c pulses, and
-    scales the samples with them.) -> (pv(name) -> float64 array or None, read_rows(p0, p1) -> complex64 [rows, K])."""
-    h = r.cphd_header
-    fname = r.cphd_details.file_name
-    dt = m.VectorParameters.get_vector_dtype()
-    nv = [int(a.NumVectors) for a in arrays]
-    P, K = nv[channel], int(arrays[channel].NumSamples)
-    vb = np.memmap(fname, dtype=dt, mode='r', offset=int(h.VB_BYTE_OFFSET) + int(m.Data.NumBytesVBP) * sum(nv[:channel]),
-                   shape=(P,))
-    raw = {'RE32F_IM32F': '>f4', 'RE16I_IM16I': '>i2', 'RE08I_IM08I': '>i1'}[m.Data.SampleType]
-    isz = np.dtype(raw).itemsize
-    off = int(h.CPHD_BYTE_OFFSET) + sum(int(a.NumVectors) * int(a.NumSamples) * 2 * isz for a in arrays[:channel])
-    sig = np.memmap(fname, dtype=raw, mode='r', offset=off, shape=(P, K, 2))
-    amp = np.asarray(vb['AmpSF'], np.float64) if 'AmpSF' in dt.names else None
+    block, and its samples after those channels' samples (fastsar._cphdxml).
+    -> (pv(name) -> float64 array or None, read_rows(p0, p1) -> complex64 [rows, K])."""
+    vb = r.read_pvp_array(channel)
+    names = vb.dtype.names
+    K = int(arrays[channel].NumSamples)
+    sig = r.signal_map(channel)
+    amp = np.asarray(vb['AmpSF'], np.float64) if 'AmpSF' in names else None
 
     def pv(name):
-        return np.array(vb[name], np.float64) if name in dt.names else None
+        return np.array(vb[name], np.float64) if name in names else None
 
     def read_rows(p0, p1):
         b = sig[p0:p1]
@@ -240,6 +240,14 @@ def _opt(m, path, conv=None):
     return conv(m) if conv else m
 
 
+def _start(v):
+    """The collection start as 'YYYY-MM-DDThh:mm:ss.ffffff' (UTC) from the XML's text; other values as str()."""
+    if isinstance(v, str):
+        from ._cphdxml import start_time
+        return start_time(v)
+    return str(v)
+
+
 def _assemble(S, tx, rcv, srp, f0, df, notes, sicd, meta, info):
     """The tail shared by the readers: the local frame at the mid-aperture scene reference point, the reference
     range of each pulse (re-referenced to one point when the scene reference point barely moves), the SICD grid
@@ -278,9 +286,8 @@ def _assemble(S, tx, rcv, srp, f0, df, notes, sicd, meta, info):
     cur_ref = ref if not fixed_ref else ref0           # the range each pulse is compensated to from here on
     origin = s0
     if sicd is not None:
-        _deps.require('sarpy')
-        from sarpy.io.complex.converter import open_complex
-        sm = open_complex(sicd).sicd_meta
+        from . import _sicdxml
+        sm = _sicdxml.read(sicd)
         if sm.Grid.Type not in ('RGAZIM', 'PLANE', 'XRGYCR', 'XCTYAT'):
             raise ValueError(f'the SICD grid is {sm.Grid.Type}, not a plane: read without sicd and form its pixels with '
                              'fastsar.backproject(S, ..., io.sicd_points(sicd, rows, cols, meta))')
@@ -334,9 +341,7 @@ def read_cphd(cphd, sicd=None, channel=0, meta=False, regrid_tol=1e-3, drop_flag
     does not define, is reported but not applied. A 0.3 file with RefFreqIndex set declares its frequencies to be
     offsets from a reference frequency it does not contain, and is refused unless ref_freq gives that reference in
     Hz; ref_freq=0.0 asserts that the file's frequencies are absolute despite the flag."""
-    _deps.require('sarpy')
-    from sarpy.io.phase_history.converter import open_phase_history
-    r = open_phase_history(cphd)
+    r = _open_cphd(cphd)
     m = r.cphd_meta
     # CPHD 0.3 (the pre-standard NGA format) keeps the per-vector positions and times under the 1.x names but sizes
     # its channels in Data.ArraySize, gives the frequency grid as Fx0 and Fx_SS, the phase sign as Global.PhaseSGN and
@@ -410,7 +415,7 @@ def read_cphd(cphd, sicd=None, channel=0, meta=False, regrid_tol=1e-3, drop_flag
         # one compiled pass on all cores: byte order, scale, conjugation, the check for non-finite and empty rows
         sig, amp = direct
         loaded = np.zeros(P, np.uint8)
-        _lib().cphd_load(sig.ctypes.data, {'>i1': 1, '>i2': 2, '>f4': 4}[sig.dtype.str], P, K,
+        _lib().cphd_load(sig.ctypes.data, sig.dtype.itemsize, P, K,
                          None if amp is None else amp.ctypes.data, 0, None, None, S.ctypes.data, loaded.ctypes.data)
         del sig
     elif direct is not None:                    # the file's own bytes, converted on all cores
@@ -533,7 +538,7 @@ def read_cphd(cphd, sicd=None, channel=0, meta=False, regrid_tol=1e-3, drop_flag
     info = dict(tx_time=pv('TxTime')[lo:hi], rcv_time=pv('RcvTime')[lo:hi], pulses=(lo, hi),
                 polarization=pols[channel], channel=ids[channel], channel_index=channel,
                 mode=_mode_type(r, m, notes), cphd_version=str(getattr(r, 'cphd_version', '') or '') or None,
-                start=_opt(m, 'Global.CollectStart' if v03 else 'Global.Timeline.CollectionStart', str),
+                start=_opt(m, 'Global.CollectStart' if v03 else 'Global.Timeline.CollectionStart', _start),
                 collector=_opt(m, f'{cpath}.CollectorName'), core_name=_opt(m, f'{cpath}.CoreName'))
     return _assemble(S, tx, rcv, srp, f0, df, notes, sicd, meta, info)
 
@@ -1067,17 +1072,26 @@ def orbit_type(orb):
     return v.decode() if isinstance(v, bytes) else str(v)
 
 
+def read_sicd(path, native=False):
+    """A SICD file (NITF 2.1) -> (pixels [rows, cols], metadata). metadata: fastsar._sicdxml.SICD, attribute access
+    by the SICD XML's element names (meta.Grid.Row.SS, meta.GeoData.SCP.ECF.get_array()) and the SICD's projection
+    (project_image_to_ground, project_ground_to_image). pixels: a read-only memory map in the file's big-endian
+    type (complex64 for RE32F_IM32F; [rows, cols, 2] for RE16I_IM16I and AMP8I_PHS8I), or with native=True an array
+    in memory, complex64 for the I and Q types (AMP8I_PHS8I stays its two bytes: amplitude index and phase)."""
+    from . import _nitf, _sicdxml
+    return _nitf.read(path).pixels(native=native), _sicdxml.read(path)
+
+
 def sicd_points(sicd, rows, cols, meta, hae=None):
     """Positions [..., 3] in read_cphd's local frame of the SICD pixels (rows, cols) (arrays of one shape), projected
     by the SICD's own model onto the surface at height hae above the ellipsoid (default: the SCP's). Any grid type,
     including range / zero-Doppler grids, which are not planes; backproject onto these points forms the image on the
     vendor's pixels."""
-    _deps.require('sarpy')
-    from sarpy.io.complex.converter import open_complex
-    sm = sicd if not isinstance(sicd, str) else open_complex(sicd).sicd_meta
+    from . import _sicdxml
+    sm = _sicdxml.read(sicd)
     rows, cols = np.broadcast_arrays(np.asarray(rows, np.float64), np.asarray(cols, np.float64))
     h = float(sm.GeoData.SCP.LLH.HAE) if hae is None else float(hae)
-    ecf = np.asarray(sm.project_image_to_ground(np.stack([rows.ravel(), cols.ravel()], 1), projection_type='HAE', hae0=h))
+    ecf = sm.project_image_to_ground(np.stack([rows.ravel(), cols.ravel()], 1), projection_type='HAE', hae0=h)
     return ecf_to_local(ecf.reshape(rows.shape + (3,)), meta)
 
 

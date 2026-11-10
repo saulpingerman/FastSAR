@@ -1,8 +1,7 @@
-"""io.read_cphd and form_cphd end to end on simulated FX-domain collections, through a stand-in for sarpy's CPHD
-reader (no CPHD writer is a dependency, and the tests write no files): open_phase_history returns the metadata
-fields, per-vector parameters and samples that read_cphd and form_cphd read, built from a simulated collection placed
-on the WGS-84 ellipsoid at the equator. The stand-in replaces sarpy's modules in sys.modules for this module's
-tests only.
+"""io.read_cphd and form_cphd end to end on simulated FX-domain collections, through a stand-in for the CPHD reader
+(the tests write no files): the function that opens a CPHD returns the metadata fields, per-vector parameters and
+samples that read_cphd and form_cphd read, built from a simulated collection placed on the WGS-84 ellipsoid at the
+equator. The stand-in replaces io._open_cphd for this module's tests only.
 
 (a) Spotlight: a fixed scene reference point (SRP), the grid from the image area. read_cphd returns the samples
     and the antenna path in its local frame; SGN = +1 data are conjugated back; non-finite samples are zeroed and
@@ -14,7 +13,6 @@ tests only.
 
 Errors are 10 log10 of the energy of the difference over that of the reference; limits about 5 dB above the
 values measured when they were set."""
-import sys
 import types
 from types import SimpleNamespace
 
@@ -67,12 +65,10 @@ class Reader:
 
 @pytest.fixture(scope='module', autouse=True)
 def stand_in_reader():
-    """sarpy's CPHD reader replaced by the stand-in while this module runs; the real modules, if loaded, return
-    afterwards."""
+    """The function with which the readers open a CPHD file (io._open_cphd) replaced by the stand-in while this
+    module runs."""
     with pytest.MonkeyPatch.context() as mp:
-        for name in ('sarpy', 'sarpy.io', 'sarpy.io.phase_history', 'sarpy.io.phase_history.converter'):
-            mp.setitem(sys.modules, name, types.ModuleType(name))
-        sys.modules['sarpy.io.phase_history.converter'].open_phase_history = Reader
+        mp.setattr(io, '_open_cphd', Reader)
         yield
     FILES.clear()
 
@@ -288,7 +284,7 @@ def test_form_cphd_moving_srp():
     assert not bad, 'FAILED: ' + '; '.join(bad)
     # process_cphd on a moving beam: the same image on the ground plane, as a SICD and as a SIDD laid out shadows
     # down; the slant plane, autofocus, apodization and the quality areas are for spotlight collections
-    # (nothing is written here: this module's stand-in replaces sarpy)
+    # (nothing is written here)
     po = fastsar.process_cphd('strip.cphd', backend='cpu', extent=(60.0, 50.0))
     assert po['mode'] == 'moving' and po['plane'] == 'ground' and po['weighting'] == 'taylor' and po['autofocus'] is None
     assert po['image'].shape == img.shape and np.abs(po['image'] - img).max() < 2e-3 * np.abs(img).max()    # another patch size
@@ -307,7 +303,7 @@ def test_form_cphd_moving_srp():
 
 
 def test_mode_outside_enumeration(spot):
-    """A CPHD 1.1.0 file whose ModeType sarpy rejects (ICEYE writes EXPERIMENTAL; sarpy sets None): the mode comes
+    """A CPHD 1.1.0 file whose ModeType a reader rejects (ICEYE writes EXPERIMENTAL; the reader gives None): the mode comes
     from the XML, with a note; a file without the element reads with mode None and no note."""
     xml = (b'<CPHD xmlns="http://api.nsgreg.nga.mil/schema/cphd/1.1.0"><CollectionID><CollectorName>X</CollectorName>'
            b'<RadarMode><ModeType>EXPERIMENTAL</ModeType></RadarMode></CollectionID></CPHD>')

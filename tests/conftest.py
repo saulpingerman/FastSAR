@@ -15,7 +15,7 @@ and the test reported as crashed). `--max-rss-gb 0` turns both off. The terminal
 module.
 
 Isolation. The former runner gave each script its own process. The modules now share one, so each undoes what it
-changes: environment variables and patched functions through monkeypatch, the stand-in sarpy modules of
+changes: environment variables and patched functions through monkeypatch, the stand-in CPHD reader of
 test_cphd.py through a module fixture, and JAX's CPU device (jax_platform_name in the scripts) through the jax_cpu
 fixture below, which also sets the default device, so the dense references stay on the CPU of a GPU or TPU host
 whatever ran before. `pytest -n 4 --dist loadfile` (pytest-xdist) runs modules in parallel worker processes.
