@@ -177,8 +177,8 @@ def _mask(out, st, area):
     nx, ny, o, e1, e2, spx, spy = planes._grid(out)
     ki, kj = planes._knots(nx, max(8, int(50.0 / spx))), planes._knots(ny, max(8, int(50.0 / spy)))
     pts = o + (ki * spx)[:, None, None] * e1 + (kj * spy)[None, :, None] * e2
-    m, _ = rgiqe.area_mask(rad, pts.reshape(-1, 3), area, bw_area, n, tasked=tasked)
-    f = np.asarray(m, np.float64).reshape(len(ki), len(kj))
+    m, _ = rgiqe.area_mask(rad, pts, area, bw_area, n, tasked=tasked)
+    f = np.asarray(m, np.float64)
     from .resample import KnotMap
     km = KnotMap(ki, kj, f, ny)
     valid = np.empty((nx, ny), bool)
