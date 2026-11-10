@@ -224,6 +224,8 @@ def form_cphd(cphd, sicd=None, *, mode='auto', backend='auto', window=True, spac
                                                 pulses=used)) or {})
     if plan.get('window') is not None:
         window = bool(plan['window'])
+    if plan.get('axes') is not None:                  # any plane through the center (a study's slant-plane grid)
+        e1, e2 = (np.asarray(v, np.float64) for v in plan['axes'])
     if window:
         wk = _taylor(K)
         wp = _taylor(P) if spot else np.ones(P, np.float32)
@@ -276,6 +278,8 @@ def form_cphd(cphd, sicd=None, *, mode='auto', backend='auto', window=True, spac
     nx = int(np.ceil((a1.max() - a1.min()) / spx)) + 1
     ny = int(np.ceil((a2.max() - a2.min()) / spy)) + 1
     origin = a1.min() * e1 + a2.min() * e2 + h * up
+    if plan.get('bounds') is not None:
+        origin = center + b[0] * e1 + b[2] * e2
     # host memory: the history, the image and the mosaic's accumulation; past what is available, a clear error
     from . import memory as _mem
     need = S.nbytes + 2 * 8 * nx * ny
