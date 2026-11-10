@@ -466,8 +466,14 @@ def _children(kern, pre, pim, c0, sl, lv):
             rawreg = next((r for r in _RAWREG if -(-W // jt) <= r), 0)
         if os.environ.get('FASTSAR_CUDA_RAWREG'):
             rawreg = int(os.environ['FASTSAR_CUDA_RAWREG'])             # testing: a tier, 0 for shared memory, -1 for reloads
-        for pb in ((pb_env,) if pb_env else _PB_CHOICES):   # pulses per block: the largest whose window fits the device
-            smem = ((4 if rawreg == 0 else 2) * pb * (W | 1) + L + 2 * pb * cols) * 4
+        # pulses per block: the largest whose window fits the device. A window too wide for two copies in shared
+        # memory at any block size (a large range decimation: an image narrow in range from a wide-band
+        # collection) keeps one copy there and reloads the raw samples for every child
+        for rawreg in ((rawreg,) if rawreg != 0 or os.environ.get('FASTSAR_CUDA_RAWREG') else (0, -1)):
+            for pb in ((pb_env,) if pb_env else _PB_CHOICES):
+                smem = ((4 if rawreg == 0 else 2) * pb * (W | 1) + L + 2 * pb * cols) * 4
+                if smem <= smem_max:
+                    break
             if smem <= smem_max:
                 break
         if os.environ.get('FASTSAR_CUDA_DEBUG'):                            # testing: the kernel's configuration
