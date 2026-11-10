@@ -357,9 +357,10 @@ def _ranks_count(below, n, radix=16):
     def take(*ranges):
         cells, found = [(0, 1 << 32, 0, n)], []                    # keys a ... b - 1 hold the ranks ca ... cb - 1
         while cells:
-            edges = [[a + (b - a) * i // min(radix, b - a) for i in range(1, min(radix, b - a))] for a, b, _, _ in cells]
+            edges = [[a + (b - a) * i // min(radix, b - a) for i in range(1, min(radix, b - a))]
+                     for a, b, _, _ in cells]
             flat = np.array([t for e in edges for t in e], np.uint32)
-            size = 16 if len(flat) <= 16 else 48                   # two compiled sizes; a short call is filled by repeats
+            size = 16 if len(flat) <= 16 else 48                   # two compiled sizes, a short call filled by repeats
             cnt = np.concatenate([below(np.resize(flat[i:i + size], size))[:len(flat[i:i + size])]
                                   for i in range(0, len(flat), size)])
             cells, at, last = [], 0, cells

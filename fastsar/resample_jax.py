@@ -157,7 +157,8 @@ def _oversampled(u, pad, n2, real, K):
 
 
 def _step(src, a, P, J, M, tab, K, *, axis, mode, nb, pad, guard, n2):
-    """Lines a ... a + nb of a pass (resample_cuda._pass's conventions) -> [nb, m] ([m, nb] along axis 0). mode 'knots': P, J as
+    """Lines a ... a + nb of a pass (resample_cuda._pass's conventions) -> [nb, m] ([m, nb] along axis 0). mode
+    'knots': P, J as
     _knot's; 'split': P = (integer part, remainder) [nb, m] from the host; 'device': P = (pos [L, m],) on the device.
     M: None, or (Px, limits [xlo, xhi, ylo, yhi], valid [nx, ny] or None), warp's mask with Px as P."""
     real = not jnp.iscomplexobj(src)
@@ -280,7 +281,8 @@ def _at(D, kink, B):
 
 
 def _step_blocks(src, a, D, w0, kink, M, coef, K, *, axis, nb, m, pad, guard, n2, B, W, R):
-    """Lines a ... a + nb of a pass by blocks of B output samples -> [nb, m] ([m, nb] along axis 0). D, kink: _blocks' and _span's;
+    """Lines a ... a + nb of a pass by blocks of B output samples -> [nb, m] ([m, nb] along axis 0). D, kink:
+    _blocks' and _span's;
     w0 [nb, nblk]: the first oversampled sample of each block's window of R, the first taps of its samples starting
     less than W after it; coef: _poly's, times pad; M: None or (Dx, limits, valid), warp's mask; K: _oversampled's."""
     real = not jnp.iscomplexobj(src)

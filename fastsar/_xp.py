@@ -83,7 +83,8 @@ def host(a):
         v = out.view(out.real.dtype).reshape(a.shape + (2,))
         step = int(max(1, min(a.shape[0], jax_block() // max(a[:1].nbytes, 1))))
         for i in range(0, a.shape[0], step):
-            v[i:i + step, ..., 0], v[i:i + step, ..., 1] = np.asarray(jnp.real(a[i:i + step])), np.asarray(jnp.imag(a[i:i + step]))
+            blk = a[i:i + step]
+            v[i:i + step, ..., 0], v[i:i + step, ..., 1] = np.asarray(jnp.real(blk)), np.asarray(jnp.imag(blk))
         return out
     return np.asarray(a)
 

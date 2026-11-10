@@ -321,7 +321,8 @@ def _map_drift(A, band, iterations, tol, workers=-1):
         if np.all(np.abs(step) < tol):
             break
     after = _jit('undo')(G, quad(c)) if jitted else _ft(G * quad(c), 'ifft', workers)
-    return dict(c=c, corr=corr, step=step, iterations=it + 1, before=_contrast(A, (0, 2)), after=_contrast(after, (0, 2)))
+    return dict(c=c, corr=corr, step=step, iterations=it + 1, before=_contrast(A, (0, 2)),
+                after=_contrast(after, (0, 2)))
 
 
 def _jit(name):
@@ -365,8 +366,9 @@ def _threads(work, items):
 def _apply(img, phi):
     """img with the phase phi [nx] (rad, FFT order) removed from its azimuth spectrum, complex64, on the device of
     img: ifft(fft(img, axis=0) * exp(-1j * phi)[:, None], axis=0), exact zeros of img kept. Column blocks: on the
-    host one thread per block of about 4 MB, on a GPU blocks of 1 GB, in JAX equal blocks of at most 2 GB (less on a device with little memory: _xp.jax_block) through
-    one jitted kernel, fewer where the device's memory is small (the last block overlaps its neighbor so that every block has the same shape)."""
+    host one thread per block of about 4 MB, on a GPU blocks of 1 GB, in JAX equal blocks of at most 2 GB (less on
+    a device with little memory: _xp.jax_block) through one jitted kernel (the last block overlaps its neighbor
+    so that every block has the same shape)."""
     nx, ny = img.shape
     q = np.exp(-1j * np.asarray(phi, np.float64)).astype(np.complex64)
     k = _xp.kind(img)

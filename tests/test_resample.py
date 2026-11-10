@@ -227,7 +227,7 @@ def test_blocks_zeros_mask_and_fallback(need, monkeypatch):
     n0, n1, m0, m1 = 200, 180, 230, 260
     src = (rng.normal(size=(n0, n1)) + 1j * rng.normal(size=(n0, n1))).astype(np.complex64)
     lk, ok = np.linspace(0, n1 - 1, 7), np.linspace(0, m0 - 1, 8)
-    p0 = resample.KnotMap(lk, ok, 0.9371 * ok[None] + 0.2013 * lk[:, None] - 21.03, m0)     # leaves the source at both ends
+    p0 = resample.KnotMap(lk, ok, 0.9371 * ok[None] + 0.2013 * lk[:, None] - 21.03, m0)     # leaves the source
     lk, ok = np.linspace(0, m0 - 1, 6), np.linspace(0, m1 - 1, 9)
     p1 = resample.KnotMap(lk, ok, 0.8137 * ok[None] + 0.0519 * lk[:, None] - 9.07, m1)
     px = resample.KnotMap(lk, ok, 0.9033 * lk[:, None] - 0.1017 * ok[None] + 3.01, m1)    # no position on a tie
@@ -236,16 +236,17 @@ def test_blocks_zeros_mask_and_fallback(need, monkeypatch):
     monkeypatch.setattr(resample_jax, '_plan_blocks', lambda *a: calls.append(plan(*a)) or calls[-1])
     for path in ('gather', 'blocks'):
         monkeypatch.setenv('FASTSAR_RESAMPLE_JAX', path)
-        out[path] = [np.asarray(resample_jax.warp(jnp.asarray(src), p0, p1, (m0, m1), mask=mk))
-                     for mk in (None, (px, (10, n0 - 11), (12, n1 - 13), None), (px, (10, n0 - 11), (12, n1 - 13), valid))]
+        masks = (None, (px, (10, n0 - 11), (12, n1 - 13), None), (px, (10, n0 - 11), (12, n1 - 13), valid))
+        out[path] = [np.asarray(resample_jax.warp(jnp.asarray(src), p0, p1, (m0, m1), mask=mk)) for mk in masks]
     for k, (g, mm) in enumerate(zip(out['gather'], out['blocks'])):
         same = (g == 0) == (mm == 0)                    # a position within 1e-5 of a mask's edge may fall either way
         assert 0.05 < (g == 0).mean() < 0.95 and np.count_nonzero(~same) <= (0, 2, 2)[k], (k, np.count_nonzero(~same))
         assert np.abs(g - mm)[same].max() < 2e-3 * np.abs(g).max()
     pos = p1(slice(0, m0))
     dense = resample.KnotMap(np.arange(m0, dtype=float), np.arange(m1, dtype=float), pos, m1)   # a knot at every sample
-    back = resample.KnotMap(np.array([0.0, m0 - 1]), np.array([0.0, 100.0, m1 - 1]), np.array([[5.0, 150, 20], [9.0, 150, 30]]), m1)
-    wild = resample.KnotMap(np.array([0.0, m0 - 1]), np.array([0.0, 8.0, m1 - 1]), np.array([[5.0, 175, 6], [9.0, 170, 30]]), m1)
+    ends = np.array([0.0, m0 - 1])
+    back = resample.KnotMap(ends, np.array([0.0, 100.0, m1 - 1]), np.array([[5.0, 150, 20], [9.0, 150, 30]]), m1)
+    wild = resample.KnotMap(ends, np.array([0.0, 8.0, m1 - 1]), np.array([[5.0, 175, 6], [9.0, 170, 30]]), m1)
     mid = jnp.asarray((rng.normal(size=(m0, n1)) + 1j * rng.normal(size=(m0, n1))).astype(np.complex64))
     ref = np.asarray(resample.lines(mid, p1, m1))
     assert calls[-1] is not None
@@ -253,7 +254,7 @@ def test_blocks_zeros_mask_and_fallback(need, monkeypatch):
         n = len(calls)
         got = np.asarray(resample.lines(mid, q, m1))
         assert all(c is None for c in calls[n:]) and np.abs(got - ref).max() < 2e-3 * np.abs(ref).max()
-    for q, taken in ((back, True), (wild, False)):          # a map that turns back is taken, a jump of 20 samples is not
+    for q, taken in ((back, True), (wild, False)):          # a map that turns back is taken, a jump is not
         monkeypatch.setenv('FASTSAR_RESAMPLE_JAX', 'gather')
         ref = np.asarray(resample.lines(mid, q, m1))
         monkeypatch.setenv('FASTSAR_RESAMPLE_JAX', 'blocks')

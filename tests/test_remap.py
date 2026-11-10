@@ -164,7 +164,8 @@ def test_ranks_from_counts():
     """Order statistics from counts below thresholds (a TPU's search) are the sorted values: neighboring ranks, the
     ends, ties, negative values, infinities and NaN (last), and one value."""
     rng = np.random.default_rng(8)
-    v = np.concatenate([rng.standard_normal(5000), np.full(40, 0.25), [0.0, -0.0, np.inf, -np.inf, np.nan, np.nan]]).astype(np.float32)
+    v = np.concatenate([rng.standard_normal(5000), np.full(40, 0.25), [0.0, -0.0, np.inf, -np.inf, np.nan, np.nan]])
+    v = v.astype(np.float32)
     rng.shuffle(v)
     calls = []
 
@@ -174,12 +175,14 @@ def test_ranks_from_counts():
     n, take = remap._ranks_count(below, v.size)
     s = np.sort(v)
     got = take((0, 1), (2500, 2564), (v.size - 4, v.size), (0, v.size))
-    assert n == v.size and all(np.array_equal(g, w, equal_nan=True) for g, w in zip(got, (s[:1], s[2500:2564], s[-4:], s)))
+    want = (s[:1], s[2500:2564], s[-4:], s)
+    assert n == v.size and all(np.array_equal(g, w, equal_nan=True) for g, w in zip(got, want))
     assert set(calls) <= {16, 48}
     calls.clear()
     assert np.array_equal(take((2500, 2564))[0], s[2500:2564]) and len(calls) < 150
     one = np.array([3.5], np.float32)
-    assert remap._ranks_count(lambda thr: np.array([np.count_nonzero(remap._key(np, one) < t) for t in thr]), 1)[1]((0, 1))[0][0] == 3.5
+    count = lambda thr: np.array([np.count_nonzero(remap._key(np, one) < t) for t in thr])
+    assert remap._ranks_count(count, 1)[1]((0, 1))[0][0] == 3.5
 
 
 def test_fastsar_remap_jax_is_checked(monkeypatch):
@@ -203,12 +206,13 @@ def test_jax_in_blocks(statistics, monkeypatch):
     def run():
         out = [np.asarray(remap.REMAPS[name](jnp.asarray(im), valid=v)) for name in NAMES for v in (None, valid)
                for im in (x, np.abs(x))]
-        out += [np.asarray(remap.linear(jnp.asarray(x), valid=valid)), np.asarray(remap.amplitude_to_density(jnp.asarray(x))),
+        out += [np.asarray(remap.linear(jnp.asarray(x), valid=valid)),
+                np.asarray(remap.amplitude_to_density(jnp.asarray(x))),
                 remap.percentile(jnp.asarray(np.abs(x).ravel()), 99), remap.percentile(jnp.asarray(x.real), 30)]
         return out
     monkeypatch.delenv('FASTSAR_JAX_BLOCK_MB', raising=False)
     ref = run()
-    for mb in ('0.9', '0.76'):                                      # blocks of 2^14 pixels: 5 with a short last one, and 4
+    for mb in ('0.9', '0.76'):                                      # blocks of 2^14 pixels: 5, the last short, and 4
         monkeypatch.setenv('FASTSAR_JAX_BLOCK_MB', mb)
         assert remap._blocked(remap._nrl_u8, jnp.asarray(x), None) is not None
         assert all(np.array_equal(g, r) for g, r in zip(run(), ref))
