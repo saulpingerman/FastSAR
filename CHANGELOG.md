@@ -79,6 +79,9 @@ was published on PyPI.
 
 ### Changed
 
+- README and docs carry the 0.2.0 release records, measured at the tag on the six devices of the 0.1.7 records.
+  The images of the three Umbra collections are bitwise those of 0.1.7, and the times are within 2.5% of them but
+  for three single figures ([docs/performance.md](docs/performance.md)).
 - Installation. CuPy with the CUDA runtime libraries is a dependency on Linux x86-64, so that `pip install fastsar`
   alone gives the GPU backend; the `cuda` extra remains as a name for other platforms. An environment that already
   holds another CuPy build should install with `--no-deps`.

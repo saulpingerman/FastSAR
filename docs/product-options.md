@@ -56,6 +56,23 @@ two collections, from the CPHD file on disk (in the page cache) to the product f
 apodization, detection and the projection to the ground; the SIDD's write includes the remap. The CPHD files are
 8.7 GB (Umbra) and 9.2 GB (Capella).
 
+The same two products on a cloud instance, for another Capella spotlight collection (2025-01-15), second run, in
+seconds:
+
+| Product | Processor | Read | Form | After formation | Write | Total |
+|---|---|---|---|---|---|---|
+| Slant SICD, 223 Mpx | Nvidia L4 (g2-standard-32) | 1.76 | 13.0 | 1.14 | 1.20 | 17.1 |
+| | the 32 vCPUs of that instance | 1.76 | 77.4 | 11.5 | 0.56 | 91.2 |
+| Ground SIDD, 428 Mpx | Nvidia L4 (g2-standard-32) | 1.77 | 13.1 | 3.57 | 1.23 | 19.7 |
+| | the 32 vCPUs of that instance | 1.76 | 78.3 | 39.0 | 7.68 | 126.8 |
+
+At the instance's on-demand price ($1.734 per hour) a thousand slant products cost $8.2 on the L4. Over six
+spotlight collections (slant products of 9 to 341 Mpx) the median totals on the L4 were 13.5 s for the slant SICD
+and 15.2 s for the SIDD. The SIDD of a collection whose slant image is about 1,000 Mpx took 50 s on the same
+L4, and a product whose images do not fit the GPU's memory is streamed through it from the host
+([performance.md](performance.md)).
+On a TPU v6e the resampling to the slant plane takes about 0.01 s per megapixel, from 35 to 1,155 Mpx.
+
 On a TPU the image likewise stays on the device. Seconds per stage on a Cloud TPU v5e (one chip, 16 GB), second
 call, on synthetic speckle images with the maps of a spaceborne geometry: a 23 Mpx ground image to a slant grid of
 the same sampling (the SICD path), and a 13 Mpx and a 53 Mpx ground image to slant grids of 49 and 196 Mpx at twice
