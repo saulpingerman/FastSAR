@@ -127,6 +127,16 @@ def as_grid(grid):
         g = dict(origin=io.local_to_ecf(np.asarray(grid['origin'], np.float64), m),
                  e1=np.asarray(grid['e1'], np.float64) @ R, e2=np.asarray(grid['e2'], np.float64) @ R,
                  spx=float(grid['spx']), spy=float(grid['spy']), shape=tuple(int(v) for v in np.shape(grid['image'])[:2]))
+        # a product formed on a grid records it. Those numbers are returned where they name the pixels the product
+        # has now: the way through the product's local frame gives them to rounding only, and forming on them again
+        # would then give the same image to float32 rounding instead of the same bits
+        own = grid.get('grid')
+        if isinstance(own, dict) and all(k in own for k in g):
+            own = dict(origin=np.ravel(np.asarray(own['origin'], np.float64)), e1=np.ravel(np.asarray(own['e1'], np.float64)),
+                       e2=np.ravel(np.asarray(own['e2'], np.float64)), spx=float(own['spx']), spy=float(own['spy']),
+                       shape=tuple(int(v) for v in np.ravel(own['shape'])))
+            if own['origin'].shape == own['e1'].shape == own['e2'].shape == (3,) and _same_grid(own, g, tol=1e-6):
+                g = own
     else:
         g = dict(grid)
         if 'spacing' in g:

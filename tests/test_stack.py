@@ -199,6 +199,13 @@ def test_common_grid_formation(scene, formed):
         assert abs(np.cross(o['e1'], o['e2']) @ o['meta']['R'] @ U - 1) < 1e-9
     again = fastsar.form_cphd(scene.paths[2], grid=formed[0], backend='cpu')      # a product as the grid: its pixels
     assert np.array_equal(again['image'], formed[2]['image'])
+    assert all(np.array_equal(stack.as_grid(formed[0])[k], scene.grid[k]) for k in ('origin', 'e1', 'e2'))
+    # a product that does not record a grid names its pixels through its own frame: the same grid to rounding of
+    # the frame's rotation (which library does the product is the machine's), the same image to float32 rounding
+    bare = {k: v for k, v in formed[0].items() if k != 'grid'}
+    assert stack._same_grid(stack.as_grid(bare), scene.grid, tol=1e-6)
+    again = fastsar.form_cphd(scene.paths[2], grid=bare, backend='cpu')
+    assert np.abs(again['image'] - formed[2]['image']).max() < 1e-4 * np.abs(formed[2]['image']).max()
 
 
 def test_moving_beam_on_a_grid(tmp_path):

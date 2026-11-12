@@ -664,7 +664,9 @@ def test_stages_on_a_device_array(kind, focused):
     ms.collection('dev.cphd', tg, amp, P=PL, phase=5.0 * s ** 2)
     o = fastsar.form_cphd('dev.cphd', backend='cpu', extent=LONG, azimuth_window='taylor',
                           _plan=lambda g: dict(fit_patch=True))
-    d = dict(o, image=xp.asarray(o['image']))
+    # the library's own copy to the device: on its CPU device an older JAX keeps the host buffer of xp.asarray, and
+    # the host image is written in place below
+    d = dict(o, image=_xp.device(o['image'], 'cuda' if kind == 'cupy' else 'jax'))
     moving.baseband(o)
     moving.baseband(d)
     top = np.abs(o['image']).max()
