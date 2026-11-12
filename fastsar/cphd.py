@@ -218,6 +218,11 @@ def form_cphd(cphd, sicd=None, *, mode='auto', backend='auto', window=True, spac
         center, e1, e2, up, axes = gl['center'], gl['e1'], gl['e2'], gl['normal'], 'grid'
         hz = float(center[2])
         graze = np.arcsin(np.clip(-((center - ant[P // 2]) / np.linalg.norm(center - ant[P // 2])) @ up, 0.05, 1.0))
+        los = center - ant[P // 2]
+        if autofocus and abs(los @ e1) > np.tan(np.radians(5.0)) * (los @ e2):
+            raise ValueError("autofocus estimates the phase error along the grid's first axis, which must be this "
+                             "collection's azimuth: the grid's second axis is "
+                             f'{np.degrees(np.arctan2(abs(los @ e1), los @ e2)):.0f} degrees from its line of sight')
     ref_r = np.asarray(meta['ref'], np.float64)
     used = (0, P)
     if not isinstance(aperture, str):                 # the pulses given (a pair on one azimuth interval: fastsar.stack)

@@ -184,6 +184,12 @@ def test_grid_refusals(scene, formed):
         fastsar.form_cphd(p, shift=(1.0, 0.0), backend='cpu')
     with pytest.raises(ValueError, match='shift must be'):
         fastsar.form_cphd(p, grid=scene.grid, shift=(1.0, np.nan), backend='cpu')
+    with pytest.raises(ValueError, match='line of sight'):             # the phase history's autofocus, likewise
+        fastsar.form_cphd(scene.paths[2], grid=scene.grid, autofocus=True, backend='cpu')
+    with pytest.raises(ValueError, match='aperture'):
+        fastsar.form_cphd(p, grid=scene.grid, aperture=(10, 5), backend='cpu')
+    part = fastsar.form_cphd(p, grid=scene.grid, aperture=(40, 350), backend='cpu')
+    assert part['pulses'] == (40, 350) and any('pulses 40 to 349' in n for n in part['notes'])
     for kw, msg in ((dict(plane='slant'), 'ground plane'), (dict(area='black'), 'processed area'),
                     (dict(area=4.0), 'processed area'), (dict(weighting='sva'), 'slant plane'),
                     (dict(spacing=0.5), 'grid gives'), (dict(extent=(40, 40)), 'grid gives'), (dict(height=1.0), 'plane')):
