@@ -431,7 +431,8 @@ i, j = np.meshgrid(np.arange(4000, 4512), np.arange(6000, 6512), indexing='ij')
 points = terrain.surface_points(out, dem, i, j)                          # [512, 512, 3], local frame
 col, meta = io.read_cphd('scene_CPHD.cphd', meta=True)
 p0, p1 = out['pulses']                                                   # the pulses the image used
-chip = fastsar.backproject(col['S'][p0:p1], col['ant'][p0:p1], col['fmin'], col['df'], points, backend='cuda')
+chip = fastsar.backproject(col['S'][p0:p1], col['ant'][p0:p1], col['fmin'], col['df'], points,
+                           backend='cuda')
 ```
 
 **Simulated** (`tests/test_terrain.py`). A squinted spotlight at 10 km on a curved track with a jerk, flown to
@@ -443,7 +444,7 @@ and 0.06 rad at 100 m. Corrected, the targets at 30 m have the on-plane width wi
 within 0.13 dB, 0.98 of its peak, and lie within 0.04 pixel of their layover point; as complex chips they differ
 from exact backprojection at their true height by -19 to -26 dB of the peak, from -1 to -4 dB uncorrected. At
 100 m the widths are within 4 to 8% and the peak 0.89 to 0.94, at 300 m within 37 to 50% and 0.65 to 0.71. What
-remains there is the range walk of the limitations below, which reaches a third of a range cell at 300 m.
+remains there is the range walk of the limitations below, which is most of a range cell at 300 m.
 
 **Measured on Kilauea.** Two Capella spotlights of the caldera, formed with the default square-resolution
 aperture: one broadside at 931 km (2.9 degrees of aperture, -1.65 rad per 100 m of height, a 17,489 by 17,093
@@ -471,11 +472,20 @@ uncorrected image, against the model's predictions for the same blocks.
   over eight parts of the scene). After the GLO-30 correction they still do, in the collapsed area. After the
   lidar correction the parts agree on a residual of -0.35 +- 0.08 rad, which the contrast test then declines:
   it is too small to raise the contrast of an image whose pit is corrected for the wrong depth.
-CHIPS
+- Against exact backprojection onto the DEM's surface, on three 256-pixel chips of the first image (590,000
+  points; the rms of the complex difference over the rms of the chip): the plane's image differs from it by -11.5
+  dB on high ground (+74 m) and the corrected image by -48 dB; in the collapsed area with the lidar surface (-190
+  to -230 m) by -4.5 dB and -38 dB; near the plane (-30 to +5 m) by -26 dB and -50 dB. The fast former itself
+  is within -52 dB of exact backprojection on the plane. The exact route took 215 s for those points on the
+  shared GPU, 0.003 megapixels per second, where formation and the correction make 3.3: the surface costs about
+  a thousand times the plane with its correction.
 - The stage takes 1.9 to 5.8 s for the 206 and 299 megapixel images on a GPU shared with other work (50 to 140
   megapixels per second) and 3 to 15 s on the host's 48 shared cores (19 to 72 megapixels per second), of which
   0.4 to 1.0 s is the height map; formation took 40 and 84 s on the same GPU.
-FLAT
+- A flat control, an Umbra spotlight of Fargo, North Dakota: with the EGM2008 undulation (-26.2 m) the DEM's
+  median is 1.6 m below the image plane with 1.8 m of relief, the predicted phase stays under 0.012 rad, nothing
+  is applied and the product is the one without a DEM, sample for sample; the stage takes 0.6 s for its height
+  map. With the undulation left at 0 the DEM lies 25 m above the plane and the warning says so.
 
 **Limitations.**
 
@@ -490,10 +500,10 @@ FLAT
 - *Range walk.* The phase is applied at the center frequency. Over the band it varies by `B / (2 fc)` of
   itself, because the range error behind it, `phi lambda / (4 pi)`, also moves the response across range bins
   during the aperture. A correction along azimuth leaves that part: it is under a quarter of a radian while
-  `|phi| B / (2 fc)` is, 8 rad of phase at a 3% band, which the square-resolution products above stay within;
-  with its whole aperture the first collection passes it 140 m from the plane. Beyond it (the simulated targets
-  at 100 and 300 m) the correction still removes most of the smear, and exact backprojection onto the surface
-  removes all of it.
+  `|phi| B / (2 fc)` is, 8 rad of phase at a 3% band, which the square-resolution products above stay within
+  outside the pit; with its whole aperture the first collection passes it 140 m from the plane. Beyond it (the
+  simulated targets at 100 and 300 m) the correction still removes most of the smear, and exact backprojection
+  onto the surface removes all of it.
 - *Spotlight only.* A moving-beam collection is refused. The model holds for it pixel by pixel, with the pulses
   that illuminate the pixel and their own center of aperture; the correction would run per patch of the mosaic.
 - The image is not moved: layover stays, and geolocation needs the height as before.
