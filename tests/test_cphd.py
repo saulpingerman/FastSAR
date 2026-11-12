@@ -296,7 +296,8 @@ def test_form_cphd_moving_srp():
     # azimuth band, as a SICD and as a SIDD laid out shadows down; quadratic autofocus leaves the focused collection
     # as it came. The slant plane is for spotlight collections; tests/test_moving.py has the other options
     # (nothing is written here)
-    ref = fastsar.form_cphd('strip.cphd', backend='cpu', extent=(60.0, 50.0), azimuth_window='taylor')
+    ref = fastsar.form_cphd('strip.cphd', backend='cpu', extent=(60.0, 50.0), azimuth_window='taylor',
+                            _plan=lambda g: dict(fit_patch=True))    # process_cphd's patch, for the same rounding
     po = fastsar.process_cphd('strip.cphd', backend='cpu', extent=(60.0, 50.0))
     assert po['mode'] == 'moving' and po['plane'] == 'ground' and po['weighting'] == 'taylor' and po['autofocus'] is None
     assert po['baseband'] and po['window'] == ('taylor', 'taylor') and po['image'].shape == img.shape

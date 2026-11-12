@@ -106,7 +106,8 @@ def test_default_product(strip):
     quadratic autofocus that leaves a focused collection as it came."""
     name, c = strip
     o = fastsar.process_cphd(name + '.cphd', backend='cpu', extent=EXT)
-    ref = fastsar.form_cphd(name + '.cphd', backend='cpu', extent=EXT, azimuth_window='taylor', spacing=(o['spx'], o['spy']))
+    ref = fastsar.form_cphd(name + '.cphd', backend='cpu', extent=EXT, azimuth_window='taylor', spacing=(o['spx'], o['spy']),
+                            _plan=lambda g: dict(fit_patch=True))    # process_cphd's patch, for the same rounding
     assert o['weighting'] == 'taylor' and o['autofocus'] is None and o['autofocus_info']['applied'] is False
     assert o['image'].shape == ref['image'].shape
     assert np.abs(np.abs(o['image']) - np.abs(ref['image'])).max() < 2e-3 * np.abs(ref['image']).max()
@@ -397,7 +398,8 @@ def test_stages_on_a_device_array(kind, focused):
     s = (np.arange(PL) - PL / 2) / (c.aperture / 2)
     tg, amp = scene()
     ms.collection('dev.cphd', tg, amp, P=PL, phase=5.0 * s ** 2)
-    o = fastsar.form_cphd('dev.cphd', backend='cpu', extent=LONG, azimuth_window='taylor')
+    o = fastsar.form_cphd('dev.cphd', backend='cpu', extent=LONG, azimuth_window='taylor',
+                          _plan=lambda g: dict(fit_patch=True))
     d = dict(o, image=xp.asarray(o['image']))
     moving.baseband(o)
     moving.baseband(d)

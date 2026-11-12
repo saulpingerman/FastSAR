@@ -33,8 +33,12 @@ along e1. What remains off the grid's axes is the shear of the range band, tan(s
 change of cos(graze) across the swath; plan refuses apodization beyond the limits SHEAR and RANGE.
 
 Devices. baseband, band_limit and autofocus take the image as a NumPy, CuPy or JAX array and return it in the same
-place. The baseband phase is computed in double on the host's cores or in a CUDA kernel; for a JAX array the host
-computes the phasor in blocks of rows and the device multiplies.
+place. The baseband phase is computed in double on the host's cores or in a CUDA kernel. JAX's device works in
+float32 (a TPU has no fast float64): the host solves psi in double along the center row and the center column of
+the grid, which the device adds as two vectors, and the device computes only what is left, a few radians that
+change slowly over the grid (_separable). Every stage crosses JAX's device in blocks sized to its memory
+(_xp.jax_block), one compiled program per block shape, and takes an image on the host through the device the same
+way (process_cphd's, for an image the device cannot hold).
 """
 import numpy as np
 
@@ -251,11 +255,106 @@ def _cuda_phase(img, row0, bm, tk, si, sj, o, a, b, k, F0):
                img)
 
 
-def baseband(out, sign=-1):
+def _exact(bm, X):
+    """F = |x - a(t)| + G(t) at the points X [..., 3], t the beam-center time solved at each one (double)."""
+    t = center_time(bm, X)
+    w = np.asarray(X, np.float64).reshape(-1, 3) - _poly(bm['A'], t.ravel()).T
+    return np.linalg.norm(w, axis=1).reshape(t.shape) + _poly(bm['G'], t)
+
+
+_TERMS = 24                   # most separable terms of the remainder that a JAX device adds (_separable)
+
+
+def _separable(bm, o, a, b, nx, ny, k, F0, tol=2e-4):
+    """psi(i, j) = k (F - F0) on the grid o + i a + j b in parts that float32 holds, for JAX's device:
+
+        psi = p1[i] + p2[j] + 2 pi theta (i - ic) (j - jc) + sum_m U[i, m] V[m, j].
+
+    p1 and p2 are psi along the center column and the center row, solved at every pixel in double and reduced
+    modulo 2 pi. What is left vanishes on both and is small and smooth (zero for a straight track and a constant
+    squint; some hundred radians over 80 km of an orbit): its part in i j is theta turns per row and column, which
+    the device takes in integers as resample_jax.deramp does, and the rest is solved at knots, split into its
+    singular vectors and carried to the pixels by a cubic spline of each. The knots are halved (twice at most)
+    until the sum gives psi at the pixels between them to tol rad.
+    -> (rows: p1 [nx] float32, theta (i - ic) turns less their nearest 1/4096 [nx] float32, that 1/4096 as an
+    integer [nx] int32, U [nx, m] float32; cols: p2 [ny] float32, j - jc [ny] int32, V [m, ny] float32), or None
+    where the rest is not smooth (pixels the beam center never crosses, whose time is held at its limit)."""
+    from scipy.interpolate import make_interp_spline
+    if min(nx, ny) < 4:
+        return None
+    ic, jc = nx // 2, ny // 2
+    i, j = np.arange(nx, dtype=np.float64), np.arange(ny, dtype=np.float64)
+    psi = lambda fi, fj: k * (_exact(bm, o + np.asarray(fi, np.float64)[..., None] * a
+                                     + np.asarray(fj, np.float64)[..., None] * b) - F0)
+    p1, p2 = psi(i, float(jc)), psi(float(ic), j)
+    for step in (_KNOTS, _KNOTS // 2, _KNOTS // 4):
+        ki, kj = (np.linspace(0, n - 1, max(4, int(np.ceil((n - 1) / step)) + 1)) for n in (nx, ny))
+        r = psi(ki[:, None], kj[None, :]) - psi(ki, float(jc))[:, None] - psi(float(ic), kj)[None, :]
+        di, dj = ki - ic, kj - jc
+        theta = float(di @ r @ dj / ((di @ di) * (dj @ dj))) if ny < 1 << 20 else 0.0
+        r -= theta * di[:, None] * dj[None, :]
+        U, sv, Vt = np.linalg.svd(r, full_matrices=False)
+        left = np.cumsum((sv * np.abs(U).max(0) * np.abs(Vt).max(1))[::-1])[::-1]       # the terms from each one on
+        m = max(1, int((left > 0.05 * tol).sum()))
+        if m > _TERMS:
+            return None
+        Ui = make_interp_spline(ki, U[:, :m] * sv[:m], k=3, axis=0)(i)
+        Vj = make_interp_spline(kj, Vt[:m].T, k=3, axis=0)(j).T
+        qi, qj = (np.unique(np.round(0.5 * (v[:-1] + v[1:])).astype(np.int64)) for v in (ki, kj))
+        got = p1[qi][:, None] + p2[qj][None, :] + theta * np.outer(qi - ic, qj - jc) + Ui[qi] @ Vj[:, qj]
+        if np.abs(psi(qi[:, None], qj[None, :]) - got).max() <= tol:
+            break
+    else:
+        return None
+    wrap = lambda v: (np.remainder(v + np.pi, 2 * np.pi) - np.pi).astype(np.float32)
+    ti = theta / (2 * np.pi) * (i - ic)
+    ti -= np.rint(ti)
+    hi = np.rint(ti * 4096)
+    return ((wrap(p1), (ti - hi / 4096).astype(np.float32), hi.astype(np.int32), Ui.astype(np.float32)),
+            (wrap(p2), (j - jc).astype(np.int32), Vj.astype(np.float32)))
+
+
+def _baseband_step(z, a, rows, cols):
+    """Rows a ... a + len(z) of an image times exp(j psi), psi in _separable's parts, all float32 and int32."""
+    import jax.numpy as jnp
+    from jax import lax
+    nb = z.shape[0]
+    p1, li, hi = (lax.dynamic_slice(v, (a,), (nb,))[:, None] for v in rows[:3])
+    U = lax.dynamic_slice(rows[3], (a, 0), (nb, rows[3].shape[1]))
+    p2, jr, V = cols[0][None, :], cols[1][None, :], cols[2]
+    turns = ((hi * jr) & 4095).astype(jnp.float32) * (1 / 4096) + li * jr.astype(jnp.float32)
+    ang = p1 + p2 + (2 * np.pi) * turns
+    for m in range(V.shape[0]):                                      # not a matrix product: exact float32
+        ang = ang + U[:, m][:, None] * V[m][None, :]
+    return z * lax.complex(jnp.cos(ang), jnp.sin(ang))
+
+
+def _baseband_jax(img, rows, cols):
+    """img [nx, ny] times exp(j psi) on JAX's device, in blocks of rows sized to its memory through one compiled
+    program: a device image -> the new array; an image on the host (complex64) crosses block by block and is
+    written in place. img: a list that holds the image alone (resample_jax._source's: a device image is freed once
+    its planes exist)."""
+    import jax.numpy as jnp
+    from . import resample_jax as rj
+    nx, ny = img[0].shape
+    host = _xp.kind(img[0]) != 'jax'
+    rows, cols = tuple(jnp.asarray(v) for v in rows), tuple(jnp.asarray(v) for v in cols)
+    rj._fits(64 * ny, 'the baseband step on the JAX device')
+    nb = int(max(1, min(nx, rj._samples(rj.BLOCK, 64) // ny)))
+    sink = rj._Sink('device', nx, ny, nb, 1, np.complex64, into=img[0] if host else None)
+    step, lines = rj._jit(_baseband_step, ()), rj._source(img)
+    # a host image is written where it is read: no block moved back over rows already done
+    for s0 in (range(0, nx, nb) if host else rj._starts(nx, nb)):
+        sink.put(s0, step(lines(s0, min(nb, nx - s0)), np.int32(s0), rows, cols))
+    return sink.done()
+
+
+def baseband(out, sign=-1, *, _jax=False):
     """Bring a moving-beam image (form_cphd's product: ground plane, axes on the track) to baseband, in place:
     multiplied by exp(sign j psi), psi the module docstring's phase less its value at the grid's center pixel.
     out['baseband'] records it; sign=+1 puts the carrier back. The image may be a NumPy, CuPy or JAX array; a JAX
-    image is replaced in out by the new array."""
+    image is replaced in out by the new array (float32 on the device, to under 1e-3 rad: _separable). _jax: an
+    image on the host crosses JAX's device in blocks (process_cphd's, for an image the device cannot hold)."""
     from .patches import _rows
     if bool(out.get('baseband')) == (sign < 0):
         return out
@@ -265,14 +364,21 @@ def baseband(out, sign=-1):
     o, e1, e2 = (np.asarray(out[k], np.float64) for k in ('origin', 'e1', 'e2'))
     a, b = float(out['spx']) * e1, float(out['spy']) * e2
     k = sign * 4 * np.pi * 0.5 * (out['band'][0] + out['band'][1]) / C
-    tk, si, sj = _lattice(bm, o, a, b, nx, ny)
     c = o + (nx // 2) * a + (ny // 2) * b
-    tc = center_time(bm, c[None])
-    F0 = float(np.linalg.norm(c - _poly(bm['A'], tc).T[0]) + _poly(bm['G'], tc)[0])
+    F0 = float(_exact(bm, c[None])[0])
     kind = _xp.kind(img)
+    sep = None
+    if kind == 'jax' or (_jax and kind == 'numpy' and img.dtype == np.complex64):
+        sep = _separable(bm, o, a, b, nx, ny, k, F0)
+    if sep is not None:                                              # the image is given up: freed as blocks are made
+        out['image'], img = None, [img]
+        out['image'] = _baseband_jax(img, *sep)
+        out['baseband'] = sign < 0
+        return out
+    tk, si, sj = _lattice(bm, o, a, b, nx, ny)
     if kind == 'cupy':
         _cuda_phase(img, 0, bm, tk, si, sj, o, a, b, k, F0)
-    elif kind == 'jax':                                              # the phasor from the host, block by block
+    elif kind == 'jax':                                              # no smooth remainder: the phasor from the host
         import jax
         import jax.numpy as jnp
         from jax import lax
@@ -352,6 +458,105 @@ def _modes(mode):
         raise ValueError(f"autofocus of a moving beam: mode must be 'quadratic' or 'spatially_variant', got {mode!r}")
 
 
+_JIT = {}
+_CELL = (128, 32)             # least rows and columns of a part of the image the guard measures the contrast of
+
+
+def _cellsums(img, h, cuts):
+    """The guard's sums over cells of img [nx, ny], h rows by the sets of columns that start at cuts [c]: the number
+    of nonzero samples, the sum of their intensity and the sum of its square -> host float64 [nx // h, 3, c] (rows
+    beyond the last whole cell are left out). Computed where the image is, in blocks of whole cells: on the host
+    one thread a cell, on a GPU blocks of 2^27 samples, on JAX's device blocks sized to its memory through one
+    compiled program (an image on the host under autofocus._via_jax crosses it block by block)."""
+    from . import autofocus as af
+    nx, ny = img.shape
+    R, kind = nx // h, _xp.kind(img)
+    out = np.zeros((R, 3, len(cuts)))
+    if kind == 'jax' or af._VIA:
+        import jax
+        import jax.numpy as jnp
+        from . import resample_jax as rj
+        if 'cells' not in _JIT:
+            def cells(blk, h):
+                p = jnp.real(blk) ** 2 + jnp.imag(blk) ** 2
+                p = p.reshape(blk.shape[0] // h, h, blk.shape[1])
+                return (p > 0).sum(1), p.sum(1), (p * p).sum(1)
+            _JIT['cells'] = jax.jit(cells, static_argnums=1)
+        g = int(max(1, min(R, _xp.jax_rows(R * h, 24 * ny, 'the guard of autofocus on the JAX device') // h)))
+        lines = rj._source(img)
+        for r0 in rj._starts(R, g):
+            t = [np.asarray(v, np.float64) for v in _JIT['cells'](lines(r0 * h, g * h), h)]
+            out[r0:r0 + g] = np.stack([np.add.reduceat(v, cuts, axis=1) for v in t], 1)
+        return out
+    xp = _xp.module(img)
+    g = int(max(1, (1 << 27) // max(h * ny, 1))) if kind == 'cupy' else 1
+
+    def work(r0):
+        blk = img[r0 * h:min(R, r0 + g) * h]
+        p = (blk.real ** 2 + blk.imag ** 2).reshape(-1, h, ny)
+        t = (xp.count_nonzero(p, axis=1), p.sum(1, dtype=xp.float64), (p * p).sum(1, dtype=xp.float64))
+        out[r0:r0 + g] = np.stack([np.add.reduceat(_xp.host(v).astype(np.float64), cuts, axis=1) for v in t], 1)
+    if kind == 'cupy':
+        for r0 in range(0, R, g):
+            work(r0)
+    else:
+        af._threads(work, range(R))
+    return out
+
+
+def _strips_jax(img, st, B, pad, win, V, coef):
+    """autofocus._apply_strips for a moving beam on JAX's device, where a strip's phase is coef[k, j] V[b] in
+    azimuth bin b of column j: strip k is rows st[k] - pad to st[k] + B + pad (zeros beyond the image), its
+    transform along the track loses that phase, the zeros of img are put back, and its middle B rows are added to
+    the result with the weights win[k] [B]. The image crosses the device in blocks of columns sized to its memory
+    (_xp.jax_block), each through one compiled program that loops over the strips: an image on the device -> a
+    device array (the blocks joined); one on the host (under autofocus._via_jax) -> a host array, written block by
+    block. st [ns], win [ns, B], V [B + 2 pad], coef [ns, ny] (float32)."""
+    import jax
+    import jax.numpy as jnp
+    from jax import lax
+    from . import autofocus as af
+    nx, ny = img.shape
+    n = B + 2 * pad
+    if 'strips' not in _JIT:
+        def strips(blk, st, coef, win, V, pad):
+            blk = blk.astype(jnp.complex64)
+            nx, n, B = blk.shape[0], V.shape[0], win.shape[1]
+            rows = jnp.arange(n, dtype=jnp.int32) - pad
+
+            def body(k, acc):
+                idx = st[k] + rows                                   # the strip's rows; beyond the image: zeros
+                s = jnp.take(blk, jnp.clip(idx, 0, nx - 1), axis=0)
+                s = jnp.where(((idx >= 0) & (idx < nx))[:, None], s, 0)
+                ph = V[:, None] * coef[k][None, :]
+                t = jnp.fft.ifft(jnp.fft.fft(s, axis=0) * lax.complex(jnp.cos(ph), -jnp.sin(ph)), axis=0)
+                t = lax.dynamic_slice(jnp.where(s != 0, t, 0), (pad, 0), (B, blk.shape[1])) * win[k][:, None]
+                cur = lax.dynamic_slice(acc, (st[k], 0), (B, blk.shape[1]))
+                return lax.dynamic_update_slice(acc, (cur + t).astype(jnp.complex64), (st[k], 0))
+            return lax.fori_loop(0, st.shape[0], body, jnp.zeros_like(blk))
+        _JIT['strips'] = jax.jit(strips, static_argnums=5)
+    f = _JIT['strips']
+    w = int(min(_xp.jax_rows(ny, 24 * nx + 64 * n, 'the autofocus correction on the JAX device'),
+                max(1, af._BLOCK['jax'] // (nx + 2 * n))))
+    std, wind, Vd = jnp.asarray(np.asarray(st, np.int32)), jnp.asarray(win), jnp.asarray(V)
+    block = af._columns(img)
+    step = lambda j: f(block(j, w), std, jnp.asarray(np.ascontiguousarray(coef[:, j:j + w])), wind, Vd, int(pad))
+    starts = list(range(0, ny - w + 1, w)) + ([ny - w] if ny % w else [])
+    if _xp.kind(img) != 'jax':                                      # written while the next block is under way
+        out, last = np.empty((nx, ny), np.complex64), None
+        for j in starts:
+            last, cur = (j, step(j)), last
+            if cur is not None:
+                _xp.to_host(out, (slice(None), slice(cur[0], cur[0] + w)), cur[1])
+        _xp.to_host(out, (slice(None), slice(last[0], last[0] + w)), last[1])
+        return out
+    parts = [step(j) for j in starts]
+    del block
+    if ny % w and len(parts) > 1:
+        parts[-1] = parts[-1][:, w - ny % w:]
+    return parts[0] if len(parts) == 1 else jnp.concatenate(parts, axis=1)
+
+
 def autofocus(img, mode='quadratic', *, band=None, footprint=None, block=None, overlap=0.5, guard=True,
               iterations=6, tol=0.02, lines=0.3, max_lines=1024, subsets=8, span=4, band_db=30.0,
               min_significance=None):
@@ -388,14 +593,21 @@ def autofocus(img, mode='quadratic', *, band=None, footprint=None, block=None, o
     Correction. autofocus.spatially_variant's: strips of `block` rows, each extended by the length of the blur,
     the phase of the fit at the strip's center removed column by column, cross-faded along the track with weights
     that sum to one; exact zeros stay exact zeros. Then the second test of the guard (autofocus._keep's rule) on
-    the rows of the blocks that were corrected: their contrast must rise, the median gain of 16 sets of columns
-    must not be below minus twice its standard error, and one of the two gains must be twice its standard error;
-    else the image is returned as it came. A single block whose own contrast does not rise, or whose sets of
-    columns lose, is given back as it came, cross-faded with its neighbors.
+    the rows of the blocks that were corrected: their contrast must rise, the median gain of the parts must not be
+    below minus twice its standard error, and one of the two gains must be twice its standard error; else the
+    image is returned as it came. The parts are the cells of _CELL rows by _CELL columns that those rows hold (16
+    sets of columns at least, as for a spotlight; the rows in cells too, because the blocks along the track are
+    separate measurements): the standard errors are measured over as many parts as the image has, so that a narrow
+    image is not declined for the few sets of columns it holds. A single block whose own contrast does not rise,
+    or whose cells lose, is given back as it came, cross-faded with its neighbors.
 
     mode: 'quadratic' or 'spatially_variant'. The phase gradient modes are refused: they estimate one phase
     function of any shape from the brightest scatterers of an image formed from one aperture, and here every
     block has its own.
+
+    img on JAX's device: the estimates, the sums of the guard and the correction run in blocks sized to its memory
+    (_xp.jax_block), one compiled program per block shape; an image on the host under autofocus._via_jax crosses
+    the device the same way (process_cphd's, for an image the device cannot hold) and the result is on the host.
 
     -> (img2 complex64 [nx, ny] where img is; info: dict(mode, band (f0, hf), block, starts [n] (first row of
     each block), estimates [n] (rad at the band edge, all columns; nan without one), estimates_std [n], subsets
@@ -411,7 +623,14 @@ def autofocus(img, mode='quadratic', *, band=None, footprint=None, block=None, o
     _modes(mode)
     if not 0 <= overlap < 1:
         raise ValueError('overlap must be in [0, 1)')
-    xp, host = _xp.module(img), _xp.kind(img) == 'numpy'
+    kind = _xp.kind(img)
+    jx = kind == 'jax' or (kind == 'numpy' and bool(af._VIA))        # estimates and correction on JAX's device
+    host = kind == 'numpy' and not jx
+    if jx:
+        import jax.numpy as xp
+        from . import resample_jax as rj
+    else:
+        xp = _xp.module(img)
     nx, ny = img.shape
     sig0 = af.MIN_SIG if min_significance is None else float(min_significance)
     B0 = int(np.clip((footprint if footprint else 2048) / 2, 256, 4096)) if block is None else int(block)
@@ -440,9 +659,15 @@ def autofocus(img, mode='quadratic', *, band=None, footprint=None, block=None, o
                 contrast_after=0.0, gain=0.0, gain_std=0.0, part_gain=0.0, part_gain_std=0.0, applied=False,
                 reason=None)
     cand, kept, ends = np.zeros(nb, bool), {}, np.zeros((2, nb, ks))        # ends: the sets' first and last columns
+    if jx:                                 # the columns of the estimates, cut by rows through one compiled program
+        cut = rj._source([np.ascontiguousarray(img[:, idx], np.complex64) if kind == 'numpy'
+                          else xp.take(img, xp.asarray(idx), axis=1)])
+        grab = lambda i: cut(int(st0[i]), B0)
+    else:
+        grab = lambda i: img[st0[i]:st0[i] + B0][:, idx].astype(xp.complex64)
 
     def estimate(i):
-        sub = img[st0[i]:st0[i] + B0][:, idx].astype(xp.complex64)
+        sub = grab(i)
         p = xp.abs(sub) ** 2
         cnt, s, mx = (_xp.host(t).astype(np.float64) for t in ((p > 0).sum(0), p.sum(0), p.max(0)))
         ok = np.flatnonzero((cnt >= 0.5 * B0) & (s > 0))
@@ -453,19 +678,19 @@ def autofocus(img, mode='quadratic', *, band=None, footprint=None, block=None, o
         sel = np.sort(ok[np.argsort((mx * cnt / np.where(s > 0, s, 1.0))[ok], kind='stable')[len(ok) - keep:]])
         m = keep // k
         cols = sub[:, sel[:k * m]]
-        a = np.sqrt(_xp.host((xp.abs(af._ft(cols * tap, workers=1 if host else -1)) ** 2).sum(1)).astype(np.float64))
+        w = 1 if host else -1
+        a = np.sqrt(_xp.host((xp.abs(af._ft(cols * tap, workers=w)) ** 2).sum(1)).astype(np.float64))
         if not (a[up].sum() > 0 and a[dn].sum() > 0):
             return
         sep = float((a[up] * v[up]).sum() / a[up].sum() - (a[dn] * v[dn]).sum() / a[dn].sum())
         A = cols.reshape(B0, k, m)
-        w = 1 if host else -1
         est = af._map_drift(A, (f0, hf, sep), iterations, tol, w, pool=True, contrast=False)
         sets = af._map_drift(A, (f0, hf, sep), iterations, tol, w, c0=float(est['c'][0]), G=est['G'], contrast=False)
         ycol = (idx[sel[:k * m]].reshape(k, m) - (ny - 1) / 2) / (ny / 2)
         info['estimates'][i], info['subsets'][i, :k] = float(est['c'][0]), sets['c']
         info['subset_significance'][i, :k] = np.where(np.isfinite(sets['c']), sets['sig'], 0.0)
         info['subset_position'][i, :k], ends[0, i, :k], ends[1, i, :k] = ycol.mean(1), ycol.min(1), ycol.max(1)
-        kept[i] = (est['G'], (f0, hf, sep), ycol)
+        kept[i] = (sel[:k * m], k, m, (f0, hf, sep), ycol)
         cand[i] = est['sig'][0] >= sig0 and (info['subset_significance'][i] >= sig0).sum() >= max(4, (k + 1) // 2)
     if host:
         af._threads(estimate, range(nb))
@@ -514,12 +739,14 @@ def autofocus(img, mode='quadratic', *, band=None, footprint=None, block=None, o
     vq = af._offsets(B0, f0, hf) ** 2
     for i in np.flatnonzero(blocks):
         if np.abs(trend[i]).max() >= tol:
-            G, bandi, ycol = kept[i]
+            sel, kk, mm, bandi, ycol = kept[i]
+            A = grab(i)[:, sel].reshape(B0, kk, mm)
+            G = af._jit('fft0')(A) if jx else af._ft(A, 'fft', -1)
             d = ycol - ybar[i]
             q = np.exp(-1j * (trend[i, 0] * d + trend[i, 1] * d * d)[None] * vq[:, None, None]).astype(np.complex64)
             G = G * xp.asarray(q)
-            level[i] = float(af._map_drift(G, bandi, iterations, tol, 1 if host else -1, c0=float(level[i]),
-                                           pool=True, G=G, contrast=False)['c'][0])
+            level[i] = float(af._map_drift(G, bandi, iterations, tol, -1, c0=float(level[i]), pool=True, G=G,
+                                           contrast=False)['c'][0])
     kept.clear()
     mid = np.zeros(nb)
     for i in range(nb):
@@ -549,19 +776,24 @@ def autofocus(img, mode='quadratic', *, band=None, footprint=None, block=None, o
         n += (n - B0) % 2
         vb = af._offsets(n, f0, hf)
         roll = 0.5 * (1 + np.cos(np.pi * np.clip((np.abs(vb) - 1) / max(0.5 / hf - 1, 1e-9), 0, 1)))
-        return af._apply_strips(img, st0, B0, (n - B0) // 2, win, (vb ** 2 * roll)[None].astype(np.float32),
-                                lambda i: (model(i, yc) * on[i])[None, :].astype(np.float32))
+        V, coef = (vb ** 2 * roll).astype(np.float32), lambda i: (model(i, yc) * on[i]).astype(np.float32)
+        if jx:
+            return _strips_jax(img, st0, B0, (n - B0) // 2, win, V, np.stack([coef(i) for i in range(nb)]))
+        return af._apply_strips(img, st0, B0, (n - B0) // 2, win, V[None], lambda i: coef(i)[None, :])
     out = correct(act)
     if not guard:
         info['applied_blocks'] = act
     else:
-        cuts = np.unique(np.concatenate([st0, st0 + B0]))
-        # the column sums of each run of rows between block boundaries [segments, 3, ny]
-        seg = lambda a: np.stack([af._colsums(a[r0:r1]) for r0, r1 in zip(cuts[:-1], cuts[1:])])
-        qb, qa = seg(img), seg(out)
-        rows = lambda i: (cuts[:-1] >= st0[i]) & (cuts[1:] <= st0[i] + B0)
-        every = np.any([rows(i) for i in np.flatnonzero(act)], axis=0)
-        cb, ca, se, med, mse = af._gain(qb[every].sum(0), qa[every].sum(0))
+        # the second test, on cells of h rows by the sets of columns: [cells along the track, 3, sets]
+        h = int(max(8, min(_CELL[0], B0 // 2)))
+        sets = int(min(ny, max(16, ny // _CELL[1])))
+        cuts = np.unique(np.round(np.linspace(0, ny, sets + 1)).astype(np.int64))[:-1]
+        qb, qa = _cellsums(img, h, cuts), _cellsums(out, h, cuts)
+        mid = (np.arange(len(qb)) + 0.5) * h
+        rows = lambda i: (mid >= st0[i]) & (mid < st0[i] + B0)
+        flat = lambda q, sel: q[sel].transpose(1, 0, 2).reshape(3, -1)   # every cell a set of its own for _gain
+        gain = lambda sel: af._gain(flat(qb, sel), flat(qa, sel), sets=int(sel.sum()) * len(cuts))
+        cb, ca, se, med, mse = gain(np.any([rows(i) for i in np.flatnonzero(act)], axis=0))
         d = float(np.log(ca / cb)) if cb > 0 and ca > 0 else 0.0
         info.update(gain=d, gain_std=se, part_gain=med, part_gain_std=mse)
         if not ca > cb:
@@ -571,7 +803,7 @@ def autofocus(img, mode='quadratic', *, band=None, footprint=None, block=None, o
         if not (d >= 2 * se or (med > 0 and med >= 2 * mse)):
             return af._skip(img, info, 'the contrast gain is within its scatter over the parts of the image'), info
         for i in np.flatnonzero(act):
-            cb, ca, se, med, mse = af._gain(qb[rows(i)].sum(0), qa[rows(i)].sum(0))
+            cb, ca, se, med, mse = gain(rows(i))
             info['block_gain'][i] = float(np.log(ca / cb)) if cb > 0 and ca > 0 else 0.0
             info['applied_blocks'][i] = ca > cb and med >= -2 * mse
         if not info['applied_blocks'].any():
@@ -820,32 +1052,42 @@ def plan(g, st, opt):
 
 def stages(out, st, product, lap, backend):
     """process_cphd's stages after formation for a moving beam: baseband, autofocus, apodization, the area's mask.
-    The image goes to the backend's device when its memory plan (memory.cuda_plan) holds it with a second image of
-    its size, and the stages run where it is. -> (out, tight: the CUDA plan takes more than half of the device)."""
-    from . import memory, weighting
+    The image goes to the backend's device when its memory plan (memory.cuda_plan) holds it with the arrays the
+    stages make beside it, and the stages run where it is. An image a CUDA device cannot hold is processed on the
+    host; one a JAX device cannot hold stays on the host and crosses the device in blocks, stage by stage. A note
+    says so. -> (out, tight: the CUDA plan takes more than half of the device)."""
+    import contextlib
+    from . import autofocus as afm, memory, weighting
     wt, af, mg = st['weighting'], st['autofocus'], st['margin']
     out['beam'], out['window'] = st['beam'], (wt, wt)
     nx, ny = out['image'].shape
     sizes = dict(ground=8 * nx * ny, valid=nx * ny if st['valid'] is not None else 0,
                  display=nx * ny if product == 'sidd' else 0)
-    budget = _xp.cuda_budget() if backend == 'cuda' else _xp.jax_budget() if backend in ('jax', 'tpu') else None
-    tight = False
-    if backend in ('cuda', 'jax', 'tpu'):
-        p = None if budget is None else memory.cuda_plan(sizes, budget, autofocus=bool(af) or wt == 'sva',
-                                                         joined=backend != 'cuda')
-        if p is None or p['place']['ground'] == 'device':
-            tight = backend == 'cuda' and p['need'] > 0.5 * p['budget']
+    jaxdev = backend in ('jax', 'tpu')
+    tight = via = False
+    if backend == 'cuda':
+        p = memory.cuda_plan(sizes, _xp.cuda_budget(), autofocus=bool(af) or wt == 'sva')
+        if p['place']['ground'] == 'device':
+            tight = p['need'] > 0.5 * p['budget']
             if tight:
                 memory.cuda_release()
-            if backend == 'cuda':                                    # through two page-locked blocks
-                from .patches import _to_device
-                out['image'] = _to_device(out['image'])
-            else:
-                out['image'] = _xp.device(out['image'], backend)
+            from .patches import _to_device
+            out['image'] = _to_device(out['image'])                  # through two page-locked blocks
         else:
             out['notes'].append(f"the device has {memory._gb(p['budget'])} for the stages after formation, which "
                                 f"take {memory._gb(p['need'])} with the image on it: they ran on the host")
+    elif jaxdev:
+        budget = _xp.jax_budget()                                    # None: a device that does not report its memory
+        p = budget and memory.cuda_plan(sizes, budget, autofocus=bool(af) or wt == 'sva', joined=True)
+        if not p or p['place']['ground'] == 'device':
+            out['image'] = _xp.device(out['image'], backend)
+        else:
+            via = True
+            out['notes'].append(f"the JAX device has {memory._gb(p['budget'])} for the stages after formation, "
+                                f"which take {memory._gb(p['need'])} with the image on it: kept on the host and "
+                                'passed through the device in blocks')
     release = memory.cuda_release if tight else (lambda: None)
+    crossing = afm._via_jax if via else contextlib.nullcontext      # a host image's autofocus and band limit
 
     def run(stage):
         """A stage that returns a new image, where the image is; on the host when the GPU has no memory for it."""
@@ -858,13 +1100,14 @@ def stages(out, st, product, lap, backend):
             memory.cuda_release()
             out['notes'].append('the stages after formation ran on the host: the GPU had no memory for them')
             return stage(out['image'])
-    baseband(out)
+    baseband(out, _jax=via)
     lap('baseband', out['image'])
     hf = min(0.5, 0.5 * st['band1'] * out['spx'])                    # the processed band: radians at its edge
     if af:
         try:
             fp = st['footprint'] / out['spx']
-            out['image'], info = run(lambda a: autofocus(a, af, band=(0.0, hf), footprint=fp))
+            with crossing():
+                out['image'], info = run(lambda a: autofocus(a, af, band=(0.0, hf), footprint=fp))
         except ValueError as e:                                      # an image too small for the estimate
             info = dict(mode=af, applied=False, reason=str(e))
             out['notes'].append(f'autofocus skipped: {e}')
@@ -873,9 +1116,14 @@ def stages(out, st, product, lap, backend):
         lap('autofocus', out['image'])
     if wt == 'sva':
         m = (np.fft.fftfreq(nx) * nx)
-        out['image'] = run(lambda a: band_limit(a, ((m >= -nx // 4) & (m < nx // 4)).astype(np.float32)))
+        with crossing():
+            out['image'] = run(lambda a: band_limit(a, ((m >= -nx // 4) & (m < nx // 4)).astype(np.float32)))
         release()
-        out['image'] = run(lambda a: weighting.sva(a, 2, inplace=_xp.kind(a) != 'jax'))
+        if jaxdev:                                                   # in slabs of rows; the image is given up
+            img, out['image'] = [out['image']], None
+            out['image'] = weighting.sva(img, 2, _jax=(None, None, 'host' if via else 'device'))
+        else:
+            out['image'] = run(lambda a: weighting.sva(a, 2, inplace=True))
         out['image'] = out['image'][mg:nx - mg]
         out['origin'] = out['origin'] + mg * out['spx'] * np.asarray(out['e1'], np.float64)
         out['center'] = (out['origin'] + ((nx - 2 * mg) / 2.0) * out['spx'] * out['e1']
