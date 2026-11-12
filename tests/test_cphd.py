@@ -9,7 +9,8 @@ equator. The stand-in replaces io._open_cphd for this module's tests only.
     samples onto its output grid.
 (b) Moving SRP (stripmap): the SRP of each pulse is the ground point broadside of the antenna, and the echoes carry
     an azimuth pattern inside the Doppler band the PRF samples. form_cphd (a mosaic with a Hann window over the
-    azimuth band about each pulse's SRP) against a direct float64 sum with that window, around each target.
+    azimuth band about each pulse's SRP) against a direct float64 sum with that window, around each target; the
+    same for a Taylor window and a rectangle, which end at the band's edge.
 
 Errors are 10 log10 of the energy of the difference over that of the reference; limits about 5 dB above the
 values measured when they were set."""
@@ -260,36 +261,50 @@ def test_form_cphd_moving_srp():
     out = fastsar.form_cphd('strip.cphd', backend='cpu', extent=(60.0, 50.0), patch=64)
     img, o, e1, e2, spx, spy, meta = (out[k] for k in ('image', 'origin', 'e1', 'e2', 'spx', 'spy', 'meta'))
     print(f'  form_cphd: mode {out["mode"]}, grid {img.shape} of {spx:.3f} x {spy:.3f} m; ' + '; '.join(out['notes']))
-    assert out['mode'] == 'moving'
+    assert out['mode'] == 'moving' and out['window'] == ('hann', 'taylor')
     # the reference: direct sum over pulses and frequencies, Taylor along frequency, Hann over the azimuth band
-    # 0.8 lambda PRF / (2 v) about each pulse's SRP, at the pixels around each target (float64)
+    # 0.8 lambda PRF / (2 v) about each pulse's SRP, at the pixels around each target (float64); then a Taylor window
+    # over that band, zero outside it, and a rectangle without the frequency window
     dsin = 0.8 * lam * (v / dy) / (2 * v)
-    wk = taylor(K)
     H = 12
-    for n, x in enumerate(io.ecf_to_local(ecf(tg), meta)):
-        i, j = int(round((x - o) @ e1 / spx)), int(round((x - o) @ e2 / spy))
-        ii, jj = np.meshgrid(np.arange(i - H, i + H), np.arange(j - H, j + H), indexing='ij')
-        q = io.local_to_ecf(o + ii[..., None] * spx * e1 + jj[..., None] * spy * e2, meta).reshape(-1, 3) - srp0
-        q = np.stack([q @ N, q @ E, q @ U], 1)                                      # the simulator's frame
-        acc = np.zeros(len(q), np.complex128)
-        for p0 in range(0, P, 100):
-            a = ant_l[p0:p0 + 100]
-            w = q[None] - a[:, None]
-            R = np.linalg.norm(w, axis=-1)                                          # [p, m]
-            wa = sm.window('hann')(((w @ d_at) / R - s_srp[p0:p0 + 100, None]) / (dsin / 2))
-            ph = np.exp(4j * np.pi * f[None, None, :] / C * (R - ref_p[p0:p0 + 100, None])[..., None])   # [p, m, K]
-            acc += np.einsum('pk,pmk,pm->m', S[p0:p0 + 100] * wk[None], ph, wa)
-        refp = acc.reshape(ii.shape)
-        check(bad, f'target {n}: form_cphd against the direct sum ({2 * H} x {2 * H} pixels)', rel_db(img[i - H:i + H, j - H:j + H], refp), -46)
+    for name, limit in (('hann', -46), ('taylor', -46), ('uniform', -42)):
+        if name != 'hann':
+            out = fastsar.form_cphd('strip.cphd', backend='cpu', extent=(60.0, 50.0), patch=64, azimuth_window=name,
+                                    window=name != 'uniform')
+            assert out['window'] == (name, 'taylor' if name != 'uniform' else 'uniform')
+        wk = taylor(K) if name != 'uniform' else np.ones(K)
+        for n, x in enumerate(io.ecf_to_local(ecf(tg), meta)):
+            if name != 'hann' and n != 1:                           # the other windows at one target
+                continue
+            i, j = int(round((x - o) @ e1 / spx)), int(round((x - o) @ e2 / spy))
+            ii, jj = np.meshgrid(np.arange(i - H, i + H), np.arange(j - H, j + H), indexing='ij')
+            q = io.local_to_ecf(o + ii[..., None] * spx * e1 + jj[..., None] * spy * e2, meta).reshape(-1, 3) - srp0
+            q = np.stack([q @ N, q @ E, q @ U], 1)                                  # the simulator's frame
+            acc = np.zeros(len(q), np.complex128)
+            for p0 in range(0, P, 100):
+                a = ant_l[p0:p0 + 100]
+                w = q[None] - a[:, None]
+                R = np.linalg.norm(w, axis=-1)                                      # [p, m]
+                wa = sm.window(None if name == 'uniform' else name)(((w @ d_at) / R - s_srp[p0:p0 + 100, None]) / (dsin / 2))
+                ph = np.exp(4j * np.pi * f[None, None, :] / C * (R - ref_p[p0:p0 + 100, None])[..., None])   # [p, m, K]
+                acc += np.einsum('pk,pmk,pm->m', S[p0:p0 + 100] * wk[None], ph, wa)
+            refp = acc.reshape(ii.shape)
+            check(bad, f'target {n}: form_cphd ({name}) against the direct sum ({2 * H} x {2 * H} pixels)',
+                  rel_db(out['image'][i - H:i + H, j - H:j + H], refp), limit)
     assert not bad, 'FAILED: ' + '; '.join(bad)
-    # process_cphd on a moving beam: the same image on the ground plane, as a SICD and as a SIDD laid out shadows
-    # down; the slant plane, autofocus, apodization and the quality areas are for spotlight collections
+    # process_cphd on a moving beam: on the ground plane, at baseband, with a Taylor window over the processed
+    # azimuth band, as a SICD and as a SIDD laid out shadows down; quadratic autofocus leaves the focused collection
+    # as it came. The slant plane is for spotlight collections; tests/test_moving.py has the other options
     # (nothing is written here)
+    ref = fastsar.form_cphd('strip.cphd', backend='cpu', extent=(60.0, 50.0), azimuth_window='taylor',
+                            _plan=lambda g: dict(fit_patch=True))    # process_cphd's patch, for the same rounding
     po = fastsar.process_cphd('strip.cphd', backend='cpu', extent=(60.0, 50.0))
     assert po['mode'] == 'moving' and po['plane'] == 'ground' and po['weighting'] == 'taylor' and po['autofocus'] is None
-    assert po['image'].shape == img.shape and np.abs(po['image'] - img).max() < 2e-3 * np.abs(img).max()    # another patch size
+    assert po['baseband'] and po['window'] == ('taylor', 'taylor') and po['image'].shape == img.shape
+    assert np.abs(np.abs(po['image']) - np.abs(ref['image'])).max() < 2e-3 * np.abs(ref['image']).max()
     pc = fastsar.process_cphd('strip.cphd', backend='cpu', extent=(60.0, 50.0), spacing=(0.5, 0.7))
     assert pc['spx'] == 0.5 and pc['spy'] == 0.7 and pc['image'].shape != img.shape       # the spacing asked for
+    assert any('aliased' in n for n in pc['notes']) and any('autofocus skipped' in n for n in pc['notes'])
     ps = fastsar.process_cphd('strip.cphd', backend='cpu', extent=(60.0, 50.0), product='sidd')
     from fastsar import sidd
     lay = sidd.shadows_down(ps)
@@ -297,9 +312,8 @@ def test_form_cphd_moving_srp():
     assert pix.dtype == np.uint8 and pix.shape == lay['image'].shape and pix.max() > 200
     los = io.ecf_to_local(ecf(np.zeros((1, 3))), meta)[0] - io.ecf_to_local(ecf(ant_l[P // 2:P // 2 + 1]), meta)[0]
     assert lay['row'] @ los > 0 and np.cross(lay['row'], lay['col'])[2] > 0.99 and abs(lay['angle']) < 1.0
-    for kw in (dict(plane='slant'), dict(weighting='sva'), dict(autofocus='quadratic'), dict(area='black')):
-        with pytest.raises(ValueError, match='moving beam'):
-            fastsar.process_cphd('strip.cphd', backend='cpu', extent=(60.0, 50.0), **kw)
+    with pytest.raises(ValueError, match='moving beam'):
+        fastsar.process_cphd('strip.cphd', backend='cpu', extent=(60.0, 50.0), plane='slant')
 
 
 def test_mode_outside_enumeration(spot):

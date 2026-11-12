@@ -17,7 +17,7 @@ The options and their defaults:
 - `plane`: `'slant'` or `'ground'`. The default is the slant plane for a SICD and the ground plane for a SIDD.
 - `autofocus`: `'quadratic'` (default), `'pga'`, `'spatially_variant'`, `'spatially_variant_pga'` or `False`.
 - `weighting`: `'taylor'`, `'uniform'` or `'sva'`. The default is Taylor for a SICD and spatially variant
-  apodization for a SIDD.
+  apodization for a SIDD (Taylor for both on a moving beam).
 - `remap`: for a SIDD, one of the remaps of the NGA MATLAB SAR Toolbox (`'nrl'` by default).
 - `spacing`: the product's pixel spacing. The default follows the bandwidth of the data: 0.96 of the reciprocal
   of the band for a complex product, half of it with `'sva'`, and 0.7 of the finer ground resolution for a SIDD
@@ -34,8 +34,9 @@ ground-plane SICD with `'sva'` (apodization runs on the slant plane), and a `spa
 product is returned as the detected amplitude; `sidd.to_display(out, out['remap'])` gives its display values.
 
 A moving-beam collection (stripmap, sliding spotlight) is formed on the ground plane on axes along the track.
-The slant plane, autofocus, apodization and the quality areas apply to spotlight collections: asking for one of
-them on a moving-beam collection raises a `ValueError`.
+The weightings, autofocus and the quality areas apply to it in the forms that
+[Moving-beam collections](#moving-beam-collections) describes; the slant plane is for spotlight collections, and
+`plane='slant'` on a moving beam raises a `ValueError`.
 
 ## Speed
 
@@ -255,7 +256,8 @@ on the ground axes, with one impulse response everywhere and a noise-equivalent 
 edges, and the pixels outside the area are set to 0. For a file that describes no antenna pattern the model cannot
 predict where the signal fades, and an `area` other than `'tasked'` raises a `ValueError`. The model's beam is
 the one the file's antenna block states; where a producer's stated boresight differs from the true beam, the
-area is displaced with it.
+area is displaced with it. On a moving beam the areas extend in ground range only
+([below](#areas-in-ground-range)).
 
 ## Autofocus on the image
 
@@ -334,8 +336,9 @@ by a zero region cannot be restored. Along azimuth the spatially variant correct
 strips: a coefficient that changes by more than about one radian per strip step leaves a residual, which a
 smaller block or a larger `overlap` reduces. The block PGA estimate is single-threaded and slow.
 
-`process_cphd(..., autofocus=)` runs these on the baseband ground image, before any resampling, and records the
-mode in the SICD (`AzAutofocus` GLOBAL or SV). In `tests/test_autofocus_image.py` a quadratic error of 2 to 40
+`process_cphd(..., autofocus=)` runs these on the baseband ground image of a spotlight, before any resampling,
+and records the mode in the SICD (`AzAutofocus` GLOBAL or SV). A moving beam has its own estimator
+([below](#autofocus-along-the-track)). In `tests/test_autofocus_image.py` a quadratic error of 2 to 40
 rad at the band edge is recovered within 3% on synthetic images (0.5% measured), and a simulated collection
 with a quadratic error injected into its phase history returns to the error-free azimuth resolution within 2%
 and peak sidelobe within 0.5 dB (0.7% and 0.3 dB measured).
@@ -511,6 +514,9 @@ uncorrected image, against the model's predictions for the same blocks.
 
 ## Weighting and spatially variant apodization
 
+This section is the spotlight's; [Moving-beam collections](#moving-beam-collections) has the same three for a
+stripmap or a sliding spotlight.
+
 `'taylor'` applies a Taylor window (nbar 4, 35 dB) to the phase history along frequency and along pulses.
 `'uniform'` applies none. `'sva'` forms the image unweighted and applies spatially variant apodization
 (`weighting.sva`) on the slant plane: at every pixel it picks, between the unweighted aperture and a Hann window,
@@ -521,6 +527,306 @@ are removed where the spectrum is a rectangle sampled at an integer multiple of 
 collections of the table above). The slant image is then resampled at exactly twice Nyquist of the rectangle that is left.
 The result is not band limited and not linear in the scene, so it suits detection and display. A SICD with
 `weighting='sva'` is allowed on the slant plane and records the weighting as SVA.
+
+## Moving-beam collections
+
+A stripmap or sliding-spotlight collection gives every pulse its own scene reference point (SRP), and a ground
+point is seen only while the beam passes over it. `form_cphd` forms such a collection as a mosaic on the ground
+plane, on axes along and across the track ([stripmap-burst.md](stripmap-burst.md)), and `process_cphd` applies
+its options to that image with `fastsar.moving`. What applies to which mode:
+
+| Option | Spotlight | Stripmap, sliding spotlight |
+|---|---|---|
+| `plane` | slant or ground | ground (`'slant'` is refused) |
+| `weighting='taylor'`, `'uniform'` | on the phase history | frequency window on the phase history, azimuth window per pixel over its processed band |
+| `weighting='sva'` | on the slant plane | on the ground grid, where the spectrum is a rectangle on its axes (see the limits below) |
+| `autofocus='quadratic'` | one error for the image | blocks along the track, tied together by a smooth fit |
+| `autofocus='spatially_variant'` | blocks and a polynomial over the scene | the same blocks along the track, with a parabola across the swath |
+| `autofocus='pga'`, `'spatially_variant_pga'` | yes | refused: one phase function per aperture, and every block has its own |
+| `area` other than `'tasked'` | in both directions | in ground range; the tasked extent along the track |
+
+### The spectrum of the image and baseband
+
+Pulse p at frequency f adds to the image around a ground point x the spatial frequency (2 f / c) u_p(x), u being
+the horizontal part of the unit vector from the antenna to x. A pixel takes the pulses whose look angle lies
+within the processed spread of the beam center's: |sin_p(x) - s_p| <= dsin / 2, where sin_p(x) is the cosine of the
+angle between the direction of flight and the line to x, s_p the same for the pulse's SRP, and dsin the spread
+that `azimuth_fraction` of the PRF (or the vendor SICD's processed bandwidth) corresponds to.
+
+- Along the track the band at a pixel is (2 f / c) [s - dsin / 2, s + dsin / 2] around the beam center's s at the
+  time the beam crosses the pixel. Its center is the Doppler centroid: zero for a broadside stripmap, constant
+  for a squinted one, and changing along the track for a sliding spotlight or a beam whose squint drifts. Its
+  width at the center frequency is 2 dsin / lambda times the ratio of the platform's speed to the footprint's: 1
+  for a stripmap flown along a straight line, about 1.1 from orbit, several for a sliding spotlight. The default
+  pixel spacing along the track follows it.
+- Across the track it is the range band times the horizontal part of the line of sight, (2 B / c) cos(graze), on
+  the carrier (2 fc / c) cos(graze); both change across the swath.
+
+`moving.baseband` removes both carriers with one phase, exact at every pixel as `planes.deramp` is for a
+spotlight. With F(x, t) = |x - a(t)| + G(t), G the integral of s |da/dt| over time, F is stationary in t at the
+time t_c(x) at which the beam center crosses x, and psi(x) = (4 pi fc / c) F(x, t_c(x)) has the gradient
+(4 pi fc / c) u(x) at that time: the center of the pixel's spectrum on both axes. For a broadside stripmap psi is
+4 pi fc / c times the range of closest approach. The track and s |da/dt| are polynomials fitted to the pulses,
+t_c is solved at knots every 32 pixels, and F is evaluated per pixel in double on the host's cores or in a CUDA
+kernel. Every `process_cphd` product of a moving beam is at baseband, and its SICD states a band centered at
+zero.
+
+JAX's device works in float32 (a TPU has no fast float64), which cannot hold 4 pi fc / c times a range of 600 km
+to a thousandth of a radian. The host therefore solves psi in double along the center row and the center column
+of the grid, at every pixel of both, and the device adds the two vectors, reduced modulo 2 pi. What is left
+vanishes on that row and that column and is small and smooth: zero for a straight track and a constant squint,
+15 rad over 30 by 6 km of a stripmap from an orbit at 600 km, 115 rad over the 5 by 5 km of a sliding spotlight.
+Its part in the product of row and column is taken in integer turns, as `planes.deramp` takes its own, and the
+rest is solved at the knots, split into its singular vectors (one or two terms) and carried to the pixels by a
+cubic spline of each; the device sums the terms. Against the phase in double at every pixel of the first, the
+middle and the last rows of such grids the float32 phase is off by at most 2e-5 rad
+(`tests/test_moving.py::test_baseband_phase_in_float32`), and the host's part takes about two seconds for a grid
+of 500 megapixels.
+
+The support is a rectangle on the grid's axes only approximately. The band along the track grows in proportion to
+the frequency (a trapezoid, 3% wider at the top of a band of 3% of the carrier), a squint moves its center with
+frequency and shears the range band by tan(squint) of the azimuth band, and cos(graze) changes the ground range
+band across the swath.
+
+### Weighting
+
+`'taylor'` is the Taylor window (nbar 4, 35 dB) along frequency and, at each pixel, over its processed azimuth
+band, zero outside it: what Taylor weighting means for a spotlight, applied to the pulses a pixel takes.
+`form_cphd` itself keeps the Hann window it has always applied there (`azimuth_window='hann'`), whose main lobe
+is 22% wider and whose first sidelobe is 3.5 dB higher; `azimuth_window='taylor'` or `'uniform'` selects the
+others. `'uniform'` is a rectangle over the processed azimuth band and no frequency window. The weights enter the
+final stage of the factorized backprojection of each patch, per subaperture and tile with their slope across the
+tile. Measured on a simulated broadside stripmap, a 3 degree squinted one and a sliding spotlight
+(`tests/test_moving.py`; widths in units of the reciprocal band, azimuth then range):
+
+| Azimuth window | 3 dB width | Peak sidelobe | Theory |
+|---|---|---|---|
+| Hann (`form_cphd`'s default) | 1.440 to 1.441 | -31.4 to -31.5 dB | 1.441, -31.5 dB |
+| Taylor (`weighting='taylor'`) | 1.181 to 1.188 | -34.5 to -35.7 dB | 1.184, -35 dB |
+| Rectangle (`weighting='uniform'`) | 0.882 to 0.891 | -13.2 to -13.5 dB | 0.886, -13.26 dB |
+
+The antenna's own pattern across the processed band multiplies these windows in real data: the image is not
+corrected for it, so an unweighted real image has lower sidelobes and a wider main lobe than the table.
+
+`'sva'` needs a rectangle sampled at exactly twice Nyquist. The image is formed with the rectangular azimuth
+weighting made wider than the processed band (by the trapezoid, the squint's shift over the band, and 6% for the
+soft edge of the per-pixel weights; 7.7% in all on the simulated stripmap), on a grid whose spacings are half the
+reciprocal of the processed azimuth band and of the ground range band at the swath center and whose rows number a
+multiple of four. At baseband, `moving.band_limit` then keeps the half of the azimuth spectrum about zero: every
+pixel is left with the same band, the processed band at the center frequency, with sharp edges, whatever its
+Doppler centroid. `weighting.sva` runs on that image, and 24 rows formed beyond each end are dropped. The product
+is on the ground grid at those spacings.
+
+What does not fit the rectangle is refused with a `ValueError` that names the reason:
+
+- a squint that shears the range band by more than 10% of its width across the azimuth band (`moving.SHEAR`);
+- a ground range band that changes by more than 5% across the swath (`moving.RANGE`);
+- a processed azimuth band that differs by more than 10% over the scene (`moving.VARY`), as under a beam whose
+  speed over the ground changes;
+- a beam center that does not move smoothly (an SRP that steps).
+
+Inside these limits an isolated point keeps its apodized sidelobes: on an ideal rectangle, a shear of 10% and a
+range sampling 5% off twice Nyquist both leave the highest pixel outside the main lobe at -48 dB, where the exact
+rectangle has it at -48 dB and the unweighted image at -17 dB. On the simulated
+collections of `tests/test_moving.py` the highest pixel within 24 pixels of a target, outside the 7 by 7 pixels of
+its main lobe, is at -42 to -53 dB of the peak on the broadside stripmap, -44 to -46 dB on the sliding spotlight
+and -42 to -51 dB under a squint of 0.5 degrees, against -17 to -18 dB unweighted; the 3 dB widths are 0.83 to
+0.90 of the reciprocal bands (0.886 unweighted) and the peaks keep their unweighted amplitude within 5%. A squint
+of 3 degrees shears the range band of that collection by 11% and is refused.
+
+### Autofocus along the track
+
+Each along-track position is formed from its own stretch of pulses, so a phase error over slow time defocuses
+each part of the strip by its own amount, and a scatterer above or below the focus plane adds a quadratic term in
+proportion to its height wherever the track curves. `moving.autofocus` estimates the error on blocks and removes
+it with a correction that follows the strip.
+
+- **Blocks.** The pulses of a pixel change completely over the footprint of the synthetic aperture (its length
+  on the ground). A block is half that footprint long, held between 256 and 4096 rows and no longer than the
+  image, and blocks overlap by half: the pixels of a block share at least half of their pulses.
+- **Estimate.** `autofocus.quadratic`'s: map drift on the brightest 30% of up to 1024 columns, for all of them
+  together and for eight contiguous sets of them across the swath. The band is the processed band, so an
+  estimate is in radians at the edge of the synthetic aperture.
+- **Guard, first test.** `quadratic`'s, on every block: the correlation peaks of all columns and of at least half
+  of the sets must be significant, the estimate of all columns must lie within three standard errors of the sets'
+  median, and no more than a quarter of the sets may lie far from it. A block that passes counts, also when its
+  estimate is small: it says that its part of the strip is focused.
+- **Fit.** Along the track the estimates of the blocks that count are tied by a robust local line (tricube
+  weights over four block steps, Tukey's biweight); a block that does not count takes the fit of its neighbors.
+  Across the swath the departures of a block's agreeing sets from their median give a linear trend where it is
+  three times its standard error (`'spatially_variant'`: a parabola, always), held at its end values beyond the
+  columns the sets cover; where there is a trend, the block's estimate of all columns is made again with the
+  trend removed column by column, because the columns in best focus would otherwise carry it.
+- **Guard, second test.** `quadratic`'s rule on the corrected rows: their contrast must rise, the median gain of
+  the parts must not be below minus twice its standard error, and one of the two gains must be twice its
+  standard error, or the image is returned as it came. For a spotlight the parts are 16 sets of columns, because
+  one estimate serves the image. Here the blocks along the track are separate measurements, so the parts are
+  cells of 128 rows by 32 columns (16 sets of columns at least), as many as the corrected rows hold, and the
+  standard errors are measured over all of them: a narrow image is then not declined for the few sets of
+  columns it holds. A single block whose own contrast does not rise, or whose cells lose, is given back as it
+  came. A fit below 0.02 rad everywhere changes nothing.
+- **Correction.** `autofocus.spatially_variant`'s: strips of one block, extended by the length of the blur,
+  corrected column by column and cross-faded along the track with weights that sum to one. Exact zeros stay
+  exact zeros.
+
+`info` holds the blocks' estimates and their standard errors, which blocks counted, the fit, the slope across the
+swath, the blocks corrected and their contrast gains. The default for a moving beam is `'quadratic'`, as for a
+spotlight.
+
+In `tests/test_moving.py`, on a simulated strip of three blocks with 36 point targets, a quadratic error of 2, 5
+and 15 rad at the edge of the synthetic aperture, injected into the phase history, is estimated as 2.00, 5.03 and
+15.35 rad. The azimuth width goes from 1.358, 2.902 and 7.764 reciprocal bands back to 1.190, 1.189 and 1.192
+(1.187 focused) and the peak sidelobe from -32.8, -25.2 and -0.6 dB to -34.1, -34.1 and -33.8 dB (-34.4 focused).
+An error that changes from 3.1 to 4.9 rad along the strip is followed by the fit (3.67, 4.05 and 4.38 rad at the
+three blocks), and the widest response comes out at 1.199. Targets 40 m above the focus plane, seen from a track
+that curves with a radius of 2.9 km, are 2.4 times as wide as in focus (2.838) and return to 1.188; a height that
+grows from -6 to 46 m across the swath is fitted with 6.0 rad per half swath, and the widest response goes from
+3.12 to 1.22. A focused collection comes back bit for bit. A slow-time error that grows along the strip also
+moves the scatterers along the track (its linear part over each aperture); autofocus does not undo that.
+
+### Areas in ground range
+
+`area='tasked_quality'`, an RNIIRS value and `'black'` keep the tasked extent along the track and extend the
+product across it, in ground range, as far as the criterion holds; the criteria and the order of the noise
+sources are those of [Processed area by image quality](#processed-area-by-image-quality). The model is
+evaluated for the moving beam: at seven positions along the track, on the line across the track through each,
+with the pulses that the pixels there are formed from. Each pulse's reference is its own SRP, so the gain of a
+ground point is the antenna's two-way pattern in elevation and in azimuth, averaged in amplitude over those
+pulses, with the spreading loss; the delay windows are those pulses' TOA1..TOA2 (TOAE1..TOAE2 for `'black'`).
+The noise level at the beam center comes once, from the pulses of the middle position. The mask is read between
+the seven lines, and pixels outside the area are 0.
+
+An area that reaches less than one step of the model's lattice beyond the tasked swath is the tasked area
+itself, on the tasked grid, with a note that says whether the receive window or the criterion ends it there. A
+file without an antenna pattern is refused as for a spotlight. In
+`tests/test_moving.py` a simulated stripmap carries an antenna block whose one-way gain falls by 10^5 dB per squared
+direction cosine across the track, and the areas end where the two-way gain computed from that formula meets the
+criterion, to one step of the model's lattice across the track (3 m there, 50 m by default): `'black'` at +-56 m
+of ground range (gain -9.6 and -9.7 dB for a noise-equivalent sigma zero of -10 dB), an RNIIRS of 4.8 at -44 and
++43 m (-7.2 dB for the -7.5 dB it needs), `'tasked_quality'` at the tasked +-25 m. With an extended window of
++-45 m `'black'` ends there, and with a window that ends at the tasked swath all three give the tasked area.
+
+### Real collections
+
+Two public Capella collections were processed on an Nvidia RTX PRO 6000 that other jobs shared.
+
+**Stripmap** (2024-11-27, VV, 200 MHz, 135,477 pulses in 13.4 s, grazing angle 53 degrees, tasked area 82.5 by
+5.0 km; a 10 by 5.1 km cut at the center of the strip, formed from the 36,000 pulses that illuminate it). A pixel
+takes 15,944 pulses. The footprint moves at 6.6 km/s under a platform at 7.3 km/s, so the azimuth band at a pixel
+is 1.228 cycles/m, 1.10 times 2 dsin / lambda, and the default product is sampled at 0.771 m along the track
+(0.2.0 sampled it at 0.859 m, coarser than that band). The beam center's squint drifts from -0.18 to +0.02
+degrees over the collection (a Doppler centroid of -0.11 cycles/m at the cut), which the baseband phase follows;
+the shear of the range band is 0.4% and the cosine of the grazing angle changes the ground range band by about
+0.5% across the swath, so apodization is accepted.
+
+The three weightings on one grid (the apodized product's, 0.407 by 0.621 m, 61 Mpx for a 3 km cut), measured at
+the 40 brightest compact points of the scene (medians; widths times the product's bandwidths):
+
+| Weighting | Image contrast | Azimuth width | Range width | Peak sidelobe, azimuth and range |
+|---|---|---|---|---|
+| `'taylor'` | 34.3 | 1.41 | 1.17 | -28.9, -23.8 dB |
+| `'uniform'` | 34.7 | 1.08 | 0.88 | -21.5, -12.2 dB |
+| `'sva'` | 44.7 | 1.10 | 0.87 | -26.4, -23.0 dB |
+
+In range the widths are the theoretical ones (1.184 and 0.886). In azimuth the antenna's two-way pattern, 12 dB
+down at the edge of the processed band by the file's gain polynomial, weights the aperture before any window
+does: the unweighted response is 1.08 wide with a -21.5 dB sidelobe, and the Taylor window on top of it gives
+1.41. Apodization keeps the unweighted widths, removes the range sidelobes and raises the contrast (the standard
+deviation of the intensity over its mean) from 34.7 to 44.7. The sidelobes that remain around these points are
+neighboring scatterers: the highest pixel within 32 pixels outside the main lobe is at -15 to -16 dB for all
+three.
+
+Autofocus on the collection as it came: six blocks of 4,096 rows (3.2 km; the footprint is 10.4 km) give -0.27,
+-0.25, -0.25, -0.14, -0.67 and -0.72 rad (standard errors 0.04 to 0.37), the fit runs from -0.24 to -0.59 rad,
+three of the six blocks are corrected, the contrast goes from 21.203 to 21.212 and the median azimuth width of 30
+points from 1.146 to 1.142 m: the collection is in focus to half a radian, and the default does no harm. With a
+quadratic error injected into the phase history (radians at the edge of a pixel's aperture):
+
+| Injected | Contrast, blurred | Azimuth width, blurred | Fit over the six blocks | Contrast after | Azimuth width after |
+|---|---|---|---|---|---|
+| none | 21.20 | 1.146 m | -0.59 to -0.24 rad | 21.21 | 1.142 m |
+| 2 rad | 20.48 | 1.238 m | 1.31 to 1.75 rad | 21.39 | 1.144 m |
+| 5 rad | 17.40 | 1.945 m | 4.31 to 4.74 rad | 21.36 | 1.145 m |
+| 15 rad | 11.88 | 5.067 m | 14.39 to 14.73 rad | 21.27 | 1.146 m |
+
+The fits are the injected error less what the collection has of its own, block by block, and every block is
+corrected.
+
+Areas. The file has an antenna block (axis and gain polynomials) and no PTRef, so the noise level is the fifth
+source of the list above: the clutter-to-noise ratio measured from 512 pulses (the least cell of a range-Doppler
+map) with the assumed mean scene sigma zero of -10 dB. The full-bandwidth window TOA1..TOA2 of the pulses that
+form a pixel is narrower than the tasked swath, so `'tasked_quality'` (a model minimum of RNIIRS 4.20 in the
+tasked swath) and an RNIIRS of 4.5 give the tasked area, with the note that the receive window holds nothing
+beyond it. `'black'` opens the swath to the extended window TOAE1..TOAE2 and finds a signal-to-noise ratio of at
+least 1 from -3,550 to +3,300 m about the swath center, 6.9 km of ground range for the 5.1 km tasked (75.6 Mpx
+for 55.5).
+
+**Sliding spotlight** (2024-08-29, HH, 300 MHz, 111,132 pulses in 10.7 s, grazing angle 61 degrees, tasked area 5
+by 5 km; a 1 by 3 km cut at the center, formed from the whole band). The footprint moves at 1.3 km/s under a
+platform at 7.2 km/s: a pixel takes 86,878 pulses (8.4 s), its azimuth band is 6.50 cycles/m, 5.8 times
+2 dsin / lambda, and the default product is sampled at 0.144 m along the track (0.2.0 sampled it at 0.84 m). The
+beam center's squint runs from -2.7 to +2.8 degrees over the collection, and the baseband phase follows it. The
+product is 6,929 by 3,013 pixels (20.9 Mpx) and takes 27.5 GB of host memory at its peak, against 27.0 GB for
+0.2.0's `form_cphd` of the same cut: the phase history is 16.8 GB as complex64 and the mosaic's range profiles
+are the rest.
+
+- Weighting. `'taylor'`: contrast 14.33, median azimuth width of 30 points 0.253 m (1.65 reciprocal bands) and
+  range width 1.23 m (1.18). `'uniform'`: contrast 11.42, azimuth width 0.206 m (1.34). `'sva'`: 12,928 by 5,783
+  pixels of 0.077 by 0.519 m, formed with a rectangle 7.8% wider than the processed band; contrast 15.15,
+  azimuth width 0.209 m (1.35), range width 0.924 m (0.89) with a peak range sidelobe of -19.7 dB. The squint at
+  the ends of the cut shears the range band by about 7% of its width, within the limit; a cut much longer along the
+  track, or half the bandwidth, passes it and is refused.
+- Autofocus on the collection as it came: three blocks give -1.64, -1.65 and -1.54 rad, each consistent over its
+  sets, and the fit runs from -1.65 to -1.58 rad. The contrast gain of the whole image, 0.4%, is within its
+  jackknife scatter (0.8%, a few bright points carry it), but the median gain of the 5,000 cells is 0.08% with a
+  standard error of 0.01%: the correction is applied (one block of three is given back, its own contrast not
+  rising), the contrast goes from 14.33 to 14.42 and the azimuth width from 0.253 to 0.250 m. With a quadratic
+  error injected:
+
+  | Injected | Contrast, blurred | Azimuth width, blurred | Fit over the three blocks | Contrast after | Azimuth width after |
+  |---|---|---|---|---|---|
+  | none | 14.33 | 0.253 m | -1.65 to -1.58 rad | 14.42 | 0.250 m |
+  | 2 rad | 14.37 | 0.249 m | 0.34 to 0.45 rad | declined | |
+  | 5 rad | 14.01 | 0.311 m | 3.31 to 3.38 rad | 14.39 | 0.245 m |
+  | 15 rad | 13.20 | 0.618 m | 13.23 to 13.30 rad | 14.37 | 0.245 m |
+
+  The fits are the injected error less the 1.6 rad the collection has of its own. With 2 rad injected the image
+  is sharper than as it came, 0.4 rad are left, and neither gain of that correction stands out of its scatter:
+  the guard returns the image as it came. With the guard's parts as 16 sets of columns, as for a spotlight, the
+  5 rad case was declined on half the band (a 1,507 column image: a gain of 3.3% against a scatter of 2.5%, and
+  a median over 16 sets within its error); over the cells its median gain is ten standard errors.
+- Areas, with the same noise source as the stripmap. `'tasked_quality'` (a model minimum of RNIIRS 5.58): -1,650
+  to +1,500 m of ground range about the swath center for the tasked +-1,500 m. An RNIIRS of 4.5: -1,650 to
+  +2,150 m. `'black'`: -3,150 to +4,100 m, 7.3 km of ground range, in the extended window.
+
+**Speed.** Seconds per stage for the stripmap cut, second call, with megapixels per second in parentheses, on an
+Nvidia RTX PRO 6000 that other jobs were using and on 16 of the host's 48 cores:
+
+| Product | Arrays | Form | Baseband | Autofocus | Apodization | Mask |
+|---|---|---|---|---|---|---|
+| Taylor SICD, 55.5 Mpx | CuPy | 8.0 | 0.058 (954) | 0.66 (84) | | |
+| | JAX on the same GPU | | 0.63 (88) | 0.49 (112) | | |
+| | NumPy | | 2.7 (20) | 3.2 (17) | | |
+| Apodized SICD, 201.8 Mpx | CuPy | 17.5 | 0.38 (527) | 1.21 (166) | 0.097 (2,077) | |
+| | JAX | | 2.25 (90) | 0.90 (224) | 0.163 (1,235) | |
+| | NumPy | | 8.2 (25) | 19.7 (10) | 9.8 (20) | |
+| Taylor SICD of the `'black'` area, 75.6 Mpx | CuPy | 5.6 | 0.066 (1,147) | 0.24 (322) | | 0.109 (694) |
+| | JAX | | 0.98 (77) | 0.37 (203) | | 0.132 (574) |
+| | NumPy | | 1.6 (47) | 1.9 (40) | | 0.24 (319) |
+
+Formation is the mosaic's on the GPU (the 36,000 pulses of the cut, 8,194 samples each); the stages after it are
+the new ones. The baseband step includes the upload of the mosaic, which the former assembles on the host, and on
+JAX the host's part of the phase (the two vectors and the knots). Autofocus is the estimate on the blocks, the
+cross-faded correction and the guard's sums before and after; it was applied in every row of the table (5 rad
+injected). The three kinds of array give the same product to 3e-7 of its peak, zeros included. The times moved
+by a factor of two between runs with the load of the machine.
+
+The image goes to the device when its memory plan (`memory.cuda_plan`) holds it with the arrays the stages make
+beside it. A CUDA device without that room leaves the stages to the host; a JAX device (a TPU) keeps the image on
+the host and takes it through in blocks, stage by stage, and a note says so. With `FASTSAR_JAX_BLOCK_MB=4096`
+the 201.8 Mpx product, which would take 7.7 GB of the device, crosses it in blocks of at most 1 GB and holds 1.6 GB
+of it at its peak: baseband 3.9 s (51 Mpx/s), autofocus 4.9 s (41), apodization 3.6 s (56). With the image on the
+device the same stages hold 8.6 GB at their peak.
 
 ## Display orientation and SIDD output
 

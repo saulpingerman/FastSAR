@@ -296,7 +296,7 @@ def sicd_meta(out):
     if mode not in ('SPOTLIGHT', 'STRIPMAP', 'DYNAMIC STRIPMAP'):
         mode = 'SPOTLIGHT' if out.get('mode') == 'spotlight' else 'DYNAMIC STRIPMAP'
     focus = out.get('autofocus')                  # the mode process_cphd ran, or form_cphd's phase-history estimate
-    focus = ('SV' if 'variant' in str(focus) else 'GLOBAL') if focus else (
+    focus = ('SV' if 'variant' in str(focus) or out.get('mode') == 'moving' else 'GLOBAL') if focus else (
         'GLOBAL' if out.get('phase_error') is not None else 'NO')
     stamp = lambda d: d.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
     start = str(meta.get('start')).strip()
