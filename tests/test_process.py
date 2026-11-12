@@ -233,10 +233,11 @@ def test_quality_area_masks_the_product(cphd, monkeypatch):
             seen['kw'] = kw
 
     def bounds(rad, kind, center, e1, e2, bw, n, tasked=None, **kw):
-        seen.update(center=center, e1=e1, e2=e2, kind=kind)
+        seen.update(center=center, e1=e1, e2=e2, kind=kind, bounds=kw)
         return (-60.0, 60.0, -45.0, 45.0)
 
     def mask(rad, pts, kind, bw, n, tasked=None, **kw):
+        seen['mask'] = kw
         q = pts - seen['center']
         level = (1.0 - np.hypot((q @ seen['e1']) / 60.0, (q @ seen['e2']) / 45.0)).astype(np.float32)   # an ellipse
         return level >= 0, dict(level=level)
@@ -245,6 +246,7 @@ def test_quality_area_masks_the_product(cphd, monkeypatch):
     monkeypatch.setattr(rgiqe, 'area_mask', mask)
     g = fastsar.process_cphd(str(d / 'c.cphd'), plane='ground', area='black', autofocus=False, backend='cpu')
     assert seen['kind'] == 'black' and 'stand-in model' in g['notes']
+    assert seen['bounds'] == seen['mask'] == dict(black_sigma0_db=-10.0)             # the reference of the black edge
     nx, ny = g['image'].shape
     I, J = np.meshgrid(np.arange(nx), np.arange(ny), indexing='ij')
     q = g['origin'] + I[..., None] * g['spx'] * g['e1'] + J[..., None] * g['spy'] * g['e2'] - seen['center']
@@ -253,6 +255,8 @@ def test_quality_area_masks_the_product(cphd, monkeypatch):
     assert abs((g['image'] != 0).mean() - np.pi / 4) < 0.03          # the ellipse inscribed in its rectangle
     s = fastsar.process_cphd(str(d / 'c.cphd'), plane='slant', area=4.5, autofocus=False, backend='cpu')
     assert seen['kind'] == 4.5 and s['plane'] == 'slant' and 0.2 < (s['image'] != 0).mean() < np.pi / 4 + 0.03
+    fastsar.process_cphd(str(d / 'c.cphd'), area='black', black_sigma0_db=-3.0, autofocus=False, backend='cpu')
+    assert seen['bounds'] == seen['mask'] == dict(black_sigma0_db=-3.0)
 
 
 @pytest.mark.parametrize('kw', [dict(), dict(plane='slant', weighting='taylor')], ids=['default', 'slant-taylor'])
@@ -332,6 +336,7 @@ def test_errors(cphd):
                       (dict(product='sidd', spacing=(0.5, 0.4)), 'square'), (dict(extent=(10.0,)), 'extent'),
                       (dict(weighting='hamming'), 'weighting'), (dict(autofocus='sharpen'), 'autofocus'),
                       (dict(area='everything'), 'area'), (dict(area=True), 'area'), (dict(spacing=-1.0), 'spacing'),
+                      (dict(area='black', black_sigma0_db='dark'), 'black_sigma0_db'),
                       (dict(product='sidd', plane='slant'), 'ground plane'),
                       (dict(plane='ground', weighting='sva'), 'slant plane'),
                       (dict(weighting='sva'), "plane='slant'")):       # the default plane of a SICD is the ground

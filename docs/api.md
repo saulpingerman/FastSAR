@@ -8,8 +8,8 @@
 - `process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None, autofocus=None, weighting=None,
   remap='nrl', remap_args=None, spacing=None, extent=None, sicd=None, mode='auto', backend='auto',
   precision='float32',
-  shadows_down=True, nesz_db=None, scene_sigma0_db=-10.0, height=None, channel=0, troposphere=None,
-  reader_options=None, target_db=-40.0)`: from a CPHD file to a SICD or SIDD
+  shadows_down=True, nesz_db=None, scene_sigma0_db=-10.0, black_sigma0_db=-10.0, height=None, channel=0,
+  troposphere=None, reader_options=None, target_db=-40.0)`: from a CPHD file to a SICD or SIDD
   ([product-options.md](product-options.md)). `plane=None` is `'ground'` for every product: the default SICD is a
   ground-plane SICD (`Grid.Type` PLANE, `Grid.ImagePlane` GROUND, rows along ground range away from the radar,
   columns so that the array is the view from above), the image as FastSAR forms it. Most producers deliver
@@ -142,7 +142,11 @@ rasterio.
 ## `fastsar.rgiqe`, `fastsar.doctor`
 
 - `rgiqe.Radiometry(cphd_path, meta, *, channel=0, pulses=None, nesz_db=None, sicd=None, sigma0_db=None,
-  scene_sigma0_db=-10.0, eval_pulses=64)` with `gain_db`, `nesz_db`, `snr`, `rniirs`; `rgiqe.area_mask` and `rgiqe.area_bounds`;
+  scene_sigma0_db=-10.0, eval_pulses=64)` with `gain_db`, `nesz_db`, `snr`, `rniirs`;
+  `rgiqe.area_mask(rad, points, kind, bandwidth_area, samples, tasked=None, tasked_rniirs=None, *,
+  ambiguities=True, black_sigma0_db=-10.0)` and `rgiqe.area_bounds(rad, kind, center, e1, e2, bandwidth_area,
+  samples, ..., black_sigma0_db=-10.0)`: `'black'` ends where a scene of `black_sigma0_db` has an SNR of 1, and the
+  RNIIRS kinds keep the RGIQE's reference of 0 dB;
   `rgiqe.rniirs`, `information_density`, `snr_to_rniirs`, `rniirs_to_snr`
   ([product-options.md](product-options.md#processed-area-by-image-quality)).
 - `python -m fastsar.doctor [--install] [--json]`, or `doctor.check()`: what this machine can run and the commands

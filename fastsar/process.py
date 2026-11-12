@@ -17,10 +17,11 @@ track, and the product is the image as formed, where the slant-plane product is 
 
 Product. 'sicd': the complex image (SICD); 'sidd': a detected, remapped 8-bit image (SIDD), laid out shadows down.
 Area. 'tasked': the image area of the file (or of the vendor SICD given). 'tasked_quality': everything at least as
-good as the tasked area; a number: everything at or above that RNIIRS; 'black': everything with a signal-to-noise
-ratio of at least 1 (fastsar.rgiqe: the radar generalized image quality equation on the collection's own antenna
-pattern and noise). The impulse response is the same over the whole image, the noise-equivalent sigma zero rises
-toward the edges, and pixels of the rectangular array outside the area are 0.
+good as the tasked area; a number: everything at or above that RNIIRS; 'black': out to where terrain of sigma zero
+black_sigma0_db (-10 dB) sinks into the noise and the ambiguities (fastsar.rgiqe: the radar generalized image
+quality equation on the collection's own antenna pattern and noise; the RNIIRS kinds use the equation's own
+reference scene of 0 dB). The impulse response is the same over the whole image, the noise-equivalent sigma zero
+rises toward the edges, and pixels of the rectangular array outside the area are 0.
 Plane. 'ground' (the default for every product) or 'slant' (a spotlight SICD). The image is always formed on the
 ground plane, on axes along the line of sight; a ground-plane SICD is the image as formed, a slant-plane SICD is
 that image resampled (fastsar.planes), and a SIDD is detected on the slant plane and projected to the ground.
@@ -63,8 +64,8 @@ def _choice(name, value, allowed):
 
 def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None, autofocus=None, weighting=None,
                  remap='nrl', remap_args=None, spacing=None, extent=None, sicd=None, mode='auto', backend='auto',
-                 precision='float32', shadows_down=True, nesz_db=None, scene_sigma0_db=-10.0, height=None, channel=0,
-                 troposphere=None, reader_options=None, target_db=-40.0):
+                 precision='float32', shadows_down=True, nesz_db=None, scene_sigma0_db=-10.0, black_sigma0_db=-10.0,
+                 height=None, channel=0, troposphere=None, reader_options=None, target_db=-40.0):
     """Form the image of a CPHD collection and write it as a SICD or a SIDD (see the module docstring).
 
     cphd: path. output: the file to write (NITF), or None to return the product without writing it.
@@ -91,6 +92,10 @@ def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None
         the track for a moving beam.
     sicd: the vendor's SICD (path, .xml or SICD metadata), whose footprint is then the tasked area.
     nesz_db, scene_sigma0_db: the noise level of the quality areas when the files give none (fastsar.rgiqe).
+    black_sigma0_db: the sigma zero (dB) whose signal-to-noise ratio of 1, ambiguities counted as noise, is the edge
+        of area='black': the area ends where the noise-equivalent sigma zero plus the ambiguity level reaches it.
+        The RNIIRS areas ('tasked_quality', a number) do not use it: their rating is the RGIQE's, for its reference
+        scene of 0 dB (co-polarized), as sarpy's PREDICTED_RNIIRS is.
     mode, backend, precision, height, channel, troposphere, reader_options, target_db: form_cphd's.
 
     -> the product dict (form_cphd's entries on the product's grid: image, origin, e1, e2, spx, spy, plane, meta,
@@ -110,6 +115,9 @@ def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None
     if not (isinstance(area, str) and area in ('tasked', 'tasked_quality', 'black')) and not (
             isinstance(area, (int, float, np.integer, np.floating)) and not isinstance(area, bool)):
         raise ValueError(f"area must be 'tasked', 'tasked_quality', 'black' or an RNIIRS, got {area!r}")
+    if not (isinstance(black_sigma0_db, (int, float, np.integer, np.floating)) and not isinstance(black_sigma0_db, bool)
+            and np.isfinite(black_sigma0_db)):
+        raise ValueError(f'black_sigma0_db must be a sigma zero in dB, got {black_sigma0_db!r}')
     if extent is not None and (np.size(extent) != 2 or np.min(extent) <= 0):
         raise ValueError(f'extent must be two positive lengths in meters, got {extent!r}')
     if spacing is not None and (np.size(spacing) not in (1, 2) or np.min(spacing) <= 0):
@@ -185,7 +193,8 @@ def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None
                                  "to follow; only area='tasked' can be processed")
             tasked = c + np.stack([b[[0, 1, 1, 0]], b[[2, 2, 3, 3]]], 1) @ np.stack([e1, e2])
             n = g['S'].shape[0] * K
-            b = np.array(rgiqe.area_bounds(rad, area, c, e1, e2, bw_area, n, tasked=tasked))
+            b = np.array(rgiqe.area_bounds(rad, area, c, e1, e2, bw_area, n, tasked=tasked,
+                                           black_sigma0_db=black_sigma0_db))
             valid = (rad, bw_area, n, tasked)
             g['notes'].extend(rad.notes)
         t1, t2 = np.linspace(b[0], b[1], 5), np.linspace(b[2], b[3], 5)
@@ -220,7 +229,7 @@ def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None
     tight = False
     try:
         if st['spot']:
-            out, tight = _spotlight(out, st, product, area, spacing, lap, cuda, jaxdev)
+            out, tight = _spotlight(out, st, product, area, spacing, lap, cuda, jaxdev, black_sigma0_db)
         elif cuda and product == 'sidd':                             # a moving beam: the remap alone is the device's
             place, tight = _cuda_place(out, dict(ground=out['image'].nbytes, display=out['image'].size))
             if place['ground'] == 'device':
@@ -257,7 +266,7 @@ def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None
     return out
 
 
-def _mask(out, st, area):
+def _mask(out, st, area, black_sigma0_db=-10.0):
     """The ground pixels [nx, ny] inside a quality area: the model on a coarse lattice, bilinear between its nodes."""
     from . import rgiqe
     from .patches import _rows
@@ -267,7 +276,7 @@ def _mask(out, st, area):
     ki = planes._knots(nx, max(4, int(min(50.0 / spx, nx / 48))))
     kj = planes._knots(ny, max(4, int(min(50.0 / spy, ny / 48))))
     pts = o + (ki * spx)[:, None, None] * e1 + (kj * spy)[None, :, None] * e2
-    m, info = rgiqe.area_mask(rad, pts, area, bw_area, n, tasked=tasked)
+    m, info = rgiqe.area_mask(rad, pts, area, bw_area, n, tasked=tasked, black_sigma0_db=black_sigma0_db)
     # the margin over the threshold where the model gives it (a smooth boundary between the nodes), else the mask
     f = np.asarray(info['level'], np.float64) if info.get('level') is not None else np.asarray(m, np.float64) - 0.5
     from .resample import KnotMap
@@ -360,7 +369,7 @@ def _detect(img, where):
     return out
 
 
-def _spotlight(out, st, product, area, spacing, lap, cuda, jaxdev=False):
+def _spotlight(out, st, product, area, spacing, lap, cuda, jaxdev=False, black_sigma0_db=-10.0):
     s, wt, mg = st['sampling'], st['weighting'], st['margin']
     out['window'] = (wt, wt)
     nx, ny = out['image'].shape
@@ -425,7 +434,7 @@ def _spotlight(out, st, product, area, spacing, lap, cuda, jaxdev=False):
         out.update(autofocus=st['autofocus'] if info.get('applied', True) else None, autofocus_info=info)
         release()
         lap('autofocus', out['image'])
-    valid = None if st['valid'] is None else _mask(out, st, area)
+    valid = None if st['valid'] is None else _mask(out, st, area, black_sigma0_db)
     if not st['via_slant']:                                          # a ground-plane SICD: the image as formed
         if valid is not None and _xp.kind(out['image']) == 'cupy':
             import cupy

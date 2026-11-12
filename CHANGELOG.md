@@ -18,6 +18,15 @@ was published on PyPI.
   image. Since apodization runs on the slant plane, `process_cphd(cphd, weighting='sva')` for a SICD now raises a
   `ValueError` unless `plane='slant'` is given. The defaults of a SIDD, of a moving-beam collection (Taylor
   weighting in range for either product) and of `form_cphd` are unchanged.
+- `area='black'` ends where a scene of sigma zero -10 dB has a signal-to-noise ratio of 1, ambiguities counted as
+  noise: where the noise-equivalent sigma zero plus the ambiguity level reaches -10 dB. In 0.2.0 the reference was
+  the RGIQE's scene (0 dB for a co-polarized channel), which put the edge about 10 dB further down the beam, past
+  where most terrain shows anything. `process_cphd`, `rgiqe.area_mask` and `rgiqe.area_bounds` take
+  `black_sigma0_db=-10.0`, and `black_sigma0_db=0.0` gives the area of 0.2.0 for a co-polarized channel. The
+  RNIIRS areas (`'tasked_quality'`, a number) keep the RGIQE's reference, so that an RNIIRS computed here is the
+  one sarpy's `PREDICTED_RNIIRS` states; `'black'` therefore no longer contains every RNIIRS area, only those whose
+  threshold needs an SNR of at least 10 dB of the reference scene. `Radiometry.snr(..., sigma0_db=)` gives the
+  ratio for a scene of any sigma zero.
 
 ## [0.2.0] - 2026-11-10
 

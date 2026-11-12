@@ -18,7 +18,15 @@ G the two-way antenna gain at the ground point x relative to the reference point
 antenna pattern: its impulse response and its noise level are the same everywhere and the signal fades toward the
 edges, so RNIIRS varies over the image through the SNR alone. area_mask and area_bounds turn the model into the
 region to process: the tasked area, the area at least as good as the tasked one, the area above a given RNIIRS, or
-everything with an SNR of at least 1.
+the area out to black.
+
+Two reference signals. An RNIIRS is a rating against a fixed reference scene, the RGIQE's: a sigma zero of 0 dB for a
+co-polarized channel and -6.02 dB for a cross-polarized one, sarpy's convention, so that an RNIIRS computed here is
+the one sarpy's PREDICTED_RNIIRS states for the same image. The edge of the 'black' area is a statement about the
+ground itself: where terrain of an ordinary brightness, black_sigma0_db (-10 dB by default), no longer stands above
+the noise and the ambiguities, that is, where the noise-equivalent sigma zero plus the ambiguity level reaches
+black_sigma0_db. The two therefore differ by the 10 dB between the references: 'black' ends where the SNR of the
+RGIQE's reference scene is about 10 dB, not 0 dB.
 """
 import os
 
@@ -489,22 +497,26 @@ class Radiometry:
         out[np.abs(c) > 1] = np.nan
         return out
 
-    def _fields(self, points, bandwidth_area, samples, ambiguities=True):
-        """The SNR before the delay window is applied, the two window margins and the unknown-pattern flag."""
+    def _fields(self, points, bandwidth_area, samples, ambiguities=True, sigma0_db=None):
+        """The SNR before the delay window is applied, the two window margins and the unknown-pattern flag.
+        sigma0_db: the scene's sigma zero in place of the reference one."""
         ev = self._evaluate(points, clamp=True)
-        den = self._nesz_ref(bandwidth_area, samples) / self._sigma_ref
+        sigma = self._sigma_ref if sigma0_db is None else 10.0 ** (0.1 * float(sigma0_db))
+        den = self._nesz_ref(bandwidth_area, samples) / sigma
         if ambiguities and self.prf:
             for k in (-2, -1, 1, 2):
                 den = den + self._evaluate(self._ambiguity(points, k))['power']
         return ev['gain'] / den, ev['margin'], ev['margin_ext'], ev['clamped']
 
-    def snr(self, points, bandwidth_area, samples, ambiguities=True, *, extended=False):
-        """Signal-to-noise power ratio at the ground points for a scene of the reference sigma zero (sigma0_db).
-        With ambiguities, the echoes of the first two azimuth ambiguities on either side (a uniform scene of the
-        same sigma zero is assumed) count as noise: SNR = G(x) / (NESZ_ref / sigma_ref + sum_k G(x_k)). Points
-        outside the full-bandwidth delay window TOA1..TOA2 of the pulses get 0; extended=True admits the extended
-        window TOAE1..TOAE2 instead."""
-        snr, mg, mge, _ = self._fields(points, bandwidth_area, samples, ambiguities)
+    def snr(self, points, bandwidth_area, samples, ambiguities=True, *, extended=False, sigma0_db=None):
+        """Signal-to-noise power ratio at the ground points for a scene of the reference sigma zero (self.sigma0_db),
+        or of sigma0_db (dB) when given. With ambiguities, the echoes of the first two azimuth ambiguities on either
+        side (a uniform scene of the same sigma zero is assumed) count as noise, which makes the ratio one of signal
+        to noise and clutter: SNR = G(x) / (NESZ_ref / sigma + sum_k G(x_k)). It is at least 1 exactly where the
+        noise-equivalent sigma zero plus the ambiguity level, NESZ(x) + sigma sum_k G(x_k) / G(x), is at most sigma.
+        Points outside the full-bandwidth delay window TOA1..TOA2 of the pulses get 0; extended=True admits the
+        extended window TOAE1..TOAE2 instead."""
+        snr, mg, mge, _ = self._fields(points, bandwidth_area, samples, ambiguities, sigma0_db)
         return np.where((mge if extended else mg) >= 0, snr, 0.0)
 
     def rniirs(self, points, bandwidth_area, samples, ambiguities=True, *, extended=False):
@@ -664,7 +676,8 @@ def _weights(nodes, i):
     return k, (i - nodes[k]) / (nodes[k + 1] - nodes[k])
 
 
-def area_mask(rad, points, kind, bandwidth_area, samples, tasked=None, tasked_rniirs=None, *, ambiguities=True):
+def area_mask(rad, points, kind, bandwidth_area, samples, tasked=None, tasked_rniirs=None, *, ambiguities=True,
+              black_sigma0_db=-10.0):
     """The part of a ground grid to process, as a boolean mask [n1, n2], and a dict describing it.
 
     rad: a Radiometry. points: a regular ground grid [n1, n2, 3] in the local frame (the grid is needed, not a list
@@ -676,28 +689,39 @@ def area_mask(rad, points, kind, bandwidth_area, samples, tasked=None, tasked_rn
                         PREDICTED_RNIIRS parameter of the SICD given to rad, else the lowest RNIIRS the model
                         predicts inside the tasked polygon;
       a number          where the predicted RNIIRS is at least that number;
-      'black'           where the SNR is at least 1, with the range swath opened to the extended delay window
-                        TOAE1..TOAE2 of the file when it has one.
+      'black'           where a scene of sigma zero black_sigma0_db (dB) has an SNR of at least 1, ambiguities
+                        counted as noise: where the noise-equivalent sigma zero plus the ambiguity level is at most
+                        black_sigma0_db. The range swath is opened to the extended delay window TOAE1..TOAE2 of
+                        the file when it has one.
+
+    The RNIIRS of the two middle kinds is the RGIQE's, for its own reference scene (rad.sigma0_db: 0 dB for a
+    co-polarized channel, -6.02 dB for a cross-polarized one), so that it is the rating sarpy's PREDICTED_RNIIRS
+    states; black_sigma0_db does not enter it. The black edge refers to the ground instead: with the default of
+    -10 dB it lies where terrain of that brightness sinks into the noise and the ambiguities, which keeps most of
+    what an image out to an SNR of 1 of the reference scene would show at less area.
 
     Apart from 'tasked', the mask is the union of the tasked polygon with the connected region that meets the
     criterion and contains the scene reference point or touches the polygon, so it never falls short of the tasked
     area. Points where the antenna pattern is not known do not meet any criterion. A lower RNIIRS threshold gives a
-    larger area, and 'black' contains every area whose threshold needs an SNR of at least 1 (at a large bandwidth
-    area a low RNIIRS needs less, and its area reaches beyond 'black' across the beam). Grids of more than about
-    300,000 points are evaluated on a lattice of at most 257 nodes per axis and interpolated.
+    larger area, and so does a lower black_sigma0_db. 'black' contains the area of every RNIIRS threshold that needs
+    a reference SNR of at least rad.sigma0_db - black_sigma0_db (10 dB for a co-polarized channel at the default);
+    a threshold that needs less, a low RNIIRS at a large bandwidth area or a tasked quality met at a low SNR, gives
+    an area that reaches beyond 'black' across the beam. Grids of more than about 300,000 points are evaluated on
+    a lattice of at most 257 nodes per axis and interpolated.
 
-    The dict holds kind, criterion ('polygon', 'rniirs' or 'snr'), threshold, snr_threshold, tasked_rniirs and
-    tasked_rniirs_source, center_rniirs, center_snr_db and nesz_ref_db (model values at the reference point),
-    level_source, border (whether the mask reaches the first and last row and the first and last column of the
-    grid), notes and level.
+    The dict holds kind, criterion ('polygon', 'rniirs' or 'snr'), threshold, snr_threshold, black_sigma0_db (for
+    'black', else None), tasked_rniirs and tasked_rniirs_source, center_rniirs, center_snr_db and nesz_ref_db (model
+    values at the reference point, for the reference scene), level_source, border (whether the mask reaches the
+    first and last row and the first and last column of the grid), notes and level.
 
     level is a float32 array of the mask's shape with level >= 0 exactly where the mask is set, for drawing the
     boundary more finely than the grid: interpolate it bilinearly and keep what is >= 0. Inside the mask it is the
     margin by which the criterion is met (0 where a point of the tasked polygon does not meet it), outside the
     margin by which it is missed, at most -0.001 (also for points that meet the criterion in a region not connected
-    to the scene). The margin is the lesser of the predicted RNIIRS minus the threshold (for 'black' the SNR in dB)
-    and the time in microseconds by which the echo lies inside the delay window, so only its sign and its zero
-    crossing mean the same thing everywhere. For 'tasked' it is +1 inside the polygon and -1 outside."""
+    to the scene). The margin is the lesser of the predicted RNIIRS minus the threshold (for 'black' the SNR in dB
+    of a scene of black_sigma0_db) and the time in microseconds by which the echo lies inside the delay window, so
+    only its sign and its zero crossing mean the same thing everywhere. For 'tasked' it is +1 inside the polygon and
+    -1 outside."""
     from scipy import ndimage
     pts = np.asarray(points, np.float64)
     if pts.ndim != 3 or pts.shape[-1] != 3:
@@ -706,7 +730,8 @@ def area_mask(rad, points, kind, bandwidth_area, samples, tasked=None, tasked_rn
     ring = None if tasked is None else _ring(tasked)
     notes = []
     c_snr = float(rad.snr(rad.ref_point[None], bandwidth_area, samples, ambiguities)[0])
-    info = dict(kind=kind, criterion='polygon', threshold=None, snr_threshold=None, tasked_rniirs=None,
+    info = dict(kind=kind, criterion='polygon', threshold=None, snr_threshold=None, black_sigma0_db=None,
+                tasked_rniirs=None,
                 tasked_rniirs_source=None, center_rniirs=float(snr_to_rniirs(bandwidth_area, c_snr)),
                 center_snr_db=float(10 * np.log10(max(c_snr, 1e-30))),
                 nesz_ref_db=float(10 * np.log10(rad._nesz_ref(bandwidth_area, samples))),
@@ -733,10 +758,13 @@ def area_mask(rad, points, kind, bandwidth_area, samples, tasked=None, tasked_rn
         mask = polygon()
         info['border'], info['level'] = border(mask), np.where(mask, 1.0, -1.0).astype(np.float32)
         return mask, info
-    extended = False
+    extended, scene = False, None
     if isinstance(kind, str) and kind == 'black':
+        if not np.isfinite(float(black_sigma0_db)):
+            raise ValueError(f'black_sigma0_db must be a sigma zero in dB, got {black_sigma0_db!r}')
         info['criterion'], thr = 'snr', 1.0
-        info['threshold'] = 1.0
+        info['threshold'], info['black_sigma0_db'] = 1.0, float(black_sigma0_db)
+        scene = float(black_sigma0_db)                              # the SNR of this scene, not of the RGIQE's
         extended = bool(rad.has_extended)
         if extended:
             notes.append('The range swath is opened to the extended delay window TOAE1..TOAE2 of the file, in which '
@@ -774,7 +802,7 @@ def area_mask(rad, points, kind, bandwidth_area, samples, tasked=None, tasked_rn
     i1 = np.arange(n1) if direct else np.unique(np.rint(np.linspace(0, n1 - 1, min(n1, 257))).astype(int))
     i2 = np.arange(n2) if direct else np.unique(np.rint(np.linspace(0, n2 - 1, min(n2, 257))).astype(int))
     lat = pts if direct else pts[i1][:, i2]
-    snr, mg, mge, cl = rad._fields(lat, bandwidth_area, samples, ambiguities)
+    snr, mg, mge, cl = rad._fields(lat, bandwidth_area, samples, ambiguities, scene)
     mg = mge if extended else mg
     snr = np.where(cl, 0.0, snr)
     ok = (snr >= thr) & (mg >= 0)
@@ -821,7 +849,7 @@ def area_mask(rad, points, kind, bandwidth_area, samples, tasked=None, tasked_rn
 
 
 def area_bounds(rad, kind, center, e1, e2, bandwidth_area, samples, tasked=None, tasked_rniirs=None, step=50.0,
-                limit=30e3, *, ambiguities=True):
+                limit=30e3, *, ambiguities=True, black_sigma0_db=-10.0):
     """Bounding rectangle (lo1, hi1, lo2, hi2), in meters from `center` along the horizontal unit vectors e1 and e2
     (local frame), of the area area_mask selects; the other arguments are area_mask's. The mask is evaluated on a
     grid of spacing `step` (m) through the center that grows on every side the mask reaches until it no longer does
@@ -843,7 +871,8 @@ def area_bounds(rad, kind, center, e1, e2, bandwidth_area, samples, tasked=None,
         a = np.arange(-np.ceil(ext[0] / step), np.ceil(ext[1] / step) + 1) * step
         b = np.arange(-np.ceil(ext[2] / step), np.ceil(ext[3] / step) + 1) * step
         pts = center + a[:, None, None] * e1 + b[None, :, None] * e2
-        mask, info = area_mask(rad, pts, kind, bandwidth_area, samples, tasked, tasked_rniirs, ambiguities=ambiguities)
+        mask, info = area_mask(rad, pts, kind, bandwidth_area, samples, tasked, tasked_rniirs, ambiguities=ambiguities,
+                               black_sigma0_db=black_sigma0_db)
         grow = np.array(info['border']) & (ext < limit)
         if not grow.any():
             break

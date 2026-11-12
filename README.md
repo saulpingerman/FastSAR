@@ -83,8 +83,8 @@ fastsar.process_cphd('scene_CPHD.cphd', 'slant.nitf', plane='slant')         # s
                                                                              # producers deliver
 fastsar.process_cphd('scene_CPHD.cphd', 'scene_SIDD.nitf', product='sidd')   # ground-plane SIDD: apodized, NRL
                                                                              # remap, shadows down
-fastsar.process_cphd('scene_CPHD.cphd', 'wide.nitf', product='sidd', area='black')   # out to a signal-to-noise
-                                                                                     # ratio of 1
+fastsar.process_cphd('scene_CPHD.cphd', 'wide.nitf', product='sidd', area='black')   # out to where -10 dB
+                                                                                     # terrain meets the noise
 ```
 
 The default SICD is on the ground plane (`Grid.Type` PLANE, `Grid.ImagePlane` GROUND, rows along ground range away

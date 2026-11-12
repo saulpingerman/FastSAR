@@ -31,7 +31,8 @@ out = fastsar.process_cphd('scene_CPHD.cphd', product='sidd', area='black', rema
 The options and their defaults:
 
 - `product`: `'sicd'` (complex image, the default) or `'sidd'` (detected, remapped 8-bit image).
-- `area`: `'tasked'` (default), `'tasked_quality'`, an RNIIRS value, or `'black'`.
+- `area`: `'tasked'` (default), `'tasked_quality'`, an RNIIRS value, or `'black'` (out to where terrain of
+  `black_sigma0_db`, -10 dB by default, sinks into the noise and the ambiguities).
 - `plane`: `'ground'` (the default for every product) or `'slant'` (a spotlight SICD only).
 - `autofocus`: `'quadratic'` (default), `'pga'`, `'spatially_variant'`, `'spatially_variant_pga'` or `False`.
 - `weighting`: `'uniform'`, `'taylor'` or `'sva'`. The default is no weighting (`'uniform'`) for a SICD, so that
@@ -256,7 +257,9 @@ where PN is the noise power per sample, PTRef the per-sample power of a 1 m^2 ta
 G(x) the two-way antenna gain relative to that point (averaged over the aperture, with the R^-4 spreading loss), and
 x_k the first two azimuth ambiguities of x on either side, whose echoes count as noise. Points whose echo falls
 outside the receive window TOA1..TOA2 get an SNR of zero. The reference sigma0 defaults to 0 dB for a co-polarized
-channel and -6.02 dB for a cross-polarized one, as in sarpy.
+channel and -6.02 dB for a cross-polarized one, as in sarpy. Because the ambiguities are counted as noise, the
+ratio is one of signal to noise and clutter: it is at least 1 exactly where the noise-equivalent sigma zero plus
+the ambiguity level, NESZ(x) + sigma0 sum_k G(x_k) / G(x), is at most sigma0.
 
 ### Noise level
 
@@ -278,7 +281,27 @@ area is the connected region around the scene reference point, joined with the t
 - `'tasked'`: the tasked polygon.
 - `'tasked_quality'`: where the RNIIRS is at least the tasked one (given, from the SICD, or the model's minimum).
 - a number: where the predicted RNIIRS is at least that number.
-- `'black'`: where the SNR is at least 1, with the range swath opened to the extended window TOAE1..TOAE2.
+- `'black'`: where a scene of sigma zero `black_sigma0_db` (-10 dB by default) has an SNR of at least 1, that is,
+  where the noise-equivalent sigma zero plus the ambiguity level is at or below -10 dB. The range swath is opened
+  to the extended window TOAE1..TOAE2.
+
+The two criteria use different reference scenes, on purpose.
+
+| | Reference sigma zero | Why |
+|---|---|---|
+| RNIIRS (`'tasked_quality'`, a number) | 0 dB co-polarized, -6.02 dB cross-polarized: the RGIQE's own, sarpy's convention | An RNIIRS is a rating against a fixed scene. With the RGIQE's reference, a value computed here is the one sarpy's `PREDICTED_RNIIRS` states for the same image, and a tasked RNIIRS read from a vendor's SICD means the same thing in the model. |
+| `'black'` | `black_sigma0_db`, -10 dB by default | The black edge is a statement about the ground: where terrain of an ordinary brightness is no longer above the noise and the ambiguities. A 0 dB scene is brighter than most terrain, so its SNR of 1 lies well past the last pixels that show anything. |
+
+With the default the black area ends where the SNR of the RGIQE's reference scene is about 10 dB, not 0 dB. It
+keeps most of what the wider area shows, at less area to form, less time and a smaller file
+(the [measurements](#the-black-area-at--10-db) are below). `black_sigma0_db=0.0` gives the area out to an SNR of 1
+of a 0 dB scene, which was the black area of 0.2.0 for a co-polarized channel.
+
+How the areas nest: every area contains the tasked one; a lower RNIIRS threshold gives a larger area; a lower
+`black_sigma0_db` gives a larger black area. `'black'` contains the area of every RNIIRS threshold that needs an
+SNR of at least 10 dB of the reference scene (the 10 dB between the two references; 4 dB for a cross-polarized
+channel). A threshold that needs less, such as a low RNIIRS at a large bandwidth area or a tasked quality that is
+met at a low SNR, gives an area that reaches beyond `'black'` across the beam.
 
 ### Example
 
@@ -302,9 +325,10 @@ lo1, hi1, lo2, hi2 = rgiqe.area_bounds(rad, 'black', c, e1, e2, bw_area, samples
 - Gain polynomials are trusted to 15 dB one-way below their peak; beyond that no area criterion is met.
 - An `'uncalibrated'` level rests on the assumed scene sigma0; a range-Doppler noise level is an upper bound.
 - Ambiguities assume a uniform scene and are placed with the mid-aperture geometry; range ambiguities are ignored.
-- A low RNIIRS threshold at a large bandwidth area needs an SNR below 1, and its area can exceed `'black'`.
+- An RNIIRS threshold that needs an SNR of the reference scene below 10 dB gives an area that exceeds `'black'`
+  at its default of -10 dB.
 
-`process_cphd(..., area=)` takes the same four kinds. The image is formed over the bounding rectangle of the area
+`process_cphd(..., area=, black_sigma0_db=-10.0)` takes the same four kinds. The image is formed over the bounding rectangle of the area
 on the ground axes, with one impulse response everywhere and a noise-equivalent sigma zero that rises toward the
 edges, and the pixels outside the area are set to 0. For a file that describes no antenna pattern the model cannot
 predict where the signal fades, and an `area` other than `'tasked'` raises a `ValueError`. The model's beam is
