@@ -207,6 +207,18 @@ Reading took 7.5 s; windowing, the range gate and formation 17.8 s (3.1 megapixe
 average with its looks 0.25 s (over 200 megapixels per second); writing 0.2 s. The coherence of a pair to its
 GeoTIFF took 20 to 29 s, of which 1.5 to 3.4 s for the common band, the coherence and its floor.
 
+The stages by themselves on 9.3-megapixel arrays, in megapixels per second (the best of three runs, the host
+and the GPU both busy with other jobs):
+
+| stage | host (48 cores) | GPU |
+|---|---|---|
+| detected image for the correlation | 10 | 89 |
+| translation estimate, the whole image | 5.0 | 40 |
+| the same with its 16 tiles | 1.6 | 9.3 |
+| translation by a phase ramp | 20 | 440 |
+| average of two images with its looks | 12 | 720 |
+| coherence over 7 by 7 pixels, fringe removed in tiles | 3.3 | 16 |
+
 ## The range gate
 
 A grid of a few kilometers is small against the swath a wide-band collection's samples span, and the first
