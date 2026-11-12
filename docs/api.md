@@ -15,16 +15,18 @@
   grid) with `product`, `area`, `weighting`, `autofocus`, `autofocus_info`, `timing` (seconds per stage) and, when
   written, `path` and `metadata`.
 - `process_stack(cphds, output=None, *, product='mean', grid=None, reference=0, spacing=None, extent=None,
-  register='fourier', equalize='mean', weights=None, window=7, weighting='taylor', aperture='auto', remap='nrl',
-  remap_args=None, shadows_down=True, backend='auto', precision='float32', max_shift=64, range_gate=True,
-  channel=0, troposphere=None, reader_options=None, target_db=-40.0)`: several collections of one scene to one
-  product ([stack.md](stack.md)). `product`: `'mean'` (a SIDD), `'coherence'` or `'change'` (two collections, a
-  GeoTIFF). Returns the product dict of `stack.mean`, `stack.coherence` or `stack.change` with `registrations`,
-  `inputs`, `timing` and, when written, `path` and `metadata`.
+  register='fourier', equalize='mean', weights=None, window=7, weighting='taylor', aperture='auto', dem=None,
+  remap='nrl', remap_args=None, shadows_down=True, backend='auto', precision='float32', max_shift=64,
+  range_gate=True, channel=0, troposphere=None, reader_options=None, target_db=-40.0)`: several collections of
+  one scene to one product ([stack.md](stack.md)). `product`: `'mean'` (a SIDD), or of two collections as a
+  coherent pair `'coherence'`, `'change'`, `'interferogram'` (GeoTIFFs) or `'coherent_sum'` (a SIDD); the pair is
+  formed from its common support ([stack.md](stack.md#coherent-pairs)). Returns the product dict of the
+  `stack` function of that name with `registrations`, `inputs`, `timing`, for a pair `support` and `baseline`,
+  and, when written, `path` and `metadata`.
 - `form_cphd(cphd, sicd=None, *, mode='auto', backend='auto', window=True, spacing=None, channel=0, patch=1024,
   azimuth_fraction=0.8, extent=None, height=None, precision='float32', target_db=-40.0, info=None,
-  autofocus=False, troposphere=None, reader_options=None, axes='track', aperture='auto', grid=None, shift=None,
-  range_gate='auto')`: the image of a CPHD file ([processing-chain.md](processing-chain.md#2-form)).
+  autofocus=False, troposphere=None, reader_options=None, axes='track', aperture='auto', band=None, grid=None,
+  shift=None, range_gate='auto')`: the image of a CPHD file ([processing-chain.md](processing-chain.md#2-form)).
   `mode`: `'auto'`, `'spotlight'`, `'moving'`. `troposphere`: passed to `read_cphd` (default: the delay the file
   gives is removed; `'model'` removes a standard-atmosphere delay for files that give none). `sicd`: path, `.xml` or SICD metadata. `spacing`, `extent`: (along, across
   track) in m. `height`: grid height above the ellipsoid. Returns a dict: `image` [nx, ny] complex64, `origin`
@@ -32,7 +34,8 @@
   frequency support along e1, e2), `window`, `phase_error` (or None), `meta` (from `read_cphd`), `notes`, and the
   grid's geometry: `plane`, `axes`, `center`, `height`, `graze`, `pulses`. `axes`: `'track'`, `'los'` (a spotlight:
   e2 along the line of sight on the ground) or `'auto'`. `aperture`: `'auto'`, `'square'`, `'full'` or the pulses
-  (first, last + 1). `grid`: an Earth-fixed ground grid (`stack.ground_grid`, or an earlier product: its pixels) in
+  (first, last + 1). `band`: the frequencies to use, (first, last) in Hz or one pair per pulse, weighted over
+  that band; with `aperture`, the selection a coherent pair is formed from (`stack.common_support`). `grid`: an Earth-fixed ground grid (`stack.ground_grid`, or an earlier product: its pixels) in
   place of the collection's own; the output then has `grid`, `shift`, `source`, `form_options` and `axes` `'grid'`.
   `shift`: (d1, d2) in m along the grid axes, the grid displaced by it ([stack.md](stack.md#registration)).
   `range_gate`: `ImageFormer`'s.
@@ -143,19 +146,32 @@ JAX) and return arrays of the same kind.
 - `ground_grid(center, extent, spacing, azimuth=0.0)`: an Earth-fixed ground grid, horizontal at `center`
   (latitude, longitude, height): `dict(origin, e1, e2, spx, spy, shape, center, lat, lon, height, azimuth)`, ECEF.
   `as_grid(grid)`: the same from a dict under other names or from a product.
-- `register(products, reference=0, *, apply='fourier', max_shift=64, tiles=4, box=5, highpass=32.0, form=None)`:
-  one translation per image against the reference; each product gets `registration` (`shift`, `shift_px`,
-  `significance`, `correlation`, `found`, `residual_rms`, `residual_median`, `residual_worst`, `tile_residuals`,
-  `tiles_used`) and `shift`. `apply`: `'fourier'`, `'reform'` or `None`.
+- `register(products, reference=0, *, apply='fourier', max_shift=64, tiles=4, box=5, highpass=32.0,
+  coherent=False, form=None)`: one translation per image against the reference; each product gets `registration`
+  (`shift`, `shift_px`, `significance`, `correlation`, `found`, `residual_rms`, `residual_median`,
+  `residual_worst`, `tile_residuals`, `tiles_used`) and `shift`. `apply`: `'fourier'`, `'reform'` or `None`.
+  `coherent`: the translation refined on the complex images; `registration` then has `coherent` (`found`,
+  `delta_px`, `tiles_used`, `quality`, `residual_px`, `gain`) and `detected`, `detected_px`.
   `shift_image(out, shift, *, inplace=False)`: a product translated on its grid by a phase ramp on its spectrum.
 - `mean(products, *, equalize=None, weights=None, tile=32)`: the incoherent average; `image` (amplitude), `looks`,
   `looks_single`, `looks_by_n`, `looks_ideal`, `looks_independent`, `brightness_spread_db`, `gains`, `inputs`.
 - `coherence(a, b, window=7, *, common_band=True, fringe='tiles', tile=384, floor=True)`: `image` (the coherence),
   `median`, `mean`, `p90`, `above_0p5`, `above_0p7`, `floor` (the same of the displaced pair), `samples`,
-  `overlap`, `fringes`, `baseline`. `change(a, b, window=7, ...)`: `image` (the intensity ratio, dB), `coherence`,
-  `ratio_sigma`.
-- `baseline(a, b, point=None, aperture='square')`: from two CPHD files or products, `d_graze`, `d_azimuth`,
-  `critical_graze`, `critical_azimuth`, `overlap_range`, `overlap_azimuth`, `overlap`, `inside`, `days`.
+  `overlap`, `fringes`, `fringes_found`, `fringe`, `baseline`. `change(a, b, window=7, *, capable=0.9, lost=0.4,
+  ...)`: `image` (the intensity ratio, dB), `coherence`, `allowed` (the coherence the two brightnesses allow),
+  `capable_fraction`, `changed_fraction`, `coherent_fraction`, `ratio_sigma`.
+- `interferogram(a, b, window=7, *, fringe=True, dem=None, dem_step=4, floor=True)`: of a registered pair formed
+  on its common support: `image` (the phase, rad), `coherence`, `fringe`, `fringe_per_km`, `fringe_found`,
+  `phase_offset`, `height_of_ambiguity`, `height_per_radian`, `displacement_per_radian`, `wavelength`,
+  `topography`, `phase_std`, `flatness`, and the coherence's statistics and `floor`.
+  `coherent_sum(a, b, window=15, *, equalize=True, coherence_window=7, dark=0.01)`: `image` (complex), `gain`
+  (`signal`, `noise`, `snr`, `second`, `expected`, `incoherent`, `coherence`), `amplitude_factor`, `fringe`.
+- `baseline(a, b, point=None, aperture='square')`: from two CPHD files or products, `inside`, `overlap_range`,
+  `overlap_azimuth`, `overlap`, `azimuth_available`, `d_graze`, `d_azimuth`, `critical_graze`,
+  `critical_azimuth`, `height_of_ambiguity`, `days`. `common_support(a, b, point=None)`: the selection of each
+  collection that covers what both have, `pulses` and `bands` (`form_cphd`'s `aperture=` and `band=`), with
+  `phi`, `rho`, `azimuth_deg`, `azimuth_available_deg`, `azimuth_needed_deg`, `overlap_range`, `d_graze`,
+  `critical_graze`, `height_of_ambiguity`, `resolution`.
   `geometry(source, channel=0)`: a collection's antenna positions, band and start without its samples.
 - `write_geotiff(path, out, bands=None)`: a stack product on its grid as a GeoTIFF in its UTM zone.
 - `process_stack`: as `fastsar.process_stack`.

@@ -2,6 +2,7 @@
 
     fastsar.process_stack(['a_CPHD.cphd', 'b_CPHD.cphd', 'c_CPHD.cphd'], 'mean_SIDD.nitf')      # speckle-reduced display
     fastsar.process_stack(['a_CPHD.cphd', 'b_CPHD.cphd'], 'coherence.tif', product='coherence')
+    fastsar.process_stack(['a_CPHD.cphd', 'b_CPHD.cphd'], 'phase.tif', product='interferogram')
 
     grid = stack.ground_grid((46.9043, -96.8288, 247.7), extent=2000.0, spacing=0.65, azimuth=247.4)
     outs = [fastsar.form_cphd(p, grid=grid) for p in paths]             # every collection on the same pixels
@@ -36,6 +37,15 @@ removed, beside the floor the same estimator gives for an incoherent pair at the
 change gives that coherence and the ratio of the two intensities; baseline tells from the geometry alone whether
 a pair has a common spectrum at all. process_stack does it all from the files, one collection in memory at a time.
 
+Coherent pairs. Two images are compared in phase only over the part of the ground spectrum both collections
+have. common_support finds it from the geometry: the look directions both apertures cover and, in each
+direction, the ground-range wavenumbers both bands hold. Each collection is cut to it in its phase history, the
+pulses by form_cphd(aperture=) and the frequencies of every pulse by form_cphd(band=), under one weighting of
+the common part; that is how process_stack forms a pair. interferogram is the phase of such a pair, with its
+linear fringe (and a surface's topography) removed and the height of ambiguity that reads it; coherent_sum adds
+the two images in phase and measures what the sum gained; register(coherent=True) refines the translation on
+the complex images.
+
 Devices. Every function works where the images are (NumPy on all cores, CuPy, JAX) and returns arrays of the
 same kind.
 """
@@ -47,8 +57,8 @@ from . import _xp, io, planes
 
 C = 299792458.0
 
-__all__ = ['ground_grid', 'as_grid', 'geometry', 'baseline', 'register', 'shift_image', 'mean', 'coherence',
-           'change', 'process_stack']
+__all__ = ['ground_grid', 'as_grid', 'geometry', 'baseline', 'common_support', 'register', 'shift_image', 'mean',
+           'coherence', 'interferogram', 'coherent_sum', 'change', 'process_stack']
 
 
 # ---------------------------------------------------------------------------------------------- the grid
@@ -286,57 +296,137 @@ def _overlap(la, lb):
                 rho=(float(r0), float(r1)), phi=(float(p0), float(p1)))
 
 
-def _common_aperture(ga, gb, point):
-    """The pulses of two collections that look at a ground point (ECEF) from one interval of azimuth: the mean of
-    the two mid-aperture directions, as wide as the narrower of the apertures an image of square resolution uses
-    (_look). -> ((first, last + 1), (first, last + 1)), or None when either collection has less than half of its
-    own such aperture inside the interval (the pair is then formed as each collection would be alone)."""
+def _point(point, geo):
+    """A ground point as ECEF: None (the collection's scene reference point), ECEF, or (latitude, longitude[, h])."""
+    if point is None:
+        return np.asarray(geo['srp'], np.float64)
+    p = np.ravel(np.asarray(point, np.float64))
+    return p if np.linalg.norm(p) > 1e6 else np.ravel(io.geodetic_to_ecf(p[0], p[1], p[2] if p.size == 3 else 0.0))
+
+
+def _directions(geo, point):
+    """Every pulse of a collection as it looks at a ground point (ECEF): phi [P] (rad, unwrapped: the direction
+    from the radar to the point in the horizontal plane there, from north toward east) and cosg [P] (the cosine of
+    the grazing angle). A pulse at frequency f samples the ground wavenumber of radius 2 f cosg / c in the
+    direction phi."""
     lat, lon, _ = (float(np.ravel(v)[0]) for v in io.ecf_to_geodetic(point))
     east, north, _ = _enu(lat, lon)
-    phi, own = [], []
-    for g in (ga, gb):
-        u = point[None] - g['ant']
-        u /= np.linalg.norm(u, axis=1, keepdims=True)
-        phi.append(np.unwrap(np.arctan2(u @ east, u @ north)))
-        own.append(_look(dict(g, pulses=None), point)['pulses'])
-    mid = [p[(lo + hi) // 2] for p, (lo, hi) in zip(phi, own)]
-    phi[1] = phi[1] + np.round((mid[0] - mid[1]) / (2 * np.pi)) * 2 * np.pi
-    mid[1] = phi[1][(own[1][0] + own[1][1]) // 2]
-    c = 0.5 * (mid[0] + mid[1])
-    w = min(abs(p[hi - 1] - p[lo]) for p, (lo, hi) in zip(phi, own))
-    out = []
-    for p, (lo, hi) in zip(phi, own):
-        idx = np.nonzero(np.abs(p - c) <= w / 2)[0]
-        if len(idx) < 0.5 * (hi - lo):
-            return None
-        out.append((int(idx[0]), int(idx[-1]) + 1))
-    return tuple(out)
+    u = point[None] - geo['ant']
+    u /= np.linalg.norm(u, axis=1, keepdims=True)
+    return np.unwrap(np.arctan2(u @ east, u @ north)), np.hypot(u @ east, u @ north)
+
+
+def common_support(a, b, point=None):
+    """The part of the ground spectrum that two collections of one scene both have, and the selection of each
+    collection's phase history that covers it: what a coherent pair is formed from.
+
+    a, b: CPHD files (their per-pulse parameters alone are read) or products of form_cphd (the whole collection
+    each came from is considered, not the pulses it used). point: the ground point (ECEF, or (latitude, longitude,
+    height)) the geometry is taken at, default a's scene reference point.
+
+    A pulse that looks at the point from the direction phi samples, at frequency f, the ground wavenumber of
+    radius 2 f cos(graze) / c in that direction. The common support is the interval of directions both apertures
+    cover, cut to its central part where it is wider than a square resolution cell needs (the common radial band
+    over its center radius), and in each direction the radii both bands reach: the grazing angle changes along a
+    squinted aperture, so the radial limits follow the direction, and a difference in grazing angle or in band
+    between the collections moves them. Each collection covers it with the pulses in the interval and, on every
+    pulse, the frequencies between the limits over its own cos(graze).
+
+    -> dict(inside (bool: there is a common support), pulses ((first, last + 1) of each collection), bands (for
+    each, [pulses, 2]: the first and last frequency of every pulse, Hz): the aperture= and band= of form_cphd;
+    phi (the interval, rad), azimuth_deg (its width), azimuth_available_deg (the whole common interval),
+    azimuth_needed_deg (what square resolution takes), rho (the radial limits at the interval's center,
+    cycles/m), overlap_range (for each collection, the fraction of its band inside the common one, at equal
+    direction), overlap_azimuth (the fraction that the apertures form_cphd would use for each alone share),
+    d_graze (degrees, b less a at equal direction), critical_graze (degrees: the difference at which the bands
+    part), height_of_ambiguity (m: the height above the grid plane that turns the phase of a b* by one cycle,
+    signed; None for equal grazing angles), resolution (ground range, azimuth; m, unweighted))."""
+    ga, gb = (v if isinstance(v, dict) and 'ant' in v else geometry(v) for v in (a, b))
+    p = _point(point, ga)
+    (pa, ca), (pb, cb) = _directions(ga, p), _directions(gb, p)
+    pb = pb + np.round((pa[len(pa) // 2] - pb[len(pb) // 2]) / (2 * np.pi)) * 2 * np.pi
+    phi, cosg, bands = (pa, pb), (ca, cb), (ga['band'], gb['band'])
+    own = [_look(dict(g, pulses=None), p)['pulses'] for g in (ga, gb)]
+    oi = [np.sort(ph[[lo, hi - 1]]) for ph, (lo, hi) in zip(phi, own)]
+    own_az = (max(0.0, min(oi[0][1], oi[1][1]) - max(oi[0][0], oi[1][0]))
+              / min(oi[0][1] - oi[0][0], oi[1][1] - oi[1][0]))
+    lo, hi = max(pa.min(), pb.min()), min(pa.max(), pb.max())
+    none = dict(inside=False, pulses=None, bands=None, phi=None, azimuth_deg=0.0, overlap_range=(0.0, 0.0),
+                azimuth_available_deg=float(np.degrees(max(hi - lo, 0.0))), overlap_azimuth=float(own_az),
+                height_of_ambiguity=None, d_graze=None, critical_graze=None)
+    if hi <= lo:
+        return none
+    order = [np.argsort(ph) for ph in phi]
+
+    def limits(lo, hi):
+        pg = np.linspace(lo, hi, 257)
+        cw = [np.interp(pg, ph[o], c[o]) for ph, c, o in zip(phi, cosg, order)]
+        rl = (2 / C) * np.maximum(bands[0][0] * cw[0], bands[1][0] * cw[1])
+        rh = (2 / C) * np.minimum(bands[0][1] * cw[0], bands[1][1] * cw[1])
+        return pg, cw, rl, rh
+    pg, cw, rl, rh = limits(lo, hi)
+    if np.median(rh - rl) <= 0:
+        return none
+    available = hi - lo
+    need = float(np.median((rh - rl) / (0.5 * (rl + rh))))
+    if available > need:
+        lo, hi = 0.5 * (lo + hi) - need / 2, 0.5 * (lo + hi) + need / 2
+        pg, cw, rl, rh = limits(lo, hi)
+    pulses, fb, frac = [], [], []
+    for ph, c, band, w in zip(phi, cosg, bands, cw):
+        idx = np.nonzero((ph >= lo) & (ph <= hi))[0]
+        if len(idx) < 2:
+            return none
+        sl = slice(int(idx[0]), int(idx[-1]) + 1)
+        pulses.append((sl.start, sl.stop))
+        f = np.stack([np.interp(ph[sl], pg, rl), np.interp(ph[sl], pg, rh)], 1) * (C / 2) / c[sl, None]
+        fb.append(np.clip(f, band[0], band[1]))
+        frac.append(float(np.mean((rh - rl) / ((2 / C) * (band[1] - band[0]) * w))))
+    psi = [np.arccos(np.clip(w, -1, 1)) for w in cw]
+    rho_c = float(np.mean(0.5 * (rl + rh)))
+    dtan = float(np.median(np.tan(psi[0]) - np.tan(psi[1])))
+    fc = 0.25 * (bands[0][0] + bands[0][1] + bands[1][0] + bands[1][1])
+    bw = min(bands[0][1] - bands[0][0], bands[1][1] - bands[1][0])
+    return dict(inside=True, pulses=tuple(pulses), bands=tuple(fb), phi=(float(lo), float(hi)),
+                azimuth_deg=float(np.degrees(hi - lo)), azimuth_available_deg=float(np.degrees(available)),
+                azimuth_needed_deg=float(np.degrees(need)), rho=(float(np.median(rl)), float(np.median(rh))),
+                overlap_range=tuple(frac), overlap_azimuth=float(own_az),
+                d_graze=float(np.degrees(np.median(psi[1] - psi[0]))),
+                critical_graze=float(np.degrees(bw / fc / np.tan(np.median(0.5 * (psi[0] + psi[1]))))),
+                height_of_ambiguity=None if abs(dtan) < 1e-12 else float(1.0 / (rho_c * dtan)),
+                resolution=(float(1.0 / np.median(rh - rl)), float(1.0 / (rho_c * (hi - lo)))))
 
 
 def baseline(a, b, point=None, aperture='square'):
-    """Whether two collections of one scene can be coherent, from their geometry alone.
+    """Whether two collections of one scene can be coherent, and how much of each the other shares, from their
+    geometry alone.
 
     a, b: CPHD files (only their per-pulse parameters are read) or products of form_cphd. point: the ground point
     (ECEF, or (latitude, longitude, height)) the geometry is taken at; default the first's scene reference point.
-    aperture: 'square' (the part of each aperture form_cphd uses without a spacing) or 'full'; a product's own
-    pulses are used as they are.
+    aperture: 'square' (the part of each aperture form_cphd uses without a spacing) or 'full', for the apertures'
+    own figures; a product's own pulses are used as they are.
 
-    Two images share spectrum only where their ground wavenumbers coincide. In range these are 2 f cos(graze) / c,
-    so a difference in grazing angle moves one band against the other and the bands part at the critical
-    difference (B / fc) / tan(graze); in azimuth the directions the apertures look from must overlap, so they part
-    when the difference in azimuth reaches the aperture's own angular extent on the ground.
+    Two images share spectrum only where their ground wavenumbers coincide (common_support). In range these are
+    2 f cos(graze) / c, so a difference in grazing angle moves one band against the other and the bands part at
+    the critical difference (B / fc) / tan(graze); in azimuth the directions the apertures look from must
+    overlap, so they part when the difference in azimuth reaches the aperture's own angular extent on the ground.
+    The same difference in grazing angle sets the height of ambiguity, 1 / (rho (tan(graze a) - tan(graze b)))
+    with rho the center radius of the common band: the height above the grid plane that turns the
+    interferometric phase by a cycle. Under a meter of it, relief decorrelates the pair within a resolution cell
+    of tall structure; hundreds of meters of it leave the phase to motion and propagation.
 
-    -> dict(d_graze, d_azimuth (degrees, b less a at mid-aperture), critical_graze, critical_azimuth (degrees),
-    overlap_range, overlap_azimuth (the fraction of a's band that b shares, each way), overlap (their product),
-    inside (both overlaps positive), graze, azimuth (of each), days (b's start less a's, where both state one))."""
-    ga, gb = geometry(a), geometry(b)
-    if point is None:
-        p = ga['srp']
-    else:
-        p = np.ravel(np.asarray(point, np.float64))
-        p = p if np.linalg.norm(p) > 1e6 else np.ravel(io.geodetic_to_ecf(p[0], p[1], p[2] if p.size == 3 else 0.0))
+    -> dict(inside (a common support exists), overlap_range (the fraction of the narrower band that is common, at
+    equal look direction), overlap_azimuth (the fraction that the apertures each image would use alone share),
+    overlap (their product), azimuth_available (the common interval of the whole apertures over what square
+    resolution needs: 1 or more means the pulses can be cut to full overlap), d_graze (degrees, b less a at equal
+    look direction; at mid-aperture where no direction is common), d_azimuth (degrees, at mid-aperture),
+    critical_graze, critical_azimuth (degrees), height_of_ambiguity (m, signed, None for equal grazing angles),
+    graze, azimuth (of each, at mid-aperture), days (b's start less a's, where both state one))."""
+    ga, gb = (v if isinstance(v, dict) and 'ant' in v else geometry(v) for v in (a, b))
+    p = _point(point, ga)
     la, lb = _look(ga, p, aperture), _look(gb, p, aperture)
     ov = _overlap(la, lb)
+    cs = common_support(ga, gb, p)
     fc = 0.25 * (la['band'][0] + la['band'][1] + lb['band'][0] + lb['band'][1])
     bw = min(la['band'][1] - la['band'][0], lb['band'][1] - lb['band'][0])
     psi = np.radians(0.5 * (la['graze'] + lb['graze']))
@@ -346,11 +436,17 @@ def baseline(a, b, point=None, aperture='square'):
                      / np.timedelta64(1, 's')) / 86400.0
     except (ValueError, TypeError):
         pass
-    return dict(d_graze=lb['graze'] - la['graze'], d_azimuth=(lb['azimuth'] - la['azimuth'] + 180.0) % 360.0 - 180.0,
+    # in range: at equal look direction where the apertures share one, else each at its own mid-aperture
+    rg = min(cs['overlap_range']) if cs['azimuth_available_deg'] > 0 else ov['range']
+    return dict(inside=bool(cs['inside'] and ov['range'] > 0 and ov['azimuth'] > 0), overlap_range=float(rg),
+                overlap_azimuth=ov['azimuth'], overlap=float(rg * ov['azimuth']),
+                azimuth_available=(float(cs['azimuth_available_deg'] / cs['azimuth_needed_deg'])
+                                   if cs['inside'] else 0.0),
+                d_graze=cs['d_graze'] if cs['inside'] else lb['graze'] - la['graze'],
+                d_azimuth=(lb['azimuth'] - la['azimuth'] + 180.0) % 360.0 - 180.0,
                 critical_graze=float(np.degrees(bw / fc / np.tan(psi))),
                 critical_azimuth=min(la['azimuth_span'], lb['azimuth_span']),
-                overlap_range=ov['range'], overlap_azimuth=ov['azimuth'], overlap=ov['range'] * ov['azimuth'],
-                inside=bool(ov['range'] > 0 and ov['azimuth'] > 0), graze=(la['graze'], lb['graze']),
+                height_of_ambiguity=cs['height_of_ambiguity'], graze=(la['graze'], lb['graze']),
                 azimuth=(la['azimuth'], lb['azimuth']), days=days)
 
 
@@ -725,7 +821,103 @@ def shift_image(out, shift, *, inplace=False):
     return res
 
 
-def register(products, reference=0, *, apply='fourier', max_shift=64, tiles=4, box=5, highpass=32.0, form=None):
+def _baseband_part(out, sl):
+    """A part of a product's complex image (sl: two slices) at baseband, as the whole image there would have it;
+    a new array unless the product is at baseband already."""
+    t = out['image'][sl]
+    if out.get('baseband'):
+        return t
+    o = (np.asarray(out['origin'], np.float64) + sl[0].start * float(out['spx']) * np.asarray(out['e1'], np.float64)
+         + sl[1].start * float(out['spy']) * np.asarray(out['e2'], np.float64))
+    w = dict(out, image=t if _xp.kind(t) == 'jax' else t.copy(), origin=o, scp=planes._scp(out))
+    planes.deramp(w)
+    return w['image']
+
+
+def _coherent_offset(a, b, around=(0.0, 0.0), tile=256, count=8):
+    """The translation d (pixels) at which b(x + d) is most coherent with a(x), sought within half a pixel of
+    `around` (the translation the detected images gave).
+
+    On up to count x count tiles of tile x tile pixels spread over the image, both at baseband, the tile's linear
+    fringe removed where it has one: the magnitude of the complex correlation sum(conj(a) b(x + d)), evaluated
+    from the two spectra on a lattice of quarter pixels about `around` and refined by a parabola. The tiles whose
+    peak lies inside the lattice and whose normalized correlation is at least 0.15 and half of the tiles' 90th
+    percentile count; d is their mean weighted by q^2 / (1 - q^2), q that correlation, without those further from
+    the median than three times the median distance (and a tenth of a pixel).
+
+    -> dict(found (four tiles or more counted), shift_px (d), delta_px (d less `around`), tiles, tiles_used, quality
+    (the median q of the tiles used), residual_px (the median distance of their own peaks from d), gain (the tiles'
+    summed correlation at d over that at `around`: what the refinement added to the coherence))."""
+    xp = _xp.module(a['image'])
+    n1, n2 = a['image'].shape
+    around = np.asarray(around, np.float64)
+    whole = np.rint(around).astype(int)
+    frac0 = around - whole
+    m = int(np.abs(whole).max()) + 8
+    T = int(min(tile, (min(n1, n2) - 2 * m) // 2))
+    none = dict(found=False, shift_px=(float(around[0]), float(around[1])), delta_px=(0.0, 0.0), tiles=0, tiles_used=0,
+                quality=None, residual_px=None, gain=1.0)
+    if T < 48:
+        return none
+    spx, spy = float(b['spx']), float(b['spy'])
+    sup = _support(b)
+    lim = (tuple(v * spx for v in sup['k1']), tuple(v * spy for v in sup['k2']))
+    wrap = (spx, spy, sup) if _wraps(sup, spx, spy) else None
+
+    def ramp(d):
+        if wrap is not None:
+            return _alias_ramp((T, T), d, wrap, xp)
+        return _ramp(T, 1.0, d[0], lim[0], xp)[:, None] * _ramp(T, 1.0, d[1], lim[1], xp)[None, :]
+    q4 = 0.25 * np.arange(-2, 3)
+    R = xp.stack([ramp((frac0[0] + p, frac0[1] + q)) for p in q4 for q in q4])
+    win = _hann(T, xp)[:, None] * _hann(T, xp)[None, :]
+    r1, r2 = np.arange(T)[:, None], np.arange(T)[None, :]
+    rows, spectra = [], []
+    for i in np.unique(np.linspace(m, n1 - m - T, min(int(count), (n1 - 2 * m) // T)).astype(int)):
+        for j in np.unique(np.linspace(m, n2 - m - T, min(int(count), (n2 - 2 * m) // T)).astype(int)):
+            at = _baseband_part(a, (slice(i, i + T), slice(j, j + T)))
+            bt = _baseband_part(b, (slice(i + whole[0], i + whole[0] + T), slice(j + whole[1], j + whole[1] + T)))
+            if not bool(_xp.host((at != 0).all() & (bt != 0).all())):
+                continue
+            f, z, thr = _fringe(at * xp.conj(bt))
+            if z > thr:
+                bt = bt * xp.asarray(np.exp(2j * np.pi * (f[0] * r1 + f[1] * r2)).astype(np.complex64))
+            at, bt = at * win, bt * win
+            X = xp.conj(_fft(at, 'fft2')) * _fft(bt, 'fft2')
+            v = np.abs(_xp.host((X[None] * R).sum((1, 2)))).astype(np.float64).reshape(5, 5)
+            nrm = T * T * np.sqrt(_scalar((xp.abs(at) ** 2).sum()) * _scalar((xp.abs(bt) ** 2).sum()))
+            p, q = np.unravel_index(int(np.argmax(v)), v.shape)
+            clear = 0 < p < 4 and 0 < q < 4
+            d = np.array([q4[p], q4[q]])
+            if clear:
+                d[0] += 0.25 * 0.5 * (v[p - 1, q] - v[p + 1, q]) / (v[p - 1, q] - 2 * v[p, q] + v[p + 1, q])
+                d[1] += 0.25 * 0.5 * (v[p, q - 1] - v[p, q + 1]) / (v[p, q - 1] - 2 * v[p, q] + v[p, q + 1])
+            rows.append((frac0[0] + d[0], frac0[1] + d[1], v[p, q] / max(nrm, 1e-30), v[2, 2], float(clear)))
+            spectra.append(X)
+    if not rows:
+        return none
+    t = np.array(rows)
+    none['tiles'] = len(t)
+    good = (t[:, 4] > 0) & (t[:, 2] > max(0.15, 0.5 * np.percentile(t[:, 2], 90)))
+    if good.sum() >= 4:
+        med = np.median(t[good, :2], 0)
+        dist = np.hypot(*(t[:, :2] - med).T)
+        good &= dist <= max(3 * np.median(dist[good]), 0.1)
+    if good.sum() < 4:
+        return none
+    wq = t[good, 2] ** 2 / np.maximum(1 - t[good, 2] ** 2, 1e-3)
+    d = (t[good, :2] * wq[:, None]).sum(0) / wq.sum()
+    Rd = ramp((d[0], d[1]))
+    at_d = sum(abs(complex(_xp.host((spectra[k] * Rd).sum()))) for k in np.nonzero(good)[0])
+    return dict(found=True, shift_px=(float(whole[0] + d[0]), float(whole[1] + d[1])),
+                delta_px=(float(d[0] - frac0[0]), float(d[1] - frac0[1])), tiles=len(t), tiles_used=int(good.sum()),
+                quality=float(np.median(t[good, 2])),
+                residual_px=float(np.median(np.hypot(*(t[good, :2] - d).T))),
+                gain=float(at_d / max(t[good, 3].sum(), 1e-30)))
+
+
+def register(products, reference=0, *, apply='fourier', max_shift=64, tiles=4, box=5, highpass=32.0, coherent=False,
+             form=None):
     """Register images formed on one grid: one translation each against a reference.
 
     products: a list of ground-plane products on the same grid (form_cphd(grid=)); complex or detected images, on
@@ -735,7 +927,8 @@ def register(products, reference=0, *, apply='fourier', max_shift=64, tiles=4, b
     None (estimate only). max_shift: the largest translation searched, pixels. tiles: the image is cut into tiles x
     tiles parts (of 48 pixels at least), each registered again after the translation. box: the side of the averaging
     before the correlation, pixels. highpass: structure of the detected images larger than this many pixels is left
-    out of the correlation (None: kept).
+    out of the correlation (None: kept). coherent: refine each translation on the complex images, to the one at
+    which the pair is most coherent (for the products of a coherent pair: interferogram, coherent_sum, coherence).
 
     Each image gets the translation (d1, d2) at which it best matches the reference, image(x + d) ~ reference(x),
     from the peak of the cross-correlation of the detected images, refined to a few hundredths of a pixel. Two
@@ -747,6 +940,16 @@ def register(products, reference=0, *, apply='fourier', max_shift=64, tiles=4, b
     the image's (tiles_used of tiles): a tenth of a pixel or two when one translation registers the pair; a pixel
     or more when it does not, which between different look directions is the layover of whatever stands above the
     grid plane and no warp of the ground removes (single tiles can set the rms: read it beside the median).
+
+    coherent. The detected images register a pair to a few hundredths of a pixel, which already costs a coherent
+    pair little; the complex images say where the rest is. Within half a pixel of the detected translation, the
+    magnitude of the complex correlation of tiles of the two images is maximized (their linear fringe removed
+    first), and the mean of the coherent tiles' peaks replaces the translation. The registration's coherent entry
+    reports it: delta_px (what it changed), tiles_used, quality (the tiles' normalized correlation), residual_px
+    (how far single tiles' peaks lie from it) and gain, the tiles' correlation at the refined translation over
+    that at the detected one (1.002 and 1.008 on the pairs measured: there is little left to gain, and shifts of
+    single tiles add 0.2 to 0.5%, so one translation is kept). It needs four coherent tiles; a pair without
+    them keeps the detected translation.
 
     -> the list of products, registered (apply) or as given, each with registration (that dict; the reference:
     shift (0, 0)) and, when applied, shift. The stack then has the reference's geolocation."""
@@ -770,6 +973,8 @@ def register(products, reference=0, *, apply='fourier', max_shift=64, tiles=4, b
         est = _estimate(ref, _xp.module(ref).asarray(_detected(p['image'], box)), float(p['spx']), float(p['spy']),
                         max_shift, tiles, highpass)
         est['reference'] = False
+        if coherent and est['found']:
+            _refine(est, products[reference], p)
         q = dict(p)
         if apply and est['found']:
             if apply == 'fourier':
@@ -785,6 +990,19 @@ def register(products, reference=0, *, apply='fourier', max_shift=64, tiles=4, b
         q['registration'] = est
         out.append(q)
     return out
+
+
+def _refine(est, ref, p):
+    """A registration (_estimate's dict) refined on the complex images, in place: coherent (_coherent_offset's
+    dict) and, where it found one, the translation replaced (detected, detected_px keep the first)."""
+    if any('complex' not in str(q['image'].dtype) for q in (ref, p)):
+        return est
+    co = _coherent_offset(ref, p, est['shift_px'])
+    est['coherent'] = co
+    if co['found']:
+        est.update(detected=est['shift'], detected_px=est['shift_px'], shift_px=co['shift_px'],
+                   shift=(co['shift_px'][0] * float(p['spx']), co['shift_px'][1] * float(p['spy'])))
+    return est
 
 
 def _reform(p, grid, shift):
@@ -1005,60 +1223,153 @@ def _band_mask(out, other, shape, xp=np):
     return _rowwise(rows, xp.asarray(np.fft.fftfreq(shape[0], spx))[:, None]), (ov['range'], ov['azimuth'])
 
 
+def _sel(v, mask):
+    """The elements of v where mask (arrays of one kind)."""
+    return v[_xp.host(mask)] if _xp.kind(v) == 'jax' else v[mask]
+
+
+def _fringe(x, step=8):
+    """The linear fringe of an interferogram x [n1, n2] (complex), and whether there is one to find.
+
+    -> (f [2]: cycles per pixel along the two axes, anywhere within half a cycle per pixel; z: the power of the
+    spectrum's peak over the level of the spectrum about it; threshold: what z must exceed for the peak to be a
+    fringe). A spectrum of N samples without a fringe has its highest sample near log(N) times its level, and
+    the threshold log(N) + 10 is one that such a spectrum seldom reaches (none of sixty simulated tiles of each
+    of 64, 128, 256 and 384 pixels did); a fringe of coherence g over N samples gives of the order of N g^2 (a
+    common part of coherence 0.1 was found on most tiles of 64 pixels, one of 0.05 on all of 256). An image of up to 512 pixels a side is transformed whole and the peak refined on
+    the transform itself to a few hundredths of its sample. A larger one takes the fringe of up to sixteen parts
+    of 512 pixels (the median of those that have one) for a first value, which keeps a steep fringe from
+    aliasing, and then the peak of the spectrum of the whole, with that removed, averaged over step x step
+    pixels."""
+    xp = _xp.module(x)
+    f0, D = np.zeros(2), 1
+    if max(x.shape) > 512:
+        D = int(step)
+        T = min(512, min(x.shape))
+        own = []
+        for i in np.unique(np.linspace(0, x.shape[0] - T, min(4, x.shape[0] // T)).astype(int)):
+            for j in np.unique(np.linspace(0, x.shape[1] - T, min(4, x.shape[1] // T)).astype(int)):
+                ft, zt, tt = _fringe(x[i:i + T, j:j + T])
+                if zt > tt:
+                    own.append(ft)
+        if own:
+            f0 = np.median(np.array(own), 0)
+            x = _unfringe(x, f0)
+    n1, n2 = x.shape[0] // D, x.shape[1] // D
+    xm = x[:n1 * D, :n2 * D].reshape(n1, D, n2, D).mean((1, 3)) if D > 1 else x
+    xm = xm * xp.float32(1.0 / max(_scalar(xp.abs(xm).max()), 1e-30))     # the squares below stay in float32's range
+    m = tuple(max(512, 1 << int(np.ceil(np.log2(v)) + (D > 1))) for v in (n1, n2))
+    F = xp.abs(_fft(xm, 'fft2', s=m)) ** 2
+    i, j = divmod(int(_xp.host(xp.argmax(F))), m[1])
+    # the level the peak stands on: the spectrum of a product of two band-limited images is not flat, so the
+    # peak is measured against the spectrum about it, the median (log 2 of an exponential's mean; a fringe
+    # that a slowly varying phase spreads over a few samples does not move it) over the samples within an eighth
+    # of the unpadded transform's width, at most 32 of its spacings
+    hw = [int(max(2, min(32, nn // 8)) * mm / nn) for mm, nn in zip(m, (n1, n2))]
+    st = [max(1, mm // nn) for mm, nn in zip(m, (n1, n2))]
+    box = xp.take(xp.take(F, xp.asarray((i + np.arange(-hw[0], hw[0] + 1, st[0])) % m[0]), axis=0),
+                  xp.asarray((j + np.arange(-hw[1], hw[1] + 1, st[1])) % m[1]), axis=1)
+    z = _scalar(F[i, j]) / max(_scalar(xp.median(box)) / np.log(2.0), 1e-30)
+    f = np.array([np.fft.fftfreq(m[0])[i], np.fft.fftfreq(m[1])[j]])
+    r1, r2 = np.arange(n1), np.arange(n2)
+    for h in (0.5, 0.125):                                           # in samples of the padded transform
+        t = np.array([-h, 0.0, h])
+        E1 = xp.asarray(np.exp(-2j * np.pi * np.outer(f[0] + t / m[0], r1)).astype(np.complex64))
+        E2 = xp.asarray(np.exp(-2j * np.pi * np.outer(r2, f[1] + t / m[1])).astype(np.complex64))
+        v = np.abs(_xp.host(E1 @ xm @ E2)).astype(np.float64)
+        for ax, (lo, mid, hi) in enumerate(((v[0, 1], v[1, 1], v[2, 1]), (v[1, 0], v[1, 1], v[1, 2]))):
+            den = lo - 2 * mid + hi
+            if den < 0:
+                f[ax] += float(np.clip(0.5 * (lo - hi) / den, -1.0, 1.0)) * h / m[ax]
+    return f0 + f / D, float(z), float(np.log(n1 * n2) + 10.0)
+
+
+def _unfringe(x, f, sign=-1):
+    """x exp(sign 2 pi j (f1 i + f2 j)) over its pixels (i, j)."""
+    xp = _xp.module(x)
+    if not (f[0] or f[1]):
+        return x
+    r1 = xp.asarray(np.exp(sign * 2j * np.pi * f[0] * np.arange(x.shape[0])).astype(np.complex64))[:, None]
+    r2 = xp.asarray(np.exp(sign * 2j * np.pi * f[1] * np.arange(x.shape[1])).astype(np.complex64))[None, :]
+    return _rowwise(lambda u, a: u * a * r2, x, r1)
+
+
 def _coherence_map(a, b, w, fringe, tile):
-    """The sample coherence of two complex images over w x w windows with a linear fringe removed: in tiles (each
-    with the fringe at the peak of its interferogram's spectrum, estimated on the tile and applied to it and a
-    halo of half a window), over the whole image ('global'), or not at all. -> (map float32, fringes [n, 2]
-    cycles per pixel)."""
+    """The sample coherence of two complex images over w x w windows with a linear fringe removed: the image's own
+    ('global'), or in tiles each tile's own (found on the tile and applied to it and a halo of half a window)
+    where the tile has a fringe to find (_fringe's test) and the image's elsewhere, or none.
+    -> (map float32, fringes [n, 2] (cycles per pixel, as removed), found [n] (bool: the tile's own), the image's
+    fringe [2] (zero when the image has none to find))."""
     xp = _xp.module(a)
     n1, n2 = a.shape
 
     def one(x, pa, pb):
         num = xp.abs(_box(x, w))
-        den = xp.sqrt(_box(pa, w) * _box(pb, w))
+        den = xp.sqrt(_box(pa, w)) * xp.sqrt(_box(pb, w))              # a product of the two could leave float32's range
         return xp.where(den > 0, num / xp.maximum(den, 1e-30), 0).astype(xp.float32)
-
-    def peak(x):
-        m = (512, 512) if max(x.shape) <= 512 else tuple(1 << int(np.ceil(np.log2(v))) for v in x.shape)
-        F = xp.abs(_fft(x[:m[0], :m[1]], 'fft2', s=m))
-        i, j = np.unravel_index(int(_xp.host(xp.argmax(F))), m)
-        return np.fft.fftfreq(m[0])[i], np.fft.fftfreq(m[1])[j]
-
-    def flat(x, f, i0, j0):
-        r1 = xp.asarray(np.exp(-2j * np.pi * f[0] * (np.arange(x.shape[0]) + i0)).astype(np.complex64))[:, None]
-        r2 = xp.asarray(np.exp(-2j * np.pi * f[1] * (np.arange(x.shape[1]) + j0)).astype(np.complex64))[None, :]
-        return x * r1 * r2
     pa, pb = _power(a), _power(b)
     x = _rowwise(lambda u, v: u * xp.conj(v), a, b)
     if not fringe:
-        return one(x, pa, pb), np.zeros((0, 2))
+        return one(x, pa, pb), np.zeros((0, 2)), np.zeros(0, bool), np.zeros(2)
+    fg, z, thr = _fringe(x)
+    if z <= thr:
+        fg = np.zeros(2)
     if fringe == 'global' or max(n1, n2) <= tile:
-        f = peak(x)
-        return one(flat(x, f, 0, 0), pa, pb), np.array([f])
+        return one(_unfringe(x, fg), pa, pb), np.array([fg]), np.array([z > thr]), fg
     h = w // 2 + 1
-    rows, fr = [], []
+    rows, fr, found = [], [], []
     for i in range(0, n1, tile):
         row = []
         for j in range(0, n2, tile):
             i1, j1 = min(i + tile, n1), min(j + tile, n2)
             a0, b0, a1, b1 = max(i - h, 0), max(j - h, 0), min(i1 + h, n1), min(j1 + h, n2)
-            f = peak(x[i:i1, j:j1])
+            f, own = fg, False
+            if min(i1 - i, j1 - j) >= 48:
+                ft, zt, tt = _fringe(x[i:i1, j:j1])
+                if zt > tt:
+                    f, own = ft, True
             fr.append(f)
+            found.append(own)
             sl = (slice(a0, a1), slice(b0, b1))
-            g = one(flat(x[sl], f, 0, 0), pa[sl], pb[sl])
+            g = one(_unfringe(x[sl], f), pa[sl], pb[sl])
             row.append(g[i - a0:i - a0 + i1 - i, j - b0:j - b0 + j1 - j])
         rows.append(xp.concatenate(row, axis=1))
-    return xp.concatenate(rows, axis=0), np.array(fr)
+    return xp.concatenate(rows, axis=0), np.array(fr), np.array(found, bool), fg
 
 
 def _stats(g, valid=None):
     xp = _xp.module(g)
-    v = g.ravel() if valid is None else g[_xp.host(valid)] if _xp.kind(g) == 'jax' else g[valid]
+    v = g.ravel() if valid is None else _sel(g, valid)
     if v.size == 0:
         return dict(median=None, mean=None, p90=None, above_0p5=None, above_0p7=None)
     med, p90 = (float(t) for t in _xp.host(xp.percentile(v, xp.asarray([50.0, 90.0], dtype=xp.float32))))
     return dict(median=med, mean=_scalar(v.mean()), p90=p90, above_0p5=_scalar((v > 0.5).mean()),
                 above_0p7=_scalar((v > 0.7).mean()))
+
+
+def _check_pair(name, a, b):
+    for nm, p in (('a', a), ('b', b)):
+        if 'complex' not in str(p['image'].dtype) or p.get('plane', 'ground') != 'ground':
+            raise ValueError(f'{name} takes complex ground-plane products; {nm} is not one')
+    if not _same_grid(_grid_of(a), _grid_of(b)):
+        raise ValueError(f'{name}: the two products are not on one grid: form them with form_cphd(grid=)')
+
+
+def _shared(a, b):
+    """The least fraction of either product's ground spectrum that the other shares, in range or in azimuth, at
+    a's scene center (_overlap of the pulses and the bands each image was formed from), and the fractions (range,
+    azimuth) of a's that b shares."""
+    p = io.local_to_ecf(planes._scp(a), a['meta'])
+    la, lb = _look(geometry(a), p), _look(geometry(b), p)
+    ab, ba = _overlap(la, lb), _overlap(lb, la)
+    return min(ab['range'], ab['azimuth'], ba['range'], ba['azimuth']), (ab['range'], ab['azimuth'])
+
+
+def _pair_baseline(a, b):
+    try:
+        return baseline(a, b, point=io.local_to_ecf(planes._scp(a), a['meta']))
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 def coherence(a, b, window=7, *, common_band=True, fringe='tiles', tile=384, floor=True):
@@ -1069,9 +1380,18 @@ def coherence(a, b, window=7, *, common_band=True, fringe='tiles', tile=384, flo
     other shares, since what one has alone can only lower the coherence: on the ground the two spectra are the
     sectors their pulses' directions and their bands span, displaced in range by a difference in grazing angle
     (the spectral shift) and in azimuth by a difference in look direction; each image is cut at baseband to the
-    other's sector. fringe: 'tiles' (a linear fringe removed in each tile x tile pixels, at the peak of the tile's
-    interferogram spectrum), 'global' (one for the image) or None. A residual baseline or registration error and a
-    tilt of the ground against the grid plane leave a fringe that a window would otherwise average down.
+    other's sector. A pair whose spectra coincide to 2% has nothing to cut and is taken as it is: a pair formed
+    on its common support (form_cphd(aperture=, band=) with common_support's selection, as process_stack forms
+    it), or an exact repeat. Forming on the common support is the better way, because there the two images also
+    carry one weighting of the common part, where a cut of two images each weighted over its own aperture leaves
+    them weighted differently (measured with the apertures displaced by 30%: 0.63 by this cut against 0.81 by the
+    selection, under Taylor weighting; docs/stack.md).
+    fringe: 'tiles' (a linear fringe removed in each tile x tile pixels: the tile's own where it has one to find,
+    the image's elsewhere), 'global' (the image's) or None. A residual baseline or registration error and a tilt
+    of the ground against the grid plane leave a fringe that a window would otherwise average down. A tile's own
+    fringe is taken at the peak of the tile's interferogram spectrum only when that peak stands clear of what a
+    spectrum without a fringe gives (_fringe): a tile of water or of vegetation has none, and the peak of its
+    noise is not fitted.
 
     The estimator. |<a b*>| / sqrt(<|a|^2> <|b|^2>) over the window is biased upward: an incoherent pair gives
     about 0.89 / sqrt(n) for n independent samples, and a window of w x w pixels holds fewer than w^2 of those,
@@ -1084,19 +1404,23 @@ def coherence(a, b, window=7, *, common_band=True, fringe='tiles', tile=384, flo
     product 'coherence', window, median, mean, p90, above_0p5, above_0p7 (over the processed pixels), floor (the
     same statistics of the displaced pair, or None), samples (the independent samples per window the floor's mean
     implies), overlap (range, azimuth: the fractions of a's spectrum that b shares; None without common_band),
-    fringes [n, 2] (cycles per pixel), baseline (baseline(a, b)), timing."""
+    fringes [n, 2] (cycles per pixel, as removed), fringes_found [n] (bool: the tile had its own), fringe (the
+    image's, cycles per pixel), baseline (baseline(a, b)), timing."""
     t0 = time.perf_counter()
-    for name, p in (('a', a), ('b', b)):
-        if 'complex' not in str(p['image'].dtype) or p.get('plane', 'ground') != 'ground':
-            raise ValueError(f'coherence takes complex ground-plane products; {name} is not one')
-    if not _same_grid(_grid_of(a), _grid_of(b)):
-        raise ValueError('coherence: the two products are not on one grid: form them with form_cphd(grid=)')
+    _check_pair('coherence', a, b)
     if fringe not in ('tiles', 'global', None, False):
         raise ValueError(f"fringe must be 'tiles', 'global' or None, got {fringe!r}")
     xp = _xp.module(a['image'])
     notes = list(a.get('notes', []))
     overlap = None
+    cut = same = False
     if common_band:
+        try:
+            least, overlap = _shared(a, b)
+            same = least >= 0.98
+        except (KeyError, TypeError, ValueError):
+            pass
+    if common_band and not same:
         za, zb = _carrier(a, on=False), _carrier(b, on=False)
         own = [za is not a['image'], zb is not b['image']]
         shape = za.shape
@@ -1109,68 +1433,353 @@ def coherence(a, b, window=7, *, common_band=True, fringe='tiles', tile=384, flo
             za = _fft(_fft(za, 'fft2') * ma, 'ifft2')
             zb = _fft(_fft(zb, 'fft2') * mb, 'ifft2')
             own = [True, True]
+            cut = True
         za = _carrier(dict(a, image=za, baseband=True), on=True, copy=not own[0])
         zb = _carrier(dict(b, image=zb, baseband=True), on=True, copy=not own[1])
     else:
         za, zb = _carrier(a, on=True), _carrier(b, on=True)
     valid = (a['image'] != 0) & (b['image'] != 0)
-    g, fr = _coherence_map(za, zb, int(window), fringe, int(tile))
+    g, fr, found, fg = _coherence_map(za, zb, int(window), fringe, int(tile))
     g = xp.where(valid, g, 0).astype(xp.float32)
     all_valid = bool(_xp.host(valid.all()))
     st = _stats(g, None if all_valid else valid)
     fl = samples = None
     if floor:
         s = 4 * int(window) + 1
-        gf, _ = _coherence_map(za[s:, s:], zb[:-s, :-s], int(window), fringe, int(tile))
+        gf = _coherence_map(za[s:, s:], zb[:-s, :-s], int(window), fringe, int(tile))[0]
         fl = _stats(gf, None if all_valid else valid[s:, s:] & valid[:-s, :-s])
         samples = None if not fl['mean'] else float(np.pi / (4 * fl['mean'] ** 2))
         del gf
     res = {k: v for k, v in a.items() if k not in ('image', 'phase_error', 'registration', 'baseband', 'valid')}
-    try:
-        bl = baseline(a, b, point=io.local_to_ecf(planes._scp(a), a['meta']))
-    except (KeyError, TypeError, ValueError):
-        bl = None
     dt = time.perf_counter() - t0
+    how = ', whose spectra coincide' if same else ', on their common band (cut in the images)' if cut else ''
     res.update(image=g, product='coherence', window=int(window), floor=fl, samples=samples, overlap=overlap,
-               fringes=fr, baseline=bl, grid=_grid_of(a), notes=notes + [
-                   f'coherence of two images over {int(window)} x {int(window)} pixels'
-                   + (', on their common band' if overlap is not None and min(overlap) > 0.02 else '')],
+               fringes=fr, fringes_found=found, fringe=(float(fg[0]), float(fg[1])), baseline=_pair_baseline(a, b),
+               grid=_grid_of(a),
+               notes=notes + [f'coherence of two images over {int(window)} x {int(window)} pixels' + how],
                timing=dict(coherence=dt, megapixels_per_second=g.size / 1e6 / max(dt, 1e-9)), **st)
     return res
 
 
-def change(a, b, window=7, **kw):
+def _noise(p, box=15):
+    """The noise level of an intensity image, from above: the 0.5th percentile of the intensity averaged over
+    box x box pixels (the darkest ground still scatters, so the noise is at most this)."""
+    s = _box(p, box)
+    v = s[::4, ::4].ravel()
+    v = _sel(v, v > 0)
+    return _percentile(v[:, None], [0.5], step=1)[0] if v.size else 0.0
+
+
+def _allowed(pa, pb, window):
+    """The coherence that the signal-to-noise ratios of two intensity images allow over a window,
+    1 / sqrt((1 + 1 / snr_a) (1 + 1 / snr_b)), with each image's noise taken from its darkest ground (_noise: an
+    upper bound on the noise, so this is a lower bound). -> (map float32, (noise of a, noise of b))."""
+    xp = _xp.module(pa)
+    na, nb = max(_noise(pa), 1e-30), max(_noise(pb), 1e-30)
+    sa, sb = _box(pa, window), _box(pb, window)
+
+    def f(u, v):
+        ra, rb = xp.maximum(u - na, 1e-6 * na) / na, xp.maximum(v - nb, 1e-6 * nb) / nb
+        return (1.0 / xp.sqrt((1 + 1 / ra) * (1 + 1 / rb))).astype(xp.float32)
+    return _rowwise(f, sa, sb), (na, nb)
+
+
+def change(a, b, window=7, *, capable=0.9, lost=0.4, **kw):
     """What changed between two registered images of one scene, two ways.
 
-    a, b, window and the keywords: coherence's. Coherent change is a loss of coherence: the scatterers within a
+    a, b, window and the other keywords: coherence's; the pair is best formed on its common support
+    (process_stack does; common_support). Coherent change is a loss of coherence: the scatterers within a
     resolution cell moved by a fraction of the wavelength, or were replaced. Incoherent change is a change of
     brightness: the ratio of the intensities averaged over the window, in decibels, less its median over the image
     (the difference in gain between the dates).
 
     What decorrelates is not only what changed. Vegetation, water, snow and tilled or wet soil lose coherence
     within hours to days, and so does any pair outside the critical baseline (baseline) or less than well
-    registered. Low coherence therefore means change only on surfaces that stay coherent, such as buildings,
-    roads and bare rock, and only against the floor of the estimator (coherence): on the repeat-pass spotlights
-    measured two weeks apart, fields were at the floor and only built surfaces above it. The intensity ratio does
-    not need coherence, but its speckle is that of the window's looks: 10 log10 of a ratio of two averages over n
-    independent samples scatters by about 6.1 / sqrt(n) dB.
+    registered. Noise does too: ground with a signal-to-noise ratio s in both images cannot exceed s / (1 + s).
+    Low coherence therefore means change only on surfaces that stay coherent, such as buildings, roads and bare
+    rock, only where the brightness allows a high coherence at all, and only against the floor of the estimator
+    (coherence): on the repeat-pass spotlights measured, fields and water were at the floor and only built
+    surfaces above it. allowed is the coherence the two brightnesses allow at each pixel, from each image's
+    noise level as its darkest ground bounds it; capable (default 0.9) and lost (0.4) set the summary: of the
+    pixels whose brightness allows more than `capable`, the fraction whose coherence is under `lost`. The
+    intensity ratio does not need coherence, but its speckle is that of the window's looks: 10 log10 of a ratio
+    of two averages over n independent samples scatters by about 6.1 / sqrt(n) dB.
 
     -> coherence's product dict with product 'change', image [nx, ny] float32 (the intensity ratio b over a, dB),
-    coherence [nx, ny] float32, ratio_sigma (dB: the scatter of the ratio the window's independent samples give
+    coherence [nx, ny] float32, allowed [nx, ny] float32, capable_fraction (of the pixels), changed_fraction (of
+    the capable pixels: coherence under `lost`), coherent_fraction (of them: coherence above 0.8), noise (the two
+    levels, in the images' units), ratio_sigma (dB: the scatter of the ratio the window's independent samples give
     for unchanged ground, where the floor was measured), and coherence's entries."""
     res = coherence(a, b, window, **kw)
     t0 = time.perf_counter()
     xp = _xp.module(res['image'])
-    pa, pb = _box(_power(a['image']), window), _box(_power(b['image']), window)
+    ia, ib = _power(a['image']), _power(b['image'])
+    pa, pb = _box(ia, window), _box(ib, window)
     valid = (pa > 0) & (pb > 0)
-    r = _rowwise(lambda u, v: 10.0 * xp.log10(xp.maximum(v, 1e-30) / xp.maximum(u, 1e-30)), pa, pb)
+    r = _rowwise(lambda u, v: 10.0 * (xp.log10(xp.maximum(v, 1e-30)) - xp.log10(xp.maximum(u, 1e-30))), pa, pb)
     med = _percentile(xp.where(valid, r, 0), [50.0])[0]
     r = xp.where(valid, r - med, 0).astype(xp.float32)
-    res.update(coherence=res['image'], image=r, product='change', ratio_median_db=med,
+    al, noise = _allowed(ia, ib, window)
+    cap = (al > capable) & valid
+    ncap = max(_scalar(cap.sum()), 1.0)
+    res.update(coherence=res['image'], image=r, product='change', ratio_median_db=med, allowed=al, noise=noise,
+               capable_fraction=_scalar(cap.mean()),
+               changed_fraction=_scalar((cap & (res['image'] < lost)).sum()) / ncap,
+               coherent_fraction=_scalar((cap & (res['image'] > 0.8)).sum()) / ncap,
                ratio_sigma=None if not res.get('samples') else float(10 / np.log(10) * np.sqrt(2.0 / res['samples'])))
     res['notes'] = res['notes'] + ['change: the intensity ratio of the second image over the first (dB, median removed) '
-                                   'and the coherence; low coherence is change only where the surface stays coherent']
+                                   'and the coherence; low coherence is change only where the surface stays coherent '
+                                   'and its brightness allows coherence']
     res['timing']['change'] = time.perf_counter() - t0
+    return res
+
+
+def _sensitivity(a, b, point):
+    """The interferometric sensitivity to height of a pair of products at a ground point (ECEF), cycles per
+    meter: rho (tan(graze a) - tan(graze b)), rho the radius of the ground wavenumber at the middle of the band
+    each image was formed from and the grazing angles those of one look direction, the middle of the two
+    apertures used. A scatterer h above the grid plane lies in each image where its range puts it, displaced
+    toward that radar by h tan(graze), and the pixel of a that shows it sees b's response to it
+    h (tan(graze a) - tan(graze b)) of ground range away from its peak, hence with that many cycles of b's ground
+    carrier in the phase of a b*. The reciprocal is the height of ambiguity."""
+    d = []
+    for q in (a, b):
+        g = geometry(q)
+        if q.get('shift') is not None and any(q['shift']):           # as the file states its orbit (see interferogram)
+            R = np.asarray(q['meta']['R'], np.float64)
+            g = dict(g, ant=g['ant'] + q['shift'][0] * (np.asarray(q['e1'], np.float64) @ R)
+                     + q['shift'][1] * (np.asarray(q['e2'], np.float64) @ R))
+        phi, cg = _directions(g, point)
+        lo, hi = g.get('pulses') or (0, len(phi))
+        d.append([phi[lo:hi], cg[lo:hi], 0.5 * (g['band'][0] + g['band'][1])])
+    d[1][0] = d[1][0] + np.round((np.median(d[0][0]) - np.median(d[1][0])) / (2 * np.pi)) * 2 * np.pi
+    mid = 0.25 * (d[0][0].min() + d[0][0].max() + d[1][0].min() + d[1][0].max())
+    cg = [float(np.interp(mid, ph[np.argsort(ph)], c[np.argsort(ph)])) for ph, c, _ in d]
+    rho = (d[0][2] * cg[0] + d[1][2] * cg[1]) / C
+    return float(rho * (np.tan(np.arccos(cg[0])) - np.tan(np.arccos(cg[1]))))
+
+
+def _plane_fit(a, b):
+    """_sensitivity over the grid of a: -> (c0, c1, c2) with the sensitivity at pixel (i, j) c0 + c1 i + c2 j."""
+    g = _grid_of(a)
+    nx, ny = g['shape']
+    pts, val = [], []
+    for i in (0.0, nx / 2.0, nx - 1.0):
+        for j in (0.0, ny / 2.0, ny - 1.0):
+            pts.append((1.0, i, j))
+            val.append(_sensitivity(a, b, g['origin'] + i * g['spx'] * g['e1'] + j * g['spy'] * g['e2']))
+    return np.linalg.lstsq(np.array(pts), np.array(val), rcond=None)[0]
+
+
+def _upsample(c, shape, step, xp):
+    """A lattice c [ni, nj] of values at every step-th pixel, bilinearly at every pixel of shape (an array of xp)."""
+    c = xp.asarray(np.asarray(c, np.float32))
+
+    def along(v, n, axis):
+        t = np.arange(n) / step
+        i0 = np.minimum(t.astype(np.int64), v.shape[axis] - 2)
+        w = xp.asarray((t - i0).astype(np.float32))
+        w = w[:, None] if axis == 0 else w[None, :]
+        lo, hi = xp.take(v, xp.asarray(i0), axis=axis), xp.take(v, xp.asarray(i0 + 1), axis=axis)
+        return lo * (1 - w) + hi * w
+    return along(along(c, shape[1], 1), shape[0], 0)
+
+
+def _height(out, dem, step=4, iterations=3):
+    """The height (m) above a product's grid plane of the surface dem(lat, lon) -> height (m above the WGS-84
+    ellipsoid; arrays of degrees) where each pixel shows it, at every step-th pixel [ni, nj] (the lattice reaches
+    past the last pixel). A point h above the plane appears displaced toward the radar by h tan(graze) of ground
+    range, so the pixel's height is the surface's that far behind it, found by repeated substitution (a surface
+    steep enough to lay over itself has several such points; one is returned)."""
+    g = _grid_of(out)
+    nx, ny = g['shape']
+    n = np.cross(g['e1'], g['e2'])
+    i, j = np.arange(0, nx + step, step), np.arange(0, ny + step, step)
+    P = g['origin'] + (i * g['spx'])[:, None, None] * g['e1'] + (j * g['spy'])[None, :, None] * g['e2']
+    geo = geometry(out)
+    lo, hi = geo.get('pulses') or (0, len(geo['ant']))
+    u = g['center'] - geo['ant'][(lo + hi) // 2]
+    ug = u - (u @ n) * n
+    back = ug / np.linalg.norm(ug) * (-(u @ n) / np.linalg.norm(ug))             # tan(graze), away from the radar
+    h = np.zeros(P.shape[:2])
+    for _ in range(int(iterations)):
+        lat, lon, _h = io.ecf_to_geodetic((P + h[..., None] * back).reshape(-1, 3))
+        H = np.asarray(dem(np.asarray(lat), np.asarray(lon)), np.float64)
+        h = ((io.geodetic_to_ecf(lat, lon, H) - g['origin']) @ n).reshape(P.shape[:2])
+    return h
+
+
+def interferogram(a, b, window=7, *, fringe=True, dem=None, dem_step=4, floor=True):
+    """The interferogram of a registered pair formed on its common support: the phase of a b* and its coherence.
+
+    a, b: ground-plane complex products on one grid, registered (register, to a few hundredths of a pixel:
+    coherent=True), formed from the selection common_support gives (form_cphd(aperture=, band=)); on the host or
+    a device. window: the side of the averaging window, pixels. fringe: remove one linear fringe, the image's own
+    (the peak of the interferogram's spectrum, when it stands clear of noise): a difference between the two
+    orbits' errors leaves a tilt of the phase across the scene that carries no information about it. dem: a
+    surface dem(lat, lon) -> height (m above the WGS-84 ellipsoid, arrays of degrees; products.read_dem), whose
+    topographic phase is removed, evaluated at every dem_step-th pixel.
+
+    Phase. Both images are formed on one plane, so ground in that plane has no phase in a b* whatever the two
+    look directions (there is no flat-earth fringe to remove). A scatterer h above the plane turns the phase by
+    2 pi h / height_of_ambiguity, with 1 / height_of_ambiguity = rho (tan(graze a) - tan(graze b)), rho the radius
+    of the common ground wavenumber band (signed: positive when a looks down more steeply). A displacement d of
+    the ground toward the radar between the two collections turns it by 4 pi d / wavelength (b after a: positive
+    phase for motion toward the radar). The phase is that of a b* averaged over the window, after the fringe and
+    the topography, less its value over the most coherent tenth of the scene (an orbit error of a fraction of the
+    wavelength makes the absolute phase meaningless). Earth curvature counts as height: the plane stands d^2 /
+    (2 R) above the surface a distance d from the grid center, which a dem accounts for and a small height of
+    ambiguity makes visible.
+
+    -> a product dict with a's geometry: image [nx, ny] float32 (the phase, radians in (-pi, pi]; 0 where either
+    image is 0), coherence [nx, ny] float32 (over the same window, same fringe), product 'interferogram', window,
+    fringe (cycles per pixel along the axes, as removed), fringe_per_km (cycles), fringe_found, phase_offset (rad,
+    removed), height_of_ambiguity (m, at the grid center; None for equal grazing angles), height_per_radian,
+    displacement_per_radian (m of line-of-sight motion), wavelength, topography (whether a dem was removed),
+    phase_std (rad: of the phase where the coherence exceeds 0.6), flatness (dict: the phase of the complex mean
+    over blocks of 128 pixels at least 5% coherent: std, p5, p95 in rad, blocks), median, mean, p90, above_0p5,
+    above_0p7 (of the coherence), floor and samples (coherence's), baseline, timing."""
+    t0 = time.perf_counter()
+    _check_pair('interferogram', a, b)
+    xp = _xp.module(a['image'])
+    w = int(window)
+    za, zb = _carrier(a, on=True), _carrier(b, on=True)
+    valid = (a['image'] != 0) & (b['image'] != 0)
+    x = _rowwise(lambda u, v: u * xp.conj(v), za, zb)
+    g0 = _grid_of(a)
+    kappa = _sensitivity(a, b, g0['center'])
+    notes = list(a.get('notes', []))
+    if dem is not None:
+        step = int(max(1, dem_step))
+        h = _height(a, dem, step)
+        kc = _plane_fit(a, b)
+        ii, jj = np.arange(h.shape[0]) * step, np.arange(h.shape[1]) * step
+        cyc = _upsample(h * (kc[0] + kc[1] * ii[:, None] + kc[2] * jj[None, :]), x.shape, step, xp)
+        turn = lambda u, c: u * (xp.cos(2 * np.pi * c) - 1j * xp.sin(2 * np.pi * c)).astype(xp.complex64)
+        x = _rowwise(turn, x, cyc)
+        notes.append(f'interferogram: the topographic phase of the surface given removed ({np.ptp(h):.1f} m of relief '
+                     'above the grid plane)')
+        del cyc
+    f, found = np.zeros(2), False
+    if fringe:
+        f, z, thr = _fringe(x)
+        found = z > thr
+        f = f if found else np.zeros(2)
+        x = _unfringe(x, f)
+    pa, pb = _power(za), _power(zb)
+    xs = _box(x, w)
+    den = xp.sqrt(_box(pa, w)) * xp.sqrt(_box(pb, w))
+    g = xp.where(valid & (den > 0), xp.abs(xs) / xp.maximum(den, 1e-30), 0).astype(xp.float32)
+    all_valid = bool(_xp.host(valid.all()))
+    st = _stats(g, None if all_valid else valid)
+    top = g >= max(st['p90'] or 0.0, 1e-6)
+    off = float(np.angle(complex(_xp.host(xp.where(top, xs, 0).sum()))))
+    rot = np.complex64(np.exp(-1j * off))
+    phase = xp.where(valid, xp.angle(xs * rot), 0).astype(xp.float32)
+    solid = g > 0.6
+    nsolid = _scalar(solid.sum())
+    pstd = None if nsolid < 2 else float(np.sqrt(max(_scalar(xp.where(solid, phase * phase, 0).sum()) / nsolid
+                                                     - (_scalar(xp.where(solid, phase, 0).sum()) / nsolid) ** 2, 0.0)))
+    flat = None
+    T = 128
+    t1, t2 = x.shape[0] // T, x.shape[1] // T
+    if min(t1, t2) >= 2:
+        xb = _xp.host(xp.where(solid, x, 0)[:t1 * T, :t2 * T].reshape(t1, T, t2, T).sum((1, 3)))
+        cnt = _xp.host(solid[:t1 * T, :t2 * T].reshape(t1, T, t2, T).sum((1, 3)))
+        blk = np.angle(xb * rot)[cnt > 0.05 * T * T]
+        if blk.size:
+            flat = dict(std=float(np.std(blk)), p5=float(np.percentile(blk, 5)), p95=float(np.percentile(blk, 95)),
+                        blocks=int(blk.size), block=T)
+    fl = samples = None
+    if floor:
+        s = 4 * w + 1
+        gf = _coherence_map(za[s:, s:], zb[:-s, :-s], w, 'global' if fringe else None, 1 << 30)[0]
+        fl = _stats(gf, None if all_valid else valid[s:, s:] & valid[:-s, :-s])
+        samples = None if not fl['mean'] else float(np.pi / (4 * fl['mean'] ** 2))
+        del gf
+    lam = 4 * C / (a['band'][0] + a['band'][1] + b['band'][0] + b['band'][1])
+    hamb = None if abs(kappa) < 1e-9 else 1.0 / kappa
+    res = {k: v for k, v in a.items() if k not in ('image', 'phase_error', 'registration', 'baseband', 'valid')}
+    dt = time.perf_counter() - t0
+    res.update(image=phase, coherence=g, product='interferogram', window=w, fringe=(float(f[0]), float(f[1])),
+               fringe_per_km=(float(f[0] / a['spx'] * 1e3), float(f[1] / a['spy'] * 1e3)), fringe_found=bool(found),
+               phase_offset=off, height_of_ambiguity=hamb,
+               height_per_radian=None if hamb is None else hamb / (2 * np.pi),
+               displacement_per_radian=lam / (4 * np.pi), wavelength=lam, topography=dem is not None, phase_std=pstd,
+               flatness=flat, floor=fl, samples=samples, baseline=_pair_baseline(a, b), grid=g0,
+               notes=notes + [f'interferogram of two images over {w} x {w} pixels'
+                              + (', one linear fringe removed' if found else '')],
+               timing=dict(interferogram=dt, megapixels_per_second=g.size / 1e6 / max(dt, 1e-9)), **st)
+    return res
+
+
+def coherent_sum(a, b, window=15, *, equalize=True, coherence_window=7, dark=0.01):
+    """The coherent sum of a registered pair formed on its common support, and what it gained.
+
+    a, b: as interferogram's. The second image is brought to the first's phase, the linear fringe of the pair and
+    what remains of the interferogram's phase averaged over window x window pixels (propagation, orbit, relief:
+    whatever varies slowly), and to its amplitude (equalize: one factor, from the most coherent tenth of the
+    scene), and added. Where the pair is coherent the amplitudes add and the intensity is 2 (1 + g) of one
+    image's for a coherence g; noise adds in power, 2 of one image's, so the signal-to-noise ratio gains 1 + g: 3
+    dB for a perfectly coherent pair, nothing for an incoherent one, and the image keeps its resolution, where the
+    incoherent average (mean) trades none of the noise for its smoother speckle. The phase a pixel of b is turned
+    by comes from its surroundings, the window without its central 5 x 5 pixels: a phase estimated from the pixel
+    itself would line up the two images' noise there, and the sum's noise would exceed twice one image's. The
+    gain is measured, not assumed.
+
+    -> a product dict with a's geometry: image [nx, ny] complex64 (a + b as brought to it, on its carrier; 0
+    where either is 0), product 'coherent_sum', phase_window, fringe (cycles per pixel), amplitude_factor (applied
+    to b), gain (dict, dB, against the first image: signal, the intensity of the sum over a's on the most
+    coherent tenth of the scene; noise, the same on the darkest ground, the fraction `dark` of the pixels by the
+    two images' intensity averaged over 15 x 15; snr, their difference; second, the same against the second
+    image, which differs where the two images' signal-to-noise ratios do (the sum gains most against the
+    noisier); expected, 10 log10(1 + g) for the mean coherence g of that tenth and equal noise; incoherent, the
+    signal gain of the sum of the intensities; coherence, that g), timing."""
+    t0 = time.perf_counter()
+    _check_pair('coherent_sum', a, b)
+    xp = _xp.module(a['image'])
+    za, zb = _carrier(a, on=True), _carrier(b, on=True)
+    valid = (a['image'] != 0) & (b['image'] != 0)
+    x = _rowwise(lambda u, v: u * xp.conj(v), za, zb)
+    f, z, thr = _fringe(x)
+    f = f if z > thr else np.zeros(2)
+    x = _unfringe(x, f)
+    pa, pb = _power(za), _power(zb)
+    w7, w = int(coherence_window), int(window)
+    den = xp.sqrt(_box(pa, w7)) * xp.sqrt(_box(pb, w7))
+    g = xp.where(valid & (den > 0), xp.abs(_box(x, w7)) / xp.maximum(den, 1e-30), 0).astype(xp.float32)
+    del den
+    p90 = _percentile(g, [90.0], step=3)[0]
+    stable = (g >= max(p90, 1e-6)) & valid
+    ns = max(_scalar(stable.sum()), 1.0)
+    sa, sb = _scalar(xp.where(stable, pa, 0).sum()) / ns, _scalar(xp.where(stable, pb, 0).sum()) / ns
+    amp = float(np.sqrt(sa / max(sb, 1e-30))) if equalize else 1.0
+    ref = _box(x, w) * xp.float32(w * w) - (_box(x, 5) * xp.float32(25.0) if w > 7 else 0)
+    del x
+    zb = _unfringe(zb, f, sign=+1)
+    tot = _rowwise(lambda u, v, r: u + xp.complex64(amp) * v * (r / xp.maximum(xp.abs(r), 1e-30)), za, zb, ref)
+    del ref, zb
+    tot = xp.where(valid, tot, 0).astype(xp.complex64)
+    ps = _power(tot)
+    one = 0.5 * (pa + xp.float32(amp * amp) * pb)
+    lev = _box(one, 15)
+    dk = (lev <= _percentile(xp.where(valid, lev, np.inf), [100.0 * float(dark)], step=2)[0]) & valid
+    sig = _scalar(xp.where(stable, ps, 0).sum()) / ns
+    nsum, na, nb = (_scalar(xp.where(dk, v, 0).sum()) for v in (ps, pa, pb))
+    first = (sig / max(sa, 1e-30)) / (nsum / max(na, 1e-30))
+    second = (sig / max(sb, 1e-30)) / (nsum / max(nb, 1e-30))
+    gs = _scalar(xp.where(stable, g, 0).sum()) / ns
+    db = lambda v: float(10 * np.log10(max(v, 1e-30)))
+    res = {k: v for k, v in a.items() if k not in ('image', 'phase_error', 'registration', 'valid')}
+    dt = time.perf_counter() - t0
+    res.update(image=tot, baseband=False, product='coherent_sum', phase_window=w, amplitude_factor=amp,
+               fringe=(float(f[0]), float(f[1])), grid=_grid_of(a),
+               gain=dict(signal=db(sig / max(sa, 1e-30)), noise=db(nsum / max(na, 1e-30)), snr=db(first),
+                         second=db(second), expected=db(1 + gs),
+                         incoherent=db((sa + amp * amp * sb) / max(sa, 1e-30)), coherence=gs),
+               notes=list(a.get('notes', [])) + ['coherent sum of two images, the second brought to the phase and '
+                                                 'amplitude of the first'],
+               timing=dict(coherent_sum=dt, megapixels_per_second=tot.size / 1e6 / max(dt, 1e-9)))
     return res
 
 
@@ -1242,16 +1851,18 @@ def write_geotiff(path, out, bands=None):
     """A stack product on its ground grid as a GeoTIFF in the UTM zone of its center (float32; needs rasterio).
 
     bands: the arrays [nx, ny] to write (default the product's image; a change product: its coherence and its
-    intensity ratio). The grid is written as it is, without resampling, with the affine transform that places its
-    pixels on the map (rotated by the grid's azimuth; rows along e1, columns along e2), when that places every
-    pixel within a tenth of a pixel of its true position, as it does for grids of a few kilometers; a larger grid
-    is resampled north up (products.geocode_image). -> dict(crs, transform, resampled)."""
+    intensity ratio; an interferogram: its phase and its coherence). The grid is written as it is, without
+    resampling, with the affine transform that places its pixels on the map (rotated by the grid's azimuth; rows
+    along e1, columns along e2), when that places every pixel within a tenth of a pixel of its true position, as
+    it does for grids of a few kilometers; a larger grid is resampled north up (products.geocode_image).
+    -> dict(crs, transform, resampled)."""
     from . import products, _deps
     _deps.require('rasterio')
     from rasterio.transform import Affine
     from rasterio.warp import transform as warp
     if bands is None:
-        bands = [out['coherence'], out['image']] if out.get('product') == 'change' else [out['image']]
+        keys = dict(change=['coherence', 'image'], interferogram=['image', 'coherence'])
+        bands = [out[k] for k in keys.get(out.get('product'), ['image'])]
     bands = [np.asarray(_xp.host(b), np.float32) for b in bands]
     nx, ny = bands[0].shape
     g = _grid_of(out)
@@ -1275,14 +1886,16 @@ def write_geotiff(path, out, bands=None):
 
 def process_stack(cphds, output=None, *, product='mean', grid=None, reference=0, spacing=None, extent=None,
                   register='fourier', equalize='mean', weights=None, window=7, weighting='taylor', aperture='auto',
-                  remap='nrl', remap_args=None, shadows_down=True, backend='auto', precision='float32', max_shift=64,
-                  range_gate=True, channel=0, troposphere=None, reader_options=None, target_db=-40.0):
+                  dem=None, remap='nrl', remap_args=None, shadows_down=True, backend='auto', precision='float32',
+                  max_shift=64, range_gate=True, channel=0, troposphere=None, reader_options=None, target_db=-40.0):
     """Several collections of one scene, from the CPHD files to one product (see the module docstring).
 
     cphds: the files, two or more. output: the file to write, or None to return the product without writing it.
     product: 'mean' (the incoherent average of all of them, written as a SIDD: detected, remapped, shadows down;
-    the speckle-reduced display product), 'coherence' or 'change' (of two collections, written as a GeoTIFF: the
-    coherence; the coherence and the intensity ratio in decibels).
+    the speckle-reduced display product), or a product of two collections as a coherent pair: 'coherence' (written
+    as a GeoTIFF), 'change' (the coherence and the intensity ratio in decibels: a GeoTIFF of two bands),
+    'interferogram' (the phase and the coherence: a GeoTIFF of two bands) or 'coherent_sum' (the sum of the two
+    complex images, written as a SIDD like the mean).
     grid: the common ground grid (stack.ground_grid, or a product: its pixels). None: the reference collection's
         tasked area on axes along its line of sight, so that its shadows fall down the rows, with square pixels of
         `spacing` (default: 0.7 of the coarsest collection's ground range resolution, finer where a collection's
@@ -1292,13 +1905,16 @@ def process_stack(cphds, output=None, *, product='mean', grid=None, reference=0,
     register: 'fourier' (one translation per image from the detected images' cross-correlation, applied on the
         spectrum: stack.register, stack.shift_image), 'reform' (applied by forming the collection again on the
         displaced grid, from the file: exact at the edges too, at the cost of a second read and formation) or None
-        (the collections' own geolocation is trusted). max_shift: the largest translation searched, pixels.
+        (the collections' own geolocation is trusted). A coherent pair's translation is refined on the complex
+        images (stack.register's coherent). max_shift: the largest translation searched, pixels.
     equalize, weights: stack.mean's (default: each image scaled to the reference's brightness; None keeps the
-        images' own units). window: the coherence window, pixels.
+        images' own units). window: the window of the coherence and of the interferogram, pixels.
     weighting: 'taylor' (nbar 4, 35 dB, on the phase history) or 'uniform'. aperture: form_cphd's; with 'auto' the
-        two collections of a coherence or change product are formed from the pulses that look from one interval of
-        azimuth (the mean of their directions, as wide as the narrower aperture of square resolution), where each
-        has at least half of it: what one aperture has alone only lowers the coherence.
+        two collections of a coherent pair are formed from their common support (stack.common_support): the
+        pulses that look from the interval of azimuth both apertures cover and, on each pulse, the frequencies
+        whose ground-range wavenumbers both bands hold, under one weighting of that support. What one collection
+        has alone only lowers the coherence, and it is removed from the phase history, not from the image.
+    dem: an interferogram's surface (stack.interferogram's).
     remap, remap_args, shadows_down: the SIDD's (sidd.write_sidd).
     range_gate: form_cphd's; True by default here: a stack's grid is often small against the collections' swaths,
         and a gated first level is several times faster.
@@ -1308,21 +1924,27 @@ def process_stack(cphds, output=None, *, product='mean', grid=None, reference=0,
     memory at a time, and each image goes to the backend's device for registration and the product, or stays on
     the host when the device lacks the room (a note says so).
 
-    -> the product dict of stack.mean, stack.coherence or stack.change (image on the host), with registrations (one
-    dict per collection, in the order given: stack.register's), inputs (per collection: path, name, collector,
-    start, graze, azimuth, pulses, shift, notes), timing (seconds: read, form, register, combine, write, total) and,
-    when written, path and metadata (the SIDD's, or the GeoTIFF's crs and transform). gains and looks_single are
-    per collection in the order given; looks_by_n counts the images as processed, the reference first.
+    -> the product dict of stack.mean, stack.coherence, stack.change, stack.interferogram or stack.coherent_sum
+    (arrays on the host), with registrations (one dict per collection, in the order given: stack.register's),
+    inputs (per collection: path, name, collector, start, graze, azimuth, pulses, band, shift, notes), timing
+    (seconds: read, form, register, combine, write, total) and, when written, path and metadata (the SIDD's, or
+    the GeoTIFF's crs and transform). A pair's product has support (stack.common_support's figures for the two
+    files, the reference first, without the per-pulse bands; trimmed: whether the pair was formed from it) and
+    baseline (stack.baseline's, of the files). gains and looks_single are per collection in the order given;
+    looks_by_n counts the images as processed, the reference first.
 
     The SIDD of a mean states what it is: ProductClass 'Detected Image', ProductType 'Multi-image incoherent
     average', the number of collections, the equivalent number of looks and the registration as
     ProductCreationExtension parameters, one ExploitationFeatures Collection per input with its own date, time and
-    geometry, and the reference collection's aperture and time for the projection (Measurement)."""
+    geometry, and the reference collection's aperture and time for the projection (Measurement). A coherent sum's
+    likewise, as ProductType 'Multi-image coherent sum' with the measured gain."""
     from .api import _backend
     from .cphd import form_cphd
     from . import products as _products
-    if product not in ('mean', 'coherence', 'change'):
-        raise ValueError(f"product must be 'mean', 'coherence' or 'change', got {product!r}")
+    pairs = dict(coherence=coherence, change=change, interferogram=interferogram, coherent_sum=coherent_sum)
+    if product != 'mean' and product not in pairs:
+        raise ValueError("product must be 'mean', 'coherence', 'change', 'interferogram' or 'coherent_sum', "
+                         f'got {product!r}')
     if register not in ('fourier', 'reform', None, False):
         raise ValueError(f"register must be 'fourier', 'reform' or None, got {register!r}")
     if weighting not in ('taylor', 'uniform'):
@@ -1339,20 +1961,20 @@ def process_stack(cphds, output=None, *, product='mean', grid=None, reference=0,
         raise ValueError('grid= gives the spacing and the shape: leave spacing and extent unset')
     if weights is not None and len(weights) != n:
         raise ValueError(f'weights: one per collection ({n}), got {len(weights)}')
+    if dem is not None and product != 'interferogram':
+        raise ValueError("dem= is the surface of product='interferogram'")
     backend = _backend(backend)
     t_start = time.perf_counter()
     timing = dict(read=0.0, form=0.0, register=0.0, combine=0.0, write=0.0)
     notes = []
-    if grid is None:
-        try:
-            geos = [geometry(p, channel) for p in paths]
-        except Exception as e:
+    geos = None
+    try:
+        geos = [geometry(p, channel) for p in paths]
+    except Exception as e:                                           # not CPHD files: no plan from their pulses
+        if grid is None:
             raise ValueError(f'the default grid is planned from the per-pulse parameters of CPHD files ({e}): '
                              'give grid= (fastsar.stack.ground_grid)') from e
-        g = _default_grid(paths[reference], geos, reference, spacing, extent)
-    else:
-        g = as_grid(grid)
-    timing['plan'] = time.perf_counter() - t_start
+    g = _default_grid(paths[reference], geos, reference, spacing, extent) if grid is None else as_grid(grid)
     mpx = g['shape'][0] * g['shape'][1] / 1e6
 
     def sync(image=None):
@@ -1362,21 +1984,36 @@ def process_stack(cphds, output=None, *, product='mean', grid=None, reference=0,
         elif _xp.kind(image) == 'jax':
             image.block_until_ready()
 
-    pulses = {}
-    if product != 'mean' and aperture == 'auto':                     # the pair on one interval of azimuth
-        try:
-            common = _common_aperture(geometry(paths[0], channel), geometry(paths[1], channel), g['center'])
-        except Exception:                                            # not CPHD files: each collection's own aperture
-            common = None
-        if common is not None:
-            pulses = dict(enumerate(common))
-            notes.append('the two collections were formed from the pulses on one interval of azimuth')
+    order = [reference] + [k for k in range(n) if k != reference]
+    select, support, bl = {}, None, None
+    if product != 'mean' and geos is not None:                       # the pair on its common support
+        cs = common_support(geos[order[0]], geos[order[1]], g['center'])
+        bl = baseline(geos[order[0]], geos[order[1]], g['center'])
+        support = {k: v for k, v in cs.items() if k != 'bands'}
+        # a fifth of a square cell's aperture, or a tenth of a band, is too little to form an image from
+        enough = (cs['inside'] and cs['azimuth_deg'] >= 0.2 * cs['azimuth_needed_deg']
+                  and min(cs['overlap_range']) >= 0.1)
+        support['trimmed'] = bool(enough and aperture == 'auto')
+        if cs['inside'] and not enough:
+            notes.append(f"the two collections share {cs['azimuth_deg']:.2f} of the {cs['azimuth_needed_deg']:.2f} "
+                         f"degrees of azimuth a square cell takes and {100 * min(cs['overlap_range']):.0f}% of a "
+                         'band: too little to form from, each was formed as it would be alone')
+        if support['trimmed']:
+            select = {order[0]: (cs['pulses'][0], cs['bands'][0]), order[1]: (cs['pulses'][1], cs['bands'][1])}
+            notes.append(f"the two collections were formed from their common support: {cs['azimuth_deg']:.2f} degrees "
+                         f"of azimuth ({cs['azimuth_available_deg']:.2f} common), "
+                         f"{100 * cs['overlap_range'][0]:.0f}% and {100 * cs['overlap_range'][1]:.0f}% of their bands")
+        elif not cs['inside']:
+            notes.append('the two collections have no common support (outside the critical baseline): each was '
+                         'formed as it would be alone')
+    timing['plan'] = time.perf_counter() - t_start
 
     def form(k, shift=None):
         t0 = time.perf_counter()
         mark = {}
-        out = form_cphd(paths[k], grid=g, shift=shift, backend=backend, window=weighting == 'taylor',
-                        aperture=pulses.get(k, aperture), precision=precision, channel=channel, troposphere=troposphere,
+        ap, fb = select.get(k, (aperture, None))
+        out = form_cphd(paths[k], grid=g, shift=shift, backend=backend, window=weighting == 'taylor', aperture=ap,
+                        band=fb, precision=precision, channel=channel, troposphere=troposphere,
                         reader_options=reader_options, target_db=target_db, range_gate=range_gate,
                         _plan=lambda q: mark.update(read=time.perf_counter()))
         t1 = time.perf_counter()
@@ -1385,7 +2022,6 @@ def process_stack(cphds, output=None, *, product='mean', grid=None, reference=0,
         out['image'] = _on_device(out['image'], backend, notes)
         return out
 
-    order = [reference] + [k for k in range(n) if k != reference]
     acc = _Mean(equalize or None, 32) if product == 'mean' else None
     regs, inputs, sms, kept = [None] * n, [None] * n, [None] * n, {}
     ref_det = None
@@ -1399,6 +2035,8 @@ def process_stack(cphds, output=None, *, product='mean', grid=None, reference=0,
         elif register:
             est = _estimate(ref_det, _detected(out['image']), g['spx'], g['spy'], max_shift, 4)
             est['reference'] = False
+            if est['found'] and product != 'mean':
+                _refine(est, kept[reference], out)
             if not est['found']:
                 notes.append(f"collection {k}: no significant correlation peak against the reference (significance "
                              f"{est['significance']:.1f}): not translated")
@@ -1419,10 +2057,11 @@ def process_stack(cphds, output=None, *, product='mean', grid=None, reference=0,
         lk = _look(geometry(out), g['center'])
         inputs[k] = dict(path=str(paths[k]), name=out['meta'].get('core_name'), collector=out['meta'].get('collector'),
                          start=str(out['meta'].get('start')), graze=lk['graze'], azimuth=lk['azimuth'],
-                         pulses=tuple(out['pulses']), shift=tuple(out['shift']), notes=list(out['notes']))
+                         pulses=tuple(out['pulses']), band=tuple(out['band']), shift=tuple(out['shift']),
+                         notes=list(out['notes']))
+        if output is not None and product in ('mean', 'coherent_sum'):   # each input's own collection metadata
+            sms[k] = _products.sicd_meta(dict(out, image=np.broadcast_to(np.complex64(0), g['shape'])))[0]
         if product == 'mean':
-            if output is not None:                                   # each input's own collection metadata
-                sms[k] = _products.sicd_meta(dict(out, image=np.broadcast_to(np.complex64(0), g['shape'])))[0]
             acc.add(out, 1.0 if weights is None else float(weights[k]))
             sync(acc.sum)
         else:
@@ -1440,16 +2079,24 @@ def process_stack(cphds, output=None, *, product='mean', grid=None, reference=0,
                 res[key] = [res[key][order.index(k)] for k in range(n)]
     else:
         a, b = kept[reference], kept[order[1]]
-        res = (coherence if product == 'coherence' else change)(a, b, window)
+        if product == 'interferogram':
+            res = interferogram(a, b, window, dem=dem)
+        elif product == 'coherent_sum':
+            res = coherent_sum(a, b, coherence_window=window)
+        else:
+            res = pairs[product](a, b, window)
         res['inputs'] = inputs
+        if bl is not None:
+            res.update(baseline=bl, support=support)
         del a, b, kept
     sync(res['image'])
     timing['combine'] += time.perf_counter() - t0
     res.update(registrations=regs, reference=reference, notes=list(res.get('notes', [])) + notes)
-    if product == 'mean':
+    sidd = product in ('mean', 'coherent_sum')
+    if sidd:
         res.update(remap=remap, remap_args=dict(remap_args or {}), shadows_down=bool(shadows_down))
     t0 = time.perf_counter()
-    if output is not None and product == 'mean':
+    if output is not None and sidd:
         from .sidd import write_sidd
         shifts = '; '.join(f'{i["shift"][0]:.2f} {i["shift"][1]:.2f}' for i in res['inputs'])
         ext = {'NumberOfCollections': n, 'ReferenceCollection': reference + 1,
@@ -1460,12 +2107,18 @@ def process_stack(cphds, output=None, *, product='mean', grid=None, reference=0,
                'Geolocation': "the reference collection's"}
         if res.get('looks'):
             ext['EquivalentNumberOfLooks'] = f"{res['looks']:.2f}"
+        kind = 'Multi-image incoherent average'
+        if product == 'coherent_sum':
+            kind = 'Multi-image coherent sum'
+            ext['Combination'] = ('sum of the complex images, the second brought to the phase and amplitude of the '
+                                  'first' + (', both formed from their common support' if select else ''))
+            ext['SignalToNoiseGain'] = (f"{res['gain']['snr']:.2f} dB measured, {res['gain']['expected']:.2f} dB for "
+                                        'the coherence')
         res['metadata'] = write_sidd(output, res, remap=remap, remap_args=remap_args, shadows_down=shadows_down,
-                                     collections=[sms[k] for k in range(n)],
-                                     product_type='Multi-image incoherent average', extensions=ext)
+                                     collections=[sms[k] for k in range(n)], product_type=kind, extensions=ext)
     elif output is not None:
         res['metadata'] = write_geotiff(output, res)
-    for key in ('image', 'coherence'):
+    for key in ('image', 'coherence', 'allowed'):
         if res.get(key) is not None:
             res[key] = _xp.host(res[key])
     if output is not None:

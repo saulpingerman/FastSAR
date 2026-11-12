@@ -20,6 +20,22 @@ was published on PyPI.
   homogeneous tiles and optional brightness equalization); `coherence` (on the common band of the two spectra,
   with a linear fringe removed and the estimator's floor measured on the pair) and `change`; `baseline` (whether
   a pair is inside the critical baseline, from the per-pulse parameters alone).
+- Coherent pairs ([docs/stack.md](docs/stack.md#coherent-pairs)). `stack.common_support(a, b)` gives, from two
+  collections' geometry, the pulses and the frequencies of each that cover the part of the ground spectrum both
+  have, and `form_cphd(band=)` takes the frequencies (one pair, or one per pulse) beside `aperture=`: the samples
+  outside get no weight and the window spans the selection, along the aperture as a function of the look
+  direction, so two collections cut to one support carry one weighting. `process_stack` forms the two
+  collections of a pair product that way. With apertures displaced by 30% the coherence of stable surfaces was
+  0.56 untrimmed, 0.63 with the images cut to their common band and 0.81 formed on the common support.
+- `stack.interferogram` (the phase and coherence of a pair, one linear fringe and an optional surface's
+  topographic phase removed, with the height of ambiguity), `stack.coherent_sum` (with its gain as measured) and
+  `process_stack(product='interferogram' | 'coherent_sum')`. `stack.change` also returns the coherence the two
+  brightnesses allow and the fraction of the pixels that can show change which do.
+  `stack.register(coherent=True)` refines a translation on the complex images. `stack.baseline` reports the
+  overlap in range at equal look direction, how much of a square aperture the two whole apertures share, and
+  the height of ambiguity.
+- `stack.coherence(fringe='tiles')` gives a tile its own fringe only where the peak of the tile's interferogram
+  spectrum stands clear of noise (`fringes_found`); other tiles take the image's.
 - `write_sidd(..., collections=, product_class=, product_type=, extensions=)`: a SIDD made from several
   collections holds one `ExploitationFeatures` `Collection` per input.
 - `ImageFormer(..., range_gate=)`, also on `form_image` and `form_cphd`: the phase history gated in range to the

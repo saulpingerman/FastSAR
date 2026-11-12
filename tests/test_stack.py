@@ -2,7 +2,11 @@
 CPHD with a known geolocation error each (the whole collection displaced by meters), formed on one Earth-fixed
 grid, registered, averaged and compared: where the grid puts the targets, the translations recovered, the two
 ways of applying them, the looks of the average, the coherence of a coherent and of an incoherent pair against
-their true values, process_stack on each device, and the options' refusals. Needs finufft (sim.simulate)."""
+their true values, process_stack on each device, and the options' refusals. Coherent pairs: apertures that
+overlap in part and grazing angles that differ, formed on their common support (the coherence of stable clutter
+against its true value, beside the cut of the images), the interferometric phase of a height step against the
+height of ambiguity, the gain of the coherent sum, and the registration refined on the complex images. Needs
+finufft (sim.simulate)."""
 import dataclasses
 from types import SimpleNamespace
 
@@ -86,6 +90,54 @@ def clutter(tmp_path_factory):
             S = sim.add_noise(S, np.sqrt(density / RES ** 2 * area / SNR), rng)
         outs.append(fastsar.form_cphd(write(d / f'clutter{k}.cphd', col, S, heading), grid=grid, backend='cpu'))
     return outs
+
+
+STEP, GRAZE = 0.3, (35.0, 35.6)             # of the pair with different grazing angles: m of height, degrees
+
+
+@pytest.fixture(scope='module')
+def pairs(tmp_path_factory):
+    """Three coherent pairs of one track heading over clutter that does not change, as files: 'az', the second
+    aperture displaced along the track by 30% of its length, with noise; 'gr', the second at a grazing angle 0.6
+    degrees steeper, with noise, over ground whose east half stands STEP higher; 'sum', the same track twice over
+    a band of clutter between bare ground, each with its own noise 15 dB under the clutter."""
+    d = tmp_path_factory.mktemp('pairs')
+    rng = np.random.default_rng(3)
+    density, heading = 3.0, 30.0
+
+    def sigma(col, graze, snr):                                        # as the clutter fixture's
+        return np.sqrt(density / RES ** 2 * (sim.C / (2 * col.df)) ** 2 / np.cos(np.radians(graze)) / snr)
+    col = sim.make_collect(res=RES, scene=SCENE, r0=10e3, graze_deg=35.0)
+    out = SimpleNamespace(grid=stack.ground_grid((LAT, LON, H0), 96.0, 0.4, azimuth=120.0), dir=d)
+    pos, a1, _ = sim.clutter_pair(SCENE, RES, rng, per_cell=density, n_bright=0)
+    S = sim.simulate(col, pos @ frame(heading), a1)
+    colb = dataclasses.replace(col, ant=col.ant + np.array([0.0, 0.3 * np.ptp(col.ant[:, 1]), 0.0]))
+    Sb = sim.add_noise(sim.simulate(colb, pos @ frame(heading), a1), sigma(col, 35.0, SNR), rng)
+    out.az = [write(d / 'az_a.cphd', col, S, heading), write(d / 'az_b.cphd', colb, Sb, heading, day=4)]
+    cols = [sim.make_collect(res=RES, scene=SCENE, r0=10e3, graze_deg=g) for g in GRAZE]
+    pos, a1, _ = sim.clutter_pair(SCENE, RES, rng, per_cell=density, n_bright=0)
+    pos[:, 2] = np.where(pos[:, 0] > 0, STEP, 0.0)
+    Sb = sim.add_noise(sim.simulate(cols[1], pos @ frame(heading), a1), sigma(cols[1], GRAZE[1], SNR), rng)
+    out.gr = [write(d / 'gr_a.cphd', cols[0], sim.simulate(cols[0], pos @ frame(heading), a1), heading),
+              write(d / 'gr_b.cphd', cols[1], Sb, heading, day=4)]
+    pos, a1, _ = sim.clutter_pair(SCENE, RES, rng, per_cell=density, n_bright=0)
+    keep = np.abs(pos[:, 0]) < 22
+    S = sim.simulate(col, pos[keep] @ frame(heading), a1[keep])
+    out.sum = [write(d / f'sum_{k}.cphd', col, sim.add_noise(S, sigma(col, 35.0, 30.0), rng), heading, day=1 + 3 * k)
+               for k in range(2)]
+    E, N, U = sim.enu_axes(LAT, LON)
+    g = out.grid
+    nx, ny = g['shape']
+    ij = np.stack(np.meshgrid(np.arange(nx) - nx / 2, np.arange(ny) - ny / 2, indexing='ij'), -1) * g['spx']
+    out.east = ij[..., 0] * (g['e1'] @ E) + ij[..., 1] * (g['e2'] @ E)   # of every pixel, m from the center
+    out.true = 1 / np.sqrt(1 + 1 / SNR)
+    return out
+
+
+def on_support(pair, grid, **kw):
+    cs = stack.common_support(pair[0], pair[1], grid['center'])
+    return [fastsar.form_cphd(p, grid=grid, backend='cpu', aperture=cs['pulses'][k], band=cs['bands'][k], **kw)
+            for k, p in enumerate(pair)], cs
 
 
 @pytest.fixture(scope='module')
@@ -359,6 +411,210 @@ def test_coherence(clutter):
         stack.coherence(a, b, fringe='every')
 
 
+def band_fraction(out):
+    """The part of the sampled band along e2 (range, on these grids) that an image's spectrum fills."""
+    p = (np.abs(np.fft.fft(out['image'][24:-24, 24:-24], axis=1)) ** 2).mean(0)
+    return float((p > 0.25 * np.percentile(p, 90)).mean())
+
+
+def test_common_support(pairs, scene, formed):
+    """What two collections share, from their geometry, and the selection of a phase history that form_cphd takes."""
+    b = stack.baseline(*pairs.az)
+    cs = stack.common_support(*pairs.az, pairs.grid['center'])
+    print(f"displaced apertures: {cs['azimuth_deg']:.2f} of {cs['azimuth_needed_deg']:.2f} degrees common, the "
+          f"apertures of each alone share {b['overlap_azimuth']:.2f}; pulses {cs['pulses']}")
+    # 30% of the aperture's length apart: 70% in common, less than a square cell takes (the whole is 1.22 of that)
+    assert b['inside'] and abs(b['overlap_range'] - 1) < 1e-3 and abs(b['azimuth_available'] - 0.7 * 1.22) < 0.02
+    assert 0.55 < b['overlap_azimuth'] < 0.7 and abs(cs['azimuth_available_deg'] - cs['azimuth_deg']) < 1e-9
+    na, nb = (hi - lo for lo, hi in cs['pulses'])
+    assert na == nb and cs['pulses'][0][0] > 0 and cs['pulses'][1][0] == 0 and cs['bands'][0].shape == (na, 2)
+    g = stack.geometry(pairs.az[0])
+    assert np.allclose(cs['bands'][0], g['band'], rtol=1e-9) and abs(b['d_graze']) < 1e-3
+    assert b['height_of_ambiguity'] is None or abs(b['height_of_ambiguity']) > 1e4
+    b = stack.baseline(*pairs.gr)
+    cs = stack.common_support(*pairs.gr, pairs.grid['center'])
+    ga, gb = np.radians(GRAZE)
+    fc = 0.5 * sum(stack.geometry(pairs.gr[0])['band'])
+    hamb = 1 / (2 * fc * np.cos(0.5 * (ga + gb)) / sim.C * (np.tan(ga) - np.tan(gb)))
+    crit = np.degrees(np.diff(stack.geometry(pairs.gr[0])['band'])[0] / fc / np.tan(0.5 * (ga + gb)))
+    print(f"grazing angles {GRAZE}: {b['overlap_range']:.3f} of the band common (critical {b['critical_graze']:.2f} "
+          f"degrees), height of ambiguity {b['height_of_ambiguity']:.3f} m (analytic {hamb:.3f})")
+    assert abs(b['d_graze'] - 0.6) < 0.01 and abs(b['critical_graze'] - crit) < 0.02 and b['overlap_azimuth'] > 0.99
+    assert abs(b['overlap_range'] - (1 - 0.6 / crit)) < 0.01 and abs(b['height_of_ambiguity'] / hamb - 1) < 0.01
+    assert b['azimuth_available'] > 1.5 and abs(cs['azimuth_deg'] - cs['azimuth_needed_deg']) < 1e-6
+    # the steeper look holds the lower ground wavenumbers: its upper frequencies meet the other's lower ones
+    fa, fb = cs['bands']
+    f0, f1 = stack.geometry(pairs.gr[0])['band']
+    assert np.allclose(fa[:, 0], f0) and np.all(fa[:, 1] < f1 - 0.2 * (f1 - f0))
+    assert np.allclose(fb[:, 1], f1) and np.all(fb[:, 0] > f0 + 0.2 * (f1 - f0))
+    assert abs(cs['resolution'][0] / cs['resolution'][1] - 1) < 0.01 and cs['resolution'][0] > RES / np.cos(ga)
+    assert not stack.common_support(scene.paths[0], scene.paths[2])['inside']      # 12 degrees apart
+    # form_cphd(band=): the frequencies used, under a window of their own
+    p, grid = scene.paths[0], scene.grid
+    whole = fastsar.form_cphd(p, grid=grid, backend='cpu', band=(f0, f1))
+    half = fastsar.form_cphd(p, grid=grid, backend='cpu', band=(f0, 0.5 * (f0 + f1)))
+    c = (slice(24, -24),) * 2
+    d = np.linalg.norm(whole['image'][c] - formed[0]['image'][c]) / np.linalg.norm(formed[0]['image'][c])
+    print(f"the whole band given as a selection against none: {20 * np.log10(d):.1f} dB; a half fills "
+          f"{band_fraction(half) / band_fraction(whole):.2f} of the spectrum")
+    assert d < 0.02 and abs(band_fraction(half) / band_fraction(whole) - 0.5) < 0.06
+    assert np.allclose(half['band'], (f0, 0.5 * (f0 + f1)), rtol=1e-6) and any('band:' in n for n in half['notes'])
+    assert abs(half['bandwidth'][1] / whole['bandwidth'][1] - 0.5) < 0.01 and whole['pulses'] == formed[0]['pulses']
+    for bad in ((f1, f0), (f0, f1, f1), np.tile([f0, f1], (7, 1)), (2 * f1, 3 * f1)):
+        with pytest.raises(ValueError, match='band'):
+            fastsar.form_cphd(p, grid=grid, backend='cpu', band=bad)
+
+
+@pytest.mark.parametrize('which', ['az', 'gr'])
+def test_trimming_restores_coherence(pairs, which):
+    """Apertures that overlap in part, and grazing angles that differ: formed on the common support, stable
+    clutter has the coherence its noise allows; formed each alone it has not, and cutting the images to their
+    common band afterwards restores it only without a weighting."""
+    pair, core = getattr(pairs, which), (slice(24, -24),) * 2
+    med = lambda r: float(np.median(r['image'][core]))
+    got = {}
+    for w in (True, False):
+        own = [fastsar.form_cphd(p, grid=pairs.grid, backend='cpu', window=w) for p in pair]
+        trim, cs = on_support(pair, pairs.grid, window=w)
+        t = stack.coherence(trim[0], trim[1])
+        got[w] = (med(stack.coherence(own[0], own[1], common_band=False)), med(stack.coherence(own[0], own[1])), med(t))
+        assert any('coincide' in n for n in t['notes']) and min(t['overlap']) > 0.98
+    print(f"{which}: alone {got[True][0]:.3f}, images cut {got[True][1]:.3f}, common support {got[True][2]:.3f} (true "
+          f"{pairs.true:.3f}); unweighted {got[False][0]:.3f}, {got[False][1]:.3f}, {got[False][2]:.3f}")
+    for w in (True, False):
+        assert abs(got[w][2] - pairs.true) < 0.02 and got[w][0] < pairs.true - 0.15
+    assert got[True][0] < got[True][1] < pairs.true - 0.1                # the cut, under Taylor weighting, falls short
+    assert abs(got[False][1] - pairs.true) < 0.03                       # and without a weighting it does not
+    # process_stack forms the pair that way by default
+    r = fastsar.process_stack(pair, product='coherence', grid=pairs.grid, backend='cpu')
+    own = fastsar.process_stack(pair, product='coherence', grid=pairs.grid, backend='cpu', aperture='square')
+    assert abs(med(r) - pairs.true) < 0.02 and med(own) < pairs.true - 0.1 and r['support']['trimmed']
+    assert tuple(r['inputs'][1]['pulses']) == tuple(r['support']['pulses'][1]) and not own['support']['trimmed']
+    width = lambda q: q['inputs'][0]['band'][1] - q['inputs'][0]['band'][0]
+    assert width(r) <= width(own)
+
+
+def test_interferogram_of_a_height_step(pairs, tmp_path, need):
+    """The phase of ground that stands higher, against the height of ambiguity; a surface given removes it."""
+    (a, b), cs = on_support(pairs.gr, pairs.grid)
+    ifg = stack.interferogram(a, b, fringe=False)
+    inner = np.zeros(pairs.grid['shape'], bool)
+    inner[24:-24, 24:-24] = True
+    hi, lo = inner & (pairs.east > 6), inner & (pairs.east < -6)
+    step = lambda r: float(np.angle(np.exp(1j * r['image'][hi]).mean() * np.conj(np.exp(1j * r['image'][lo]).mean())))
+    want = 2 * np.pi * STEP / ifg['height_of_ambiguity']
+    print(f"height step of {STEP} m: {step(ifg):.3f} rad, 2 pi h / (height of ambiguity "
+          f"{ifg['height_of_ambiguity']:.3f} m) = {want:.3f}; coherence {ifg['median']:.3f}")
+    assert ifg['product'] == 'interferogram' and ifg['image'].dtype == np.float32
+    assert np.abs(ifg['image']).max() <= np.pi + 1e-5
+    assert abs(ifg['height_of_ambiguity'] / cs['height_of_ambiguity'] - 1) < 0.01 and abs(step(ifg) - want) < 0.05
+    assert abs(ifg['height_per_radian'] * 2 * np.pi - ifg['height_of_ambiguity']) < 1e-9 and not ifg['topography']
+    assert abs(ifg['displacement_per_radian'] - ifg['wavelength'] / (4 * np.pi)) < 1e-12
+    assert 0.03 < ifg['wavelength'] < 0.032
+    assert abs(float(np.median(ifg['coherence'][24:-24, 24:-24])) - pairs.true) < 0.02 and ifg['floor']['median'] < 0.45
+    E, N, U = sim.enu_axes(LAT, LON)
+    c0 = io.geodetic_to_ecf(LAT, LON, H0)
+
+    def dem(lat, lon):
+        return H0 + np.where((io.geodetic_to_ecf(lat, lon, np.full(np.shape(lat), H0)) - c0) @ E > 0, STEP, 0.0)
+    flat = stack.interferogram(a, b, fringe=False, dem=dem)
+    print(f"with the surface removed: step {step(flat):.3f} rad, phase scatter {flat['phase_std']:.3f} rad "
+          f"({ifg['phase_std']:.3f})")
+    assert abs(step(flat)) < 0.05 and flat['phase_std'] < 0.2 < ifg['phase_std'] and flat['topography']
+    # one linear fringe: found and removed
+    i = np.arange(a['image'].shape[0])[:, None]
+    tilted = dict(b, image=(b['image'] * np.exp(2j * np.pi * 0.013 * i)).astype(np.complex64))
+    t = stack.interferogram(a, tilted, dem=dem)
+    assert t['fringe_found'] and abs(t['fringe'][0] + 0.013) < 2e-4 and abs(t['fringe'][1]) < 2e-4
+    assert abs(t['fringe_per_km'][0] - t['fringe'][0] / 0.4 * 1e3) < 1e-6 and t['phase_std'] < 0.25
+    need('rasterio')
+    import rasterio
+    r = fastsar.process_stack(pairs.gr, str(tmp_path / 'ifg.tif'), product='interferogram', grid=pairs.grid,
+                              backend='cpu', dem=dem)
+    assert r['product'] == 'interferogram' and abs(r['height_of_ambiguity'] / ifg['height_of_ambiguity'] - 1) < 0.01
+    assert r['topography'] and r['phase_std'] < 0.25 and r['support']['trimmed']
+    with rasterio.open(tmp_path / 'ifg.tif') as src:
+        assert src.count == 2 and np.array_equal(src.read(1), r['image'])
+        assert np.array_equal(src.read(2), r['coherence'])
+    with pytest.raises(ValueError, match='not on one grid'):
+        stack.interferogram(a, dict(b, spx=0.5))
+
+
+def test_coherent_sum(pairs, clutter, tmp_path, need):
+    """Two images of one scene with independent noise: the sum gains 3 dB of signal-to-noise ratio, an incoherent
+    pair's nothing."""
+    outs = [fastsar.form_cphd(p, grid=pairs.grid, backend='cpu') for p in pairs.sum]
+    s = stack.coherent_sum(outs[0], outs[1], dark=0.2)
+    g = s['gain']
+    print(f"coherent sum: signal {g['signal']:+.2f} dB, noise {g['noise']:+.2f} dB, signal to noise {g['snr']:+.2f} dB "
+          f"({g['expected']:.2f} for the coherence {g['coherence']:.3f})")
+    assert s['product'] == 'coherent_sum' and s['image'].dtype == np.complex64 and not s['baseband']
+    assert abs(g['signal'] - 6.0) < 0.1 and abs(g['noise'] - 3.01) < 0.2 and abs(g['snr'] - 3.0) < 0.2
+    assert abs(g['snr'] - g['expected']) < 0.2 and abs(g['incoherent'] - 3.01) < 0.05 and g['coherence'] > 0.97
+    assert abs(g['second'] - g['snr']) < 0.15                          # equal noise: the same against either image
+    assert abs(s['amplitude_factor'] - 1) < 0.03 and s['window'] == outs[0]['window']
+    twice = stack.coherent_sum(outs[0], outs[0])
+    assert np.allclose(twice['image'], 2 * outs[0]['image'], rtol=1e-4, atol=1e-4 * np.abs(outs[0]['image']).max())
+    inc = stack.coherent_sum(clutter[0], clutter[2])['gain']
+    print(f"an incoherent pair: signal to noise {inc['snr']:+.2f} dB")
+    assert inc['snr'] < 1.2 and inc['coherence'] < 0.6                 # what choosing the tenth by its coherence leaves
+    need('sarpy')
+    f = tmp_path / 'sum.nitf'
+    r = fastsar.process_stack(pairs.sum, str(f), product='coherent_sum', grid=pairs.grid, backend='cpu')
+    m = r['metadata']
+    # the darkest hundredth of an image this small is a few windows: a loose bound on the gain measured there
+    assert r['image'].dtype == np.complex64 and 1.5 < r['gain']['snr'] < 4.5 and abs(r['gain']['signal'] - 6.0) < 0.1
+    assert m.ProductCreation.ProductType == 'Multi-image coherent sum'
+    ext = {e.attrib['name']: e.text for e in m.element.iter() if e.tag.endswith('ProductCreationExtension')}
+    assert ext['NumberOfCollections'] == '2' and 'dB' in ext['SignalToNoiseGain'] and 'phase' in ext['Combination']
+    sd, pix = read_sidd(f)
+    assert len(sd.ExploitationFeatures.Collections) == 2 and pix.dtype == np.uint8
+    assert np.array_equal(pix, fastsar.sidd.to_display(r, 'nrl'))
+
+
+def test_register_coherent(clutter):
+    """A displacement of a tenth of a pixel, found on the complex images."""
+    a, b = clutter[0], clutter[1]
+    moved = stack.shift_image(b, (0.12 * 0.4, -0.08 * 0.4))
+    det = stack.register([a, moved], apply=None)[1]['registration']
+    reg = stack.register([a, moved], coherent=True)
+    r = reg[1]['registration']
+    co = r['coherent']
+    err = np.hypot(r['shift_px'][0] + 0.12, r['shift_px'][1] - 0.08)
+    print(f"displaced by (0.12, -0.08) pixels: detected images {np.round(det['shift_px'], 3)}, complex "
+          f"{np.round(r['shift_px'], 3)} on {co['tiles_used']} tiles of correlation {co['quality']:.2f}, gain {co['gain']:.4f}")
+    assert co['found'] and co['tiles_used'] >= 4 and err < 0.02 and co['gain'] >= 1 - 1e-6 and co['quality'] > 0.8
+    assert np.allclose(r['detected_px'], det['shift_px'], atol=1e-6) and co['residual_px'] < 0.05
+    assert np.allclose(np.add(r['detected_px'], co['delta_px']), r['shift_px'], atol=1e-9)
+    c = (slice(24, -24),) * 2
+    back = stack.coherence(reg[0], reg[1])
+    assert abs(float(np.median(back['image'][c])) - 1 / np.sqrt(1 + 1 / SNR)) < 0.015
+    # an incoherent pair has no coherent tiles: the detected translation stays (here there is none to find either)
+    inc = stack.register([a, clutter[2]], coherent=True)[1]['registration']
+    assert not inc['found'] or not inc['coherent']['found']
+
+
+def test_fringe_is_not_fitted_to_noise(clutter):
+    """A tile takes its own fringe only where it has one."""
+    a, b, other = clutter[0], clutter[1], clutter[2]
+    inc = stack.coherence(a, other, tile=64, common_band=False)
+    assert not inc['fringes_found'].any() and not np.any(inc['fringes']) and inc['fringe'] == (0.0, 0.0)
+    i = np.arange(a['image'].shape[0])[:, None]
+    tilted = dict(b, image=(b['image'] * np.exp(2j * np.pi * 0.04 * i)).astype(np.complex64))
+    coh = stack.coherence(a, tilted, tile=64)
+    assert coh['fringes_found'].all() and np.abs(coh['fringes'][:, 0] + 0.04).max() < 2e-3
+    assert abs(coh['fringe'][0] + 0.04) < 2e-4
+    # a steep fringe in a large interferogram (found on parts first, so that averaging does not alias it), and none
+    rng = np.random.default_rng(2)
+    n = 700
+    noise = lambda: (rng.standard_normal((n, n)) + 1j * rng.standard_normal((n, n))).astype(np.complex64)
+    ii, jj = np.arange(n)[:, None], np.arange(n)[None, :]
+    f, z, thr = stack._fringe(np.exp(2j * np.pi * (0.1103 * ii - 0.0711 * jj)).astype(np.complex64) + 3 * noise())
+    assert z > thr and abs(f[0] - 0.1103) < 2e-5 and abs(f[1] + 0.0711) < 2e-5
+    f, z, thr = stack._fringe(noise())
+    assert z < thr
+
+
 def test_baseline_from_the_files(scene):
     b = stack.baseline(scene.paths[0], scene.paths[1])
     assert b['inside'] and b['overlap'] > 0.9 and abs(b['d_graze']) < 0.03 and abs(b['days'] - 3.0) < 1e-6
@@ -455,11 +711,15 @@ def test_process_stack_default_grid_and_pairs(scene, registered, tmp_path, need)
     # the pair is formed from the pulses on one interval of azimuth; with each collection's own aperture it is
     # the coherence of the two images registered above
     own = fastsar.process_stack(scene.paths[:2], product='coherence', grid=scene.grid, aperture='square', backend='cpu')
-    ref = stack.coherence(registered[0], registered[1], 7)
+    both = stack.register([fastsar.form_cphd(p, grid=scene.grid, backend='cpu') for p in scene.paths[:2]],
+                          coherent=True)
+    ref = stack.coherence(both[0], both[1], 7)
     assert c['product'] == 'coherence' and np.allclose(own['image'], ref['image'], atol=2e-3) and c['median'] > 0.9
-    assert any('one interval of azimuth' in n for n in c['notes']) and min(c['overlap']) > 0.99
-    assert c['median'] >= own['median'] - 0.005 and c['inputs'][0]['pulses'] != own['inputs'][0]['pulses'] or \
-        c['inputs'][1]['pulses'] != own['inputs'][1]['pulses']
+    assert any('common support' in n for n in c['notes']) and min(c['overlap']) > 0.99
+    assert c['support']['trimmed'] and not own['support']['trimmed'] and c['baseline']['inside']
+    assert c['median'] >= own['median'] - 0.005 and tuple(c['inputs'][0]['pulses']) == tuple(c['support']['pulses'][0])
+    reg = c['registrations'][1]
+    assert reg['coherent']['found'] and np.hypot(*np.subtract(reg['shift_px'], reg['detected_px'])) < 0.1
     with rasterio.open(tmp_path / 'coh.tif') as src:
         assert src.count == 1 and src.crs.to_epsg() == 32618 and not c['metadata']['resampled']
         assert np.array_equal(src.read(1), c['image'])
@@ -473,6 +733,7 @@ def test_process_stack_default_grid_and_pairs(scene, registered, tmp_path, need)
     with rasterio.open(tmp_path / 'ch.tif') as src:
         assert src.count == 2 and np.array_equal(src.read(1), ch['coherence']) and np.array_equal(src.read(2), ch['image'])
     for kw, msg in ((dict(product='coherence'), 'two collections'), (dict(product='ratio'), 'product must be'),
+                    (dict(product='mean', dem=lambda la, lo: la), 'dem='),
                     (dict(reference=7), 'reference'), (dict(grid=scene.grid, spacing=0.5), 'grid= gives'),
                     (dict(register='affine'), 'register must be'), (dict(weights=[1.0]), 'weights')):
         with pytest.raises(ValueError, match=msg):
@@ -513,3 +774,17 @@ def test_process_stack_devices(scene, backend, request):
     assert _xp.kind(m['image']) == kind
     assert np.allclose(_xp.host(m['image']), stack.mean(cpu)['image'], rtol=5e-3, atol=1e-3 * float(m['image'].max()))
     assert _xp.kind(stack.coherence(dev[0], dev[1])['image']) == kind
+    # a coherent pair where the images live: the same numbers as on the host
+    both = stack.register([dict(q, image=_xp.device(q['image'], backend)) for q in host], coherent=True)
+    cref = stack.register(host, coherent=True)
+    assert np.allclose(both[1]['registration']['shift_px'], cref[1]['registration']['shift_px'], atol=0.01)
+    for fn, key in ((stack.interferogram, 'coherence'), (stack.coherent_sum, 'image'), (stack.change, 'allowed')):
+        d, h = fn(both[0], both[1]), fn(cref[0], cref[1])
+        assert _xp.kind(d['image']) == kind and _xp.kind(d[key]) == kind
+        e = np.abs(_xp.host(d[key])[c] - h[key][c])
+        assert np.median(e) < 2e-3 * np.abs(h[key][c]).max(), fn.__name__
+    oi = fastsar.process_stack(pair, product='interferogram', grid=g, backend=backend)
+    ri = fastsar.process_stack(pair, product='interferogram', grid=g, backend='cpu')
+    assert isinstance(oi['image'], np.ndarray) and abs(oi['median'] - ri['median']) < 0.01
+    assert abs(fastsar.process_stack(pair, product='coherent_sum', grid=g, backend=backend)['gain']['signal']
+               - fastsar.process_stack(pair, product='coherent_sum', grid=g, backend='cpu')['gain']['signal']) < 0.05
