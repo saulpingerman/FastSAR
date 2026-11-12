@@ -77,13 +77,21 @@ autofocus, sidelobe weighting and the display remap as options
 ([product-options.md](https://github.com/saulpingerman/FastSAR/blob/main/docs/product-options.md)):
 
 ```python
-fastsar.process_cphd('scene_CPHD.cphd', 'scene_SICD.nitf')                   # slant-plane SICD, autofocused
+fastsar.process_cphd('scene_CPHD.cphd', 'scene_SICD.nitf')                   # ground-plane SICD: the image as
+                                                                             # formed, unweighted, autofocused
+fastsar.process_cphd('scene_CPHD.cphd', 'slant.nitf', plane='slant')         # slant-plane SICD, as most
+                                                                             # producers deliver
 fastsar.process_cphd('scene_CPHD.cphd', 'scene_SIDD.nitf', product='sidd')   # ground-plane SIDD: apodized, NRL
                                                                              # remap, shadows down
 fastsar.process_cphd('scene_CPHD.cphd', 'wide.nitf', product='sidd', area='black')   # out to a signal-to-noise
                                                                                      # ratio of 1
 ```
 
+The default SICD is on the ground plane (`Grid.Type` PLANE, `Grid.ImagePlane` GROUND, rows along ground range away
+from the radar, the view from above), because that is the plane FastSAR forms on: exact for any track, and one
+resampling fewer. Most producers deliver slant-plane SICDs, and a tool that assumes one without reading
+`Grid.ImagePlane` needs `plane='slant'`
+([what to check](https://github.com/saulpingerman/FastSAR/blob/main/docs/product-options.md#the-ground-plane-sicd-the-default)).
 Every stage after formation runs where the image lives, on the CPU, an Nvidia GPU or a TPU.
 
 [`examples/chain.py`](https://github.com/saulpingerman/FastSAR/blob/main/examples/chain.py) runs this chain from the command line (`--simulate` needs no data);

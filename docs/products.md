@@ -46,8 +46,9 @@ of the squared window. CPHD has no radiometric calibration; beta0 and sigma0 nee
 
 ## SICD output
 
-`write_sicd(path, out)` builds the metadata with `sicd_meta`: a PLANE grid on the ground plane or, for a
-slant-plane product of `process_cphd`, the slant plane; rows along range away from the radar and columns so that
+`write_sicd(path, out)` builds the metadata with `sicd_meta`: a PLANE grid on the ground plane (`form_cphd`'s
+images, and the default SICD of `process_cphd`) or, for a slant-plane product of `process_cphd(plane='slant')`,
+the slant plane; rows along range away from the radar and columns so that
 row x column points up (the view from above, for either look side); `AzAutofocus` GLOBAL or SV when autofocus
 ran; the aperture position as a polynomial in time and one center-of-aperture time, so
 SICD's projection is the model of `geolocate`. Impulse response parameters are nominal; there is no Radiometric

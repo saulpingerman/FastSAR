@@ -3,6 +3,22 @@
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The date of a version is the day it
 was published on PyPI.
 
+## [Unreleased]
+
+### Changed
+
+- The defaults of `process_cphd` (a change of behavior from 0.2.0). The default SICD is now on the ground plane
+  and unweighted: `plane=None` is `'ground'` for every product, and `weighting=None` is `'uniform'` for a SICD
+  (`'sva'` for a SIDD, as before). 0.2.0 wrote a slant-plane SICD with Taylor weighting, and
+  `process_cphd(cphd, output, plane='slant', weighting='taylor')` reproduces it. The ground plane is the plane
+  FastSAR forms on, so the default product is the image as formed (`Grid.Type` PLANE, `Grid.ImagePlane` GROUND,
+  rows along ground range away from the radar, the view from above); most producers deliver slant-plane SICDs,
+  and [docs/product-options.md](docs/product-options.md#the-ground-plane-sicd-the-default) lists what a consumer
+  that assumes one should check. No weighting leaves the choice of an apodization to the user of the complex
+  image. Since apodization runs on the slant plane, `process_cphd(cphd, weighting='sva')` for a SICD now raises a
+  `ValueError` unless `plane='slant'` is given. The defaults of a SIDD, of a moving-beam collection (Taylor
+  weighting in range for either product) and of `form_cphd` are unchanged.
+
 ## [0.2.0] - 2026-11-10
 
 ### Added

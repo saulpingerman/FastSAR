@@ -5,19 +5,38 @@ underneath it and keeps its own defaults.
 
 ```python
 import fastsar
-fastsar.process_cphd('scene_CPHD.cphd', 'scene_SICD.nitf')                    # complex image, slant plane
+fastsar.process_cphd('scene_CPHD.cphd', 'scene_SICD.nitf')                    # complex image, ground plane, unweighted
+fastsar.process_cphd('scene_CPHD.cphd', 'scene_SICD.nitf', plane='slant')     # complex image, slant plane
 fastsar.process_cphd('scene_CPHD.cphd', 'scene_SIDD.nitf', product='sidd')    # detected image, ground plane
 out = fastsar.process_cphd('scene_CPHD.cphd', product='sidd', area='black', remap='density')   # nothing written
 ```
+
+> **The default SICD is a ground-plane SICD.**
+>
+> FastSAR forms every spotlight image on the ground plane, and unless asked otherwise `process_cphd` writes that
+> image. The file says so: `Grid.Type` is `PLANE` and `Grid.ImagePlane` is `GROUND`. Rows run along ground range
+> away from the radar, and columns run so that the array is the view from above.
+>
+> This is less common than the alternative. Most producers deliver slant-plane SICDs (`ImagePlane` `SLANT`), and
+> `plane='slant'` gives one.
+>
+> A reader that projects pixels through the metadata (the SICD projection model, as sarpy and sarkit implement it)
+> handles both planes. Check any tool that assumes a slant plane without reading `Grid.ImagePlane`
+> ([the list is below](#the-ground-plane-sicd-the-default)).
+>
+> Ground is the default because it is the plane of formation. Backprojection onto the ground plane is exact for any
+> track, and the ground-plane product is the image as formed, where the slant-plane product is that image
+> resampled once more ([the measured comparison](#forming-on-the-ground-or-on-the-slant-plane-and-projecting)).
 
 The options and their defaults:
 
 - `product`: `'sicd'` (complex image, the default) or `'sidd'` (detected, remapped 8-bit image).
 - `area`: `'tasked'` (default), `'tasked_quality'`, an RNIIRS value, or `'black'`.
-- `plane`: `'slant'` or `'ground'`. The default is the slant plane for a SICD and the ground plane for a SIDD.
+- `plane`: `'ground'` (the default for every product) or `'slant'` (a spotlight SICD only).
 - `autofocus`: `'quadratic'` (default), `'pga'`, `'spatially_variant'`, `'spatially_variant_pga'` or `False`.
-- `weighting`: `'taylor'`, `'uniform'` or `'sva'`. The default is Taylor for a SICD and spatially variant
-  apodization for a SIDD.
+- `weighting`: `'uniform'`, `'taylor'` or `'sva'`. The default is no weighting (`'uniform'`) for a SICD, so that
+  whoever uses the complex image can still choose an apodization, and spatially variant apodization (`'sva'`) for
+  a SIDD.
 - `remap`: for a SIDD, one of the remaps of the NGA MATLAB SAR Toolbox (`'nrl'` by default).
 - `spacing`: the product's pixel spacing. The default follows the bandwidth of the data: 0.96 of the reciprocal
   of the band for a complex product, half of it with `'sva'`, and 0.7 of the finer ground resolution for a SIDD
@@ -26,20 +45,33 @@ The options and their defaults:
 - `extent`: the sides of the tasked area in meters about the scene center, for a collection that states no image
   area or in place of the one it states.
 
-Some combinations are refused with a `ValueError` before the image is formed: a SIDD on the slant plane, a
-ground-plane SICD with `'sva'` (apodization runs on the slant plane), and a `spacing` with `'sva'` for a SICD
-(apodization fixes the spacing at twice Nyquist). Without an `output` nothing is written, and the image of a SIDD
-product is returned as the detected amplitude; `sidd.to_display(out, out['remap'])` gives its display values.
+The defaults by product:
 
-A moving-beam collection (stripmap, sliding spotlight) is formed on the ground plane on axes along the track.
-The slant plane, autofocus, apodization and the quality areas apply to spotlight collections: asking for one of
-them on a moving-beam collection raises a `ValueError`.
+| `product` | `plane` | `weighting` | `autofocus` | `area` | `remap` |
+|---|---|---|---|---|---|
+| `'sicd'` | `'ground'` | `'uniform'` | `'quadratic'` | `'tasked'` | |
+| `'sidd'` | `'ground'` | `'sva'` | `'quadratic'` | `'tasked'` | `'nrl'` |
+
+FastSAR 0.2.0 wrote a slant-plane SICD with Taylor weighting by default;
+`process_cphd(cphd, output, plane='slant', weighting='taylor')` is that product.
+
+Some combinations are refused with a `ValueError` before the image is formed: a SIDD on the slant plane, a
+ground-plane SICD with `'sva'` (apodization runs on the slant plane, so an apodized SICD needs `plane='slant'`),
+and a `spacing` with `'sva'` for a SICD (apodization fixes the spacing at twice Nyquist). Without an `output`
+nothing is written, and the image of a SIDD product is returned as the detected amplitude;
+`sidd.to_display(out, out['remap'])` gives its display values.
+
+A moving-beam collection (stripmap, sliding spotlight) is formed on the ground plane on axes along the track,
+with Taylor weighting in range unless another is asked for, for a SICD as for a SIDD. The slant plane, autofocus,
+apodization and the quality areas apply to spotlight collections: asking for one of them on a moving-beam
+collection raises a `ValueError`.
 
 ## Speed
 
 The stages after formation take the image as a NumPy, CuPy or JAX array and run where it lives, so a GPU or TPU
-run keeps the image on the device from formation until the file is written. Seconds for the default products of
-two collections, from the CPHD file on disk (in the page cache) to the product file, second run:
+run keeps the image on the device from formation until the file is written. Seconds for two products of two
+collections, the slant-plane SICD with Taylor weighting (`plane='slant', weighting='taylor'`) and the default SIDD,
+from the CPHD file on disk (in the page cache) to the product file, second run:
 
 | Collection, product | Processor | Read | Form | After formation | Write | Total |
 |---|---|---|---|---|---|---|
@@ -53,8 +85,8 @@ two collections, from the CPHD file on disk (in the page cache) to the product f
 | | 48 CPU cores | 1.16 | 35.4 | 17.8 | 3.6 | 57.9 |
 
 "After formation" is the baseband step, quadratic autofocus, the resampling to the slant plane and, for the SIDD,
-apodization, detection and the projection to the ground; the SIDD's write includes the remap. The CPHD files are
-8.7 GB (Umbra) and 9.2 GB (Capella).
+apodization, detection and the projection to the ground; the SIDD's write includes the remap. The default SICD, on
+the ground plane, has no resampling stage. The CPHD files are 8.7 GB (Umbra) and 9.2 GB (Capella).
 
 The same two products on a cloud instance, for another Capella spotlight collection (2025-01-15), second run, in
 seconds:
@@ -93,8 +125,8 @@ resampling to the slant plane includes a mask of valid ground pixels.
 Each stage compiles once per image shape: 45, 28 and 110 s for the resampling to the slant plane of the three
 sizes, 8 to 14 s for the projection to the ground, and 30 to 50 s for the autofocus estimate.
 
-The default products of a small Umbra spotlight collection (a 0.64 GB CPHD file) on the same TPU v5e, second run,
-in seconds:
+The same two products of a small Umbra spotlight collection (a 0.64 GB CPHD file) on the same TPU v5e, second
+run, in seconds:
 
 | Product | Read | Form | After formation | Write | Total |
 |---|---|---|---|---|---|
@@ -107,8 +139,8 @@ The first run of each product, which compiles, takes 103 and 84 s.
 
 FastSAR forms every spotlight image on a ground plane, where backprojection is exact for any track. A planar
 slant grid is exact only for a straight track: on an orbit, the range history of a slant-plane pixel departs from
-that of the ground point it stands for, and a long aperture defocuses. The slant-plane product is therefore the
-ground image resampled.
+that of the ground point it stands for, and a long aperture defocuses. The ground-plane product, the default, is
+the image as formed. The slant-plane product is the ground image resampled.
 
 The slant plane is the plane through the scene center point that holds the antenna's position and velocity at the
 center of aperture. A pixel at azimuth a and range r shows the ground point that has, at the center of aperture,
@@ -145,10 +177,34 @@ ignores phase altogether, is 0.56). FastSAR therefore
 forms on the ground plane always, and derives the slant-plane product from it by the range and range-rate map,
 which is exact at the center of aperture for any track.
 
-A ground-plane SICD is the image as formed, at baseband, on axes along the line of sight. Its rows run along
-ground range away from the radar whatever the squint. It is sampled for the whole extent of its spectrum along
-the line of sight, which under squint is wider than the range band alone, so that the product's spectrum does not
-wrap.
+### The ground-plane SICD (the default)
+
+A ground-plane SICD is the image as formed, at baseband, on axes along the line of sight. Its metadata state
+`Grid.Type` PLANE and `Grid.ImagePlane` GROUND, and the row and column unit vectors lie in the ground plane at the
+scene center point. Its rows run along ground range away from the radar whatever the squint, and its columns run
+so that row x column points up (the view from above, for either look side). It is sampled for the whole extent of
+its spectrum along the line of sight, which under squint is wider than the range band alone, so that the product's
+spectrum does not wrap.
+
+Most producers deliver slant-plane SICDs, so software written against their products may assume one. A consumer
+of the ground-plane product should check the following.
+
+- Projection. A reader that uses the SICD projection model with the grid's own unit vectors (sarpy's
+  `point_projection`, sarkit) needs nothing: in the tests below sarpy places each target within 0.05 pixel on
+  both planes.
+- Spacings and bandwidths. `Grid.Row.SS` is a ground range spacing and `Grid.Row.ImpRespBW` a ground-plane
+  bandwidth. A tool that takes them for slant range (c / 2B for the range resolution, or a division by the cosine
+  of the grazing angle to reach the ground) applies the slant-to-ground factor twice.
+- Pixel area. A tool that derives one radiometric quantity from another through the slant-plane area of a pixel,
+  1 / (`Row.ImpRespBW` x `Col.ImpRespBW`), has the ground-plane area here.
+- Spectrum. Under squint the spectrum of the ground-plane image is a parallelogram: its extent across the line of
+  sight is the azimuth band, and its position along the line of sight shifts with the azimuth frequency. A taper
+  applied along rows and along columns separately assumes a rectangle. To apodize a squinted collection after
+  the fact, take `plane='slant'`, whose spectrum is the usual one.
+- Pairs. An interferogram or a change detection against a vendor's slant-plane image needs both on one grid:
+  `plane='slant'`, or `sicd=` with the vendor's file.
+
+`plane='slant'` gives the slant-plane SICD for any of these.
 
 In `tests/test_planes.py` and `tests/test_process.py`, on a simulated collection with a 20 to 25 degree squint
 and a curved track, flown to either side, each target falls within 0.05 pixel of the position sarpy's projection

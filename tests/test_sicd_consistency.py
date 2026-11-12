@@ -1,7 +1,7 @@
 """The SICD metadata products.sicd_meta builds, against the rules SICD sets between its fields and against sarkit's
 consistency checker (Python 3.11 or later; the rules are also asserted here without it): every product of form_cphd
-(track axes and line-of-sight axes, with and without a window) and of process_cphd (slant and ground plane; Taylor,
-uniform and SVA weighting; autofocus on and off) of simulated collections flown both ways, one of them squinted
+(track axes and line-of-sight axes, with and without a window) and of process_cphd (its default; slant and ground
+plane; Taylor, uniform and SVA weighting; autofocus on and off) of simulated collections flown both ways, one of them squinted
 past 45 degrees so that its band is off-center and wraps around the sampling rate; a collection whose first pulse
 precedes its stated start; and, when the files are on this machine, two real collections with their vendor SICDs.
 Needs sarpy only through sarkit's own dependencies."""
@@ -107,10 +107,11 @@ def test_form_cphd_products(cphd):
     assert any(seen) and not all(seen)          # bands that wrap around the sampling rate, and bands that fit
 
 
-CASES = {'slant, Taylor': {}, 'slant, uniform, no autofocus': dict(weighting='uniform', autofocus=False),
-         'slant, SVA': dict(weighting='sva'), 'ground, Taylor': dict(plane='ground'),
+CASES = {'default (ground, uniform)': {}, 'slant, Taylor': dict(plane='slant', weighting='taylor'),
+         'slant, uniform, no autofocus': dict(plane='slant', weighting='uniform', autofocus=False),
+         'slant, SVA': dict(plane='slant', weighting='sva'), 'ground, Taylor': dict(plane='ground', weighting='taylor'),
          'ground, uniform, no autofocus': dict(plane='ground', weighting='uniform', autofocus=False),
-         'slant, Taylor, phase gradient autofocus': dict(autofocus='pga')}
+         'slant, Taylor, phase gradient autofocus': dict(plane='slant', weighting='taylor', autofocus='pga')}
 
 
 def test_process_cphd_products(cphd, tmp_path):
@@ -122,12 +123,15 @@ def test_process_cphd_products(cphd, tmp_path):
         sm, a, wraps = check(out, name)
         assert sm.ImageFormation.AzAutofocus == ('GLOBAL' if out.get('autofocus') else 'NO')
         assert kw.get('autofocus') is not False or sm.ImageFormation.AzAutofocus == 'NO'
-    # as written: the file's own XML passes as the metadata did
-    f = str(tmp_path / 'p.nitf')
-    sm = fastsar.process_cphd(path, f, backend='cpu')['metadata']
+        assert sm.Grid.ImagePlane == kw.get('plane', 'ground').upper()
+        assert sm.Grid.Row.WgtType.WindowName == kw.get('weighting', 'uniform').upper()
+    # as written: the file's own XML passes as the metadata did, for the default product and a slant-plane one
     from fastsar import _sicdxml
-    back = _sicdxml.read(f)
-    assert back.to_xml_bytes() == sm.to_xml_bytes() and not sarkit_errors(back)
+    for kw in ({}, dict(plane='slant', weighting='taylor')):
+        f = str(tmp_path / 'p.nitf')
+        sm = fastsar.process_cphd(path, f, backend='cpu', **kw)['metadata']
+        back = _sicdxml.read(f)
+        assert back.to_xml_bytes() == sm.to_xml_bytes() and not sarkit_errors(back)
 
 
 def test_first_pulse_before_the_start(cphd):
@@ -165,8 +169,10 @@ def test_real_collections(name, request):
     runs = {'form_cphd, track axes': lambda: F(cphd_path, backend='cuda'),
             'form_cphd, line-of-sight axes': lambda: F(cphd_path, backend='cuda', axes='los'),
             'process_cphd': lambda: P(cphd_path, backend='cuda'),
-            'process_cphd, vendor SICD': lambda: P(cphd_path, sicd=sicd_path, backend='cuda'),
-            'process_cphd, SVA': lambda: P(cphd_path, backend='cuda', weighting='sva'),
+            'process_cphd, slant, Taylor': lambda: P(cphd_path, backend='cuda', plane='slant', weighting='taylor'),
+            'process_cphd, vendor SICD': lambda: P(cphd_path, sicd=sicd_path, backend='cuda', plane='slant',
+                                                   weighting='taylor'),
+            'process_cphd, SVA': lambda: P(cphd_path, backend='cuda', plane='slant', weighting='sva'),
             'process_cphd, ground, uniform': lambda: P(cphd_path, backend='cuda', plane='ground', weighting='uniform',
                                                        autofocus=False)}
     for what, run in runs.items():

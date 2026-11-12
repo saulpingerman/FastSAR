@@ -10,9 +10,15 @@
   precision='float32',
   shadows_down=True, nesz_db=None, scene_sigma0_db=-10.0, height=None, channel=0, troposphere=None,
   reader_options=None, target_db=-40.0)`: from a CPHD file to a SICD or SIDD
-  ([product-options.md](product-options.md)). Returns the product dict (`form_cphd`'s entries on the product's
-  grid) with `product`, `area`, `weighting`, `autofocus`, `autofocus_info`, `timing` (seconds per stage) and, when
-  written, `path` and `metadata`.
+  ([product-options.md](product-options.md)). `plane=None` is `'ground'` for every product: the default SICD is a
+  ground-plane SICD (`Grid.Type` PLANE, `Grid.ImagePlane` GROUND, rows along ground range away from the radar,
+  columns so that the array is the view from above), the image as FastSAR forms it. Most producers deliver
+  slant-plane SICDs; `plane='slant'` gives one, and a tool that assumes a slant plane without reading
+  `Grid.ImagePlane` needs it ([what to check](product-options.md#the-ground-plane-sicd-the-default)).
+  `weighting=None` is `'uniform'` for a SICD and `'sva'` for a SIDD (`'taylor'` for a moving-beam collection);
+  `autofocus=None` is `'quadratic'` for a spotlight. Returns the product dict (`form_cphd`'s entries on the
+  product's grid) with `product`, `area`, `weighting`, `autofocus`, `autofocus_info`, `timing` (seconds per stage)
+  and, when written, `path` and `metadata`.
 - `form_cphd(cphd, sicd=None, *, mode='auto', backend='auto', window=True, spacing=None, channel=0, patch=1024,
   azimuth_fraction=0.8, extent=None, height=None, precision='float32', target_db=-40.0, info=None,
   autofocus=False, troposphere=None, reader_options=None, axes='track', aperture='auto')`: the image of a CPHD file ([processing-chain.md](processing-chain.md#2-form)).

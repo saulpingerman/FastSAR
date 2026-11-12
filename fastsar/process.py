@@ -1,7 +1,19 @@
 """From a CPHD file to a product on disk, with the choices a production processor offers:
 
-    fastsar.process_cphd('scene_CPHD.cphd', 'scene_SICD.nitf')                    # complex, slant plane, autofocus
+    fastsar.process_cphd('scene_CPHD.cphd', 'scene_SICD.nitf')                    # complex, ground plane, unweighted
+    fastsar.process_cphd('scene_CPHD.cphd', 'scene_SICD.nitf', plane='slant')     # complex, slant plane
     fastsar.process_cphd('scene_CPHD.cphd', 'scene_SIDD.nitf', product='sidd')    # detected, ground plane, SVA, NRL
+
+The default SICD is a ground-plane SICD, which is less common than a slant-plane one. FastSAR forms every spotlight
+image on the ground plane, and the default product is that image: Grid.Type PLANE and Grid.ImagePlane GROUND, rows
+along ground range away from the radar, columns so that the array is the view from above. Most producers deliver
+slant-plane SICDs (ImagePlane SLANT), and plane='slant' gives one. A reader that projects pixels through the
+metadata (the SICD projection model, as sarpy and sarkit implement it) handles both planes. Check any tool that
+assumes a slant plane without reading Grid.ImagePlane: one that takes Row.SS for a slant range spacing, that
+converts to ground range itself, or that derives one radiometric scale factor from another through a slant-plane
+pixel area. Ground is the default because it is the plane of formation: backprojection onto it is exact for any
+track, and the product is the image as formed, where the slant-plane product is that image resampled once more
+(docs/product-options.md, Planes, has the measured comparison).
 
 Product. 'sicd': the complex image (SICD); 'sidd': a detected, remapped 8-bit image (SIDD), laid out shadows down.
 Area. 'tasked': the image area of the file (or of the vendor SICD given). 'tasked_quality': everything at least as
@@ -9,19 +21,27 @@ good as the tasked area; a number: everything at or above that RNIIRS; 'black': 
 ratio of at least 1 (fastsar.rgiqe: the radar generalized image quality equation on the collection's own antenna
 pattern and noise). The impulse response is the same over the whole image, the noise-equivalent sigma zero rises
 toward the edges, and pixels of the rectangular array outside the area are 0.
-Plane. 'slant' or 'ground'. The image is always formed on the ground plane, where backprojection is exact for any
-track, on axes along the line of sight; a slant-plane product is that image resampled (fastsar.planes), a
-ground-plane SICD is the image as formed, and a ground-plane SIDD is detected on the slant plane and projected.
+Plane. 'ground' (the default for every product) or 'slant' (a spotlight SICD). The image is always formed on the
+ground plane, on axes along the line of sight; a ground-plane SICD is the image as formed, a slant-plane SICD is
+that image resampled (fastsar.planes), and a SIDD is detected on the slant plane and projected to the ground.
 Autofocus. 'quadratic' (one quadratic phase error over the aperture, by map drift), 'pga', 'spatially_variant'
 or 'spatially_variant_pga' (a phase error that varies over the scene), or False (fastsar.autofocus.image_autofocus).
-Weighting. 'taylor' (nbar 4, 35 dB, on the phase history), 'uniform', or 'sva' (spatially variant apodization,
-fastsar.weighting, on the slant plane at twice Nyquist: the unweighted resolution without the sidelobes).
+Weighting. 'uniform' (none: the default for a SICD, which leaves the choice of an apodization to whoever uses the
+complex image), 'taylor' (nbar 4, 35 dB, on the phase history), or 'sva' (spatially variant apodization,
+fastsar.weighting, on the slant plane at twice Nyquist: the unweighted resolution without the sidelobes; the
+default for a SIDD, and for a SICD it needs plane='slant').
 Remap (SIDD). A name of fastsar.remap.REMAPS (the NGA MATLAB SAR Toolbox's: 'nrl', 'density', 'brighter', 'darker',
 'highcontrast', 'pedf', 'log') or a function.
 
-Defaults: the tasked area; a SICD on the slant plane with Taylor weighting and quadratic autofocus; for a SIDD the
-ground plane, spatially variant apodization and the NRL remap. A moving-beam collection (stripmap, sliding
-spotlight) is formed on the ground plane on axes along the track, without autofocus or apodization.
+Defaults, by product:
+
+    product   plane     weighting   autofocus     remap
+    'sicd'    'ground'  'uniform'   'quadratic'   -
+    'sidd'    'ground'  'sva'       'quadratic'   'nrl'
+
+and the tasked area for both. process_cphd(cphd, out, plane='slant', weighting='taylor') is the default SICD of
+FastSAR 0.2.0. A moving-beam collection (stripmap, sliding spotlight) is formed on the ground plane on axes along
+the track, with Taylor weighting in range by default for either product, and without autofocus or apodization.
 """
 import contextlib
 import time
@@ -49,10 +69,16 @@ def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None
 
     cphd: path. output: the file to write (NITF), or None to return the product without writing it.
     product: 'sicd' or 'sidd'. area: 'tasked', 'tasked_quality', an RNIIRS (number) or 'black'.
-    plane: 'slant' or 'ground'; None: slant for a SICD, ground for a SIDD (and for any moving-beam collection).
+    plane: 'ground' or 'slant'; None: 'ground', for every product. The default SICD is therefore a ground-plane
+        SICD (Grid.Type PLANE, Grid.ImagePlane GROUND: the image as formed, rows along ground range away from the
+        radar, columns so that the array is the view from above). Most producers deliver slant-plane SICDs, and
+        plane='slant' (a spotlight SICD only) gives one; a tool that assumes a slant plane without reading
+        Grid.ImagePlane needs it.
     autofocus: 'quadratic', 'pga', 'spatially_variant', 'spatially_variant_pga' or False; None: 'quadratic' for a
         spotlight, none for a moving beam.
-    weighting: 'taylor', 'uniform' or 'sva'; None: 'taylor' for a SICD, 'sva' for a SIDD ('taylor' for a moving beam).
+    weighting: 'uniform', 'taylor' or 'sva'; None: 'uniform' for a SICD (no weighting: an apodization can still be
+        applied to the complex image), 'sva' for a SIDD; 'taylor' for a moving beam, either product. 'sva' for a
+        SICD needs plane='slant'.
     remap, remap_args: the SIDD's remap and its parameters (fastsar.sidd.to_display). shadows_down: lay a SIDD out
         with range increasing down the rows (False: the grid's own layout).
     spacing: the product's pixel spacing in meters: (azimuth, range) on the slant plane, (across, along the line of
@@ -117,8 +143,8 @@ def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None
         """The formation grid, from the geometry form_cphd read: the area's bounds and the sampling its spectrum asks."""
         st['read'] = time.perf_counter()
         spot = g['mode'] == 'spotlight'
-        pl = plane or ('slant' if product == 'sicd' and spot else 'ground')
-        wt = weighting or ('sva' if product == 'sidd' and spot else 'taylor')
+        pl = plane or 'ground'
+        wt = weighting or (('sva' if product == 'sidd' else 'uniform') if spot else 'taylor')
         af = ('quadratic' if spot else False) if autofocus is None else autofocus
         if not spot:
             for name, v, ok in (('plane', pl, pl == 'ground'), ('weighting', wt, wt != 'sva'), ('autofocus', af, not af),
