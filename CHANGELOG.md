@@ -5,6 +5,23 @@ was published on PyPI.
 
 ## [Unreleased]
 
+### Added
+
+- Radiometric calibration in the SICD. `process_cphd` writes the `Radiometric` block of a spotlight SICD when the
+  CPHD file supports it, and only then: `NoiseLevel` (ABSOLUTE) and `RCSSFPoly`, `SigmaZeroSFPoly`,
+  `BetaZeroSFPoly` and `GammaZeroSFPoly`, by SICD's definitions. With `PTRef` and `PNRef` in the file both the
+  signal and the noise level are calibrated; with `PTRef` alone (Umbra) the noise level is the noise power
+  measured from the phase history, and the product's notes say so; without `PTRef` (Capella) there is no block,
+  and the notes say why. An `'sva'` product and a moving-beam collection get none. The factors follow the antenna
+  gain over the image as 2-D polynomials, since the image is not corrected for the antenna pattern, and the notes
+  state their order and residual. `out['radiometric']` holds what was written;
+  `rgiqe.calibration`, `rgiqe.reference_levels` and `rgiqe.support_area` are the pieces
+  ([docs/product-options.md](docs/product-options.md#radiometric-calibration), with the simulator's accuracy
+  and the comparison with a vendor's SICD). The step adds a `radiometry` entry to `timing`; where the noise has to
+  be measured it reads 512 pulses of the file again.
+- `sim.write_cphd(..., pt_ref=, pn_ref=, beam=)` writes the reference levels and an antenna block, and
+  `sim.beam_gain` gives the matching gain of simulated scatterers.
+
 ### Changed
 
 - The defaults of `process_cphd` (a change of behavior from 0.2.0). The default SICD is now on the ground plane

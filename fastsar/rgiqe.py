@@ -27,13 +27,18 @@ ground itself: where terrain of an ordinary brightness, black_sigma0_db (-10 dB 
 the noise and the ambiguities, that is, where the noise-equivalent sigma zero plus the ambiguity level reaches
 black_sigma0_db. The two therefore differ by the 10 dB between the references: 'black' ends where the SNR of the
 RGIQE's reference scene is about 10 dB, not 0 dB.
+
+Calibration. The same levels tie the image's pixel power to RCS and sigma zero: calibration gives the content of the
+SICD Radiometric block (the noise level and the four scale factor polynomials) for an image of a collection whose
+file states PTRef, and reference_levels says what a file states.
 """
 import os
 
 import numpy as np
 
 
-__all__ = ['rniirs', 'information_density', 'snr_to_rniirs', 'rniirs_to_snr', 'Radiometry', 'area_mask', 'area_bounds']
+__all__ = ['rniirs', 'information_density', 'snr_to_rniirs', 'rniirs_to_snr', 'Radiometry', 'area_mask', 'area_bounds',
+           'reference_levels', 'support_area', 'calibration']
 
 C = 299792458.0
 RNIIRS_FIT = (3.4761, 0.4357)          # RNIIRS = a0 + a1 log2(information density), sarpy's fit of 2022-02-01
@@ -157,6 +162,33 @@ class _Pattern:
         return g, out
 
 
+def _parameters(m, meta, ch):
+    """The Channel.Parameters entry of the channel that meta describes (by its identifier, else by index), or None."""
+    pars = getattr(getattr(m, 'Channel', None), 'Parameters', None)
+    par = _find(pars, meta.get('channel')) if meta.get('channel') is not None else None
+    if par is None:
+        par = pars[ch] if pars is not None and len(pars) > ch else None
+    return par
+
+
+def reference_levels(cphd_path, meta, channel=0):
+    """(PTRef, PNRef / BNRef) of the channel of a CPHD file that meta (read_cphd's) describes: the per-sample power
+    of a 1 m^2 point target at the scene reference point, and the noise power per sample. None for a level the file
+    does not state. A file with PTRef supports the radiometric calibration of its image (calibration); with PNRef
+    as well, its noise level needs no measurement."""
+    if hasattr(cphd_path, 'cphd_meta'):
+        r = cphd_path
+    else:
+        from .io import _open_cphd
+        r = _open_cphd(str(cphd_path))
+    par = _parameters(r.cphd_meta, meta, int(meta.get('channel_index', channel)))
+    pt = getattr(getattr(par, 'TgtRefLevel', None), 'PTRef', None)
+    nl = getattr(par, 'NoiseLevel', None)
+    pn = getattr(nl, 'PNRef', None)
+    return (None if pt is None else float(pt),
+            None if pn is None else float(pn) / float(getattr(nl, 'BNRef', None) or 1.0))
+
+
 def _sicd_meta(sicd):
     if isinstance(sicd, (str, bytes, os.PathLike)):
         from . import _sicdxml
@@ -236,11 +268,7 @@ class Radiometry:
             raise ValueError('the radiometric model needs at least two pulses')
         self.pulses_used = P
         self.ref_point = (np.asarray(meta['srp'], np.float64) - meta['origin']) @ np.asarray(meta['R']).T
-        par = _find(getattr(getattr(m, 'Channel', None), 'Parameters', None), meta.get('channel')) \
-            if meta.get('channel') is not None else None
-        if par is None:
-            pars = getattr(getattr(m, 'Channel', None), 'Parameters', None)
-            par = pars[ch] if pars is not None and len(pars) > ch else None
+        par = _parameters(m, meta, ch)
         pv = r.read_pvp_array(ch)
         names = pv.dtype.names
         v1 = par is not None and 'TOA1' in names                    # a CPHD 1.x channel
@@ -885,3 +913,127 @@ def area_bounds(rad, kind, center, e1, e2, bandwidth_area, samples, tasked=None,
     if box is not None:
         out = np.array([min(out[0], box[0]), max(out[1], box[1]), min(out[2], box[2]), max(out[3], box[3])])
     return tuple(float(v) for v in out)
+
+
+def support_area(ant, band, point):
+    """Ground-plane area (cycles^2 / m^2) of the spatial-frequency support of a spotlight image at the ground point
+    `point` [3] (local frame): pulse p at frequency f lies at (2 f / c) times the horizontal part of the unit vector
+    from the antenna (ant [P, 3]) to the point, and the support is the region these sweep over the pulses and over
+    the band (first, last frequency in Hz). This is the area the samples fill, as the calibration needs it; the
+    product of the bandwidths of its bounding rectangle is larger."""
+    u = np.asarray(point, np.float64) - np.asarray(ant, np.float64)
+    u = (u / np.linalg.norm(u, axis=1, keepdims=True))[:, :2]
+    ring = np.concatenate([2 * band[0] / C * u, 2 * band[1] / C * u[::-1]])
+    x, y = ring[:, 0], ring[:, 1]
+    return float(0.5 * abs(np.sum(x * np.roll(y, -1) - y * np.roll(x, -1))))
+
+
+def _fit_2d(u, v, f, order):
+    """Least squares in the relative error of a polynomial of the given order in each of u and v (in [-1, 1]) to the
+    positive values f: coefficients [order + 1, order + 1] in powers of u and v."""
+    cheb = np.polynomial.chebyshev
+    V = cheb.chebvander2d(u, v, [order, order])
+    c = np.linalg.lstsq(V / f[:, None], np.ones(len(f)), rcond=None)[0].reshape(order + 1, order + 1)
+    T = np.zeros((order + 1, order + 1))                           # Chebyshev to power basis, by columns
+    for k in range(order + 1):
+        p = cheb.cheb2poly(np.eye(order + 1)[k])
+        T[:len(p), k] = p
+    return T @ c @ T.T
+
+
+def calibration(rad, sicd, samples, bandwidth_area, coherent=None, noise=None, *, tasked=None, region=None,
+                tolerance_db=0.1, max_order=8):
+    """The content of the SICD Radiometric block of an image of the collection, from the collection's own levels.
+
+    rad: a Radiometry with the file's PTRef (level_source 'cphd': with its PNRef; 'cphd+measured': with the noise
+    measured from the phase history; a measurement that finds no noise leaves the noise level out). sicd: the
+    image's SICD metadata (fastsar._sicdxml.SICD), whose projection gives each pixel's ground point. samples: the
+    number of phase-history values the image sums (pulses x samples per pulse). bandwidth_area: the ground-plane
+    area of their spatial-frequency support (support_area). coherent, noise: the sum of the aperture weights over
+    the samples and the sum of their squares (both `samples` for an unweighted image, the default).
+
+    The formers sum the weighted samples without normalization. With PTRef the per-sample power of a 1 m^2 point at
+    the scene reference point, PN the noise power per sample and G(x) the two-way gain at the ground point x
+    relative to the reference point (Radiometry.gain_db: the image is not corrected for the antenna pattern), the
+    image has
+
+        peak power of a point of 1 m^2             coherent^2 PTRef G(x)
+        mean power of clutter of sigma zero 1      samples noise PTRef G(x) / bandwidth_area
+        mean power of thermal noise                noise PN
+
+    so pixel power times 1 / (coherent^2 PTRef G(x)) is RCS in m^2, and times bandwidth_area / (samples noise
+    PTRef G(x)) it is sigma zero. Beta zero is sigma zero / cos(SlopeAng) and gamma zero sigma zero / sin(GrazeAng),
+    SICD's relations, with the angles of the scene center point. The four factors are properties of the ground
+    point, the same for a ground-plane and a slant-plane image of it. Each is written as a polynomial in SICD's
+    image coordinates (meters from the scene center point along rows and along columns), a constant times one fit
+    of 1 / G(x) by least squares in the relative error on a lattice over the image; the order, the same in both
+    coordinates, is the lowest for which the fit is within tolerance_db of the model on a finer lattice, up to
+    max_order (order 8 follows a gain that falls some 30 dB over the image; where no order reaches the tolerance, the
+    one with the least error is taken and residual_db says what it is). tasked: the corners [4, 3] of the tasked area,
+    for the residual there. region: a function of lattice points [n1, n2, 3] (local) -> the mask of those to fit
+    and to judge: the pixels that hold data (default: all of them; a slant-plane image is zero beyond the ground
+    that was formed, and the polynomials mean nothing there). Points where the antenna pattern is not known are
+    left out.
+
+    -> dict(source (rad.level_source), noise_db (thermal noise power of a pixel, dB: NoisePoly, a constant; None
+    without a noise power), rcs, sigma0, beta0, gamma0 (coefficients [n + 1, n + 1], exponent of the row coordinate
+    first), order, residual_db (largest error of the fit over the region), tasked_residual_db (over the tasked
+    area, or None), gain_span_db (the range of G over the region), nesz_db (noise-equivalent sigma zero at the
+    scene center point, or None), scp, urow, ucol (the frame the polynomials are in, ECF))."""
+    from .io import ecf_to_local
+    if getattr(rad, 'pt_ref', None) is None:
+        raise ValueError('the calibration needs the PTRef of the CPHD file '
+                         f"(level_source 'cphd' or 'cphd+measured', not {rad.level_source!r})")
+    n = float(samples)
+    coherent, noise = (n if v is None else float(v) for v in (coherent, noise))
+    rows, cols = int(sicd.ImageData.NumRows), int(sicd.ImageData.NumCols)
+    r0, c0 = float(sicd.ImageData.SCPPixel.Row), float(sicd.ImageData.SCPPixel.Col)
+    ssr, ssc = float(sicd.Grid.Row.SS), float(sicd.Grid.Col.SS)
+    hx, hy = (max(abs(a), abs(b), 1.0) for a, b in ((-r0 * ssr, (rows - 1 - r0) * ssr),
+                                                    (-c0 * ssc, (cols - 1 - c0) * ssc)))
+
+    def lattice(m):
+        """m x m pixels over the image: coordinates in [-1, 1], 1 / G, and which of them count."""
+        r, c = np.meshgrid(np.linspace(0, rows - 1, m), np.linspace(0, cols - 1, m), indexing='ij')
+        pts = ecf_to_local(sicd.project_image_to_ground(np.stack([r, c], -1)), rad.meta)
+        ev = rad._evaluate(pts, clamp=True)
+        ok = np.isfinite(pts).all(-1) & ~ev['clamped'] & (ev['gain'] > 0)
+        if region is not None:
+            ok &= np.asarray(region(pts), bool)
+        inside = None if tasked is None else _in_polygon(pts[..., :2], _ring(tasked)[:, :2])
+        return ((r - r0) * ssr / hx)[ok], ((c - c0) * ssc / hy)[ok], 1.0 / ev['gain'][ok], \
+            None if inside is None else inside[ok]
+
+    u, v, f, _ = lattice(33)
+    uu, vv, ff, inside = lattice(64)                               # the fit is judged between its own nodes
+    if len(f) < 4 or len(ff) < 4:
+        raise ValueError('the antenna pattern is known at too few points of the image for a fit of the scale factors')
+    best = None
+    for order in range(0, int(max_order) + 1):
+        if (order + 1) ** 2 > len(f):
+            break
+        coef = _fit_2d(u, v, f, order)
+        p = np.polynomial.polynomial.polyval2d(uu, vv, coef)
+        err = np.abs(10 * np.log10(np.where(p > 0, p, 1e-300) / ff))
+        res = float(err.max())
+        if best is None or res < best[0]:
+            best = (res, order, coef, err)
+        if res <= tolerance_db:
+            break
+    res, order, coef, err = best
+    k = np.arange(order + 1)
+    inv_gain = coef / (hx ** k[:, None] * hy ** k[None, :])         # 1 / G in meters from the scene center point
+    rcs = 1.0 / (coherent ** 2 * rad.pt_ref)
+    sigma = float(bandwidth_area) / (n * noise * rad.pt_ref)
+    slope, graze = np.radians(float(sicd.SCPCOA.SlopeAng)), np.radians(float(sicd.SCPCOA.GrazeAng))
+    pn = rad.noise_per_sample
+    noise_db = float(10 * np.log10(noise * pn)) if pn is not None and pn > 0 else None
+    return dict(source=rad.level_source, noise_db=noise_db, rcs=rcs * inv_gain, sigma0=sigma * inv_gain,
+                beta0=sigma / np.cos(slope) * inv_gain, gamma0=sigma / np.sin(graze) * inv_gain, order=int(order),
+                residual_db=res,
+                tasked_residual_db=None if inside is None or not inside.any() else float(err[inside].max()),
+                gain_span_db=float(10 * np.log10(ff.max() / ff.min())),
+                nesz_db=None if noise_db is None else float(noise_db + 10 * np.log10(sigma * inv_gain[0, 0])),
+                scp=np.asarray(sicd.GeoData.SCP.ECF.get_array(), np.float64),
+                urow=np.asarray(sicd.Grid.Row.UVectECF.get_array(), np.float64),
+                ucol=np.asarray(sicd.Grid.Col.UVectECF.get_array(), np.float64))

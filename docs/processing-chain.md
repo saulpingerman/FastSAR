@@ -3,7 +3,8 @@
 The calls from a CPHD file to products, as [`examples/chain.py`](../examples/chain.py) runs them; signatures are in
 the [API reference](api.md). Not covered: TOA-domain CPHD, Capella's 2022 dynamic stripmap
 convention, autofocus of moving-beam mosaics, speckle filters, coregistration across grids, phase unwrapping,
-radiometric calibration.
+radiometric calibration beyond the SICD `Radiometric` block of a spotlight collection whose file states `PTRef`
+([product-options.md](product-options.md#radiometric-calibration)).
 
 ## 1. Read
 

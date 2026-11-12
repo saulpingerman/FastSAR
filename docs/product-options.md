@@ -1,7 +1,8 @@
 # Product options: area, plane, autofocus, weighting, SICD and SIDD
 
 `process_cphd` goes from a CPHD file to a product on disk in one call. `form_cphd` remains the formation step
-underneath it and keeps its own defaults.
+underneath it and keeps its own defaults. A spotlight SICD is radiometrically calibrated where the file supports
+it ([Radiometric calibration](#radiometric-calibration)).
 
 ```python
 import fastsar
@@ -197,7 +198,8 @@ of the ground-plane product should check the following.
   bandwidth. A tool that takes them for slant range (c / 2B for the range resolution, or a division by the cosine
   of the grazing angle to reach the ground) applies the slant-to-ground factor twice.
 - Pixel area. A tool that derives one radiometric quantity from another through the slant-plane area of a pixel,
-  1 / (`Row.ImpRespBW` x `Col.ImpRespBW`), has the ground-plane area here.
+  1 / (`Row.ImpRespBW` x `Col.ImpRespBW`), has the ground-plane area here. FastSAR writes all four scale factors
+  of the `Radiometric` block itself, so none needs deriving ([Radiometric calibration](#radiometric-calibration)).
 - Spectrum. Under squint the spectrum of the ground-plane image is a parallelogram: its extent across the line of
   sight is the azimuth band, and its position along the line of sight shifts with the azimuth frequency. A taper
   applied along rows and along columns separately assumes a rectangle. To apodize a squinted collection after
@@ -328,12 +330,105 @@ lo1, hi1, lo2, hi2 = rgiqe.area_bounds(rad, 'black', c, e1, e2, bw_area, samples
 - An RNIIRS threshold that needs an SNR of the reference scene below 10 dB gives an area that exceeds `'black'`
   at its default of -10 dB.
 
-`process_cphd(..., area=, black_sigma0_db=-10.0)` takes the same four kinds. The image is formed over the bounding rectangle of the area
-on the ground axes, with one impulse response everywhere and a noise-equivalent sigma zero that rises toward the
-edges, and the pixels outside the area are set to 0. For a file that describes no antenna pattern the model cannot
-predict where the signal fades, and an `area` other than `'tasked'` raises a `ValueError`. The model's beam is
-the one the file's antenna block states; where a producer's stated boresight differs from the true beam, the
-area is displaced with it.
+`process_cphd(..., area=, black_sigma0_db=-10.0)` takes the same four kinds. The image is formed over the bounding
+rectangle of the area on the ground axes, with one impulse response everywhere and a noise-equivalent sigma zero
+that rises toward the edges, and the pixels outside the area are set to 0. For a file that describes no antenna
+pattern the model cannot predict where the signal fades, and an `area` other than `'tasked'` raises a
+`ValueError`. The model's beam is the one the file's antenna block states; where a producer's stated boresight
+differs from the true beam, the area is displaced with it.
+
+## Radiometric calibration
+
+A spotlight SICD from `process_cphd` carries the SICD `Radiometric` block when the CPHD file supports it, and only
+then. The product's `notes` say which source was used or why there is no block, and `out['radiometric']` holds
+what was written (`None` without a block).
+
+| The CPHD file states | The SICD carries |
+|---|---|
+| `PTRef` and `PNRef` | `NoiseLevel` and the four scale factor polynomials: a calibrated signal and a calibrated noise level |
+| `PTRef` only (Umbra) | the same, with the noise level measured from the phase history: a calibrated signal and a measured noise level, and the note says so |
+| no `PTRef` (Capella) | no `Radiometric` block |
+
+No block is ever written from an assumed scene brightness. Two kinds of product have none whatever the file
+states: one with `weighting='sva'`, because apodization is not linear in the scene (the peak of an isolated point
+survives it, the clutter and noise levels do not, and a reader such as sarpy derives the missing factors from any
+one that is present), and one of a moving-beam collection, which the model does not cover.
+
+**What is written.** `NoiseLevel` has the type ABSOLUTE and a constant `NoisePoly`, the thermal noise power of a
+pixel in dB. `RCSSFPoly`, `SigmaZeroSFPoly`, `BetaZeroSFPoly` and `GammaZeroSFPoly` are polynomials in SICD's image
+coordinates (meters from the scene center point along rows and along columns) whose values, multiplied by pixel
+power, give RCS in m^2, sigma zero, beta zero and gamma zero.
+
+**Where the numbers come from.** FastSAR's formers sum the weighted phase history without normalization. Let
+PTRef be the per-sample power of a 1 m^2 point at the scene reference point, PN the noise power per sample
+(`PNRef / BNRef`, or the measurement), w the aperture weights of the N samples the image uses, A the ground-plane
+area of their spatial-frequency support (`rgiqe.support_area`) and G(x) the two-way antenna gain at the ground
+point x relative to the reference point, with the spreading loss (`Radiometry.gain_db`). Then
+
+```
+peak power of a point of 1 m^2             (sum w)^2 PTRef G(x)
+mean power of clutter of sigma zero 1      N sum(w^2) PTRef G(x) / A
+mean power of thermal noise                sum(w^2) PN
+
+RCSSF(x)       = 1 / ((sum w)^2 PTRef G(x))
+SigmaZeroSF(x) = A / (N sum(w^2) PTRef G(x))
+BetaZeroSF(x)  = SigmaZeroSF(x) / cos(SlopeAng)
+GammaZeroSF(x) = SigmaZeroSF(x) / sin(GrazeAng)
+NoisePoly      = 10 log10(sum(w^2) PN)
+```
+
+For `'uniform'` both sums are N; for `'taylor'` they are those of the two Taylor windows, and RCSSF / SigmaZeroSF
+is 1.52 times its unweighted value. The noise-equivalent sigma zero, the noise power times SigmaZeroSF, is
+PN A / (N PTRef G(x)) for either weighting. The baseband step, autofocus and the resampling to the slant plane do
+not change the scale, and the factors belong to the ground point: a ground-plane and a slant-plane SICD of one
+collection state the same values at the same place, each in its own coordinates.
+
+The image is not corrected for the antenna pattern (`ImageBeamComp` NO), so the factors rise toward the edges as
+1 / G(x). Each polynomial is a constant times one fit of 1 / G(x) over the image by least squares in the relative
+error, of the lowest order (the same in both coordinates, at most 8) that stays within 0.1 dB of the model on a
+lattice finer than the one fitted. The note states the order and the residual. Order 8 follows a gain that falls
+by about 30 dB over the image; where an area asked for reaches further down the beam, the residual stated is
+larger than 0.1 dB. A file with `PTRef` and no antenna pattern gets factors that follow the spreading loss alone.
+
+**For a consumer.** All four factors are written, so none needs deriving. SICD's relations between sigma zero,
+beta zero and gamma zero hold exactly, with the angles of the scene center point. The relation between RCS and
+beta zero through the area of a resolution cell, which sarpy computes as 1 / (`Row.ImpRespBW` x `Col.ImpRespBW`)
+and takes for a slant-plane area, does not carry over to a ground-plane SICD: those are ground-plane bandwidths
+there, and the bounding rectangle of a support that squint shears. Read the polynomial of the quantity wanted.
+
+**Measured.** In `tests/test_calibration.py` a simulated collection flown both ways, with an antenna beam that
+peaks off the scene center and with PTRef and PNRef in its file, is processed on both planes with both weightings,
+and the polynomials of each written file are read and evaluated by sarpy. Point targets of 0.5 to 8 m^2 come back
+within 0.07 dB of their RCS, clutter of -13 dB within 0.08 dB of its sigma zero (beta zero and gamma zero
+likewise), and the noise power within 0.03 dB of `NoisePoly`. The fits are of order 5 or 6 and follow 10 to 11 dB
+of gain to 0.04 to 0.08 dB. A unit point target and unit-variance noise through the formers give the sum of the
+weights to within 0.07 dB and the sum of their squares to 0.03 dB on both planes, with autofocus on and off: the
+formers' own accuracy, with no normalization to correct for. sarkit's consistency check passes with the block
+present (`tests/test_sicd_consistency.py`).
+
+Against the vendor's SICD of one Umbra spotlight collection (2024-09-10; PTRef, no PNRef), over the same
+ground through each file's own projection and its own block:
+
+- At the scene center the two agree: over the central 500 m the sigma zero from FastSAR's block is -8.3 dB and
+  from the vendor's -8.8 dB.
+- Away from the center they part, by -1.5 to +9.9 dB (FastSAR less vendor) over 500 m boxes within 2 km of the
+  center. The vendor's factors are constant over its image (to 0.06 dB). FastSAR's follow the gain of the file's
+  antenna block, a 0.54 degree beam whose boresight the file puts 1.5 km from the scene reference point, which
+  falls by 21 dB over the tasked rectangle (fitted at order 8 to 0.06 dB).
+- The image does not darken with that modeled gain. Over 200 m cells the vendor's sigma zero falls by 0.2 dB per
+  dB of modeled gain (correlation -0.30), where a rise of 1 dB per dB would show the roll-off. Against the modeled
+  gain mirrored through the scene center point it rises by 0.5 dB per dB (correlation +0.61). The beam of this
+  collection therefore does not lie where its antenna block, read by the conventions of the CPHD standard, puts
+  it, and until that is understood FastSAR's factors should be trusted at the scene center only. The quality
+  areas rest on the same antenna block.
+- Noise. The vendor's `NoisePoly` times its sigma zero factor is -71.5 dB, and its `theoretical_nesz_db`
+  parameter states -30.8 dB. FastSAR's noise level, measured from the phase history, gives a noise-equivalent
+  sigma zero of -24.8 dB at the scene center. The darkest 100 m cells of the image lie at -18 dB by either block,
+  an upper bound.
+
+A Capella spotlight collection (2025-03-13) states no PTRef, so its FastSAR SICD has no `Radiometric`
+block and the note says why. The vendor's SICD of that collection states a noise-equivalent sigma zero of -18.4 dB
+at its scene center point.
 
 ## Autofocus on the image
 

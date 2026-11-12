@@ -791,4 +791,4 @@ def test_given_noise_level_and_arguments():
     with pytest.raises(ValueError, match='ground grid'):
         rgiqe.area_mask(rad, X, 'black', BA, N)
     assert set(rgiqe.__all__) == {'rniirs', 'information_density', 'snr_to_rniirs', 'rniirs_to_snr', 'Radiometry',
-                                  'area_mask', 'area_bounds'}
+                                  'area_mask', 'area_bounds', 'reference_levels', 'support_area', 'calibration'}

@@ -146,14 +146,47 @@ def _reference_geometry(arp, varp, srp):
                 SlopeAngle=np.degrees(np.arccos(U @ spn)), LayoverAngle=deg(-spn @ E, -spn @ N))
 
 
+def _beam_axes(ant):
+    """The antenna's X and Y axes [Np, 3] at each pulse of a track ant [Np, 3] (simulator frame): X along the track,
+    made normal to the line of sight, and Y = boresight x X, so that X x Y is the boresight, which follows the scene
+    center (CPHD's antenna coordinate frame)."""
+    ant = np.asarray(ant, np.float64)
+    z = -ant / np.linalg.norm(ant, axis=1, keepdims=True)
+    v = np.gradient(ant, axis=0)
+    x = v - np.einsum('ij,ij->i', v, z)[:, None] * z
+    x /= np.linalg.norm(x, axis=1, keepdims=True)
+    return x, np.cross(z, x)
+
+
+def beam_gain(col, pos, beam):
+    """Two-way amplitude gain [Np, N] of the scatterers pos [N, 3] at each pulse, relative to the scene center, for
+    the antenna write_cphd(beam=) describes. beam = (a, dcx, dcy): the one-way power gain is
+    -a ((DCX - dcx)^2 + (DCY - dcy)^2) dB in the direction cosines along the antenna's axes (_beam_axes), so the beam
+    peaks dcx, dcy off the scene center; the gain includes the spreading loss (R0 / R)^2. Multiply a scatterer's
+    amplitude by it pulse by pulse, or by its mean over the pulses."""
+    a, dcx, dcy = (float(v) for v in beam)
+    ant = np.asarray(col.ant, np.float64)
+    x, y = _beam_axes(ant)
+    d = np.asarray(pos, np.float64)[None] - ant[:, None]
+    r = np.linalg.norm(d, axis=-1)
+    u = d / r[..., None]
+    ux, uy = np.einsum('pnk,pk->pn', u, x), np.einsum('pnk,pk->pn', u, y)
+    g = -a * ((ux - dcx) ** 2 + (uy - dcy) ** 2 - dcx ** 2 - dcy ** 2)
+    return 10.0 ** (0.1 * g) * (np.linalg.norm(ant, axis=1)[:, None] / r) ** 2
+
+
 def write_cphd(path, col, S, lat, lon, height=0.0, heading=0.0, speed=200.0, srp=None, scene=None, pol='VV',
-               start='2026-01-01T00:00:00.000000Z', tropo=0.0):
+               start='2026-01-01T00:00:00.000000Z', tropo=0.0, pt_ref=None, pn_ref=None, beam=None):
     """Write a simulated phase history S [Np, K] (this module's convention: compensated to the scene center, phase
     exp(-j 4 pi f dR / c)) as a monostatic frequency-domain CPHD 1.0.1 file, placed by to_ecf, with the pulses
     `speed` m/s apart in time along the track. srp: per-pulse scene reference points [Np, 3] in the simulator's
     frame for a moving beam (S compensated to them), default the scene center. scene: side (m) of the square image
     area, default the extent the collection's frequency step leaves unambiguous. tropo: the two-way troposphere
     delay (s, one value or one per pulse) written as TDTropoSRP; S should already hold it (exp(-j 2 pi f tropo)).
+    pt_ref, pn_ref: the reference levels written as TgtRefLevel.PTRef (the power per sample of a 1 m^2 point at the
+    scene center: a scatterer of RCS s then has the amplitude sqrt(s pt_ref)) and NoiseLevel.PNRef (the noise power
+    per sample, with BNRef 1); None writes neither. beam: (a, dcx, dcy) writes an antenna block with the pattern of
+    beam_gain (a spotlight: the boresight follows the scene center); S should hold that gain. None: no antenna.
     The file is written by fastsar._cphdxml.write_cphd."""
     from . import _cphdxml
     from .io import ecf_to_geodetic
@@ -184,6 +217,35 @@ def write_cphd(path, col, S, lat, lon, height=0.0, heading=0.0, speed=200.0, srp
         off += size
     fmin, fmax = col.fmin, col.fmin + (K - 1) * col.df
     poly = lambda tag, v: f'<{tag} order1="0" order2="0"><Coef exponent1="0" exponent2="0">{g(v)}</Coef></{tag}>'
+    levels = ('' if pt_ref is None else f'<TgtRefLevel><PTRef>{g(pt_ref)}</PTRef></TgtRefLevel>') + (
+        '' if pn_ref is None else f'<NoiseLevel><PNRef>{g(pn_ref)}</PNRef><BNRef>1.0</BNRef></NoiseLevel>')
+    chan_ant = antenna = ''
+    if beam is not None:
+        a_db, dcx, dcy = (float(b) for b in beam)
+        poly1 = lambda tag, c: f'<{tag} order1="{len(c) - 1}">' + ''.join(
+            f'<Coef exponent1="{i}">{g(b)}</Coef>' for i, b in enumerate(c)) + f'</{tag}>'
+        M = np.array([[np.cos(h), np.sin(h), 0.0], [-np.sin(h), np.cos(h), 0.0], [0.0, 0.0, 1.0]]).T
+        M = M @ enu_axes(lat, lon)                                  # the simulator's axes in ECF, as to_ecf
+        tm = 0.5 * (t[0] + t[-1])
+        shift = np.polynomial.Polynomial([-tm, 1.0])
+        axis = lambda tag, v: f'<{tag}>' + ''.join(poly1(k, np.polynomial.Polynomial(np.polynomial.polynomial.polyfit(
+            t - tm, (v @ M)[:, i], min(5, P - 1)))(shift).coef) for i, k in enumerate('XYZ')) + f'</{tag}>'
+        xa, ya = _beam_axes(ant)
+        gain = np.array([[0.0, 2 * a_db * dcy, -a_db], [2 * a_db * dcx, 0.0, 0.0], [-a_db, 0.0, 0.0]])
+        poly2 = lambda tag, c: f'<{tag} order1="{c.shape[0] - 1}" order2="{c.shape[1] - 1}">' + ''.join(
+            f'<Coef exponent1="{i}" exponent2="{j}">{g(c[i, j])}</Coef>' for i in range(c.shape[0])
+            for j in range(c.shape[1])) + f'</{tag}>'
+        flat = poly2('GainPoly', np.zeros((1, 1))) + poly2('PhasePoly', np.zeros((1, 1)))
+        chan_ant = ('<Antenna><TxAPCId>APC</TxAPCId><TxAPATId>PAT</TxAPATId><RcvAPCId>APC</RcvAPCId>'
+                    '<RcvAPATId>PAT</RcvAPATId></Antenna>')
+        antenna = f"""<Antenna><NumACFs>1</NumACFs><NumAPCs>1</NumAPCs><NumAntPats>1</NumAntPats>
+<AntCoordFrame><Identifier>ACF</Identifier>{axis('XAxisPoly', xa)}{axis('YAxisPoly', ya)}</AntCoordFrame>
+<AntPhaseCenter><Identifier>APC</Identifier><ACFId>ACF</ACFId>{xyz('APCXYZ', np.zeros(3))}</AntPhaseCenter>
+<AntPattern><Identifier>PAT</Identifier><FreqZero>{g(0.5 * (fmin + fmax))}</FreqZero><EBFreqShift>false</EBFreqShift>
+<MLFreqDilation>false</MLFreqDilation>{poly1('GainBSPoly', [0.0])}
+<EB>{poly1('DCXPoly', [0.0])}{poly1('DCYPoly', [0.0])}</EB>
+<Array>{poly2('GainPoly', gain)}{poly2('PhasePoly', np.zeros((1, 1)))}</Array><Elem>{flat}</Elem></AntPattern>
+</Antenna>"""
     xml = f"""<CPHD xmlns="http://api.nsgreg.nga.mil/schema/cphd/1.0.1">
 <CollectionID><CollectorName>FastSAR simulator</CollectorName><CoreName>SIMULATED</CoreName><CollectType>MONOSTATIC</CollectType>
 <RadarMode><ModeType>{'SPOTLIGHT' if not np.any(srp) else 'STRIPMAP'}</ModeType></RadarMode><Classification>UNCLASSIFIED</Classification><ReleaseInfo>UNRESTRICTED</ReleaseInfo></CollectionID>
@@ -198,14 +260,14 @@ def write_cphd(path, col, S, lat, lon, height=0.0, heading=0.0, speed=200.0, srp
 <Channel><RefChId>{pol}</RefChId><FXFixedCPHD>true</FXFixedCPHD><TOAFixedCPHD>true</TOAFixedCPHD><SRPFixedCPHD>{'false' if np.any(srp) else 'true'}</SRPFixedCPHD>
 <Parameters><Identifier>{pol}</Identifier><RefVectorIndex>{m}</RefVectorIndex><FXFixed>true</FXFixed><TOAFixed>true</TOAFixed><SRPFixed>{'false' if np.any(srp) else 'true'}</SRPFixed>
 <Polarization><TxPol>{pol[0]}</TxPol><RcvPol>{pol[1]}</RcvPol></Polarization><FxC>{g(0.5 * (fmin + fmax))}</FxC><FxBW>{g(fmax - fmin)}</FxBW><TOASaved>{g(0.9 / col.df)}</TOASaved>
-<DwellTimes><CODId>COD</CODId><DwellId>DWELL</DwellId></DwellTimes></Parameters></Channel>
+<DwellTimes><CODId>COD</CODId><DwellId>DWELL</DwellId></DwellTimes>{chan_ant}{levels}</Parameters></Channel>
 <PVP>{''.join(pvp)}</PVP>
 <Dwell><NumCODTimes>1</NumCODTimes><CODTime><Identifier>COD</Identifier>{poly('CODTimePoly', 0.5 * (t[0] + t[-1]))}</CODTime>
 <NumDwellTimes>1</NumDwellTimes><DwellTime><Identifier>DWELL</Identifier>{poly('DwellTimePoly', t[-1] - t[0])}</DwellTime></Dwell>
 <ReferenceGeometry><SRP>{xyz('ECF', sr[m])}{xyz('IAC', (sr[m] - s0) @ np.stack([ux, uy, U]).T)}</SRP><ReferenceTime>{g(t[m] + rng[m] / C)}</ReferenceTime>
 <SRPCODTime>{g(0.5 * (t[0] + t[-1]))}</SRPCODTime><SRPDwellTime>{g(t[-1] - t[0])}</SRPDwellTime><Monostatic>{xyz('ARPPos', tx[m])}{xyz('ARPVel', vel[m])}
 <SideOfTrack>{geom.pop('SideOfTrack')}</SideOfTrack>{''.join(f'<{k}>{g(v)}</{k}>' for k, v in geom.items())}</Monostatic></ReferenceGeometry>
-</CPHD>"""
+{antenna}</CPHD>"""
     v = np.zeros(P, _cphdxml.pvp_dtype(_cphdxml.ET.fromstring(xml).find('{http://api.nsgreg.nga.mil/schema/cphd/1.0.1}PVP'),
                                        8 * off))
     v['TxTime'], v['TxPos'], v['TxVel'] = t, tx, vel

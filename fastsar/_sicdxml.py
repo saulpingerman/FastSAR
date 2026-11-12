@@ -10,7 +10,8 @@
 What implements what (NGA.STND.0024, SICD Volumes 1 to 3, version 1.3.0):
 - build and the element order tables: the XML structure of Volume 1 (Design and Implementation Description),
   for the blocks a backprojected product on a plane carries (CollectionInfo, ImageCreation, ImageData, GeoData, Grid,
-  Timeline, Position, RadarCollection, ImageFormation, SCPCOA).
+  Timeline, Position, RadarCollection, ImageFormation, SCPCOA), and radiometric: the Radiometric block (the noise
+  level and the scale factor polynomials that turn pixel power into RCS, sigma zero, beta zero and gamma zero).
 - derive: the fields Volume 1 defines as functions of others: GeoData.SCP.LLH, the SCPCOA block (the aperture
   reference point's position, velocity and acceleration at the scene center point's center of aperture time; slant
   and ground range; Doppler cone, graze, incidence, twist, slope, azimuth and layover angles; side of track), the
@@ -396,6 +397,21 @@ def derive_corners(sm):
         ET.SubElement(icp, 'Lon').text = text(float(p[1]))
     insert(sm.element.find('GeoData'), c)
     return sm
+
+
+def radiometric(cal):
+    """The Radiometric element of a calibrated image. cal: dict(noise_db (the thermal noise power of a pixel in dB,
+    written as an ABSOLUTE NoiseLevel with a constant NoisePoly; None: no NoiseLevel), rcs, sigma0, beta0, gamma0
+    (coefficients [n1, n2] of the polynomials in the row and the column coordinate, m from the scene center point,
+    whose values times pixel power are RCS in m^2, sigma zero, beta zero and gamma zero)): fastsar.rgiqe.calibration's
+    dict."""
+    kids = []
+    if cal.get('noise_db') is not None:
+        kids.append(el('NoiseLevel', [el('NoiseLevelType', 'ABSOLUTE'), poly('NoisePoly', [[float(cal['noise_db'])]])]))
+    for tag, key in (('RCSSFPoly', 'rcs'), ('SigmaZeroSFPoly', 'sigma0'), ('BetaZeroSFPoly', 'beta0'),
+                     ('GammaZeroSFPoly', 'gamma0')):
+        kids.append(poly(tag, np.atleast_2d(np.asarray(cal[key], np.float64))))
+    return el('Radiometric', kids)
 
 
 def specification(sm):

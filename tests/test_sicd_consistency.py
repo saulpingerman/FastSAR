@@ -1,7 +1,8 @@
 """The SICD metadata products.sicd_meta builds, against the rules SICD sets between its fields and against sarkit's
 consistency checker (Python 3.11 or later; the rules are also asserted here without it): every product of form_cphd
 (track axes and line-of-sight axes, with and without a window) and of process_cphd (its default; slant and ground
-plane; Taylor, uniform and SVA weighting; autofocus on and off) of simulated collections flown both ways, one of them squinted
+plane; Taylor, uniform and SVA weighting; autofocus on and off; with the Radiometric block of a calibrated collection)
+of simulated collections flown both ways, one of them squinted
 past 45 degrees so that its band is off-center and wraps around the sampling rate; a collection whose first pulse
 precedes its stated start; and, when the files are on this machine, two real collections with their vendor SICDs.
 Needs sarpy only through sarkit's own dependencies."""
@@ -83,7 +84,9 @@ def cphd(request, tmp_path_factory):
     ant[:, 2] += -100.0 * y ** 2 + 6.0 * y
     col = dataclasses.replace(col, ant=ant[::-1].copy() if left else ant)
     path = str(tmp_path_factory.mktemp('consistency') / 'c.cphd')
-    sim.write_cphd(path, col, sim.simulate(col, TG, np.ones(len(TG))), LAT, LON, H0, heading=HEADING, scene=140.0)
+    # with reference levels and an antenna beam, so that the SICDs of process_cphd carry a Radiometric block
+    sim.write_cphd(path, col, sim.simulate(col, TG, np.ones(len(TG))), LAT, LON, H0, heading=HEADING, scene=140.0,
+                   pt_ref=1.0, pn_ref=1.0e-3, beam=(3.0e4, 2.0e-3, -3.0e-3))
     return path, request.node.callspec.id if hasattr(request.node, 'callspec') else str(squint), squint
 
 
@@ -125,6 +128,14 @@ def test_process_cphd_products(cphd, tmp_path):
         assert kw.get('autofocus') is not False or sm.ImageFormation.AzAutofocus == 'NO'
         assert sm.Grid.ImagePlane == kw.get('plane', 'ground').upper()
         assert sm.Grid.Row.WgtType.WindowName == kw.get('weighting', 'uniform').upper()
+        # the Radiometric block of every linear product, with polynomials that follow the beam, passes with the rest
+        rad = sm.Radiometric
+        assert (rad is not None) == (kw.get('weighting') != 'sva'), name
+        if rad is not None:
+            assert rad.NoiseLevel.NoiseLevelType == 'ABSOLUTE' and rad.NoiseLevel.NoisePoly.get_array().shape == (1, 1)
+            shapes = {getattr(rad, k).get_array().shape for k in ('RCSSFPoly', 'SigmaZeroSFPoly', 'BetaZeroSFPoly',
+                                                                 'GammaZeroSFPoly')}
+            assert len(shapes) == 1 and min(shapes.pop()) >= 2, name
     # as written: the file's own XML passes as the metadata did, for the default product and a slant-plane one
     from fastsar import _sicdxml
     for kw in ({}, dict(plane='slant', weighting='taylor')):
@@ -132,6 +143,7 @@ def test_process_cphd_products(cphd, tmp_path):
         sm = fastsar.process_cphd(path, f, backend='cpu', **kw)['metadata']
         back = _sicdxml.read(f)
         assert back.to_xml_bytes() == sm.to_xml_bytes() and not sarkit_errors(back)
+        assert back.Radiometric is not None and back.Radiometric.RCSSFPoly[0, 0] > 0
 
 
 def test_first_pulse_before_the_start(cphd):

@@ -17,8 +17,11 @@
   `Grid.ImagePlane` needs it ([what to check](product-options.md#the-ground-plane-sicd-the-default)).
   `weighting=None` is `'uniform'` for a SICD and `'sva'` for a SIDD (`'taylor'` for a moving-beam collection);
   `autofocus=None` is `'quadratic'` for a spotlight. Returns the product dict (`form_cphd`'s entries on the
-  product's grid) with `product`, `area`, `weighting`, `autofocus`, `autofocus_info`, `timing` (seconds per stage)
-  and, when written, `path` and `metadata`.
+  product's grid) with `product`, `area`, `weighting`, `autofocus`, `autofocus_info`, `radiometric` (a SICD's
+  calibration, the content of its `Radiometric` block, or `None` where the collection supports none; `notes` says
+  which source was used or why there is none:
+  [product-options.md](product-options.md#radiometric-calibration)), `timing` (seconds per stage) and, when
+  written, `path` and `metadata`.
 - `form_cphd(cphd, sicd=None, *, mode='auto', backend='auto', window=True, spacing=None, channel=0, patch=1024,
   azimuth_fraction=0.8, extent=None, height=None, precision='float32', target_db=-40.0, info=None,
   autofocus=False, troposphere=None, reader_options=None, axes='track', aperture='auto')`: the image of a CPHD file ([processing-chain.md](processing-chain.md#2-form)).
@@ -148,6 +151,12 @@ rasterio.
   samples, ..., black_sigma0_db=-10.0)`: `'black'` ends where a scene of `black_sigma0_db` has an SNR of 1, and the
   RNIIRS kinds keep the RGIQE's reference of 0 dB;
   `rgiqe.rniirs`, `information_density`, `snr_to_rniirs`, `rniirs_to_snr`
+- `rgiqe.calibration(rad, sicd, samples, bandwidth_area, coherent=None, noise=None, *, tasked=None, region=None,
+  tolerance_db=0.1, max_order=8)`: the content of the SICD `Radiometric` block of an image, as a dict: `noise_db`
+  (the constant of `NoisePoly`), `rcs`, `sigma0`, `beta0`, `gamma0` (polynomial coefficients in SICD's image
+  coordinates), `order`, `residual_db`, `nesz_db`, `source`. `rgiqe.reference_levels(cphd_path, meta, channel=0)`:
+  (PTRef, PNRef / BNRef) of a CPHD file, `None` for one it does not state. `rgiqe.support_area(ant, band, point)`:
+  the ground-plane area of an image's spatial-frequency support
   ([product-options.md](product-options.md#processed-area-by-image-quality)).
 - `python -m fastsar.doctor [--install] [--json]`, or `doctor.check()`: what this machine can run and the commands
   that install what is missing.
@@ -194,5 +203,7 @@ rasterio.
 
 - `quality.point_target(img, ij, d_az=1.0, d_rg=1.0, ...)`: resolution, PSLR, ISLR, peak. `quality.upsample`.
 - `sim.make_collect(...)`, `sim.simulate(col, pos, amp)` (needs finufft), `sim.simulate_brute(col, pos, amp)`.
-- `sim.write_cphd(path, col, S, lat, lon, height=0.0, heading=0.0, ...)`: a simulated collection as a CPHD 1.0.1
-  file placed on the Earth. `sim.to_ecf(points, lat, lon, height=0.0, heading=0.0)`.
+- `sim.write_cphd(path, col, S, lat, lon, height=0.0, heading=0.0, ..., pt_ref=None, pn_ref=None, beam=None)`: a
+  simulated collection as a CPHD 1.0.1 file placed on the Earth, with the reference levels PTRef and PNRef and an
+  antenna block when they are given. `sim.beam_gain(col, pos, beam)`: the two-way amplitude gain of scatterers
+  under that antenna. `sim.to_ecf(points, lat, lon, height=0.0, heading=0.0)`.
