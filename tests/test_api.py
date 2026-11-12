@@ -209,3 +209,55 @@ def test_cuda_first_level_window(wide_band, monkeypatch):
     monkeypatch.delenv('FASTSAR_CUDA_SMEM_KB')
     small = sim.make_collect(res=0.5, scene=60.0, r0=5e3)
     assert fastsar.ImageFormer(small.ant, small.fmin, small.df, small.K, **GRID, backend='cuda').range_gate is None
+
+
+@pytest.mark.cuda
+def test_cuda_range_gate_transfer(monkeypatch):
+    """The device range gate with small blocks and a stream that is behind (work queued ahead of every block):
+    every gated history is the cpu's and the same bits each time, on the default stream and on a caller's. The gate
+    first staged its blocks in two page-locked buffers that it rewrote while the asynchronous copy of the block
+    before last was still queued, and then formed an image from the wrong pulses; and a transfer that delivers
+    other samples is refused, not imaged."""
+    import cupy as cp
+    from fastsar import ffbp_cuda
+    rng = np.random.default_rng(8)
+    res, r0, K, P = 0.5, 30e3, 6000, 768
+    df = sim.C / (2 * res) / K
+    y = (np.arange(P) - (P - 1) / 2) * (r0 * sim.C / 9.6e9 / (2 * res) / P)
+    ant = np.stack([np.full(P, -r0 * np.cos(np.radians(40.0))), y, np.full(P, r0 * np.sin(np.radians(40.0)))], 1)
+    grid = dict(nx=96, ny=96, spx=0.4, spy=0.4, e1=(0.0, 1.0, 0.0), e2=(1.0, 0.0, 0.0))
+    args = (ant, 9.6e9 - (K // 2) * df, df, K)
+    S = (rng.standard_normal((P, K), np.float32) + 1j * rng.standard_normal((P, K), np.float32)).astype(np.complex64)
+    ref = fastsar.ImageFormer(*args, **grid, backend='cpu', range_gate=True)._gate(S)
+    former = fastsar.ImageFormer(*args, **grid, backend='cuda', range_gate=True)
+    monkeypatch.setattr(ffbp_cuda, 'BLOCK_BYTES', 4 << 20)           # 34 pulses a block: 23 blocks
+    heavy = cp.random.standard_normal((3000, 3000), dtype=cp.float32)
+    copy_rows = ffbp_cuda._copy_rows
+
+    def behind(dst, src, nth):                                       # the device still busy when the host moves on
+        heavy @ heavy
+        return copy_rows(dst, src, nth)
+    monkeypatch.setattr(ffbp_cuda, '_copy_rows', behind)
+    first, worst = None, -np.inf
+    for k in range(24):
+        if k % 2:
+            with cp.cuda.Stream(non_blocking=True) as stream:        # a caller that works on a stream of its own
+                out = former._gate(S)
+                stream.synchronize()
+        else:
+            out = former._gate(S)
+        out = cp.asnumpy(out)
+        first = out if first is None else first
+        worst = max(worst, rel_db(out, ref))
+        assert np.array_equal(out, first), k
+    print(f'cuda range gate, 24 times in 23 blocks behind a busy stream: at worst {worst:.1f} dB from the cpu gate')
+    assert worst < -90
+    img, cpu = former(S), fastsar.ImageFormer(*args, **grid, backend='cpu', range_gate=True)(S)
+    assert rel_db(img, cpu) < -55
+    # the check across the transfer: a block that arrives as other samples
+    def torn(dst, src):
+        dst.data.copy_from_host(src.ctypes.data, src.nbytes)
+        dst[-1] = dst[0]                                              # a pulse of another place in the block
+    monkeypatch.setattr(ffbp_cuda, '_to_device_now', torn)
+    with pytest.raises(RuntimeError, match='did not reach the GPU'):
+        former(S)

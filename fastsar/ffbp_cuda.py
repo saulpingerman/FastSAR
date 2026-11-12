@@ -745,12 +745,37 @@ def _upload_planes(S, pre, pim, win, check, scaled, scale=None):
     return scale
 
 
+def _to_device_now(dst, src):
+    """The C-contiguous host array src copied into the C-contiguous device array dst, complete when this returns:
+    the work queued on the current stream is waited for (dst may be a block of the pool that a queued kernel still
+    writes), then the copy is synchronous. src may be rewritten or freed at once. cupy.asarray and ndarray.set read
+    a page-locked source asynchronously, after they return (CuPy leaves the ordering to the caller): a staging
+    buffer rewritten for the next block before the stream had reached the copy of the last put the next block's
+    pulses in both places."""
+    cp.cuda.get_current_stream().synchronize()
+    dst.data.copy_from_host(src.ctypes.data, src.nbytes)
+
+
+def _row_check(x, stride):
+    """A position-weighted sum of every stride-th sample of the rows of x [r, K] (host or device), complex128:
+    equal on both sides of a transfer that delivered the block."""
+    xp = cp.get_array_module(x)
+    w = xp.arange(1, x.shape[0] + 1, dtype=xp.float64)
+    return (x[:, ::stride].sum(axis=1, dtype=xp.complex128) * w).sum()
+
+
 def range_gate(S, g, win=None):
     """S [P, K] complex (host or device) gated in range on the device in pulse blocks (g: api._gate_plan): windowed
     (win: (wp [P], wk [K]) or None), checked for non-finite samples (ValueError), padded to the guard, inverse
     transformed along frequency, the bins about the reference range transformed back, cut to the band and its
-    guards and tapered -> [P, K'] complex64 on the device. A host history crosses in blocks through two pinned
-    staging buffers, each rewritten only once its last transfer is complete."""
+    guards and tapered -> [P, K'] complex64 on the device.
+
+    A host history crosses in blocks through one page-locked staging buffer by synchronous copies
+    (_to_device_now): the buffer is read only inside the copy and is free when it returns, so the next block may
+    be written into it whatever the device is doing (the host fills it while the device transforms the block
+    before). Each block is also checked across the transfer: a weighted sum of a subsample of its rows, taken on
+    the host from the history itself and on the device from what arrived, must agree (RuntimeError otherwise: a
+    wrong image is not returned)."""
     P, K = S.shape
     npl, Kp, N, k0, k1 = g['npl'], g['Kp'], g['N'], g['k0'], g['k1']
     h = N // 2
@@ -762,20 +787,23 @@ def range_gate(S, g, win=None):
         wpd, wkd = cp.asarray(win[0], cp.float32)[:, None], cp.asarray(win[1], cp.float32)[None, :]
     if host:
         from .patches import _ncpu
-        bufs = [memory._pinned(nb * K * 8) for _ in range(2)]
-        stg = [np.frombuffer(b, np.complex64, nb * K).reshape(nb, K) for b in bufs]
+        buf = memory._pinned(nb * K * 8)                    # owned by this call until it returns
+        stg = np.frombuffer(buf, np.complex64, nb * K).reshape(nb, K)
         nth = max(1, min(8, _ncpu() - 1))
-    sums, done = [], [None, None]
-    for n, i in enumerate(range(0, P, nb)):
+        stride = max(1, K // 509)
+    sums, sent, got, scale = [], [], [], []
+    for i in range(0, P, nb):
         r = min(nb, P - i)
         z = cp.zeros((r, Kp), cp.complex64)
         if host:
-            if done[n % 2] is not None:
-                done[n % 2].synchronize()                                         # the buffer's last transfer is complete
-            _copy_rows(stg[n % 2][:r], S[i:i + r], nth)
-            z[:, npl:npl + K] = cp.asarray(stg[n % 2][:r])                        # asynchronous from pinned memory
-            done[n % 2] = cp.cuda.Event()
-            done[n % 2].record()
+            _copy_rows(stg[:r], S[i:i + r], nth)
+            b = cp.empty((r, K), cp.complex64)
+            _to_device_now(b, stg[:r])
+            sent.append(_row_check(S[i:i + r], stride))
+            scale.append(float(np.abs(S[i:i + r, ::stride]).sum(dtype=np.float64)) * r)
+            got.append(_row_check(b, stride))
+            z[:, npl:npl + K] = b
+            del b
         else:
             z[:, npl:npl + K] = S[i:i + r]
         if win is not None:
@@ -787,11 +815,17 @@ def range_gate(S, g, win=None):
         del q
         cp.multiply(u[:, k0:k1], T, out=out[i:i + r])
         del u
-    cp.cuda.get_current_stream().synchronize()                                    # before the staging buffers go back
     if not np.isfinite(complex(cp.stack(sums).sum())):
         bad = next(i for n, i in enumerate(range(0, P, nb)) if not np.isfinite(complex(sums[n])))
         raise ValueError(f'phase history has non-finite samples (NaN or inf), in pulses {bad} to {min(P, bad + nb) - 1}; '
                          'zero them (S[~np.isfinite(S)] = 0) or drop the pulses')
+    if host:
+        got = cp.asnumpy(cp.stack(got))
+        for n, i in enumerate(range(0, P, nb)):
+            if not abs(got[n] - sent[n]) <= 1e-6 * scale[n]:
+                raise RuntimeError(f'cuda range gate: pulses {i} to {min(P, i + nb) - 1} did not reach the GPU as they are on '
+                                   f'the host (check sums {sent[n]:.6g} sent, {got[n]:.6g} received): no image is formed '
+                                   'from them. Please report this; range_gate=False or another backend avoids the gate')
     return out
 
 

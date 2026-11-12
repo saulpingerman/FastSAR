@@ -138,6 +138,32 @@ def test_sicd_against_sarpy(scene, monkeypatch):
         _nitf.write_sicd(path, np.abs(scene.a), scene.sicd_xml)
 
 
+def test_map_closes_while_a_worker_keeps_its_task(scene, monkeypatch):
+    """A worker of the row pool keeps its last task for a moment after the task's result is in. The file's memory
+    map must close all the same (a view of it held by the task raised BufferError on a loaded host), and the
+    pixels must be in the file."""
+    from fastsar import patches
+    kept, rows = [], patches._rows
+
+    def keeping(fn, n, chunk=256):                                    # the task outlives the call, as in a worker
+        kept.append(fn)
+        return rows(fn, n, chunk)
+    monkeypatch.setattr(patches, '_rows', keeping)
+    path = scene.tmp / 'kept.nitf'
+    n = _nitf.write_sicd(path, scene.a, scene.sicd_xml)
+    assert kept and n == path.stat().st_size
+    monkeypatch.undo()
+    f = _nitf.read(path)
+    assert np.array_equal(f.pixels(native=True), scene.a) and f.xml('SICD') == [scene.sicd_xml]
+    _nitf.write_sicd(scene.tmp / 'plain.nitf', scene.a, scene.sicd_xml)
+    assert np.array_equal(_nitf.read(scene.tmp / 'plain.nitf').pixels(), f.pixels())
+    path = scene.tmp / 'kept_sidd.nitf'
+    monkeypatch.setattr(patches, '_rows', keeping)
+    _nitf.write_sidd(path, scene.d, [(scene.sidd_xml, 'SIDD', SIDD_SPEC)])
+    monkeypatch.undo()
+    assert np.array_equal(_nitf.read(path).pixels(native=True), scene.d)
+
+
 def test_sidd_against_sarpy(scene):
     """One SIDD (with its SICD) written by sarpy and here."""
     from sarpy.io.product.converter import open_product

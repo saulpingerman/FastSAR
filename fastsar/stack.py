@@ -1228,9 +1228,9 @@ def _on_device(image, backend, notes):
                          f'({need / 1e9:.1f} GB): they ran on the host')
             return image
         import cupy
-        dev = cupy.asarray(image)
-        cupy.cuda.Stream.null.synchronize()                          # the former's page-locked image may be given up now
-        return dev
+        # a synchronous copy: the former's image is page-locked memory, which cupy.asarray reads after it returns,
+        # and the image is given up (and its block reused) as soon as this returns
+        return cupy.asarray(image, blocking=True)
     if backend in ('jax', 'tpu'):
         budget = _xp.jax_budget()
         if budget is not None and not memory.cuda_plan(dict(ground=need), budget, joined=True)['fits']:

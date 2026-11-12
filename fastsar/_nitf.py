@@ -485,8 +485,14 @@ def _write_pixels(fd, offset, a, dtype, mm=None):
     chunk = _chunk(row_bytes)
     cast = 'unsafe' if a.dtype.kind == dtype.kind else 'same_kind'
     if mm is not None and rows:
-        dst = np.frombuffer(mm, dtype, int(np.prod(a.shape, dtype=np.int64)), offset).reshape(a.shape)
-        _rows(lambda sl: np.copyto(dst[sl], a[sl], casting=cast), rows, chunk)
+        # the workers reach the map through a holder that is emptied once every block is written: a worker of the
+        # pool keeps its last task, and what the task refers to, for a moment after the task's result is in, and a
+        # view of the map alive then would keep the map from being closed (BufferError, seen on a loaded host)
+        hold = [np.frombuffer(mm, dtype, int(np.prod(a.shape, dtype=np.int64)), offset).reshape(a.shape)]
+        try:
+            _rows(lambda sl: np.copyto(hold[0][sl], a[sl], casting=cast), rows, chunk)
+        finally:
+            hold.clear()
         return
 
     def put(buf, pos):
@@ -561,12 +567,7 @@ def write(path, images, des, fields=None):
                 pos += len(s) + len(d['xml'])
         finally:
             if mm is not None:
-                try:
-                    mm.close()
-                except BufferError:
-                    # a worker of the row pool still holds its last block's view of the map for a moment after its
-                    # result is in (seen on a heavily loaded host): the map is then released with that view
-                    pass
+                mm.close()
     finally:
         os.close(fd)
     return total

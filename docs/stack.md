@@ -200,11 +200,11 @@ combination, the translations applied, whose geolocation the product has, and th
 phenomenology on the product's plane. `Measurement` carries the reference collection's aperture and time, so the
 SIDD's own projection is the reference's. sarkit's consistency check passes it (`tests/test_stack.py`).
 
-Time for the six collections (3.0 to 4.7 GB each) to the SIDD of the average, on an Nvidia RTX PRO 6000 and a
-48-core host, both shared with other jobs: 12.6 s, or 4.5 megapixels of formed image per second end to end.
-Reading took 2.4 s; windowing, the range gate and formation 7.1 s (7.9 megapixels per second); registration
-3.0 s (the detected images, 17 correlations and the translation of each image: 16 megapixels per second); the
-average with its looks 0.09 s; writing 0.05 s. The coherence of a pair to its GeoTIFF took 5.5 s, of which 0.9 s
+Time for the six collections (3.0 to 4.7 GB each) to the SIDD of the average, on an Nvidia RTX PRO 6000 shared
+with other jobs and 16 cores of the host: 14.6 s, or 3.8 megapixels of formed image per second end to end.
+Reading took 3.3 s; windowing, the range gate and formation 7.9 s (7.1 megapixels per second); registration
+3.2 s (the detected images, 17 correlations and the translation of each image: 15 megapixels per second); the
+average with its looks 0.11 s; writing 0.08 s. The coherence of a pair to its GeoTIFF took 5.5 s, of which 0.9 s
 for the common band, the coherence and its floor. With the host ten times oversubscribed the same calls took 36
 to 56 s and 20 to 29 s.
 
@@ -228,8 +228,11 @@ filter did not fit the shared memory of the GPU's kernel, and 0.2.0 refused the 
 such a history in range first: each pulse is padded by an eighth of the band on either side, transformed to
 range, cut to the bins the image spans over the aperture with a margin, and transformed back over the band and
 its guards, which are tapered to 0. `range_gate='auto'` does so where the first level would not fit, `True`
-wherever the gate keeps less than half of the samples, and `False` never; `process_stack` uses `True`. The image
-equals that of the whole history: -68 dB on a simulated collection with clutter outside the gate (cpu and cuda),
+wherever the gate keeps less than half of the samples, and `False` never; `process_stack` uses `True`. A host
+history crosses to the device block by block through one page-locked buffer by synchronous copies, so the buffer
+is free when the next block is written into it, and every block is checked across the transfer (a weighted sum
+of a subsample of its rows, on the host and on the device): a block that did not arrive as it was raises an
+error instead of entering an image. The image equals that of the whole history: -68 dB on a simulated collection with clutter outside the gate (cpu and cuda),
 and -63 dB for a 2 km image of a 76,032-sample collection on the cuda backend against the cpu backend ungated.
 
 ## Tests
