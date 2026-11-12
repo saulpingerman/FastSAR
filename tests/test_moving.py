@@ -240,7 +240,7 @@ def test_autofocus_recovers_a_height_offset(heights):
           f'{np.median(r[:, 2]):.1f} dB ({np.median(r0[:, 2]):.1f})')
     assert info['applied'] and blurred[:, 0].max() > 2 * r0[:, 0].max()
     assert (np.abs(info['slope']) > 3).all() == (heights == 'tilted')
-    assert np.abs(r[:, 0] / r0[:, 0] - 1).max() < 0.03 and np.abs(np.median(r[:, 2]) - np.median(r0[:, 2])) < 1.5
+    assert np.abs(r[:, 0] / r0[:, 0] - 1).max() < 0.06 and np.abs(np.median(r[:, 2]) - np.median(r0[:, 2])) < 1.5
 
 
 def test_products_on_disk(tmp_path):

@@ -283,13 +283,13 @@ def baseband(out, sign=-1):
         if baseband not in rj._JIT:
             rj._JIT[baseband] = jax.jit(lambda z, cs, sn: z * lax.complex(cs, sn))
         for s in rj._starts(nx, nb):
-            ph = np.empty((nb, ny), np.float64)
+            cs, sn = np.empty((nb, ny), np.float32), np.empty((nb, ny), np.float32)
 
             def work(sl):
-                ph[sl] = k * (_path(bm, tk, si, sj, o, a, b, slice(s + sl.start, s + sl.stop), ny) - F0)
+                ph = k * (_path(bm, tk, si, sj, o, a, b, slice(s + sl.start, s + sl.stop), ny) - F0)
+                cs[sl], sn[sl] = np.cos(ph), np.sin(ph)
             _rows(work, nb, int(max(1, min(64, (1 << 17) // max(ny, 1)))))
-            sink.put(s, rj._JIT[baseband](lines(s, nb), jnp.asarray(np.cos(ph).astype(np.float32)),
-                                          jnp.asarray(np.sin(ph).astype(np.float32))))
+            sink.put(s, rj._JIT[baseband](lines(s, nb), jnp.asarray(cs), jnp.asarray(sn)))
         out['image'] = sink.done()
     else:
         def work(sl):
@@ -371,17 +371,20 @@ def autofocus(img, mode='quadratic', *, band=None, footprint=None, block=None, o
     the image, and overlap by `overlap`: the pixels of a block then share at least half of their pulses.
     Estimate. Each block gives quadratic's estimate by map drift on the fraction `lines` of up to max_lines
     columns, and the columns are cut into `subsets` contiguous sets across the swath that each give their own.
-    A block is a candidate when the correlation peak of all its columns and of at least half of its sets (and
-    four) stands min_significance robust deviations above the other lags.
-    Fit. The sets' estimates of the candidates are tied together by a robust local fit: around each block's
-    center, tricube weights over `span` block steps along the track, a line along the track, across the swath a
-    linear term when it is significant ('spatially_variant': a parabola, always), and Tukey's biweight against
-    outliers. Blocks without an estimate take the fit of their neighbors.
-    Guard, as quadratic's, with the fit in place of one value. A block counts when the median of its sets lies
-    within three standard errors (from their scatter about the fit) of the fit and no more than a quarter of them
-    lie far from it (4.5 times that scatter and twice tol, the iteration's own precision); the fit is then made
-    again from the blocks that count. A block with a small estimate counts:
-    it says that its part of the strip is focused.
+    Guard, the first test, quadratic's on every block. The correlation peak of all its columns and of at least
+    half of its sets (and four) must stand min_significance robust deviations above the other lags; the estimate
+    of all columns must lie within three standard errors (from the sets' scatter about their median) of that
+    median; and no more than a quarter of the sets may lie far from it (4.5 times the scatter and twice tol, the
+    iteration's own precision). A block with a small estimate counts: it says that its part of the strip is
+    focused. Without the guard every block with significant peaks counts.
+    Fit. Across the swath, the departures of the sets that agree from their block's median are fitted against
+    their offset from the block's middle, locally along the track (tricube weights over `span` block steps,
+    Tukey's biweight against outliers): a linear trend where it is three times its standard error
+    ('spatially_variant': a parabola, always). The trend is held at its end values beyond the columns the sets
+    cover. Along the track, the estimates of all columns of the blocks that count, made again with the trend
+    removed column by column wherever there is one (the columns in best focus would otherwise carry the
+    estimate), are tied by a local line with the same weights. Blocks that do not count take the fit of their
+    neighbors.
     Correction. autofocus.spatially_variant's: strips of `block` rows, each extended by the length of the blur,
     the phase of the fit at the strip's center removed column by column, cross-faded along the track with weights
     that sum to one; exact zeros stay exact zeros. Then the second test of the guard (autofocus._keep's rule) on
@@ -397,8 +400,9 @@ def autofocus(img, mode='quadratic', *, band=None, footprint=None, block=None, o
     -> (img2 complex64 [nx, ny] where img is; info: dict(mode, band (f0, hf), block, starts [n] (first row of
     each block), estimates [n] (rad at the band edge, all columns; nan without one), estimates_std [n], subsets
     [n, sets], subset_significance, subset_position [n, sets] (-1 to 1 across the swath), counted [n] (the first
-    test), fit [n], slope [n], curve [n] (the fit at a block's center is fit + slope y + curve y^2, y from -1 to
-    1 across the swath), applied_blocks [n], block_gain [n] (log of the contrast ratio), edge_rad (least,
+    test), fit [n], slope [n], curve [n], offset [n], reach (the correction at a block's center is fit + slope d +
+    curve d^2, d = y - offset with y from -1 to 1 across the swath, held within reach = (least, greatest y of the
+    sets)), applied_blocks [n], block_gain [n] (log of the contrast ratio), edge_rad (least,
     greatest of the fit), contrast_before, contrast_after (the whole image), gain, gain_std, part_gain,
     part_gain_std (of the corrected blocks, as quadratic's), applied, reason))."""
     from . import autofocus as af
@@ -431,10 +435,11 @@ def autofocus(img, mode='quadratic', *, band=None, footprint=None, block=None, o
                 estimates_std=np.full(nb, np.nan), subsets=np.full((nb, ks), np.nan),
                 subset_significance=np.zeros((nb, ks)), subset_position=np.full((nb, ks), np.nan),
                 counted=np.zeros(nb, bool), fit=np.zeros(nb), slope=np.zeros(nb), curve=np.zeros(nb),
+                offset=np.zeros(nb), reach=(-1.0, 1.0),
                 applied_blocks=np.zeros(nb, bool), block_gain=np.zeros(nb), edge_rad=(0.0, 0.0), contrast_before=0.0,
                 contrast_after=0.0, gain=0.0, gain_std=0.0, part_gain=0.0, part_gain_std=0.0, applied=False,
                 reason=None)
-    cand = np.zeros(nb, bool)
+    cand, kept, ends = np.zeros(nb, bool), {}, np.zeros((2, nb, ks))        # ends: the sets' first and last columns
 
     def estimate(i):
         sub = img[st0[i]:st0[i] + B0][:, idx].astype(xp.complex64)
@@ -456,9 +461,11 @@ def autofocus(img, mode='quadratic', *, band=None, footprint=None, block=None, o
         w = 1 if host else -1
         est = af._map_drift(A, (f0, hf, sep), iterations, tol, w, pool=True, contrast=False)
         sets = af._map_drift(A, (f0, hf, sep), iterations, tol, w, c0=float(est['c'][0]), G=est['G'], contrast=False)
+        ycol = (idx[sel[:k * m]].reshape(k, m) - (ny - 1) / 2) / (ny / 2)
         info['estimates'][i], info['subsets'][i, :k] = float(est['c'][0]), sets['c']
         info['subset_significance'][i, :k] = np.where(np.isfinite(sets['c']), sets['sig'], 0.0)
-        info['subset_position'][i, :k] = (idx[sel[:k * m]].reshape(k, m).mean(1) - (ny - 1) / 2) / (ny / 2)
+        info['subset_position'][i, :k], ends[0, i, :k], ends[1, i, :k] = ycol.mean(1), ycol.min(1), ycol.max(1)
+        kept[i] = (est['G'], (f0, hf, sep), ycol)
         cand[i] = est['sig'][0] >= sig0 and (info['subset_significance'][i] >= sig0).sum() >= max(4, (k + 1) // 2)
     if host:
         af._threads(estimate, range(nb))
@@ -470,31 +477,59 @@ def autofocus(img, mode='quadratic', *, band=None, footprint=None, block=None, o
     if not cand.any():
         return af._skip(img, info, 'the correlation peak is not significant in enough parts of any block'), info
     cen = st0 + (B0 - 1) / 2
-    ypos, sets, across = info['subset_position'], info['subsets'], 2 if mode == 'spatially_variant' else 'auto'
-    model = lambda i, y: info['fit'][i] + info['slope'][i] * y + info['curve'][i] * y * y
-
-    def fit(blocks):
-        """The local fit at every block's center from the significant sets of `blocks` -> those sets [n, sets]."""
-        good = blocks[:, None] & (info['subset_significance'] >= sig0)
-        X = np.broadcast_to(cen[:, None], (nb, ks))[good]
-        for i in range(nb):                                          # beyond those blocks: the nearest's fit
-            x0 = float(np.clip(cen[i], X.min(), X.max()))
-            near = np.sort(np.abs(np.unique(X) - x0))
-            h = max(span * step, near[min(1, len(near) - 1)] + step)
-            r = _local_fit(X, ypos[good], sets[good], x0, h, tol, across)
-            info['fit'][i], info['slope'][i], info['curve'][i] = r
-        return good
-    good = fit(cand)
-    for i in np.flatnonzero(cand if guard else np.zeros(nb, bool)):  # the first test: a block's sets about the fit
-        res = sets[i, good[i]] - model(i, ypos[i, good[i]])
-        sd = 1.4826 * float(np.median(np.abs(res - np.median(res))))
-        info['estimates_std'][i] = sd / np.sqrt(len(res))
-        info['counted'][i] = (abs(np.median(res)) <= 3 * info['estimates_std'][i] + tol
-                              and np.count_nonzero(np.abs(res) > 4.5 * sd + 2 * tol) <= len(res) // 4)
-    if guard and not info['counted'].any():
+    ypos, sets, sig = info['subset_position'], info['subsets'], info['subset_significance']
+    across = 2 if mode == 'spatially_variant' else 'auto'
+    # the first test, quadratic's, block by block: the estimate of all columns against its sets
+    use = np.zeros((nb, ks), bool)                                  # the sets that agree: the trend's data
+    for i in np.flatnonzero(cand):
+        g = sig[i] >= sig0
+        med = float(np.median(sets[i, g]))
+        dev = np.abs(sets[i] - med)
+        sd = 1.4826 * float(np.median(dev[g]))
+        info['estimates_std'][i] = sd / np.sqrt(g.sum())
+        use[i] = g & (dev <= 4.5 * sd + 2 * tol)
+        info['counted'][i] = (abs(info['estimates'][i] - med) <= 3 * info['estimates_std'][i] + tol
+                              and (g & ~use[i]).sum() <= g.sum() // 4)
+    blocks = info['counted'] if guard else cand
+    if not blocks.any():
         return af._skip(img, info, 'the parts of the blocks disagree on the estimate'), info
-    if guard and not info['counted'][cand].all():
-        fit(info['counted'])
+    # across the swath: the sets' departures from their block's median against their offset from its middle, by a
+    # local fit of which the trend alone is kept, and no farther than the sets reach
+    use &= blocks[:, None]
+    ybar = np.array([ypos[i, use[i]].mean() if use[i].any() else 0.0 for i in range(nb)])
+    ref = np.array([np.median(sets[i, use[i]]) if use[i].any() else 0.0 for i in range(nb)])
+    X, dY, R = np.broadcast_to(cen[:, None], (nb, ks))[use], (ypos - ybar[:, None])[use], (sets - ref[:, None])[use]
+    reach = (float(ends[0][use].min()), float(ends[1][use].max()))
+    xb = cen[blocks]
+    where = []
+    trend = np.zeros((nb, 2))
+    for i in range(nb):                                              # beyond the blocks that count: the nearest's fit
+        x0 = float(np.clip(cen[i], xb.min(), xb.max()))
+        near = np.sort(np.abs(xb - x0))
+        where.append((x0, max(span * step, near[min(1, len(near) - 1)] + step)))
+        trend[i] = _local_fit(X, dY, R, *where[i], tol, across)[1:]
+    # along the track: the blocks' estimates of all columns, made again with the trend removed column by column
+    # (the columns in best focus would otherwise carry the estimate), tied by a local line
+    level = info['estimates'].copy()
+    vq = af._offsets(B0, f0, hf) ** 2
+    for i in np.flatnonzero(blocks):
+        if np.abs(trend[i]).max() >= tol:
+            G, bandi, ycol = kept[i]
+            d = ycol - ybar[i]
+            q = np.exp(-1j * (trend[i, 0] * d + trend[i, 1] * d * d)[None] * vq[:, None, None]).astype(np.complex64)
+            G = G * xp.asarray(q)
+            level[i] = float(af._map_drift(G, bandi, iterations, tol, 1 if host else -1, c0=float(level[i]),
+                                           pool=True, G=G, contrast=False)['c'][0])
+    kept.clear()
+    mid = np.zeros(nb)
+    for i in range(nb):
+        mid[i] = float(np.interp(where[i][0], xb, ybar[blocks]))
+        info['fit'][i] = _local_fit(xb, np.zeros(len(xb)), level[blocks], *where[i], tol, 0)[0]
+    info['slope'], info['curve'], info['offset'], info['reach'] = trend[:, 0], trend[:, 1], mid, reach
+
+    def model(i, y):
+        d = np.clip(y, *reach) - mid[i]
+        return info['fit'][i] + trend[i, 0] * d + trend[i, 1] * d * d
     yc = (np.arange(ny) - (ny - 1) / 2) / (ny / 2)
     most = np.array([np.abs(model(i, yc)).max() for i in range(nb)])
     act = most >= tol                                                # blocks whose correction is not nothing
