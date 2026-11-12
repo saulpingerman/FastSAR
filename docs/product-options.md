@@ -25,6 +25,8 @@ The options and their defaults:
   the product that the image is aliased.
 - `extent`: the sides of the tasked area in meters about the scene center, for a collection that states no image
   area or in place of the one it states.
+- `dem`, `geoid`: a DEM, with which the defocus of terrain off the image plane is removed before the autofocus
+  ([terrain-informed focusing](#terrain-informed-focusing)). The default is none.
 
 Some combinations are refused with a `ValueError` before the image is formed: a SIDD on the slant plane, a
 ground-plane SICD with `'sva'` (apodization runs on the slant plane), and a `spacing` with `'sva'` for a SICD
@@ -337,6 +339,101 @@ mode in the SICD (`AzAutofocus` GLOBAL or SV). In `tests/test_autofocus_image.py
 rad at the band edge is recovered within 3% on synthetic images (0.5% measured), and a simulated collection
 with a quadratic error injected into its phase history returns to the error-free azimuth resolution within 2%
 and peak sidelobe within 0.5 dB (0.7% and 0.3 dB measured).
+
+## Terrain-informed focusing
+
+`process_cphd(..., dem=)` removes the defocus of terrain that lies off the image plane. The correction is
+computed from the collection geometry and the DEM (`fastsar.terrain`); nothing is estimated from the image, and
+the image stays on its plane.
+
+```python
+import fastsar
+out = fastsar.process_cphd('scene_CPHD.cphd', 'scene_SICD.nitf',
+                           dem='Copernicus_DSM_COG_10_N19_00_W156_00_DEM.tif', geoid=22.4)
+out['terrain']                     # applied, quadratic_rad, height, offset, relief, layover, block, order, ...
+```
+
+**What it corrects.** The fast formers focus on a horizontal plane at the scene height. A scatterer at height
+`h` above the plane appears at the plane point that has its range and range rate at the center of aperture
+(layover, which `products.geolocate` and `geocode_image` undo when given a height). On a curved track it is
+also defocused: its range history differs from that of the plane point by a phase that is quadratic and higher
+across the aperture. To first order in `h`, with `t` the time from the center of aperture, `R` the range, `w`
+the unit normal of the slant plane, `w_z` its vertical component and `A_w` the antenna's acceleration along `w`
+in the scene's frame,
+
+    phi(t) = 2 pi h A_w t^2 / (lambda R w_z)
+
+so that at the ends of an aperture of length `L` flown at speed `v`
+
+    phi_edge = pi / 2 (h / lambda) (L / R)^2 (R / rho) / w_z,        rho = v^2 / A_w
+
+`rho` is the radius of curvature of the track out of the slant plane. A straight track gives zero at any
+height. The phase is proportional to the height and to the square of the aperture, and for a given azimuth
+resolution `lambda / (2 L / R)` it grows with the wavelength and with `R / rho`. From a circular orbit of radius
+`r` looking broadside, `(R / rho) / w_z` is about `R R_e / r^2` (`R_e` the Earth's radius), a tenth from low
+orbit.
+
+*A worked number.* An X-band spotlight (31 mm) from 6,965 km orbit radius at 931 km slant range has
+`R R_e / r^2 = 0.12`. The 2.9 degrees of aperture that give 0.31 m of azimuth resolution then put 1.65 rad at
+the band edge per 100 m of height (the closed form above gives 1.64, the exact model 1.65): the usual tolerance
+of pi / 4 is reached 48 m from the plane. With the whole 5.4 degree aperture it is 5.7 rad per 100 m, and the
+tolerance 14 m. On that collection, of the Kilauea caldera, the surface lies between 120 m below and 100 m
+above the plane in a 2015 DEM, and since the 2018 collapse up to 600 m below.
+
+**The DEM and its datum.** `dem` is a GeoTIFF path (any CRS; a list of paths for tiles), a function
+`dem(lat, lon) -> height` in meters above the WGS-84 ellipsoid (the convention of `products.read_dem`,
+`geolocate` and `geocode_image`), or a number, a surface of that ellipsoid height. Most DEMs give heights above
+a geoid: Copernicus GLO-30 and GLO-90 above EGM2008, SRTM above EGM96. `geoid` is the height of the geoid above
+the ellipsoid at the scene (the undulation `N`), which is added: `h_ellipsoid = H_dem + N`. It is +22 m in
+Hawaii and -26 m in North Dakota, and lies between -106 and +85 m. A DEM file is refused without it (`geoid=0.0`
+states that the file holds ellipsoid heights). `N` can be read from a public geoid grid, for example PROJ's
+`us_nga_egm08_25.tif`, with `products.read_dem(grid)(lat, lon)`. As a check, the median of the DEM over the image
+is compared with the image plane, which is at the scene height the collection states: when they differ by more
+than 10 m plus three times the DEM's standard deviation over the image, a `terrain.TerrainWarning` is raised and
+a note is left in the product. That catches a forgotten offset on flat ground, a wrong tile or wrong units; it
+cannot see an offset of 20 m under 200 m of relief.
+
+**How.** `terrain.heights` finds, on a lattice of about 10 m over the image, the height of the surface that
+each pixel shows: the point of the DEM on the pixel's circle of constant range and Doppler, by a scan over
+height. Where the circle meets the surface more than once (layover: a slope steeper than the line of sight),
+the heights of the crossings are averaged with the ground area each contributes as the weight; outside the
+DEM nothing is corrected. `terrain.coefficients` gives the phase as a polynomial in azimuth frequency from the
+antenna positions themselves, with no small-angle expansion; its constant and linear terms place the
+scatterer at its layover point with the phase of its range at the center of aperture, which is where and how
+the SICD's projection expects it. The degree is the lowest that fits within a hundredth of a radian: 2 or 3
+from orbit, up to 8 for a short range and a track with a jerk. The phase is removed by the strips of the
+spatially variant autofocus: per column, so that it follows range pixel by pixel, and cross-faded along azimuth
+over blocks of about 64 m, on the device that holds the image, with exact zeros kept. It runs on the baseband
+ground image before the data-driven autofocus, which then sees the residual: what the DEM got wrong, and the
+errors that have nothing to do with terrain.
+
+**What the product says.** `out['terrain']` holds what was applied (`applied`, `powers`, `edge_rad`,
+`quadratic_rad`: the least and greatest quadratic coefficient in radians at the band edge; `height`; the DEM's
+`offset` from the plane and its `relief`; the `layover` and `outside` fractions), `out['notes']` a line, and
+`out['timing']['terrain']` the stage's seconds. The grid, the geolocation and the SICD's projection are
+unchanged: the SICD is still `Grid.Type` PLANE on the same plane, and it records the step as an
+`ImageFormation.Processing` element (`TERRAIN PHASE CORRECTION`). The image is not orthorectified; heights
+enter geolocation as before.
+
+**The exact route.** Exact backprojection takes any points, so an image can be formed on the surface itself, at
+the exact kernel's cost. `terrain.surface_points` gives the surface point each pixel shows, and the result is the
+image on the same pixel grid with every scatterer of the surface focused:
+
+```python
+import numpy as np
+import fastsar
+from fastsar import io, terrain
+
+out = fastsar.form_cphd('scene_CPHD.cphd', axes='los')                   # the pixel grid, on the plane
+dem = terrain.as_dem('dem.tif', geoid=22.4)
+i, j = np.meshgrid(np.arange(4000, 4512), np.arange(6000, 6512), indexing='ij')
+points = terrain.surface_points(out, dem, i, j)                          # [512, 512, 3], local frame
+col, meta = io.read_cphd('scene_CPHD.cphd', meta=True)
+p0, p1 = out['pulses']                                                   # the pulses the image used
+chip = fastsar.backproject(col['S'][p0:p1], col['ant'][p0:p1], col['fmin'], col['df'], points, backend='cuda')
+```
+
+MEASURED
 
 ## Weighting and spatially variant apodization
 

@@ -295,7 +295,8 @@ def focus(out, dem, *, order=None, block=None, post=None, tol=0.05, check=True):
 
     out: form_cphd(axes='los')'s output, or process_cphd's ground image: brought to baseband in place if it is not
     (planes.deramp), and its image (a NumPy, CuPy or JAX array) replaced by the corrected one, on the same device.
-    dem: dem(lat, lon) -> height above the WGS-84 ellipsoid in meters (as_dem makes one of a GeoTIFF or a number).
+    dem: dem(lat, lon) -> height above the WGS-84 ellipsoid in meters (as_dem makes one of a GeoTIFF or a number),
+        or heights' output for this image (its h may be edited: heights from another source, on its lattice).
     order: the degree of the polynomial in azimuth frequency, 2 to 8; None: the lowest that fits the model within
         tol / 5 at the heights of the scene (2 from orbit; more for a short range or a track with a jerk). Terms
         that stay under tol / 10 are dropped.
@@ -319,7 +320,7 @@ def focus(out, dem, *, order=None, block=None, post=None, tol=0.05, check=True):
     planes.deramp(out)
     img = out['image']
     nx, ny, o, e1, e2, spx, spy = grid
-    hm = heights(out, dem, post=post)
+    hm = dem if isinstance(dem, dict) else heights(out, dem, post=post)
     h = np.nan_to_num(hm['h'])
     own = hm['plane'][np.isfinite(hm['plane'])]
     band = _band(grid, fr, ant, fc)

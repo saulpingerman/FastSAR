@@ -253,6 +253,24 @@ def test_against_exact_backprojection_at_the_true_height(scene):
         assert db(img) > -6 and db(o['image']) < lim, (k, db(img), db(o['image']))
 
 
+def test_exact_route(scene):
+    """The documented route to an image on the surface itself: read_cphd's history backprojected at
+    surface_points. The target 100 m above the plane, smeared over 40 pixels in the plane's image, has the
+    on-plane response at its own pixel."""
+    out, pix, hp = scene['out'], scene['pix'], scene['hp']
+    col, meta = io.read_cphd(scene['path'], meta=True)
+    ref = _measure(out['image'], out, pix[3])
+    k = 5
+    i0, j0 = int(round(pix[k, 0])), int(round(pix[k, 1]))
+    I, J = np.meshgrid(np.arange(i0 - 20, i0 + 20), np.arange(j0 - 20, j0 + 20), indexing='ij')
+    pts = terrain.surface_points(out, terrain.as_dem(hp + HTS[k]), I, J)
+    chip = fastsar.backproject(col['S'], col['ant'], col['fmin'], col['df'], pts, backend='cpu', window=False)
+    m = quality.point_target(chip, (20, 20), out['spx'], out['spy'], half=16)
+    assert abs(m['i'] - (pix[k, 0] - i0 + 20)) < 0.05 and abs(m['j'] - (pix[k, 1] - j0 + 20)) < 0.05
+    assert m['res_az'] == pytest.approx(ref['res_az'], rel=0.02) and m['res_rg'] == pytest.approx(ref['res_rg'], rel=0.02)
+    assert abs(m['pslr_az'] - ref['pslr_az']) < 0.3 and m['peak'] == pytest.approx(ref['peak'], rel=0.02)
+
+
 def test_flat_dem_changes_nothing(scene):
     out = scene['out']
     img = out['image']
