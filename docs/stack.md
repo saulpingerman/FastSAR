@@ -201,14 +201,15 @@ phenomenology on the product's plane. `Measurement` carries the reference collec
 SIDD's own projection is the reference's. sarkit's consistency check passes it (`tests/test_stack.py`).
 
 Time for the six collections (3.0 to 4.7 GB each) to the SIDD of the average, on an Nvidia RTX PRO 6000 and a
-48-core host that other jobs kept fully loaded: 36 s, or 1.5 megapixels of formed image per second end to end.
-Reading took 7.5 s; windowing, the range gate and formation 17.8 s (3.1 megapixels per second); registration
-9.9 s (the detected images, 17 correlations and the translation of each image: 4.7 megapixels per second); the
-average with its looks 0.25 s (over 200 megapixels per second); writing 0.2 s. The coherence of a pair to its
-GeoTIFF took 20 to 29 s, of which 1.5 to 3.4 s for the common band, the coherence and its floor.
+48-core host, both shared with other jobs: 12.6 s, or 4.5 megapixels of formed image per second end to end.
+Reading took 2.4 s; windowing, the range gate and formation 7.1 s (7.9 megapixels per second); registration
+3.0 s (the detected images, 17 correlations and the translation of each image: 16 megapixels per second); the
+average with its looks 0.09 s; writing 0.05 s. The coherence of a pair to its GeoTIFF took 5.5 s, of which 0.9 s
+for the common band, the coherence and its floor. With the host ten times oversubscribed the same calls took 36
+to 56 s and 20 to 29 s.
 
-The stages by themselves on 9.3-megapixel arrays, in megapixels per second (the best of three runs, the host
-and the GPU both busy with other jobs):
+The stages by themselves on 9.3-megapixel arrays, in megapixels per second (the best of three runs, measured
+with the host oversubscribed, so the host column is a lower bound):
 
 | stage | host (48 cores) | GPU |
 |---|---|---|
