@@ -19,7 +19,8 @@ LAT, LON, H0, HEADING = 40.79, -77.86, 351.0, 30.0
 HTS = np.array([-300.0, -100.0, -30.0, 0.0, 30.0, 100.0, 300.0])
 # where the targets appear, m from the scene center across and along the line of sight: every one in its own
 # columns, the high and low ones in the middle rows, where their smear of up to 50 m stays inside the image
-SPOT = np.array([[10.0, -60.0], [-45.0, 20.0], [45.0, -20.0], [0.0, 0.0], [-45.0, 40.0], [45.0, -40.0], [-10.0, 60.0]])
+SPOT = np.array([[10.0, -60.0], [-45.0, 20.0], [45.0, -20.0], [0.0, 0.0], [-45.0, 40.0], [45.0, -40.0],
+                 [-10.0, 60.0]])
 
 
 def _collect(squint, left, curved=True):
@@ -98,7 +99,8 @@ def test_scaling_law():
     c, law, res = edge(20.0, 40e3)
     assert res < 1e-3 and 0.5 < law < 0.7 and c == pytest.approx(law, rel=0.02), (c, law)
     assert edge(-20.0, 40e3)[0] == pytest.approx(-c, rel=0.01) and edge(20.0, -40e3)[0] == pytest.approx(-c, rel=0.01)
-    assert edge(40.0, 40e3)[0] == pytest.approx(2 * c, rel=0.01) and edge(20.0, 80e3)[0] == pytest.approx(c / 2, rel=0.01)
+    assert edge(40.0, 40e3)[0] == pytest.approx(2 * c, rel=0.01)
+    assert edge(20.0, 80e3)[0] == pytest.approx(c / 2, rel=0.01)
     assert edge(20.0, 40e3, part=0.5)[0] == pytest.approx(c / 4, rel=0.02)
 
 
@@ -134,7 +136,8 @@ def _scene(squint, left, directory):
         f = planes.slant_frame(g['meta'], g['center'])
         t = np.linspace(-85, 85, 5)
         pts = g['center'] + (t[:, None, None] * g['e1'] + t[None, :, None] * g['e2']).reshape(-1, 3)
-        b = planes.sampling(f, g['ant'], (g['fmin'], g['fmin'] + (g['S'].shape[1] - 1) * g['df']), pts, g['e1'], g['e2'])
+        band = (g['fmin'], g['fmin'] + (g['S'].shape[1] - 1) * g['df'])
+        b = planes.sampling(f, g['ant'], band, pts, g['e1'], g['e2'])
         return dict(spacing=(0.96 / b['bx'], 0.96 / b['by']), bounds=(-85, 85, -85, 85))
     out = fastsar.form_cphd(path, axes='los', window=False, backend='cpu', aperture='full', _plan=plan)
     planes.deramp(out)
@@ -191,7 +194,7 @@ def test_defocus_is_the_models(scene):
             def lobe(p):                                             # the highest lobe's width at -3 dB (m)
                 m, lo = int(np.argmax(p)), p < p.max() / np.sqrt(2)
                 return (np.argmax(lo[m:]) + np.argmax(lo[m::-1])) / 16 * out['spx']
-            assert lobe(pred) == pytest.approx(lobe(act), abs=0.03), (k, lobe(pred), lobe(act))    # a sample and a half
+            assert lobe(pred) == pytest.approx(lobe(act), abs=0.03), (k, lobe(pred), lobe(act))   # 1.5 samples
         width[k] = _measure(img, out, pix[k])['res_az']
     ref = _measure(img, out, pix[3])
     assert -14.5 < ref['pslr_az'] < -12.3
@@ -219,11 +222,13 @@ def test_correction_restores_the_targets(scene):
             warnings.simplefilter('ignore', terrain.TerrainWarning)
             info = terrain.focus(o, terrain.as_dem(hp + HTS[k]))
         assert info['applied'] and info['fit_rad'] < 0.011 and info['height'][1] == pytest.approx(HTS[k], abs=0.01)
-        assert 6 <= info['order'] <= 8 and np.abs(info['edge_rad']).max() > 10 and any('terrain: focused' in n for n in o['notes'])
+        assert 6 <= info['order'] <= 8 and np.abs(info['edge_rad']).max() > 10
+        assert any('terrain: focused' in n for n in o['notes'])
         m = _measure(o['image'], out, pix[k])
-        assert abs(m['i'] - pix[k, 0]) < pos and abs(m['j'] - pix[k, 1]) < pos, (k, m['i'] - pix[k, 0], m['j'] - pix[k, 1])
-        assert 0.99 < m['res_az'] / ref['res_az'] < wid and 0.99 < m['res_rg'] / ref['res_rg'] < rg, (k, m['res_az'], m['res_rg'])
-        assert abs(m['pslr_az'] - ref['pslr_az']) < pslr and m['peak'] > peak * ref['peak'], (k, m['pslr_az'], m['peak'])
+        assert abs(m['i'] - pix[k, 0]) < pos and abs(m['j'] - pix[k, 1]) < pos, (k, m['i'], m['j'])
+        assert 0.99 < m['res_az'] / ref['res_az'] < wid, (k, m['res_az'])
+        assert 0.99 < m['res_rg'] / ref['res_rg'] < rg, (k, m['res_rg'])
+        assert abs(m['pslr_az'] - ref['pslr_az']) < pslr and m['peak'] > peak * ref['peak'], (k, m['pslr_az'])
         before = _measure(img, out, pix[k])
         assert m['res_az'] < 0.6 * before['res_az'] and m['peak'] > 1.9 * before['peak']
 
@@ -267,7 +272,8 @@ def test_exact_route(scene):
     chip = fastsar.backproject(col['S'], col['ant'], col['fmin'], col['df'], pts, backend='cpu', window=False)
     m = quality.point_target(chip, (20, 20), out['spx'], out['spy'], half=16)
     assert abs(m['i'] - (pix[k, 0] - i0 + 20)) < 0.05 and abs(m['j'] - (pix[k, 1] - j0 + 20)) < 0.05
-    assert m['res_az'] == pytest.approx(ref['res_az'], rel=0.02) and m['res_rg'] == pytest.approx(ref['res_rg'], rel=0.02)
+    assert m['res_az'] == pytest.approx(ref['res_az'], rel=0.02)
+    assert m['res_rg'] == pytest.approx(ref['res_rg'], rel=0.02)
     assert abs(m['pslr_az'] - ref['pslr_az']) < 0.3 and m['peak'] == pytest.approx(ref['peak'], rel=0.02)
 
 
@@ -345,7 +351,8 @@ def test_layover_and_missing_dem():
     hm = terrain.heights(out, hole, post=6.0)
     assert 0.1 < hm['outside'] < 0.9 and np.isnan(hm['h']).mean() == pytest.approx(hm['outside'])
     rng = np.random.default_rng(1)
-    o = _product(_collect(20.0, False), image=(rng.normal(size=(480, 440)) + 1j * rng.normal(size=(480, 440))).astype(np.complex64))
+    img = (rng.normal(size=(480, 440)) + 1j * rng.normal(size=(480, 440))).astype(np.complex64)
+    o = _product(_collect(20.0, False), image=img)
     with warnings.catch_warnings():
         warnings.simplefilter('ignore', terrain.TerrainWarning)
         info = terrain.focus(o, hole)
@@ -354,7 +361,7 @@ def test_layover_and_missing_dem():
         terrain.heights(out, lambda lat, lon: np.full(np.shape(lat), np.nan))
 
 
-# ------------------------------------------------------------------------------------------------ the DEM's conventions
+# ------------------------------------------------------------------------------------------------ the DEM
 def test_dem_conventions(tmp_path, need):
     need('rasterio')
     lat, lon = LAT + 0.01 * np.arange(-2, 3)[:, None], LON + 0.01 * np.arange(-2, 3)[None, :]
@@ -371,8 +378,9 @@ def test_dem_conventions(tmp_path, need):
     assert np.isnan(west(LAT, LON + 0.02))
     both = terrain.as_dem([tmp_path / 'w.tif', tmp_path / 'e.tif'], geoid=-30.0)
     assert np.abs(both(lat, lon) - surf(lat, lon)).max() < 1e-6
-    assert terrain.as_dem(120.0)(lat, lon).shape == (5, 5) and np.all(terrain.as_dem(120, geoid=5.0)(lat, lon) == 125.0)
-    assert np.all(terrain.as_dem(surf, geoid=-30.0)(lat, lon) == surf(lat, lon) - 30.0) and terrain.as_dem(surf) is surf
+    assert terrain.as_dem(120.0)(lat, lon).shape == (5, 5)
+    assert np.all(terrain.as_dem(120, geoid=5.0)(lat, lon) == 125.0) and terrain.as_dem(surf) is surf
+    assert np.all(terrain.as_dem(surf, geoid=-30.0)(lat, lon) == surf(lat, lon) - 30.0)
     for bad in ('nan', None, float('inf')):
         with pytest.raises(ValueError):
             terrain.as_dem(bad if bad != 'nan' else float('nan'))
@@ -390,11 +398,13 @@ def test_warning_for_a_dem_off_the_scene_height():
     o = dict(base, notes=[])
     with pytest.warns(terrain.TerrainWarning, match=r'\+30 m from the image plane'):
         info = terrain.focus(o, flat)
-    assert info['offset'] == pytest.approx(30.0, abs=0.5) and info['relief'] < 2 and any('geoid' in n for n in o['notes'])
+    assert info['offset'] == pytest.approx(30.0, abs=0.5) and info['relief'] < 2
+    assert any('geoid' in n for n in o['notes'])
     with warnings.catch_warnings():
         warnings.simplefilter('error', terrain.TerrainWarning)
         o = dict(base, notes=[])
-        assert abs(terrain.focus(o, terrain.as_dem(flat, geoid=-30.0))['offset']) < 0.5 and not any('geoid' in n for n in o['notes'])
+        assert abs(terrain.focus(o, terrain.as_dem(flat, geoid=-30.0))['offset']) < 0.5
+        assert not any('geoid' in n for n in o['notes'])
         hills = lambda lat, lon: hp + 30.0 + 2e5 * (np.asarray(lat) - LAT)        # 60 m of relief
         assert terrain.focus(dict(base, notes=[]), hills)['relief'] > 20
         terrain.focus(dict(base, notes=[]), flat, check=False)
@@ -484,10 +494,12 @@ def test_process_cphd_with_a_dem(scene, tmp_path):
     base = fastsar.process_cphd(path, **kw)
     assert 'terrain' not in base and 'terrain' not in base['timing']
     flat = fastsar.process_cphd(path, dem=hp, **kw)
-    assert not flat['terrain']['applied'] and np.array_equal(flat['image'], base['image']) and 'terrain' in flat['timing']
+    assert not flat['terrain']['applied'] and np.array_equal(flat['image'], base['image'])
+    assert 'terrain' in flat['timing']
     with warnings.catch_warnings():
         warnings.simplefilter('ignore', terrain.TerrainWarning)
-        o = fastsar.process_cphd(path, str(tmp_path / 't.nitf'), dem=lambda lat, lon: np.full(np.shape(lat), hp), geoid=30.0, **kw)
+        o = fastsar.process_cphd(path, str(tmp_path / 't.nitf'), dem=lambda lat, lon: np.full(np.shape(lat), hp),
+                                 geoid=30.0, **kw)
     t = o['terrain']
     assert t['applied'] and t['height'][1] == pytest.approx(30.0, abs=0.01) and 2 in t['powers'] and t['block'] >= 32
     assert o['timing']['terrain'] > 0 and any(n.startswith('terrain: focused with the DEM') for n in o['notes'])
@@ -505,12 +517,14 @@ def test_process_cphd_with_a_dem(scene, tmp_path):
     m0 = quality.point_target(products.sicd_meta(base)[1], (int(round(rc[0])), int(round(rc[1]))), sm.Grid.Row.SS,
                               sm.Grid.Col.SS, half=16)
     assert abs(m1['i'] - rc[0]) < 0.1 and abs(m1['j'] - rc[1]) < 0.1, (m1['i'] - rc[0], m1['j'] - rc[1])
-    assert m1['pslr_rg'] < -12 and m1['pslr_az'] < -12 and m0['pslr_rg'] > -5 and m1['peak'] > 1.5 * m0['peak']   # rows: range
+    # the SICD's rows run along range: axis 1 of its array is azimuth
+    assert m1['pslr_rg'] < -12 and m1['pslr_az'] < -12 and m0['pslr_rg'] > -5 and m1['peak'] > 1.5 * m0['peak']
     # the slant-plane product carries it too, and a moving beam or a file without its datum is refused at once
     with warnings.catch_warnings():
         warnings.simplefilter('ignore', terrain.TerrainWarning)
         s = fastsar.process_cphd(path, dem=hp + 30.0, backend='cpu')
-    assert s['plane'] == 'slant' and s['terrain']['applied'] and list(s['timing']).index('terrain') < list(s['timing']).index('autofocus')
+    stages = list(s['timing'])
+    assert s['plane'] == 'slant' and s['terrain']['applied'] and stages.index('terrain') < stages.index('autofocus')
     with pytest.raises(ValueError, match='geoid='):
         fastsar.process_cphd(path, dem='dem.tif', backend='cpu')
     with pytest.raises(ValueError, match='spotlight'):
