@@ -313,6 +313,9 @@ def sicd_meta(out):
         row=axis(urow, ss_r, bw_r, kr, w_r, lim_r), col=axis(ucol, ss_c, bw_c, kc, w_c, lim_c),
         start=start, duration=float(t.max()), arp=arp, f0=f0, f1=f1, pol=pol, t0=float(t[p0]), t1=float(t[p1 - 1]),
         autofocus=focus))
+    if (out.get('terrain') or {}).get('applied'):   # focused with a DEM's heights, on the same plane
+        from .terrain import _record
+        _record(sm, out['terrain'])
     return sm, a
 
 

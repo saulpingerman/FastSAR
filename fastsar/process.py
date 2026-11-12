@@ -18,6 +18,8 @@ Weighting. 'taylor' (nbar 4, 35 dB, on the phase history), 'uniform', or 'sva' (
 fastsar.weighting, on the slant plane at twice Nyquist: the unweighted resolution without the sidelobes).
 Remap (SIDD). A name of fastsar.remap.REMAPS (the NGA MATLAB SAR Toolbox's: 'nrl', 'density', 'brighter', 'darker',
 'highcontrast', 'pedf', 'log') or a function.
+Terrain. dem: the surface's heights, with which the defocus of terrain off the image plane is computed from the
+collection geometry and removed before the data-driven autofocus (fastsar.terrain); the image stays on its plane.
 
 Defaults: the tasked area; a SICD on the slant plane with Taylor weighting and quadratic autofocus; for a SIDD the
 ground plane, spatially variant apodization and the NRL remap. A moving-beam collection (stripmap, sliding
@@ -44,7 +46,8 @@ def _choice(name, value, allowed):
 def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None, autofocus=None, weighting=None,
                  remap='nrl', remap_args=None, spacing=None, extent=None, sicd=None, mode='auto', backend='auto',
                  precision='float32', shadows_down=True, nesz_db=None, scene_sigma0_db=-10.0, height=None, channel=0,
-                 troposphere=None, reader_options=None, target_db=-40.0):
+                 troposphere=None, reader_options=None, target_db=-40.0,
+                 dem=None, geoid=None):
     """Form the image of a CPHD collection and write it as a SICD or a SIDD (see the module docstring).
 
     cphd: path. output: the file to write (NITF), or None to return the product without writing it.
@@ -66,6 +69,12 @@ def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None
     sicd: the vendor's SICD (path, .xml or SICD metadata), whose footprint is then the tasked area.
     nesz_db, scene_sigma0_db: the noise level of the quality areas when the files give none (fastsar.rgiqe).
     mode, backend, precision, height, channel, troposphere, reader_options, target_db: form_cphd's.
+    dem: terrain-informed focusing of a spotlight (fastsar.terrain.focus): a DEM GeoTIFF (a path, or a list of
+        tiles), a function dem(lat, lon) -> height above the WGS-84 ellipsoid in meters (products.read_dem's), or a
+        number (a surface of that ellipsoid height). None: the scene is taken to lie on the image plane. With a
+        dem the product holds terrain (terrain.focus's info: what was applied, the range of its coefficients).
+    geoid: the height of the geoid above the ellipsoid at the scene (m), added to the DEM's heights; a DEM file
+        needs it (Copernicus DEM: the EGM2008 undulation; 0.0 for a DEM of ellipsoid heights; terrain.as_dem).
 
     -> the product dict (form_cphd's entries on the product's grid: image, origin, e1, e2, spx, spy, plane, meta,
     notes, ...), with product, area, weighting, autofocus (the mode run), autofocus_info, timing (seconds of each
@@ -97,6 +106,9 @@ def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None
     if weighting == 'sva' and product == 'sicd' and spacing is not None:
         raise ValueError("weighting='sva' sets the slant spacing itself (twice Nyquist): leave spacing=None")
     timing, st = {}, {}
+    if dem is not None:                                              # a DEM that cannot be used fails before the read
+        from . import terrain
+        st['dem'] = terrain.as_dem(dem, geoid)
     t0 = time.perf_counter()
     st['start'] = t0
 
@@ -116,6 +128,9 @@ def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None
     def plan(g):
         """The formation grid, from the geometry form_cphd read: the area's bounds and the sampling its spectrum asks."""
         st['read'] = time.perf_counter()
+        if dem is not None and g['mode'] != 'spotlight':
+            raise ValueError('dem= (terrain-informed focusing) is for spotlight collections; this one has a moving '
+                             'beam')
         spot = g['mode'] == 'spotlight'
         pl = plane or ('slant' if product == 'sicd' and spot else 'ground')
         wt = weighting or ('sva' if product == 'sidd' and spot else 'taylor')
@@ -375,6 +390,11 @@ def _spotlight(out, st, product, area, spacing, lap, cuda, jaxdev=False):
             out['image'] = _xp.device(out['image'], 'cuda')
     planes.deramp(out, _cuda=cuda, _jax=jaxdev)
     lap('baseband', out['image'])
+    if st.get('dem') is not None:                                    # the terrain's defocus, before any estimate
+        from . import terrain
+        terrain._stage(out, st['dem'])
+        release()
+        lap('terrain', out['image'])
     if st['autofocus']:
         from .autofocus import image_autofocus
         try:

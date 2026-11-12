@@ -9,10 +9,12 @@
   remap='nrl', remap_args=None, spacing=None, extent=None, sicd=None, mode='auto', backend='auto',
   precision='float32',
   shadows_down=True, nesz_db=None, scene_sigma0_db=-10.0, height=None, channel=0, troposphere=None,
-  reader_options=None, target_db=-40.0)`: from a CPHD file to a SICD or SIDD
+  reader_options=None, target_db=-40.0, dem=None, geoid=None)`: from a CPHD file to a SICD or SIDD
   ([product-options.md](product-options.md)). Returns the product dict (`form_cphd`'s entries on the product's
   grid) with `product`, `area`, `weighting`, `autofocus`, `autofocus_info`, `timing` (seconds per stage) and, when
-  written, `path` and `metadata`.
+  written, `path` and `metadata`. `dem` (a GeoTIFF path or a list of them, a function `dem(lat, lon)` of ellipsoid
+  heights, or a number) with `geoid` (the geoid's height above the ellipsoid at the scene, required for a file)
+  runs terrain-informed focusing on a spotlight before the autofocus and adds `terrain` to the product.
 - `form_cphd(cphd, sicd=None, *, mode='auto', backend='auto', window=True, spacing=None, channel=0, patch=1024,
   azimuth_fraction=0.8, extent=None, height=None, precision='float32', target_db=-40.0, info=None,
   autofocus=False, troposphere=None, reader_options=None, axes='track', aperture='auto')`: the image of a CPHD file ([processing-chain.md](processing-chain.md#2-form)).
@@ -132,6 +134,30 @@ rasterio.
 - `weighting.sva(img, oversample=2, *, axes=(1, 0), joint=True, inplace=False)`: spatially variant apodization.
   `weighting.keystone(S, ant, fmin, df, scp, e1, symmetric=True)`: the phase history trimmed to a rectangle of
   slant-plane spatial frequencies.
+
+## `fastsar.terrain`
+
+Terrain-informed focusing of a ground-plane spotlight image on axes along the line of sight
+([product-options.md](product-options.md#terrain-informed-focusing)). Heights `h` are in meters above the image
+plane; a DEM is a function `dem(lat, lon)` of heights above the WGS-84 ellipsoid.
+
+- `as_dem(dem, geoid=None)`: that function from a GeoTIFF path (or a list of tiles), a function or a number;
+  `geoid`, the geoid's height above the ellipsoid at the scene, is added, and a file needs it (`0.0` for ellipsoid
+  heights).
+- `focus(out, dem, *, order=None, block=None, post=None, tol=0.05, check=True)`: removes the terrain's defocus
+  from `out['image']` (NumPy, CuPy or JAX array, replaced on its device) and returns `info`, also
+  `out['terrain']`: `applied`, `reason`, `band`, `powers`, `edge_rad`, `quadratic_rad`, `height`, `offset`,
+  `relief`, `layover`, `outside`, `block`, `post`, `order`, `fit_rad`. `dem` may be `heights`' output.
+  `terrain.TerrainWarning` when the DEM's median over the image is off the image plane by more than 10 m plus
+  three times its standard deviation (`check`).
+- `heights(out, dem, *, post=None)`: the height of the surface each pixel shows, through layover, on a lattice:
+  `dict(h, i, j, post, layover, outside, plane)`.
+- `phase_error(out, i, j, h, pulses=257)`: the exact model at pixels showing heights `h`: `(xi, phi)`, the
+  azimuth frequency (cycles per pixel) and the phase (rad) of each pulse. `coefficients(out, i, j, h, *, order=4,
+  band=None, pulses=257)`: its polynomial in the azimuth frequency, `(c [..., order + 1], band, residual)`; `c[..., 2]`
+  is the quadratic phase at the band edge.
+- `surface_points(out, dem, i, j, *, post=None)`: the points [..., 3] of the surface that pixels show, for
+  `backproject`: the image formed on the surface itself.
 
 ## `fastsar.rgiqe`, `fastsar.doctor`
 
