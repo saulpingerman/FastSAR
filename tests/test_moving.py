@@ -369,6 +369,24 @@ def test_backends_agree(backend):
             assert np.array_equal(o['image'] == 0, ref['image'] == 0) and (o['image'] == 0).any()
 
 
+@pytest.mark.cuda
+def test_small_gpu_gives_the_same_product(monkeypatch):
+    """A GPU without room for the image and a second one of its size (FASTSAR_CUDA_BLOCK_MB: a megabyte to count
+    on): the stages after formation run on the host, a note says so, and the product is the device's to float32
+    rounding."""
+    pytest.importorskip('cupy')
+    tg, amp = scene()
+    ms.collection('small.cphd', tg, amp, P=PL, phase=5.0 * ((np.arange(PL) - PL / 2) / 500.0) ** 2)
+    for kw in (dict(), dict(weighting='sva'), dict(product='sidd')):
+        monkeypatch.delenv('FASTSAR_CUDA_BLOCK_MB', raising=False)
+        ref = fastsar.process_cphd('small.cphd', backend='cuda', extent=LONG, **kw)
+        monkeypatch.setenv('FASTSAR_CUDA_BLOCK_MB', '1')
+        o = fastsar.process_cphd('small.cphd', backend='cuda', extent=LONG, **kw)
+        assert sum('they ran on the host' in n for n in o['notes']) == 1 and not any('host' in n for n in ref['notes'])
+        assert o['autofocus'] == ref['autofocus'] == 'quadratic'
+        assert np.abs(o['image'] - ref['image']).max() < 2e-6 * np.abs(ref['image']).max()
+
+
 @pytest.mark.parametrize('kind', ['cupy', 'jax'])
 def test_stages_on_a_device_array(kind, focused):
     """The stages themselves on a device array against the host's: baseband to rounding of the phase, the band

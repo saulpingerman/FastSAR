@@ -576,7 +576,7 @@ def _range_area(g, bm, b, opt, step=50.0, limit=30e3):
     if not (sp['pulses'] > 1).all():
         raise ValueError(f'area={area!r}: part of the tasked extent along the track is not illuminated')
     n0 = _LINES // 2
-    rads, bw, ns = [], sp['b1'] * sp['b2'], sp['pulses'] * K
+    bw, ns = sp['b1'] * sp['b2'], sp['pulses'] * K               # the support's area on the ground, samples summed
     span = lambda n: (int(sp['first'][n]), int(sp['first'][n] + sp['pulses'][n]))
     kw = dict(channel=opt['channel'], sicd=g['sicd'], scene_sigma0_db=opt['scene_sigma0_db'])
     rad = rgiqe.Radiometry(opt['cphd'], g['meta'], pulses=span(n0), nesz_db=opt['nesz_db'], **kw)
@@ -673,9 +673,10 @@ def plan(g, st, opt):
     area, spacing, extent, cphd, channel, nesz_db, scene_sigma0_db).
 
     Spacing. 'taylor' and 'uniform' keep form_cphd's own (0.96 of the reciprocal of the nominal bands) unless the
-    azimuth band at the pixels is wider than that samples (a sliding spotlight), and a given spacing is used as
-    it is. 'sva': exactly half the reciprocal of the processed azimuth band and of the ground range band at the
-    swath center, on a grid whose rows number a multiple of four.
+    azimuth band of the image is wider than that samples (a footprint slower than the platform: an orbit, a
+    sliding spotlight; a squint), and a given spacing is used as it is. 'sva': exactly half the reciprocal of
+    the processed azimuth band and of the ground range band at the swath center, on a grid whose rows number a
+    multiple of four. An area beyond the tasked swath is formed on the tasked grid's own pixel lattice.
     Apodization is refused (ValueError) where the rectangle of the module docstring does not hold: the processed
     azimuth band differs over the scene by more than VARY, the squint shears the range band by more than SHEAR of
     it, or the ground range band changes across the swath by more than RANGE."""
@@ -797,14 +798,14 @@ def stages(out, st, product, lap, backend):
             tight = backend == 'cuda' and p['need'] > 0.5 * p['budget']
             if tight:
                 memory.cuda_release()
-            if backend == 'cuda':                                    # through two page-locked blocks, not one of its size
+            if backend == 'cuda':                                    # through two page-locked blocks
                 from .patches import _to_device
                 out['image'] = _to_device(out['image'])
             else:
                 out['image'] = _xp.device(out['image'], backend)
         else:
-            out['notes'].append(f"the device has {p['budget'] / 1e9:.1f} GB for the stages after formation, which "
-                                f"take {p['need'] / 1e9:.1f} GB with the image on it: they ran on the host")
+            out['notes'].append(f"the device has {memory._gb(p['budget'])} for the stages after formation, which "
+                                f"take {memory._gb(p['need'])} with the image on it: they ran on the host")
     release = memory.cuda_release if tight else (lambda: None)
 
     def run(stage):
