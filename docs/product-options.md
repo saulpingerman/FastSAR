@@ -453,17 +453,18 @@ Copernicus GLO-30 with the EGM2008 undulation at the scene (22.4 m, PROJ's `us_n
 the model is the image itself: the quadratic coefficients that map drift estimates on 512-pixel blocks of the
 uncorrected image, against the model's predictions for the same blocks.
 
-- Over the whole first scene (1,886 blocks) the estimates correlate with the predictions at 0.76, with a slope
-  of 1.35 +- 0.09, an intercept of +0.57 rad and an rms residual of 1.27 rad. The excess is the DEM's age: it
-  predates the 2018 collapse of the caldera floor. On the blocks where a 2019 lidar DEM (USGS,
-  doi:10.5066/P9F1ZU8O) agrees with GLO-30 within 10 m (620 blocks) the slope is 1.05 +- 0.10 (correlation
-  0.56, intercept +0.16 rad, rms residual 1.2 rad, the size of the scatter of the block estimates; 1.00 +- 0.06
-  on the better half of those blocks). With the lidar DEM's heights the slope is 1.10 +- 0.09 outside the pit
-  that lava has been filling since 2020. Scaling the DEM's heights for the highest contrast of the unchanged low
-  ground (15 million pixels, every eighth column) gives a factor of 0.99.
+- Over the whole first scene (1,886 blocks, weighted as the spatially variant autofocus weights them) the
+  estimates correlate with the predictions at 0.76, with a slope of 1.35 +- 0.11, an intercept of +0.57 rad and
+  an rms residual of 1.27 rad (the errors are a jackknife over sixteen parts of the scene). The excess is the
+  DEM's age: it predates the 2018 collapse of the caldera floor. On the blocks where a 2019 lidar DEM (USGS,
+  doi:10.5066/P9F1ZU8O) agrees with GLO-30 within 10 m (620 blocks) the slope is 1.05 +- 0.24 (1.06 +- 0.05
+  unweighted; correlation 0.56, intercept +0.16 rad, rms residual 1.2 rad, the size of the scatter of the block
+  estimates). With the lidar DEM's heights the slope is 1.10 +- 0.13 outside the pit that lava has been filling
+  since 2020. Scaling the DEM's heights for the highest contrast of the unchanged low ground (15 million
+  pixels, every eighth column) gives a factor of 0.99.
 - On the second scene the predictions span only -0.7 to +0.7 rad against a block scatter of 0.8 rad: correlation
-  0.35, slope 1.37 +- 0.10 over all blocks and 1.35 +- 0.14 on unchanged terrain (1.0 to 2.2 when a trend across
-  the scene is fitted with it), intercept -0.2 rad. The sign is the model's; the scale is not resolved there.
+  0.35, slope 1.37 +- 0.28 over all blocks and 1.35 +- 0.27 on unchanged terrain (1.27 +- 0.08 unweighted),
+  intercept -0.2 rad. The sign is the model's; the scale is not resolved there.
 - With GLO-30 the correction raises the contrast of the first image by 0.8% and narrows 88 bright compact
   points by 4.8% in azimuth (median; 5.3% and 3.8% more peak amplitude where the predicted phase is 1 to 2 rad).
   With the lidar DEM the points where the phase is 2 to 9 rad go from 0.53 to 0.46 m, with 10% more amplitude,
