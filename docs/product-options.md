@@ -377,8 +377,9 @@ orbit.
 `R R_e / r^2 = 0.12`. The 2.9 degrees of aperture that give 0.31 m of azimuth resolution then put 1.65 rad at
 the band edge per 100 m of height (the closed form above gives 1.64, the exact model 1.65): the usual tolerance
 of pi / 4 is reached 48 m from the plane. With the whole 5.4 degree aperture it is 5.7 rad per 100 m, and the
-tolerance 14 m. On that collection, of the Kilauea caldera, the surface lies between 120 m below and 100 m
-above the plane in a 2015 DEM, and since the 2018 collapse up to 600 m below.
+tolerance 14 m. That collection is of the Kilauea caldera, whose surface lies between 120 m below and 100 m
+above the plane in the Copernicus DEM, and since the collapse of 2018 more than 100 m lower than that over 3.7
+square kilometers.
 
 **The DEM and its datum.** `dem` is a GeoTIFF path (any CRS; a list of paths for tiles), a function
 `dem(lat, lon) -> height` in meters above the WGS-84 ellipsoid (the convention of `products.read_dem`,
@@ -433,7 +434,69 @@ p0, p1 = out['pulses']                                                   # the p
 chip = fastsar.backproject(col['S'][p0:p1], col['ant'][p0:p1], col['fmin'], col['df'], points, backend='cuda')
 ```
 
-MEASURED
+**Simulated** (`tests/test_terrain.py`). A squinted spotlight at 10 km on a curved track with a jerk, flown to
+either side, with point targets 30, 100 and 300 m above and below the plane: phases of 12, 40 and 120 rad at
+the band edge, the cubic term the largest. On a straight track the phase is zero at any height. Uncorrected,
+the targets are 1.8 to 2.1, 2.7 to 2.9 and 4.1 to 4.2 times as wide in azimuth as a target on the plane, with
+0.50, 0.34 and 0.24 of its peak, and the phase of their azimuth spectra is the model's within 0.01 rad at 30 m
+and 0.06 rad at 100 m. Corrected, the targets at 30 m have the on-plane width within 0.7%, its peak sidelobe
+within 0.13 dB, 0.98 of its peak, and lie within 0.04 pixel of their layover point; as complex chips they differ
+from exact backprojection at their true height by -19 to -26 dB of the peak, from -1 to -4 dB uncorrected. At
+100 m the widths are within 4 to 8% and the peak 0.89 to 0.94, at 300 m within 37 to 50% and 0.65 to 0.71. What
+remains there is the range walk of the limitations below, which reaches a third of a range cell at 300 m.
+
+**Measured on Kilauea.** Two Capella spotlights of the caldera, formed with the default square-resolution
+aperture: one broadside at 931 km (2.9 degrees of aperture, -1.65 rad per 100 m of height, a 17,489 by 17,093
+pixel ground image), one squinted 30 degrees at 611 km (2.3 degrees, -0.83 rad per 100 m). Heights are from
+Copernicus GLO-30 with the EGM2008 undulation at the scene (22.4 m, PROJ's `us_nga_egm08_25.tif`). The test of
+the model is the image itself: the quadratic coefficients that map drift estimates on 512-pixel blocks of the
+uncorrected image, against the model's predictions for the same blocks.
+
+- Over the whole first scene (1,886 blocks) the estimates correlate with the predictions at 0.76, with a slope
+  of 1.35 +- 0.09, an intercept of +0.57 rad and an rms residual of 1.27 rad. The excess is the DEM's age: it
+  predates the 2018 collapse of the caldera floor. On the blocks where a 2019 lidar DEM (USGS,
+  doi:10.5066/P9F1ZU8O) agrees with GLO-30 within 10 m (620 blocks) the slope is 1.05 +- 0.10 (correlation
+  0.56, intercept +0.16 rad, rms residual 1.2 rad, the size of the scatter of the block estimates; 1.00 +- 0.06
+  on the better half of those blocks). With the lidar DEM's heights the slope is 1.10 +- 0.09 outside the pit
+  that lava has been filling since 2020. Scaling the DEM's heights for the highest contrast of the unchanged low
+  ground (15 million pixels, every eighth column) gives a factor of 0.99.
+- On the second scene the predictions span only -0.7 to +0.7 rad against a block scatter of 0.8 rad: correlation
+  0.35, slope 1.37 +- 0.10 over all blocks and 1.35 +- 0.14 on unchanged terrain (1.0 to 2.2 when a trend across
+  the scene is fitted with it), intercept -0.2 rad. The sign is the model's; the scale is not resolved there.
+- With GLO-30 the correction raises the contrast of the first image by 0.8% and narrows 88 bright compact
+  points by 4.8% in azimuth (median; 5.3% and 3.8% more peak amplitude where the predicted phase is 1 to 2 rad).
+  With the lidar DEM the points where the phase is 2 to 9 rad go from 0.53 to 0.46 m, with 10% more amplitude,
+  and the rms of the block estimates falls from 1.94 rad to 0.74 rad (1.47 rad with GLO-30).
+- The default quadratic autofocus declines the uncorrected image because its parts disagree (-2.1 to +2.8 rad
+  over eight parts of the scene). After the GLO-30 correction they still do, in the collapsed area. After the
+  lidar correction the parts agree on a residual of -0.35 +- 0.08 rad, which the contrast test then declines:
+  it is too small to raise the contrast of an image whose pit is corrected for the wrong depth.
+CHIPS
+- The stage takes 1.9 to 5.8 s for the 206 and 299 megapixel images on a GPU shared with other work (50 to 140
+  megapixels per second) and 3 to 15 s on the host's 48 shared cores (19 to 72 megapixels per second), of which
+  0.4 to 1.0 s is the height map; formation took 40 and 84 s on the same GPU.
+FLAT
+
+**Limitations.**
+
+- *The DEM.* The correction is as good as the heights: 10 m of error is 0.17 rad on the first collection above
+  and 0.6 rad with its whole aperture. A DEM older than the terrain (the caldera above), a surface model where
+  the radar sees the ground or the reverse, and the geoid offset all enter directly. The data-driven autofocus
+  runs after the correction and sees what is left.
+- *One height per pixel.* In layover the heights that share a pixel are averaged, so each is corrected for the
+  wrong height by up to the relief folded into the pixel. Along azimuth the height is averaged over half a
+  block (32 m by default), so a cliff keeps a residual within a block of its edge; `terrain.focus(block=)` sets
+  the rows of a block.
+- *Range walk.* The phase is applied at the center frequency. Over the band it varies by `B / (2 fc)` of
+  itself, because the range error behind it, `phi lambda / (4 pi)`, also moves the response across range bins
+  during the aperture. A correction along azimuth leaves that part: it is under a quarter of a radian while
+  `|phi| B / (2 fc)` is, 8 rad of phase at a 3% band, which the square-resolution products above stay within;
+  with its whole aperture the first collection passes it 140 m from the plane. Beyond it (the simulated targets
+  at 100 and 300 m) the correction still removes most of the smear, and exact backprojection onto the surface
+  removes all of it.
+- *Spotlight only.* A moving-beam collection is refused. The model holds for it pixel by pixel, with the pulses
+  that illuminate the pixel and their own center of aperture; the correction would run per patch of the mosaic.
+- The image is not moved: layover stays, and geolocation needs the height as before.
 
 ## Weighting and spatially variant apodization
 
