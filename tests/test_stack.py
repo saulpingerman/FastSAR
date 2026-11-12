@@ -149,6 +149,32 @@ def test_common_grid_formation(scene, formed):
     assert np.array_equal(again['image'], formed[2]['image'])
 
 
+def test_moving_beam_on_a_grid(tmp_path):
+    """A moving-beam collection (stripmap: the scene reference point follows the antenna), formed as a mosaic on an
+    Earth-fixed grid turned 45 degrees from its track: the targets where the grid says."""
+    col = sim.make_collect(res=0.5, scene=60.0, r0=6e3, graze_deg=35.0)
+    srp = np.zeros_like(col.ant)
+    srp[:, 1] = col.ant[:, 1]
+    tg = np.array([[0.0, 0.0, 0.0], [12.0, -15.0, 0.0], [-15.0, 18.0, 0.0], [10.0, 10.0, 0.0]])
+    dr = np.linalg.norm(tg[None] - col.ant[:, None], axis=-1) - np.linalg.norm(srp - col.ant, axis=1)[:, None]
+    S = np.exp(-4j * np.pi / sim.C * col.freqs[None, :, None] * dr[:, None, :]).sum(-1).astype(np.complex64)
+    sim.write_cphd(str(tmp_path / 'strip.cphd'), col, S, LAT, LON, H0, heading=30.0, srp=srp)
+    grid = stack.ground_grid((LAT, LON, H0), 70.0, 0.4, azimuth=75.0)
+    o = fastsar.form_cphd(str(tmp_path / 'strip.cphd'), grid=grid, backend='cpu')
+    assert o['mode'] == 'moving' and o['axes'] == 'grid' and o['image'].shape == grid['shape']
+    assert stack._same_grid(stack.as_grid(o), grid)
+    E, N, U = sim.enu_axes(LAT, LON)
+    A = np.linalg.inv(np.array([[grid['e1'] @ E, grid['e2'] @ E], [grid['e1'] @ N, grid['e2'] @ N]])) / grid['spx']
+    want = (tg @ frame(30.0).T)[:, :2] @ A.T + np.array(grid['shape']) / 2
+    for i, j in want:
+        m = quality.point_target(o['image'], (int(round(i)), int(round(j))), 0.4, 0.4, half=10)
+        assert abs(m['i'] - i) < 0.1 and abs(m['j'] - j) < 0.1, (i, j, m['i'], m['j'])
+    with pytest.raises(ValueError, match='spotlight'):                 # the moving beam's own refusals stand
+        fastsar.process_cphd(str(tmp_path / 'strip.cphd'), grid=grid, autofocus='quadratic', backend='cpu')
+    p = fastsar.process_cphd(str(tmp_path / 'strip.cphd'), grid=grid, backend='cpu')
+    assert p['plane'] == 'ground' and np.array_equal(p['image'], o['image'])
+
+
 def test_grid_refusals(scene, formed):
     p = scene.paths[0]
     for kw, msg in ((dict(spacing=0.5), 'spacing'), (dict(extent=(50, 50)), 'extent'), (dict(height=0.0), 'height')):

@@ -561,7 +561,12 @@ def write(path, images, des, fields=None):
                 pos += len(s) + len(d['xml'])
         finally:
             if mm is not None:
-                mm.close()
+                try:
+                    mm.close()
+                except BufferError:
+                    # a worker of the row pool still holds its last block's view of the map for a moment after its
+                    # result is in (seen on a heavily loaded host): the map is then released with that view
+                    pass
     finally:
         os.close(fd)
     return total

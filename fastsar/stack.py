@@ -21,7 +21,7 @@ of the grazing angle, differently for each look direction. Over tens of kilomete
 cut into grids of a few kilometers each.
 
 Registration. Collections formed on one grid agree only as well as their orbits and timing are known, which for
-the small satellites measured is 7 to 22 m (docs/product-options.md). register finds one translation per image
+the small satellites measured is 9 to 22 m (docs/stack.md). register finds one translation per image
 against a reference from the cross-correlation of the detected images (the peak of the correlation of their
 box-filtered, clipped decibel images, refined on the upsampled correlation), reports how significant the peak is
 and what tiles of the image still disagree by afterwards, and applies it: by a phase ramp on the spectrum of the
@@ -1314,7 +1314,8 @@ def process_stack(cphds, output=None, *, product='mean', grid=None, reference=0,
     -> the product dict of stack.mean, stack.coherence or stack.change (image on the host), with registrations (one
     dict per collection, in the order given: stack.register's), inputs (per collection: path, name, collector,
     start, graze, azimuth, pulses, shift, notes), timing (seconds: read, form, register, combine, write, total) and,
-    when written, path and metadata (the SIDD's, or the GeoTIFF's crs and transform).
+    when written, path and metadata (the SIDD's, or the GeoTIFF's crs and transform). gains and looks_single are
+    per collection in the order given; looks_by_n counts the images as processed, the reference first.
 
     The SIDD of a mean states what it is: ProductClass 'Detected Image', ProductType 'Multi-image incoherent
     average', the number of collections, the equivalent number of looks and the registration as
@@ -1437,6 +1438,9 @@ def process_stack(cphds, output=None, *, product='mean', grid=None, reference=0,
         res['inputs'] = [dict(inputs[k], **{q: v for q, v in i.items() if q in ('gain', 'weight')})
                          for k, i in zip(order, acc.inputs)]
         res['inputs'] = [res['inputs'][order.index(k)] for k in range(n)]
+        for key in ('gains', 'looks_single'):                        # per collection, in the order given
+            if res.get(key) is not None:
+                res[key] = [res[key][order.index(k)] for k in range(n)]
     else:
         a, b = kept[reference], kept[order[1]]
         res = (coherence if product == 'coherence' else change)(a, b, window)

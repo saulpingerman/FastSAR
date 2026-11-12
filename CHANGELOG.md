@@ -31,6 +31,8 @@ was published on PyPI.
   window ... exceeds the GPU's shared memory", for example a 2 km image of a collection with 76,032 samples per
   pulse). Such a history is now gated in range to the image's swath first, on the device, with a note in the
   product; the image equals that of the whole history to -63 dB (measured against the cpu backend).
+- Writing a NITF file could fail with "BufferError: cannot close exported pointers exist" on a heavily loaded
+  host, when a worker thread still held its last block of the file's memory map as the map was closed.
 - `docs/products.md` said that two passes formed onto one grid are coregistered by construction; that holds for
   the geometry as known, and real repeat collections lay 9 to 22 m apart. `products.coherence` gave its bias for
   independent pixels; the note now states the measured floor of oversampled images.
