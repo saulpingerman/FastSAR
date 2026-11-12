@@ -793,7 +793,11 @@ def stages(out, st, product, lap, backend):
             tight = backend == 'cuda' and p['need'] > 0.5 * p['budget']
             if tight:
                 memory.cuda_release()
-            out['image'] = _xp.device(out['image'], backend)
+            if backend == 'cuda':                                    # through two page-locked blocks, not one of its size
+                from .patches import _to_device
+                out['image'] = _to_device(out['image'])
+            else:
+                out['image'] = _xp.device(out['image'], backend)
         else:
             out['notes'].append(f"the device has {p['budget'] / 1e9:.1f} GB for the stages after formation, which "
                                 f"take {p['need'] / 1e9:.1f} GB with the image on it: they ran on the host")
