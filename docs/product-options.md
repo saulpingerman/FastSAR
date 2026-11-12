@@ -603,9 +603,8 @@ over the collection, and the baseband phase follows it.
   +2,150 m. `'black'`: -3,150 to +4,100 m, 7.3 km of ground range, in the extended window.
 
 **Speed.** Seconds per stage for the stripmap cut, second call, with megapixels per second in parentheses. The
-GPU and the host were shared: the first block of rows was timed with other jobs on the GPU and a load average of
-about 100 on the host's 48 cores, the others with the GPU at full utilization by other jobs and a load average
-of 250 to 400, so these are lower bounds on the rates.
+GPU and the host were shared with other jobs throughout (the GPU at full utilization, a load average of 250 to
+400 on the host's 48 cores), so these are lower bounds on the rates.
 
 | Product | Arrays | Form | Baseband | Autofocus | Apodization | Mask |
 |---|---|---|---|---|---|---|
@@ -618,7 +617,7 @@ of 250 to 400, so these are lower bounds on the rates.
 | | NumPy, host | | 6.5 (12) | 18.2 (4) | | 1.5 (50) |
 
 Formation is the mosaic's on the GPU (the 36,000 pulses of the cut, 8,194 samples each); on the CPU backend,
-under the heavier load, the mosaic of a 2 km cut (11.1 Mpx from 24,000 pulses) took 619 s. The stages after
+under that load, the mosaic of a 2 km cut (11.1 Mpx from 24,000 pulses) took 619 s. The stages after
 formation are the new ones. The baseband step on the GPU includes the upload of the mosaic, which the former
 assembles on the host; for a JAX array its phase is computed on the host's cores, so it runs at the host's rate.
 Autofocus is the estimate on the blocks, the cross-faded correction and the guard's contrast sums before and
