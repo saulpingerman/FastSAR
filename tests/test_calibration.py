@@ -4,8 +4,9 @@ PNRef, and processed on both planes with both linear weightings. Point targets o
 zero and noise of known power per sample come back through the written file's own polynomials, read and evaluated
 by sarpy, within 0.1 dB. Then the levels of support: PTRef with a measured noise level, no PTRef, apodized
 products (a moving beam is in test_cphd.py); and the check of the antenna block against the beam's footprint in
-the phase history, by which the data decide the pattern's pointing: as the file states it, on the scene reference
-point, or not to be trusted. Needs sarpy and finufft."""
+the phase history, by which the data decide the pattern's pointing (as the file states it, on the scene reference
+point, or not to be trusted) and which measures the beam's width against the modeled two-way one. Needs sarpy and
+finufft."""
 import dataclasses
 
 import numpy as np
@@ -19,6 +20,7 @@ pytestmark = pytest.mark.needs('sarpy', 'finufft')
 LAT, LON, H0, HEADING = 40.79, -77.86, 351.0, 30.0
 PT_REF, PN_REF = 3.0e-4, 2.0           # power per sample of a 1 m^2 point at the scene center; noise power per sample
 BEAM = (3.0e4, 2.0e-3, -3.0e-3)        # one-way dB per squared direction cosine; where the beam peaks
+NARROW = (1.2e5,) + BEAM[1:]           # a beam of half the width, which the clutter patch holds out to three radii
 TG = np.array([[0.0, 0.0, 0.0], [31.0, -22.0, 0.0], [-40.0, 36.0, 0.0], [44.0, 41.0, 0.0], [-47.0, -44.0, 0.0],
                [12.0, 49.0, 0.0]])
 RCS = np.array([1.0, 4.0, 0.5, 2.0, 1.0, 8.0])
@@ -37,13 +39,13 @@ def echoes(col, pos, amp):
     for p in range(col.Np):
         dr = np.linalg.norm(pos - col.ant[p], axis=1) - r0[p]
         c = amp[p] * np.exp(-1j * (4.0 * np.pi * col.fref / C) * dr)
-        out[p] = finufft.nufft1d1((4.0 * np.pi * col.df / C) * dr, c, col.K, eps=1e-12, isign=-1)
+        out[p] = finufft.nufft1d1((4.0 * np.pi * col.df / C) * dr, c, col.K, eps=1e-12, isign=-1, nthreads=1)
     return out
 
 
 @pytest.fixture(scope='module', params=[(20.0, False), (-25.0, True)], ids=['right', 'left'])
 def scene(request, tmp_path_factory):
-    """Three files of one collection: point targets, clutter, and noise alone."""
+    """Files of one collection: point targets, clutter, noise alone, and clutter with noise for the footprint."""
     squint, left = request.param
     col = sim.make_collect(res=0.35, scene=170.0, r0=10e3, graze_deg=35.0)
     y = col.ant[:, 1] / np.ptp(col.ant[:, 1])
@@ -63,13 +65,24 @@ def scene(request, tmp_path_factory):
     gain = np.concatenate([sim.beam_gain(col, pos[a:a + 4096], BEAM) for a in range(0, n, 4096)], axis=1)
     Sc = echoes(col, pos, amp * gain)
     sim.write_cphd(str(d / 'clutter.cphd'), col, Sc, LAT, LON, H0, **kw)
-    # the same echoes in a file whose antenna frames point 0.008 off the scene center, which the beam follows
-    sim.write_cphd(str(d / 'steered.cphd'), col, Sc, LAT, LON, H0, boresight=STATED, **kw)
     # the same scene under a beam that peaks on the other side of the scene center than the file says
     gain = np.concatenate([sim.beam_gain(col, pos[a:a + 4096], (BEAM[0], -BEAM[1], -BEAM[2])) for a in range(0, n, 4096)], 1)
-    sim.write_cphd(str(d / 'displaced.cphd'), col, echoes(col, pos, amp * gain), LAT, LON, H0, **kw)
+    Sd = echoes(col, pos, amp * gain)
     noise = (rs.standard_normal(S.shape) + 1j * rs.standard_normal(S.shape)) * np.sqrt(PN_REF / 2.0)
     sim.write_cphd(str(d / 'noise.cphd'), col, noise, LAT, LON, H0, **kw)
+    # the footprint's files hold the noise as well, as a collection does: the clutter as the file states the beam,
+    # the same in a file whose antenna frames point 0.008 off the scene center while the beam follows it, and the
+    # displaced beam
+    sim.write_cphd(str(d / 'lit.cphd'), col, Sc + noise, LAT, LON, H0, **kw)
+    sim.write_cphd(str(d / 'steered.cphd'), col, Sc + noise, LAT, LON, H0, boresight=STATED, **kw)
+    sim.write_cphd(str(d / 'displaced.cphd'), col, Sd + noise, LAT, LON, H0, **kw)
+    # for the beam's width: clutter well over a weak noise floor under the narrow beam, in a file that states that
+    # beam and in one that states a pattern of twice its roll-off in dB (a two-way pattern stored as one-way)
+    m = n // 4
+    Sw = echoes(col, pos[:m], 2.0 * amp[:m] * sim.beam_gain(col, pos[:m], NARROW)) + 0.2 * noise
+    kn = dict(kw, pn_ref=0.04 * PN_REF)
+    sim.write_cphd(str(d / 'width.cphd'), col, Sw, LAT, LON, H0, **dict(kn, beam=NARROW))
+    sim.write_cphd(str(d / 'once.cphd'), col, Sw, LAT, LON, H0, **dict(kn, beam=(2.0 * NARROW[0],) + NARROW[1:]))
     sim.write_cphd(str(d / 'unmeasured.cphd'), col, S + noise, LAT, LON, H0, **dict(kw, pn_ref=None))
     sim.write_cphd(str(d / 'uncalibrated.cphd'), col, S, LAT, LON, H0, **dict(kw, pt_ref=None, pn_ref=None))
     # the sigma zero the scatterers drawn inside the averaging disc amount to, and the noise power drawn
@@ -94,12 +107,16 @@ def db(x):
 
 
 @pytest.mark.parametrize('plane, weighting', CASES, ids=[f'{p}-{w}' for p, w in CASES])
-def test_known_levels_come_back_from_the_written_factors(scene, plane, weighting):
+def test_known_levels_come_back_from_the_written_factors(scene, plane, weighting, monkeypatch):
     """RCS of the point targets from their peak power and RCSSFPoly; sigma zero, beta zero and gamma zero of the
     clutter from its mean power and their polynomials; the noise power from NoisePoly, and the noise-equivalent
     sigma zero from both."""
     from sarpy.geometry import point_projection
     d, col, ecf, pn, sigma0 = scene
+    # the clutter file has no noise in it and its patch ends two radii from the beam's peak, which draws a fitted
+    # center 0.3 radii toward the patch's middle: here the file's pointing is taken as stated (the check of it,
+    # on files with noise, is test_the_data_decide_the_pointing)
+    monkeypatch.setattr(rgiqe, '_FOOTPRINT_RATIO', np.inf)
     kw = dict(plane=plane, weighting=weighting, backend='cpu')
     f = d / 'p.nitf'
     o = fastsar.process_cphd(str(d / 'targets.cphd'), str(f), **kw)
@@ -231,15 +248,17 @@ def test_the_data_decide_the_pointing(scene, tmp_path):
     noise alone show no footprint: the file's pointing stays, unverified. With the phase history given, the file
     is not read for any of it."""
     d, col, ecf, pn, _ = scene
-    c, meta = io.read_cphd(str(d / 'clutter.cphd'), meta=True)
-    rad = rgiqe.Radiometry(str(d / 'clutter.cphd'), meta)
+    assert rgiqe._FOOTPRINT_RATIO == 0.4
+    c, meta = io.read_cphd(str(d / 'lit.cphd'), meta=True)
+    rad = rgiqe.Radiometry(str(d / 'lit.cphd'), meta)
     f = rad.footprint
     assert rad.level_source == 'cphd' and rad.pointing == 'file' and f['status'] == 'consistent'
-    assert f['ratio'] < 0.5 and f['fitted_correlation'] > 0.6 and f['file']['ratio'] == f['ratio']
+    assert f['ratio'] < 0.3 and f['fitted_correlation'] > 0.8 and f['file']['ratio'] == f['ratio']
+    assert f['width'] is None                                        # clutter under 6 dB over the noise in the map
     assert f['reference_point'] == f['file'] and rad.measure_footprint() is f      # the frames are on it already
     assert sum('agrees with the antenna block as the file points it' in n for n in rad.notes) == 1
     assert 60.0 < f['radius_m'] < 85.0                               # the two-way half-power radius: 71 m at 10 km
-    given = rgiqe.Radiometry(str(d / 'clutter.cphd'), meta, history=c['S'])
+    given = rgiqe.Radiometry(str(d / 'lit.cphd'), meta, history=c['S'])
     assert given.pointing == 'file' and given._blocks['history'] is None
     assert given.footprint['offset'] == pytest.approx(f['offset'], abs=2e-4)   # the file's samples, or the history's
     g = np.linspace(-60.0, 60.0, 7)
@@ -249,7 +268,7 @@ def test_the_data_decide_the_pointing(scene, tmp_path):
     c1, meta1 = io.read_cphd(str(d / 'steered.cphd'), meta=True)
     turned = rgiqe.Radiometry(str(d / 'steered.cphd'), meta1, history=c1['S'])
     t = turned.footprint
-    assert turned.pointing == 'reference point' and t['status'] == 'consistent' and t['ratio'] < 0.5
+    assert turned.pointing == 'reference point' and t['status'] == 'consistent' and t['ratio'] < 0.3
     assert t['file']['status'] == 'inconsistent' and t['file']['ratio'] > 0.8
     assert t['reference_point']['ratio'] == t['ratio'] and t['file']['offset_m'] > 2 * t['offset_m']
     assert np.hypot(*t['file']['offset']) == pytest.approx(np.hypot(*STATED), rel=0.5)
@@ -263,7 +282,7 @@ def test_the_data_decide_the_pointing(scene, tmp_path):
     c2, meta2 = io.read_cphd(str(d / 'displaced.cphd'), meta=True)
     off = rgiqe.Radiometry(str(d / 'displaced.cphd'), meta2, history=c2['S'])
     h = off.footprint
-    assert off.pointing is None and h['status'] == 'inconsistent' and h['ratio'] > 0.5
+    assert off.pointing is None and h['status'] == 'inconsistent' and h['ratio'] > 0.6
     assert h['file']['status'] == h['reference_point']['status'] == 'inconsistent'
     assert h['fitted_correlation'] > h['correlation'] + 0.1
     assert sum('no trusted antenna pattern' in n for n in off.notes) == 1
@@ -283,7 +302,7 @@ def test_the_data_decide_the_pointing(scene, tmp_path):
         assert sum('unverified' in n for n in r.notes) == 1
     # the products
     p = tmp_path / 'p.nitf'
-    o = fastsar.process_cphd(str(d / 'clutter.cphd'), str(p), backend='cpu')
+    o = fastsar.process_cphd(str(d / 'lit.cphd'), str(p), backend='cpu')
     kept = o['radiometric']
     assert not kept['constant'] and kept['order'] >= 1 and any('as the file points it, over' in n for n in o['notes'])
     o = fastsar.process_cphd(str(d / 'steered.cphd'), str(p), backend='cpu')
@@ -308,6 +327,27 @@ def test_the_data_decide_the_pointing(scene, tmp_path):
     ant = 0.5 * (o['meta']['tx'] + o['meta']['rcv'])[o['pulses'][0]:o['pulses'][1]]
     area = rgiqe.support_area(ant, o['band'], o['center'])
     assert rgiqe.calibration(off, sm, n, area)['constant'] and not rgiqe.calibration(off, sm, n, area, constant=False)['constant']
+
+
+def test_the_footprint_has_the_width_of_the_two_way_beam(scene):
+    """The measured footprint's width over the modeled two-way beam's, along the antenna's X and Y: 1 where the
+    file states the beam the echoes were made under (the pattern applied once on transmit and once on receive),
+    and the square root of 2 where the file states as its one-way pattern what is the two-way gain (twice the
+    roll-off in dB), so that the model's two applications make the beam too narrow. The pointing does not
+    depend on it."""
+    d = scene[0]
+    got = {}
+    for name in ('width', 'once'):
+        _, meta = io.read_cphd(str(d / f'{name}.cphd'), meta=True)
+        rad = rgiqe.Radiometry(str(d / f'{name}.cphd'), meta)
+        f = got[name] = rad.footprint
+        assert rad.pointing == 'file' and f['status'] == 'consistent' and len(f['width']) == 2, name
+        assert sum('times as wide as the modeled two-way beam' in n for n in rad.notes) == 1
+    w, o = np.array(got['width']['width']), np.array(got['once']['width'])
+    assert np.all((w > 0.8) & (w < 1.2)), w
+    assert np.all((o > 1.15) & (o < 1.65)), o
+    assert np.all((o / w > 1.2) & (o / w < 1.65)), o / w
+    assert got['once']['radius'] == pytest.approx(got['width']['radius'] / np.sqrt(2.0), rel=0.03)
 
 
 def test_support_area_and_clutter_gain(scene):

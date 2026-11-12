@@ -152,7 +152,8 @@ rasterio.
   them and the model has no trusted pattern), and `footprint` the check behind it, of the antenna block against
   the beam's footprint in the phase history: a dict with `status` (`'consistent'`, `'inconsistent'`,
   `'unchecked'` with `reason`), `correlation`, `fitted_correlation`, `offset`, `offset_m`, `radius_m`, `ratio`,
-  and the same under `file` and `reference_point` for each pointing
+  the same under `file` and `reference_point` for each pointing, and `width`, the footprint's measured width
+  over that of the modeled two-way beam along the antenna's X and Y axes
   ([product-options.md](product-options.md#the-antenna-patterns-pointing));
   `rgiqe.area_mask(rad, points, kind, bandwidth_area, samples, tasked=None, tasked_rniirs=None, *,
   ambiguities=True, black_sigma0_db=-10.0)` and `rgiqe.area_bounds(rad, kind, center, e1, e2, bandwidth_area,

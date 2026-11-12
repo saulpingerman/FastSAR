@@ -363,9 +363,10 @@ The measurement is the beam's footprint in the phase history: the range-Doppler 
 measurement uses (64 to 512 of them, from the history `process_cphd` has read). Each cell of delay and Doppler is
 a patch of ground, and the model's map is the two-way gain over a ground lattice binned into the same cells, with
 the azimuth ambiguities folded in and a fitted noise floor. The fit moves the modeled beam to where the two maps
-(their logarithms) correlate best. A pointing passes when the fitted beam center lies within half a half-power
-radius of the two-way beam from the modeled one, which is about 3 dB of gain at the half-power radius; scene
-content alone moves the fitted center by about 0.2 radii.
+(their logarithms) correlate best. A pointing passes when the fitted beam center lies within 0.4 of a half-power
+radius of the two-way beam from the modeled one. That is 2 to 3 dB of gain at the half-power radius, and twice
+the 0.2 radii by which scene content alone moves the fitted center
+([how the tolerance was set](#the-pointing-and-the-width-against-the-images)).
 
 1. `'file'`: the antenna frames as the file states them, when they pass.
 2. `'reference point'`: when they fail, the same pattern (its shape, its orientation about the boresight and any
@@ -382,38 +383,95 @@ Seven Umbra spotlight collections (2024-05 to 2025-01, satellites 05 to 08) and 
 
 | Collection | As the file points it | On the reference point | Pointing used |
 |---|---|---|---|
-| Umbra-07, 2024-09-10 | 2.01 km, 1.00 radii | 0.54 km, 0.27 | reference point |
-| UMBRA-06, 2024-05-28 | 1.50 km, 0.77 | 0.36 km, 0.19 | reference point |
+| Umbra-07, 2024-09-10 | 2.00 km, 1.00 radii | 0.51 km, 0.26 | reference point |
+| UMBRA-06, 2024-05-28 | 1.62 km, 0.83 | 0.37 km, 0.19 | reference point |
 | UMBRA-06, 2024-07-14 | 1.24 km, 0.65 | 0.40 km, 0.21 | reference point |
-| UMBRA-06, 2024-07-28 | 1.22 km, 0.65 | 0.38 km, 0.20 | reference point |
+| UMBRA-06, 2024-07-28 | 1.31 km, 0.70 | 0.22 km, 0.12 | reference point |
 | UMBRA-06, 2024-10-26 | 1.08 km, 0.71 | 0.47 km, 0.31 | reference point |
-| UMBRA-08, 2024-11-12 | 0.97 km, 0.49 | 1.09 km, 0.55 | file |
-| UMBRA-05, 2025-01-19 | 0.82 km, 0.44 | 0.87 km, 0.47 | file |
-| Capella, 2025-03-13 | 1.22 km, 0.46 | 0.61 km, 0.23 | file |
+| UMBRA-08, 2024-11-12 | 0.97 km, 0.49 | 1.09 km, 0.55 | none |
+| UMBRA-05, 2025-01-19 | 0.82 km, 0.44 | 0.87 km, 0.47 | none |
+| Capella, 2025-03-13 | 1.22 km, 0.46 | 0.61 km, 0.23 | reference point |
 | Capella, 2025-01-19 | no fit | | file, unverified |
 
 The offsets are those of the fitted beam center from the modeled one, in kilometers on the ground and in
 half-power radii. In all seven Umbra files the per-vector frames (`TxACX`, `TxACY` and the same for receive, with
 ACY along the velocity; `TxEB` and `RcvEB` zero; pattern arrays that peak within 2e-4 of their origin, 1e-3 along
 X for UMBRA-05) put the boresight 0.15 to 0.18 degrees ahead of the scene reference point along the track, 1.4 to
-1.6 km on the ground, and the data put the beam 0.8 to 2.0 km from there, toward the reference point in every one
-(1.26 km on average, standard error 0.15 km). Five fail as the file points them and pass on the reference point;
-two lie halfway and pass either way, so they keep the file's pointing. The second Capella collection gives no
-fit: at a range of 931 km its clutter stands 1.9 dB above the noise in the map.
+1.6 km on the ground, and the data put the beam 0.8 to 2.0 km from there, toward the reference point in every
+one. Five fail as the file points them and pass on the reference point. Two lie about halfway between the two
+pointings and pass neither: their SICDs carry constant scale factors, and their quality areas are refused. The
+first Capella collection fails as its file points it, by a small margin, and passes on the reference point; it
+states no `PTRef`, so only its quality areas depend on the choice. The second Capella collection gives no fit: at
+a range of 931 km its clutter stands 1.9 dB above the noise in the map.
 
 One observation on the Umbra frames, which is not used as a rule: the stated offset is the rotation of the line
 of sight over 0.19 to 0.21 s in each of the seven files. With the frames taken 0.20 s later than stamped the
-boresight falls on the reference point in all seven (to 2e-4 along ACY), and the fitted offsets are 0.16 to 0.48
-radii, against 0.44 to 1.00 as stamped and 0.19 to 0.55 on the reference point. The delay that fits each file
-best scatters from 0.10 to 0.27 s (mean 0.16 s, standard deviation 0.05 s, which is the fit's noise), so the
+boresight falls on the reference point in all seven (to 2e-4 along ACY), and the fitted offsets are 0.12 to 0.48
+radii, against 0.44 to 1.00 as stamped and 0.12 to 0.55 on the reference point. The delay that fits each file
+best scatters from 0.10 to 0.27 s (mean 0.17 s, standard deviation 0.06 s, which is the fit's noise), so the
 footprints agree with one common delay near 0.2 s and cannot tell it from a boresight on the reference point.
 
-On the first of those collections the modeled gain was held against the image itself. Over 200 m cells within
-2.4 km of the scene center the image's brightness changes by -0.23 dB per dB of the gain as the file points it
-(correlation -0.30) and by +0.50 dB per dB of the gain on the reference point (correlation +0.31), where a
-correct model over homogeneous ground gives +1: the re-pointed pattern has the right sense and about twice the
-roll-off the image shows over this farmland. Its quality areas change with the pointing as follows (across by
-along the line of sight, and the pixels of the SIDD):
+### The beam's width
+
+The same map gives the beam's width. With the modeled beam at its fitted center, the model is widened along the
+antenna's X and Y axes until it fits the map best (least squares of the logarithms, over the noise floor of the
+measurement, with one scale), and `rad.footprint['width']` holds the two factors: the measured footprint's width
+over that of the modeled two-way beam. It is a record for the reader and changes nothing in the model. It is
+`None` where the clutter stands less than 6 dB over the noise floor in the map. On simulated clutter the factors
+come back within 0.15 of 1 under the stated beam, and 1.40 to 1.42 times larger where the file states a pattern
+of twice the roll-off in dB, for which 1.41 is expected (`tests/test_calibration.py`).
+
+The width answers one question about a file directly: whether its `AntPattern` is the one-way gain the standard
+asks for, applied once on transmit and once on receive. A two-way pattern stored as one-way, or a model that
+applied a pattern twice where the antenna applies it once, would make the measured footprint 1.41 times as wide
+as the modeled one. In the seven Umbra files the transmit and the receive pattern are two entries with the same
+content: the same `GainZero` (46.0 to 49.3 dB), the same gain array in dB whose peak is `GainZero` and whose
+half-power width is 0.51 to 0.58 degrees, and the same per-vector frames. The two Capella files name one pattern
+for both. The model evaluates the transmit and the receive pattern once each, adds their dB, and refers the sum
+to the gain toward the scene reference point, so the absolute level of the arrays drops out.
+
+| Collection | Across track | Along track | From 1,024 pulses |
+|---|---|---|---|
+| Umbra-07, 2024-09-10 | 1.050 | 1.025 | 1.06, 1.03 |
+| UMBRA-06, 2024-05-28 | 1.075 | 1.050 | 1.06, 1.04 |
+| UMBRA-06, 2024-07-14 | 1.125 | 1.025 | 1.12, 1.04 |
+| UMBRA-06, 2024-07-28 | 1.100 | 1.050 | 1.11, 1.04 |
+| UMBRA-06, 2024-10-26 | 1.150 | 1.075 | 1.15, 1.06 |
+| UMBRA-08, 2024-11-12 | 0.950 | 1.000 | 0.96, 1.01 |
+| UMBRA-05, 2025-01-19 | 1.050 | 1.150 | 1.06, 1.16 |
+| Capella, 2025-03-13 | not measured | | 1.29, 1.01 |
+
+The first two columns are `rad.footprint['width']` from the 64 or 128 pulses of the noise measurement (X is
+across the track in these files and Y along it); the last is the same fit on 1,024 pulses with both widths
+searched together. Over the seven Umbra collections the footprint is 1.07 times as wide as the modeled two-way
+beam across the track (standard deviation 0.07) and 1.05 times along it (0.05): the pattern is applied as it
+should be, once each way, and the beam is a few percent wider than the stored arrays, whose own polynomial
+(`GainPoly`) is 5 to 10% wider along X than the array beside it. The Capella collection's clutter stands 4.7 dB over the
+floor; from 1,024 pulses its width across the track is 1.29 with an interval of 1.02 to 1.90, and 1.01 along it
+(0.92 to 1.12).
+
+### The pointing and the width against the images
+
+A second measurement of the same beam, which does not use the range-Doppler map, set the tolerance. For each of
+the seven Umbra collections the default ground-plane SICD was formed, and its brightness (the noise level taken
+out, cells of 200 m, the half of the cells with the least texture) was fitted with the file's two-way pattern
+placed at a free center, with the azimuth ambiguities of each cell added.
+
+- The center that fits the image lies 0.02 to 0.35 radii from the reference point and 0.61 to 0.97 radii from the
+  file's boresight, in all seven. It lies 0.04 to 0.33 radii (0.18 on average) from the center the range-Doppler
+  map gives, which is the scatter of either estimate.
+- For the five collections that pass on the reference point, the brightness of the low-texture ground follows the
+  modeled gain there with a slope of +0.70 to +0.80 dB per dB (1 for uniform ground under a perfect model; the
+  ambiguities, the few percent of width and the residual pointing take the rest). Over all cells, towns
+  included, the slope is +0.51 to +0.67: texture attenuates it. The width that fits these images best is 1.15
+  to 1.30 across the track and 1.05 to 1.15 along it, from cells that reach 1.3 radii from the center.
+- For the two collections that lie halfway, the gain as the file points it gives slopes of +0.45 and +0.31 over
+  a modeled span of 22 dB, and the gain on the reference point +1.05 and +0.54. A tolerance of half a radius
+  accepted the file's pointing for these two (0.49 and 0.44 radii) and wrote polynomials spanning 23 dB over
+  images whose brightness follows a third to a half of that. At 0.4 neither pointing passes.
+
+On the first collection the quality areas change with the pointing as follows (across by along the line of
+sight, and the pixels of the SIDD):
 
 | Area | As the file points it | On the reference point |
 |---|---|---|
@@ -428,18 +486,18 @@ to +3.2 km and from -3.3 to +6.15 km.
 ### The black area at -10 dB
 
 Two spotlight collections with tasked areas of 5 by 5 km, at a reference of 0 dB, which was that of 0.2.0, and at
-the default, with the pattern pointed as the data decide (the Umbra collection on the reference point; with the
-file's pointing, as in 0.2.0, its area at 0 dB was 8.30 x 11.35 km). Sizes are across by along the line of sight,
+the default, with the pattern pointed as the data decide (both on the reference point; with the files' pointing,
+as in 0.2.0, the areas at 0 dB were 8.30 x 11.35 km and 11.85 x 7.95 km). Sizes are across by along the line of sight,
 and the pixels are those of the SIDD that `process_cphd(product='sidd', area='black')` plans:
 
 | Collection | `black_sigma0_db=0.0` | `black_sigma0_db=-10.0` (default) |
 |---|---|---|
 | Umbra, 2024-09-10 | 8.15 x 11.10 km, 90.5 km^2, 348 Mpx | 7.75 x 9.05 km, 70.1 km^2, 267 Mpx |
-| Capella, 2025-03-13 | 11.85 x 7.95 km, 94.2 km^2, 1,643 Mpx | 6.15 x 7.85 km, 48.3 km^2, 833 Mpx |
+| Capella, 2025-03-13 | 11.80 x 7.95 km, 93.8 km^2, 1,634 Mpx | 6.00 x 7.90 km, 47.4 km^2, 816 Mpx |
 
 The Umbra area shrinks along the line of sight and hardly across it. Across the beam its edge is where the azimuth
 ambiguities reach the signal, and their level follows the scene's own sigma zero, so that edge does not move with
-the reference. The Capella collection has a noise-equivalent sigma zero of -13.6 dB at the scene center (an
+the reference. The Capella collection has a noise-equivalent sigma zero of -13.8 dB at the scene center (an
 uncalibrated level, from the measured clutter-to-noise ratio), and its area halves.
 
 ## Radiometric calibration
@@ -526,17 +584,19 @@ present (`tests/test_sicd_consistency.py`).
 Against the vendor's SICD of one Umbra spotlight collection (2024-09-10; PTRef, no PNRef), over the same ground
 through each file's own projection and its own block. The vendor's factors are constant over its image (to
 0.06 dB). FastSAR's follow the file's pattern with the boresights on the scene reference point, which the data
-chose over the file's pointing (0.27 against 1.00 half-power radii); the gain falls 9.9 dB over the tasked
+chose over the file's pointing (0.26 against 1.00 half-power radii); the gain falls 9.9 dB over the tasked
 rectangle and the fit is of order 6, to 0.03 dB.
 
 - At the scene center the two agree: over the central 500 m FastSAR's sigma zero is 0.4 dB above the vendor's
   (-8.4 against -8.8 dB).
 - Over 64 boxes of 500 m within 2 km of the center FastSAR less vendor is +1.95 dB on average, with a standard
   deviation of 1.18 dB and a range of +0.05 to +4.82 dB (slant-plane product: +1.94, 1.22, +0.03 to +4.72). The
-  difference is the modeled gain, which the vendor's constant factors leave in the image. The image darkens by
-  half as much as the model says ([above](#the-antenna-patterns-pointing): +0.50 dB per dB). Taking the image's
-  own roll-off for the truth, FastSAR's factors are too large toward the edges by up to about 2.4 dB and the
-  vendor's too small by as much.
+  difference is the modeled gain, which the vendor's constant factors leave in the image. The footprint in the
+  phase history has the width of the modeled two-way beam (1.05 and 1.03), and over ground of low texture the
+  image darkens by 0.78 dB per dB of the modeled gain
+  ([above](#the-pointing-and-the-width-against-the-images)); over all cells, with the town at the scene center,
+  the slope is +0.54. The residual pointing (0.26 radii) leaves the factors uncertain by about 1.5 dB at the half-power
+  radius.
 - With constant factors (`rgiqe.calibration(..., constant=True)`) the same boxes differ by +0.06 dB on average
   (standard deviation 0.26 dB, range -0.85 to +1.00). With the file's pointing they differed by -1.5 to +9.9 dB.
 - Noise. The vendor's `NoisePoly` times its sigma zero factor is -71.5 dB, and its `theoretical_nesz_db`

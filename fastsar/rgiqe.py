@@ -45,7 +45,8 @@ RNIIRS_FIT = (3.4761, 0.4357)          # RNIIRS = a0 + a1 log2(information densi
 _FLOOR_DB = 15.0                       # one-way depth below the peak to which an antenna gain polynomial is trusted
 _NOISE_BLOCKS, _NOISE_BLOCK_PULSES = 4, 128
 _NOISE_BUDGET = 8e6                    # about the most phase-history samples the noise measurement transforms
-_FOOTPRINT_RATIO = 0.5                 # measured against modeled beam center, in half-power radii: beyond it, they disagree
+_FOOTPRINT_RATIO = 0.4                 # measured against modeled beam center, in half-power radii: beyond it, they disagree
+_FOOTPRINT_CLUTTER = 4.0               # least clutter over the noise floor (power ratio) for the footprint's width
 _CELL_SAMPLES = 1000                   # least number of power samples averaged into a cell of the range-Doppler map
 
 
@@ -256,9 +257,13 @@ class Radiometry:
     the antenna's X and Y axes to add to every direction), offset_m (its size on the ground at the reference
     range), radius, radius_m (the half-power radius of the two-way beam), ratio (offset over radius), and under
     file and reference_point the same numbers for each of the two pointings (the top level holds those of the
-    pointing in use; the file's when none is trusted). A pointing fails when the fitted
-    beam center lies more than half a half-power radius from the modeled one (about 3 dB of gain at the half-power
-    radius; scene content alone moves the fitted center by some 0.2 radii). pointing says which is in use:
+    pointing in use; the file's when none is trusted). A pointing fails when the fitted beam center lies more than
+    0.4 of a half-power radius from the modeled one (2 to 3 dB of gain at the half-power radius, and twice the 0.2
+    radii by which scene content alone moves the fitted center). width is the footprint's measured width over
+    that of the modeled two-way beam along the antenna's X and Y axes (None where the clutter stands less than
+    6 dB over the noise in the map): near 1 where transmit and receive each apply the pattern, as the model
+    does, and near 1.4 for a beam that only one of them shapes. It is a record and changes nothing. pointing
+    says which is in use:
       'file'             the antenna frames as the file states them: they pass, or could not be checked (a scene
                          of a few point scatterers, clutter under the noise, no samples to measure: a note says
                          the pattern is unverified);
@@ -445,23 +450,12 @@ class Radiometry:
                 g = g + p(u - sx, v - sy)
         return g
 
-    def _check_footprint(self, fp):
-        """Set self.footprint and self.pointing from the measured range-Doppler map fp (_measure_noise's), turn the
-        antenna frames when the data ask for it, and add the note."""
-        out = dict(status='unchecked', reason=None, correlation=None, fitted_correlation=None, offset=None,
-                   offset_m=None, radius=None, radius_m=None, ratio=None, file=None, reference_point=None)
-        self.footprint = out
-        if self._ant is None:
-            out['reason'] = 'the file describes no antenna pattern'
-            return out
-
-        def unchecked(reason):
-            out['reason'] = reason
-            self.notes.append(f"The antenna block could not be checked against the beam's footprint in the phase "
-                              f"history ({reason}): the pattern is used as the file points it, unverified.")
-            return out
-        if fp is None:
-            return unchecked('no pulses could be measured for it')
+    def _footprint_model(self, fp, reach=3.0):
+        """The model of the measured range-Doppler map fp (_measure_noise's) -> dict(D, the map; radius, the
+        half-power radius of the two-way beam in direction cosine; r0, the reference range; predict(ox, oy, wx,
+        wy), the modeled gain over a ground lattice out to `reach` radii binned into the map's cells, with the
+        beam moved by (ox, oy) in direction cosine and widened by (wx, wy) along the antenna's X and Y about its
+        peak), or the reason there is none."""
         b, e = self._blocks, self._e
         i = len(e['rt']) // 2
         D = np.asarray(fp['power'], np.float64)
@@ -472,15 +466,16 @@ class Radiometry:
         U, V = np.meshgrid(gp, gp, indexing='ij')
         two = self._pattern_db('tx', U, V, i) + self._pattern_db('rcv', U, V, i)
         if not np.isfinite(two).all() or np.ptp(two) < 6.0:
-            return unchecked('the pattern has no beam within 0.02 of its origin in direction cosine')
-        inside = two >= two.max() - 3.0
-        radius = float(np.sqrt(inside.sum() * (gp[1] - gp[0]) ** 2 / np.pi))
+            return 'the pattern has no beam within 0.02 of its origin in direction cosine'
+        cell = (gp[1] - gp[0]) ** 2
+        radius = float(np.sqrt((two >= two.max() - 3.0).sum() * cell / np.pi))
         if not 1e-4 < radius < 0.015:
-            return unchecked('the pattern has no beam within 0.02 of its origin in direction cosine')
-        # a ground lattice out to three radii, with its direction cosines and its delay and Doppler cells
+            return 'the pattern has no beam within 0.02 of its origin in direction cosine'
+        pu, pv = (float(v.ravel()[int(two.argmax())]) for v in (U, V))
+        # a ground lattice out to `reach` radii, with its direction cosines and its delay and Doppler cells
         r0 = float(e['rt'][i])
-        half = 3.0 * radius * r0 / max(np.sin(self.graze), 0.2)
-        g = np.linspace(-half, half, 121)
+        half = reach * radius * r0 / max(np.sin(self.graze), 0.2)
+        g = np.linspace(-half, half, int(round(40 * reach)) + 1)
         X = (self.ref_point + g[:, None, None] * self.range_dir + g[None, :, None] * self.cross_dir).reshape(-1, 3)
         j0 = int(fp['start']) - int(b['fsel'][0])
         j1 = j0 + nb - 1
@@ -492,8 +487,9 @@ class Radiometry:
         tmid = 0.5 * (d0 + d1)
         nu = fp['sgn'] * fp['f0'] * (d1 - d0) / max(nb - 1, 1)       # cycles per pulse
         # each lattice point is shared between the four cells about it (the lattice is no finer than the cells):
-        # Doppler cell c holds the bins c nb / ndf .. (c + 1) nb / ndf - 1 and wraps, delay cell k is edges[k]..[k+1]
-        fd = (nu % 1.0) * ndf - 0.5
+        # Doppler cell c holds the bins c nb / ndf .. (c + 1) nb / ndf - 1 (its middle lies half a bin under that
+        # of the frequencies c / ndf .. (c + 1) / ndf) and wraps, delay cell k is edges[k]..[k+1]
+        fd = (nu % 1.0) * ndf - 0.5 + 0.5 * ndf / nb
         ft = (tmid - edges[0]) / (edges[1] - edges[0]) - 0.5
         d_lo, t_lo = np.floor(fd).astype(int), np.floor(ft).astype(int)
         wd, wt = fd - d_lo, ft - t_lo
@@ -516,12 +512,98 @@ class Radiometry:
             weight = weight * np.clip(np.nan_to_num(tap, nan=1.0), 0.0, 1.0)
         same = bool(self._ant['same'])
 
-        def predict(ox=0.0, oy=0.0):
-            gdb = 2.0 * self._pattern_db('tx', dc['tx'][0] + ox, dc['tx'][1] + oy, i) if same else sum(
-                self._pattern_db(k, dc[k][0] + ox, dc[k][1] + oy, i) for k in ('tx', 'rcv'))
+        def predict(ox=0.0, oy=0.0, wx=1.0, wy=1.0):
+            at = lambda k: self._pattern_db(k, pu + (dc[k][0] + ox - pu) / wx, pv + (dc[k][1] + oy - pv) / wy, i)
+            gdb = 2.0 * at('tx') if same else at('tx') + at('rcv')
             v = 10.0 ** (0.1 * gdb) * weight
             return sum(np.bincount(ix, weights=v * wv, minlength=ndf * nt + 1) for ix, wv in splat)[:ndf * nt].reshape(ndf, nt)
+        return dict(D=D, radius=radius, r0=r0, predict=predict)
 
+    def _footprint_width(self, fp, ox, oy):
+        """Widths of the measured footprint over those of the modeled two-way beam along the antenna's X and Y axes
+        -> (wx, wy), or None where the clutter does not stand _FOOTPRINT_CLUTTER times over the noise floor.
+
+        The model of the map (out to 4.5 radii) with the beam moved by about (ox, oy) and widened about its peak,
+        over the noise floor of the measurement, is fitted to the map by least squares of the logarithms with one
+        scale: each width in turn on a grid from 0.6 to 2, the center once more, then the widths to 0.025. One
+        pattern applied where two are (transmit and receive) would show as widths of about 1.4."""
+        floor = fp.get('floor')
+        model = self._footprint_model(fp, 4.5) if floor is not None else ''
+        if isinstance(model, str):
+            return None
+        D, predict, radius = model['D'], model['predict'], model['radius']
+        F = np.broadcast_to(np.maximum(np.asarray(floor, np.float64), 1e-9 * D.max())[None, :], D.shape)
+        if np.percentile(D / F, 95) < _FOOTPRINT_CLUTTER:
+            return None
+        logd = np.log(np.maximum(D, 1e-300))
+        gold = 0.5 * (np.sqrt(5.0) - 1.0)
+
+        def cost(ox, oy, wx, wy):
+            """Mean squared difference of the logarithms at the scale that makes it least (golden section)."""
+            M = predict(ox, oy, wx, wy)
+            if not M.any():
+                return np.inf
+            j = lambda ls: float(np.mean((logd - np.log(np.exp(ls) * M + F)) ** 2))
+            a = float(np.log(D.max() / M.max())) - 9.0
+            b = a + 18.0
+            c, d = b - gold * (b - a), a + gold * (b - a)
+            jc, jd = j(c), j(d)
+            for _ in range(28):
+                if jc < jd:
+                    b, d, jd = d, c, jc
+                    c = b - gold * (b - a)
+                    jc = j(c)
+                else:
+                    a, c, jc = c, d, jd
+                    d = a + gold * (b - a)
+                    jd = j(d)
+            return min(jc, jd)
+        w = [1.0, 1.0]
+        best = cost(ox, oy, *w)
+
+        def widths(grid):
+            nonlocal best
+            for axis in (0, 1):
+                for v in grid(w[axis]):
+                    t = list(w)
+                    t[axis] = float(v)
+                    c = cost(ox, oy, *t)
+                    if c < best:
+                        best, w[axis] = c, float(v)
+        widths(lambda v: np.arange(0.6, 2.01, 0.1))
+        cx, cy = ox, oy
+        for px in (cx - radius / 8, cx, cx + radius / 8):
+            for py in (cy - radius / 8, cy, cy + radius / 8):
+                c = cost(px, py, *w)
+                if c < best:
+                    best, ox, oy = c, px, py
+        for _ in range(2):
+            widths(lambda v: v + np.arange(-0.075, 0.076, 0.025))
+        return float(w[0]), float(w[1])
+
+    def _check_footprint(self, fp):
+        """Set self.footprint and self.pointing from the measured range-Doppler map fp (_measure_noise's), turn the
+        antenna frames when the data ask for it, and add the note."""
+        out = dict(status='unchecked', reason=None, correlation=None, fitted_correlation=None, offset=None,
+                   offset_m=None, radius=None, radius_m=None, ratio=None, file=None, reference_point=None, width=None)
+        self.footprint = out
+        if self._ant is None:
+            out['reason'] = 'the file describes no antenna pattern'
+            return out
+
+        def unchecked(reason):
+            out['reason'] = reason
+            self.notes.append(f"The antenna block could not be checked against the beam's footprint in the phase "
+                              f"history ({reason}): the pattern is used as the file points it, unverified.")
+            return out
+        if fp is None:
+            return unchecked('no pulses could be measured for it')
+        model = self._footprint_model(fp)
+        if isinstance(model, str):
+            return unchecked(model)
+        e = self._e
+        i = len(e['rt']) // 2
+        D, radius, r0, predict = model['D'], model['radius'], model['r0'], model['predict']
         logd = np.log(np.maximum(D, 1e-300 + 1e-12 * D.max()))
         floor = 0.2 * float(np.percentile(D, 5))
         A = D.ravel()
@@ -573,6 +655,10 @@ class Radiometry:
             return unchecked(f'the clutter stands only {contrast:.1f} dB above the noise in the range-Doppler map, '
                              f'and the fit explains too little of it (correlation {best[0]:.2f})' if contrast < 3.0 else
                              f'the map does not resemble a beam (correlation {best[0]:.2f} at the best fit)')
+        out['width'] = self._footprint_width(fp, best[1], best[2])
+        if out['width'] is not None:
+            self.notes.append("The beam's footprint in the phase history is %.2f and %.2f times as wide as the modeled "
+                              "two-way beam along the antenna's X and Y axes." % out['width'])
         km = lambda v: f"{v['offset_m'] / 1e3:.2f} km ({v['ratio']:.2f} of the half-power radius of the two-way beam)"
         if file['status'] == 'consistent':
             self.notes.append(f"The beam's footprint in the phase history agrees with the antenna block as the file "
@@ -948,9 +1034,17 @@ def _measure_noise(r, ch, pv, fsel, K, history=None):
             f'The clutter power per sample from the scene swath is {clutter:.4g}.')
     foot = None
     if fmap is not None:
-        f0 = float(np.mean(_pvp(pv, 'SC0' if 'SC0' in names else 'FX1')[rows])) + k0 * scss
+        # the frequency a Doppler shift is counted at: in one delay bin the phase of an echo turns at the middle of
+        # its band, not at the first sample's frequency
+        fx = [n for n in ('FX1', 'FX2', 'Fx1', 'Fx2') if n in names]
+        f0 = 0.5 * float(np.mean(_pvp(pv, fx[0])[rows]) + np.mean(_pvp(pv, fx[1])[rows])) if len(fx) >= 2 else \
+            float(np.mean(_pvp(pv, 'SC0')[rows])) + (k0 + 0.5 * (Ku - 1)) * scss
+        # the noise under the map: the per-bin floor (the fitted lines, else the least cell) summed over each cell
+        per_bin = np.maximum(np.min([np.polyval(c, tau[fwi]) for c in lines], axis=0), 0.0) if method == 'extended swath' \
+            else np.full(len(fwi), rd_min)
+        floor = np.add.reduceat(per_bin, bounds) * (nb // ndf) * float(np.sum(w * w))
         foot = dict(power=fmap / len(starts), edges=edges, nb=nb, start=int(starts[len(starts) // 2]), sgn=sgn, f0=f0,
-                    window=(t1, t2), extended=(e1, e2) if ext else None)
+                    window=(t1, t2), extended=(e1, e2) if ext else None, floor=floor)
     return dict(noise=noise, clutter=clutter, method=method, rd_min=rd_min, extended=ext_level, pulses=len(rows),
                 swath=(t1, t2), profile_mean=float(prof.mean()), note=note, footprint=foot, samples=Ku)
 

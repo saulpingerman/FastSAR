@@ -21,16 +21,24 @@ was published on PyPI.
   (for the quality areas it was part of `form`).
 - The antenna pattern's pointing is decided by the data (`Radiometry.pointing`, `Radiometry.footprint`). The
   beam's footprint is measured from the range-Doppler power of a few hundred pulses and compared with the modeled
-  gain. The file's antenna frames are used where they pass (the fitted beam center within half a half-power radius
-  of the modeled one). Where they fail, the same pattern is tried with each pulse's boresight on that pulse's
-  scene reference point, where a tracking beam is steered, and used if it passes. Where neither passes the model
-  has no trusted pattern: the quality areas other than `'tasked'` raise a `ValueError` and the scale factors of
-  the `Radiometric` block are constants. A scene that shows no footprint keeps the file's pointing, with a note
-  that it is unverified. Of seven Umbra collections five fail as their files point them (0.65 to 1.00 radii; the
-  frames put the boresight 1.4 to 1.6 km ahead of the scene reference point) and pass on the reference point
-  (0.19 to 0.31), and two pass as stated; on one of the five the black area moves from 7.90 x 9.45 km to 7.75 x
-  9.05 km, centered on the reference point, and the tasked-quality area from 7.65 x 6.75 km to 5.95 x 6.70 km
+  gain. The file's antenna frames are used where they pass (the fitted beam center within 0.4 of a half-power
+  radius of the modeled one). Where they fail, the same pattern is tried with each pulse's boresight on that
+  pulse's scene reference point, where a tracking beam is steered, and used if it passes. Where neither passes
+  the model has no trusted pattern: the quality areas other than `'tasked'` raise a `ValueError` and the scale
+  factors of the `Radiometric` block are constants. A scene that shows no footprint keeps the file's pointing,
+  with a note that it is unverified. Of seven Umbra collections five fail as their files point them (0.65 to 1.00
+  radii; the frames put the boresight 1.4 to 1.6 km ahead of the scene reference point) and pass on the reference
+  point (0.12 to 0.31), and two lie halfway and pass neither (0.44 to 0.55); on one of the five the black area
+  moves from 7.90 x 9.45 km to 7.75 x 9.05 km, centered on the reference point, and the tasked-quality area from
+  7.65 x 6.75 km to 5.95 x 6.70 km. The tolerance was set against the brightness of the formed images, which
+  follows the gain on the reference point at +0.70 to +0.80 dB per dB over ground of low texture for the five,
+  and the gain as the file points it at +0.31 and +0.45 for the two
   ([docs/product-options.md](docs/product-options.md#the-antenna-patterns-pointing)).
+- The beam's width is measured from the same footprint (`Radiometry.footprint['width']`): the measured width over
+  that of the modeled two-way beam, along the antenna's X and Y axes, where the clutter stands 6 dB over the
+  noise in the map. It is a record and does not change the model. A pattern applied once where the antenna
+  applies it on transmit and on receive would read 1.41; the seven Umbra collections read 1.07 across the track
+  (standard deviation 0.07) and 1.05 along it (0.05).
 - The clutter factor of the `Radiometric` block uses the samples' own density in spatial frequency
   (`rgiqe.clutter_gain`): pulses spaced unevenly in angle moved a simulated sigma zero by up to 0.1 dB under a
   Taylor window.
