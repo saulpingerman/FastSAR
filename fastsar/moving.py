@@ -697,7 +697,10 @@ def plan(g, st, opt):
     notes, valid, tasked = g['notes'], None, b
     if area != 'tasked':
         b, valid = _range_area(g, bm, b, opt)
-    t1, t2 = np.linspace(b[0], b[1], 7), np.linspace(b[2], b[3], 5)
+    # the spectrum over the rectangle that sets the sampling: the area's for apodization, whose band every pixel
+    # must hold, else the tasked one, so that a wider area lies on the tasked product's own pixels
+    over = b if wt == 'sva' else tasked
+    t1, t2 = np.linspace(over[0], over[1], 7), np.linspace(over[2], over[3], 5)
     pts = c + (t1[:, None, None] * e1 + t2[None, :, None] * e2).reshape(-1, 3)
     sp = spectrum(bm, ant, fband, K, pts, e1, e2)
     use = sp['full'] if sp['full'].any() else sp['pulses'] > 1
@@ -705,7 +708,7 @@ def plan(g, st, opt):
         raise ValueError('no pulse of the collection illuminates the area: check the extent')
     smooth = bm['drift'] <= 0.05
     b1 = float(np.median(sp['b1'][use]))                             # the processed azimuth band, cycles/m
-    b2 = float(np.interp(0.5 * (b[2] + b[3]), t2, sp['b2'].reshape(len(t1), len(t2)).mean(0)))
+    b2 = float(np.interp(0.5 * (over[2] + over[3]), t2, sp['b2'].reshape(len(t1), len(t2)).mean(0)))
     wide = float((sp['b1'] * fband[1] / fc + 2 * np.abs(sp['k1c']) * (fband[1] - fc) / fc)[use].max())
     lam = C / (f0 + K / 2 * df)
     own = (0.96 * lam / (2 * dsin), 0.96 * C / (2 * K * df) / np.cos(g['graze']))        # form_cphd's spacing
