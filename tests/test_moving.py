@@ -556,7 +556,7 @@ def test_small_jax_device_gives_the_same_product(monkeypatch):
         monkeypatch.delenv('FASTSAR_JAX_BLOCK_MB', raising=False)
         ref = fastsar.process_cphd(name, backend='jax', **kw)
         ref = dict(ref, image=np.array(ref['image']))                # a copy: a view would keep the device array
-        assert not any('JAX device' in n for n in ref['notes'])
+        assert not any('JAX device' in n for n in ref['notes']), ref['notes']
         gc.collect()
         monkeypatch.setenv('FASTSAR_JAX_BLOCK_MB', '0.2')
         sizes = []

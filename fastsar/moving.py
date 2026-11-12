@@ -1081,11 +1081,12 @@ def stages(out, st, product, lap, backend):
         p = budget and memory.cuda_plan(sizes, budget, autofocus=bool(af) or wt == 'sva', joined=True)
         if not p or p['place']['ground'] == 'device':
             out['image'] = _xp.device(out['image'], backend)
-        else:
+        else:                                # too large for the device, or small enough to cross it for nothing
             via = True
-            out['notes'].append(f"the JAX device has {memory._gb(p['budget'])} for the stages after formation, "
-                                f"which take {memory._gb(p['need'])} with the image on it: kept on the host and "
-                                'passed through the device in blocks')
+            if not p['fits']:
+                out['notes'].append(f"the JAX device has {memory._gb(p['budget'])} for the stages after formation, "
+                                    f"which take {memory._gb(p['need'])} with the image on it: kept on the host and "
+                                    'passed through the device in blocks')
     release = memory.cuda_release if tight else (lambda: None)
     crossing = afm._via_jax if via else contextlib.nullcontext      # a host image's autofocus and band limit
 
