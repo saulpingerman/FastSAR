@@ -128,3 +128,243 @@ def test_pfa_support(scene):
     assert e < -15
     with pytest.raises(ValueError, match='support'):
         fastsar.form_image(scene.S, c.ant, c.fmin, c.df, **GRID, algorithm='pfa', pfa_guard=10.0, pfa_support='circumscribed')
+
+
+@pytest.fixture(scope='module')
+def wide_band():
+    """An image narrow in range from a wide-band collection (24,000 samples for an image of 40 m): points in the
+    image, and clutter over 3 km of range around it."""
+    rng = np.random.default_rng(3)
+    res, r0, K, P = 0.5, 30e3, 24000, 384
+    df = sim.C / (2 * res) / K
+    y = (np.arange(P) - (P - 1) / 2) * (r0 * sim.C / 9.6e9 / (2 * res) / P)
+    psi = np.radians(40.0)
+    ant = np.stack([np.full(P, -r0 * np.cos(psi)), y, np.full(P, r0 * np.sin(psi))], 1)
+    col = sim.Collect(fmin=9.6e9 - (K // 2) * df, df=df, K=K, ant=ant, res=res)
+    pts = np.array([[0.0, 0.0, 0], [11.3, -7.1, 0], [-14.2, 12.4, 0], [15.1, 16.2, 0], [-9.3, -15.7, 0]])
+    cl = np.stack([(rng.random(4000) - 0.5) * 3000, (rng.random(4000) - 0.5) * 60, np.zeros(4000)], 1)
+    amp = np.concatenate([np.full(5, 30.0), (rng.standard_normal(4000) + 1j * rng.standard_normal(4000)) / np.sqrt(2)])
+    S = sim.simulate(col, np.concatenate([pts, cl]), amp).astype(np.complex64)
+    return SimpleNamespace(col=col, S=S, grid=dict(nx=96, ny=96, spx=0.4, spy=0.4, e1=(0.0, 1.0, 0.0), e2=(1.0, 0.0, 0.0)))
+
+
+@pytest.mark.needs('finufft')
+@pytest.mark.parametrize('window', [True, False])
+def test_range_gate(wide_band, window):
+    """The phase history gated in range to the image's swath: fewer samples, a first level that decimates less,
+    and the image of the whole history to the former's accuracy."""
+    c = wide_band.col
+    args = (c.ant, c.fmin, c.df, c.K)
+    full = fastsar.ImageFormer(*args, **wide_band.grid, backend='cpu', window=window, range_gate=False)
+    gated = fastsar.ImageFormer(*args, **wide_band.grid, backend='cpu', window=window, range_gate=True)
+    assert full.range_gate is None and fastsar.ImageFormer(*args, **wide_band.grid, backend='cpu').range_gate is None
+    g = gated.range_gate
+    assert g['K'] == c.K and g['kept'] < c.K // 20 and 'range gate' in g['note']
+    assert gated._plan['levels'][0]['Dk'] < 4 < full._plan['levels'][0]['Dk']
+    a, b = full(wide_band.S), gated(wide_band.S)
+    db = rel_db(b, a)
+    print(f'window {window}: gated to {g["kept"]} of {c.K} samples; against the whole history {db:.1f} dB')
+    assert db < -55                                                  # measured -68 dB
+    assert np.array_equal(fastsar.form_image(wide_band.S, *args[:3], **wide_band.grid, backend='cpu', window=window, range_gate=True), b)
+    with pytest.raises(ValueError, match='range_gate'):
+        fastsar.ImageFormer(*args, **wide_band.grid, backend='cpu', range_gate='yes')
+    bad = wide_band.S.copy()
+    bad[7, 100] = np.nan
+    with pytest.raises(ValueError, match='non-finite'):
+        gated(bad)
+    with pytest.raises(ValueError, match='phase history must be'):
+        gated(wide_band.S[:, :-1])
+    # an image that fills the swath is not gated
+    small = sim.make_collect(res=0.5, scene=60.0, r0=5e3)
+    assert fastsar.ImageFormer(small.ant, small.fmin, small.df, small.K, **GRID, backend='cpu', range_gate=True).range_gate is None
+
+
+@pytest.mark.cuda
+@pytest.mark.needs('finufft')
+def test_cuda_first_level_window(wide_band, monkeypatch):
+    """A range decimation whose filter window no variant of the cuda first-level kernel can hold in shared memory
+    (an image narrow in range from a wide-band collection: refused through 0.2.0): the history is gated in range
+    first, and the image is the cpu backend's of the whole history."""
+    from fastsar import ffbp_cuda
+    c = wide_band.col
+    args = (c.ant, c.fmin, c.df, c.K)
+    monkeypatch.setenv('FASTSAR_CUDA_SMEM_KB', '99')                 # the shared memory of an Ada-generation card
+    with pytest.raises(ValueError, match='first-level window'):
+        fastsar.ImageFormer(*args, **wide_band.grid, backend='cuda', range_gate=False)(wide_band.S)
+    former = fastsar.ImageFormer(*args, **wide_band.grid, backend='cuda')
+    assert not ffbp_cuda.first_level_fits(fastsar.ImageFormer(*args, **wide_band.grid, backend='cpu')._plan)
+    assert former.range_gate is not None and 'shared memory' in former.range_gate['note']
+    img = former(wide_band.S)
+    ref = fastsar.ImageFormer(*args, **wide_band.grid, backend='cpu', range_gate=False)(wide_band.S)
+    db = rel_db(img, ref)
+    print(f'cuda, gated to {former.range_gate["kept"]} of {c.K} samples, against the cpu image of the whole history: {db:.1f} dB')
+    assert db < -55                                                  # measured -68 dB
+    import cupy as cp
+    assert np.allclose(former(cp.asarray(wide_band.S)), img, rtol=1e-4, atol=1e-4 * np.abs(img).max())       # a device history
+    bad = wide_band.S.copy()
+    bad[7, 100] = np.inf
+    with pytest.raises(ValueError, match='non-finite'):
+        former(bad)
+    # where the window fits, nothing is gated
+    monkeypatch.delenv('FASTSAR_CUDA_SMEM_KB')
+    small = sim.make_collect(res=0.5, scene=60.0, r0=5e3)
+    assert fastsar.ImageFormer(small.ant, small.fmin, small.df, small.K, **GRID, backend='cuda').range_gate is None
+
+
+@pytest.mark.cuda
+def test_cuda_range_gate_transfer(monkeypatch):
+    """The device range gate with small blocks and a stream that is behind (work queued ahead of every block):
+    every gated history is the cpu's and the same bits each time, on the default stream and on a caller's. The gate
+    first staged its blocks in two page-locked buffers that it rewrote while the asynchronous copy of the block
+    before last was still queued, and then formed an image from the wrong pulses; and a transfer that delivers
+    other samples is refused, not imaged."""
+    import cupy as cp
+    from fastsar import ffbp_cuda
+    rng = np.random.default_rng(8)
+    res, r0, K, P = 0.5, 30e3, 6000, 768
+    df = sim.C / (2 * res) / K
+    y = (np.arange(P) - (P - 1) / 2) * (r0 * sim.C / 9.6e9 / (2 * res) / P)
+    ant = np.stack([np.full(P, -r0 * np.cos(np.radians(40.0))), y, np.full(P, r0 * np.sin(np.radians(40.0)))], 1)
+    grid = dict(nx=96, ny=96, spx=0.4, spy=0.4, e1=(0.0, 1.0, 0.0), e2=(1.0, 0.0, 0.0))
+    args = (ant, 9.6e9 - (K // 2) * df, df, K)
+    S = (rng.standard_normal((P, K), np.float32) + 1j * rng.standard_normal((P, K), np.float32)).astype(np.complex64)
+    ref = fastsar.ImageFormer(*args, **grid, backend='cpu', range_gate=True)._gate(S)
+    former = fastsar.ImageFormer(*args, **grid, backend='cuda', range_gate=True)
+    monkeypatch.setattr(ffbp_cuda, 'BLOCK_BYTES', 4 << 20)           # 34 pulses a block: 23 blocks
+    heavy = cp.random.standard_normal((3000, 3000), dtype=cp.float32)
+    copy_rows = ffbp_cuda._copy_rows
+
+    def behind(dst, src, nth):                                       # the device still busy when the host moves on
+        heavy @ heavy
+        return copy_rows(dst, src, nth)
+    monkeypatch.setattr(ffbp_cuda, '_copy_rows', behind)
+    first, worst = None, -np.inf
+    for k in range(24):
+        if k % 2:
+            with cp.cuda.Stream(non_blocking=True) as stream:        # a caller that works on a stream of its own
+                out = former._gate(S)
+                stream.synchronize()
+        else:
+            out = former._gate(S)
+        out = cp.asnumpy(out)
+        first = out if first is None else first
+        worst = max(worst, rel_db(out, ref))
+        assert np.array_equal(out, first), k
+    print(f'cuda range gate, 24 times in 23 blocks behind a busy stream: at worst {worst:.1f} dB from the cpu gate')
+    assert worst < -90
+    img, cpu = former(S), fastsar.ImageFormer(*args, **grid, backend='cpu', range_gate=True)(S)
+    assert rel_db(img, cpu) < -55
+    # the check across the transfer: a block that arrives as other samples
+    def torn(dst, src):
+        dst.data.copy_from_host(src.ctypes.data, src.nbytes)
+        dst[-1] = dst[0]                                              # a pulse of another place in the block
+    monkeypatch.setattr(ffbp_cuda, '_to_device_now', torn)
+    with pytest.raises(RuntimeError, match='did not reach the GPU'):
+        former(S)
+
+
+@pytest.mark.cuda
+def test_cuda_range_gate_within_the_device_budget(monkeypatch):
+    """The device range gate sized to what the device has free (FASTSAR_CUDA_BLOCK_MB stands in for a GPU that other
+    work has filled). With room for the result and a few pulses it runs in blocks of that many and gives the gate
+    of a free device. With less than the result and one pulse's block take, or when an allocation fails all the
+    same, nothing is raised: the history is gated on the host on all cores, the former takes it from there, the
+    image is the one of a free device, and the gate's note says where it ran."""
+    import cupy as cp
+    from fastsar import ffbp_cuda
+    rng = np.random.default_rng(8)
+    res, r0, K, P = 0.5, 30e3, 6000, 768
+    df = sim.C / (2 * res) / K
+    y = (np.arange(P) - (P - 1) / 2) * (r0 * sim.C / 9.6e9 / (2 * res) / P)
+    ant = np.stack([np.full(P, -r0 * np.cos(np.radians(40.0))), y, np.full(P, r0 * np.sin(np.radians(40.0)))], 1)
+    grid = dict(nx=96, ny=96, spx=0.4, spy=0.4, e1=(0.0, 1.0, 0.0), e2=(1.0, 0.0, 0.0))
+    args = (ant, 9.6e9 - (K // 2) * df, df, K)
+    S = (rng.standard_normal((P, K), np.float32) + 1j * rng.standard_normal((P, K), np.float32)).astype(np.complex64)
+    make = lambda: fastsar.ImageFormer(*args, **grid, backend='cuda', range_gate=True)
+    monkeypatch.delenv('FASTSAR_CUDA_BLOCK_MB', raising=False)
+    free = make()
+    ref, img = cp.asnumpy(free._gate(S)), free(S)
+    g = free.range_gate
+    assert 'on the host' not in g['note']
+    result, row = 8 * P * g['kept'], ffbp_cuda.range_gate_bytes(g, K)
+    # room for the result and five pulses: blocks of five
+    blocks, inner = [], ffbp_cuda._range_gate
+    monkeypatch.setattr(ffbp_cuda, '_range_gate', lambda S, g, win, nb: (blocks.append(nb), inner(S, g, win, nb))[1])
+    monkeypatch.setenv('FASTSAR_CUDA_BLOCK_MB', repr((result + 5.5 * row) / 2 ** 20))
+    former = make()
+    out = former._gate(S)
+    assert blocks == [5] and isinstance(out, cp.ndarray) and 'on the host' not in former.range_gate['note']
+    assert rel_db(cp.asnumpy(out), ref) < -90
+    del out
+    # less than the result and one pulse take: on the host, and the image all the same
+    monkeypatch.setenv('FASTSAR_CUDA_BLOCK_MB', '1')
+    former = make()
+    out = former._gate(S)
+    assert blocks == [5] and isinstance(out, np.ndarray) and out.dtype == np.complex64
+    assert rel_db(out, ref) < -90 and former.range_gate['note'].count('gated on the host') == 1
+    small = former(S)
+    assert former.range_gate['note'].count('gated on the host') == 1 and rel_db(small, img) < -55
+    assert isinstance(former._gate(cp.asarray(S)), np.ndarray)       # a device history comes to the host for it
+    # room by the budget, and an allocation that fails all the same (the device filled in between)
+    monkeypatch.delenv('FASTSAR_CUDA_BLOCK_MB')
+
+    def full(S, g, win, nb):
+        cp.empty((1 << 20,), cp.complex64)
+        raise cp.cuda.memory.OutOfMemoryError(1 << 30, 0)
+    monkeypatch.setattr(ffbp_cuda, '_range_gate', full)
+    former = make()
+    out = former._gate(S)
+    assert isinstance(out, np.ndarray) and rel_db(out, ref) < -90 and 'gated on the host' in former.range_gate['note']
+    bad = S.copy()
+    bad[5, 17] = np.nan
+    with pytest.raises(ValueError, match='non-finite'):               # the host gate checks the samples as well
+        former._gate(bad)
+
+
+@pytest.mark.cuda
+@pytest.mark.needs('finufft')
+def test_form_cphd_notes_a_range_gate_on_the_host(wide_band, monkeypatch, tmp_path):
+    """form_cphd on a GPU without room for the range gate: the product is the one of a free device and its notes
+    say that the gate ran on the host."""
+    path = str(tmp_path / 'wide.cphd')
+    sim.write_cphd(path, wide_band.col, wide_band.S, 40.79, -77.86, 351.0, scene=40.0)
+    kw = dict(backend='cuda', range_gate=True, extent=(38.0, 38.0), spacing=0.4)
+    monkeypatch.delenv('FASTSAR_CUDA_BLOCK_MB', raising=False)
+    ref = fastsar.form_cphd(path, **kw)
+    assert sum('range gate' in n for n in ref['notes']) == 1 and not any('on the host' in n for n in ref['notes'])
+    monkeypatch.setenv('FASTSAR_CUDA_BLOCK_MB', '1')
+    out = fastsar.form_cphd(path, **kw)
+    assert sum('range gate' in n and 'gated on the host' in n for n in out['notes']) == 1
+    assert out['image'].shape == ref['image'].shape and rel_db(out['image'], ref['image']) < -55
+
+
+@pytest.mark.cuda
+def test_device_copy_is_complete_when_it_returns(scene):
+    """_xp.device on the image a cuda former returns (page-locked host memory) while the device is busy: the copy is
+    complete when the call returns, so the host image written right afterwards does not reach it, on the default
+    stream and on a caller's (cupy.asarray reads a page-locked source after it returns: through 0.2.0 the device
+    copy then took what the host wrote)."""
+    import contextlib
+    import cupy as cp
+    from fastsar import _xp
+    from fastsar.resample_cuda import host_empty
+    c = scene.col
+    heavy = cp.random.standard_normal((4000, 4000), dtype=cp.float32)
+    rng = np.random.default_rng(2)
+    big = (rng.standard_normal((1024, 1024), np.float32) + 1j * rng.standard_normal((1024, 1024), np.float32)).astype(np.complex64)
+    for own in (False, True):
+        for k in range(4):
+            if k % 2:
+                img = fastsar.form_image(scene.S, c.ant, c.fmin, c.df, **GRID, backend='cuda')
+            else:
+                img = host_empty(big.shape, big.dtype)
+                img[:] = big
+            want = img.copy()
+            with cp.cuda.Stream(non_blocking=True) if own else contextlib.nullcontext():
+                for _ in range(3):
+                    heavy @ heavy                                    # work queued ahead of the copy
+                dev = _xp.device(img, 'cuda')
+                img[:] = 0
+                assert np.array_equal(cp.asnumpy(dev), want), (own, k)
+    assert _xp.device(dev, 'cuda') is dev
+    assert np.array_equal(cp.asnumpy(_xp.device(want[::2, 1::3], 'cuda')), want[::2, 1::3])      # any layout

@@ -202,7 +202,8 @@ def _igeolo(latlon):
 
 
 def write_sidd(path, out, *, remap='nrl', remap_args=None, valid=None, shadows_down=True, version=3,
-               product_name=None, classification='UNCLASSIFIED', sicd=None):
+               product_name=None, classification='UNCLASSIFIED', sicd=None, collections=None, product_class=None,
+               product_type=None, extensions=None):
     """Write a form_cphd product as a SIDD: a detected, remapped 8-bit image (MONO8I) in a NITF 2.1 file.
 
     The pixels are to_display's (remap, remap_args (a dict of the remap's parameters), valid and shadows_down as
@@ -226,7 +227,11 @@ def write_sidd(path, out, *, remap='nrl', remap_args=None, valid=None, shadows_d
     'UNCLASSIFIED', or a dict of the ISM markings of anything else (classification, ownerProducer, ...). sicd: the
     SICD metadata (products.sicd_meta, or anything fastsar._sicdxml.read takes) of the complex image the product was
     made from; it supplies the collection information and geometry and is stored in the file beside the SIDD.
-    Default: products.sicd_meta(out), not stored.
+    Default: products.sicd_meta(out), not stored. collections: for a product made from several collections (an
+    average of registered images, stack.mean), the SICD metadata of each input in order: ExploitationFeatures then
+    holds one Collection for each (its sensor, date and time, geometry and phenomenology on this product's plane),
+    while the projection stays the product's own. product_class, product_type: ProductCreation's (default
+    'Detected Image', none). extensions: a dict of names and values written as ProductCreationExtension parameters.
 
     -> the metadata written (fastsar._siddxml.SIDD: attribute access by the XML's element names)."""
     from datetime import datetime, timezone
@@ -282,7 +287,8 @@ def write_sidd(path, out, *, remap='nrl', remap_args=None, valid=None, shadows_d
         product_name=str(product_name), lut=name, shadow=shadow, corners=latlon(outline(0, rows, 0, cols)),
         valid_ll=latlon(poly), ref_ecf=ecf(ref), ref_pixel=ref, spacing=(lay['row_ss'], lay['col_ss']), t_coa=t_coa,
         urow=urow, ucol=ucol, rows=rows, cols=cols, arp=[getattr(sm.Position.ARPPoly, k).get_array() for k in 'XYZ'],
-        valid_rc=poly, sicd=sm), version)
+        valid_rc=poly, sicd=sm, collections=None if collections is None else [_sicdxml.read(c) for c in collections],
+        product_class=product_class, product_type=product_type, extensions=extensions), version)
     # NITF: the XML segments (the SIDD, then the SICD it was made from when one is given), each image segment's
     # corner coordinates rounded to the arcsecond
     xmls = [(sd.to_xml_bytes(), 'SIDD', _siddxml.SPECIFICATION[version])]

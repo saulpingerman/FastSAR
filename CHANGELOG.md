@@ -94,6 +94,47 @@ was published on PyPI.
   Taylor window.
 - `sim.write_cphd(..., pt_ref=, pn_ref=, beam=)` writes the reference levels and an antenna block, and
   `sim.beam_gain` gives the matching gain of simulated scatterers.
+- Several collections of one scene ([docs/stack.md](docs/stack.md)). `process_stack(cphds, output, product=)`
+  forms each collection on one Earth-fixed ground grid, registers them and writes the incoherent average as a
+  SIDD (`'mean'`), or the coherence or the change of a pair as a GeoTIFF. The collections are read and formed one
+  at a time, and the stack stages run where the images are (all cores, CuPy, JAX). A stack product carries no
+  radiometric calibration, and its `dem` is the surface of an interferogram: terrain-informed focusing works on
+  one collection's own axes and is not applied to a stack.
+- `form_cphd(..., grid=, shift=)` and `process_cphd(..., grid=)`: a collection formed on an Earth-fixed ground
+  grid (`stack.ground_grid`, or an earlier product for its pixels) in place of its own, and on that grid
+  displaced by a translation. Products record the grid. `process_cphd` on a grid keeps its defaults where they
+  apply: the SICD is unweighted, and the SIDD, whose apodization a grid rules out, is Taylor weighted with a note
+  (`weighting='sva'` by name, the quality areas, the slant plane and a `dem` are refused). A SICD on a grid
+  carries no `Radiometric` block. A moving beam on a grid along its track is processed as on its own grid; on
+  another grid the product is the image as formed there, with a note.
+- `fastsar.stack`: `ground_grid` and `as_grid`; `register` (one translation per image from the detected images'
+  cross-correlation, with its significance and the residual shifts of tiles) and `shift_image` (the translation
+  applied by a phase ramp on the baseband spectrum); `mean` (with the equivalent number of looks measured on
+  homogeneous tiles and optional brightness equalization); `coherence` (on the common band of the two spectra,
+  with a linear fringe removed and the estimator's floor measured on the pair) and `change`; `baseline` (whether
+  a pair is inside the critical baseline, from the per-pulse parameters alone).
+- Coherent pairs ([docs/stack.md](docs/stack.md#coherent-pairs)). `stack.common_support(a, b)` gives, from two
+  collections' geometry, the pulses and the frequencies of each that cover the part of the ground spectrum both
+  have, and `form_cphd(band=)` takes the frequencies (one pair, or one per pulse) beside `aperture=`: the samples
+  outside get no weight and the window spans the selection, along the aperture as a function of the look
+  direction, so two collections cut to one support carry one weighting. `process_stack` forms the two
+  collections of a pair product that way. With apertures displaced by 30% the coherence of stable surfaces was
+  0.56 untrimmed, 0.63 with the images cut to their common band and 0.81 formed on the common support.
+- `stack.interferogram` (the phase and coherence of a pair, one linear fringe and an optional surface's
+  topographic phase removed, with the height of ambiguity), `stack.coherent_sum` (with its gain as measured) and
+  `process_stack(product='interferogram' | 'coherent_sum')`. `stack.change` also returns the coherence the two
+  brightnesses allow and the fraction of the pixels that can show change which do.
+  `stack.register(coherent=True)` refines a translation on the complex images. `stack.baseline` reports the
+  overlap in range at equal look direction, how much of a square aperture the two whole apertures share, and
+  the height of ambiguity.
+- `stack.coherence(fringe='tiles')` gives a tile its own fringe only where the peak of the tile's interferogram
+  spectrum stands clear of noise (`fringes_found`); other tiles take the image's.
+- `write_sidd(..., collections=, product_class=, product_type=, extensions=)`: a SIDD made from several
+  collections holds one `ExploitationFeatures` `Collection` per input.
+- `ImageFormer(..., range_gate=)`, also on `form_image` and `form_cphd`: the phase history gated in range to the
+  image's swath before formation. On the cuda backend the gate sizes its blocks to the device memory that is free
+  (`fastsar._xp.cuda_budget`), and where other work has filled the device it runs on the host on all cores, with
+  a note in the product. `form_cphd(aperture=(first, last + 1))`: the pulses to use.
 
 ### Changed
 
@@ -138,6 +179,23 @@ was published on PyPI.
   both for the narrower band), and the `bandwidth` entry of the product states that band. An autofocus that was
   applied is recorded in the SICD as `AzAutofocus` SV. A grid smaller than one patch is formed as a single patch
   of its own size. `form_cphd` itself gives the image of 0.2.0 for the same arguments.
+
+### Fixed
+
+- The cuda backend refused an image narrow in range from a wide-band collection ("the cuda backend's first-level
+  window ... exceeds the GPU's shared memory", for example a 2 km image of a collection with 76,032 samples per
+  pulse). Such a history is now gated in range to the image's swath first, on the device where it has room and
+  on the host otherwise, with a note in the product; the image equals that of the whole history to -63 dB
+  (measured against the cpu backend).
+- Writing a NITF file could fail with "BufferError: cannot close exported pointers exist" on a heavily loaded
+  host, when a worker thread still held its last block of the file's memory map as the map was closed. The
+  workers now reach the map through a holder that is emptied before the map is closed.
+- `fastsar._xp.device(a, 'cuda')` returned before a page-locked host array (the image a cuda former returns) had
+  been read, so that writing the host array afterwards changed the device copy. No path of 0.2.0 wrote it. The
+  copy is now complete when the call returns.
+- `docs/products.md` said that two passes formed onto one grid are coregistered by construction; that holds for
+  the geometry as known, and real repeat collections lay 9 to 22 m apart. `products.coherence` gave its bias for
+  independent pixels; the note now states the measured floor of oversampled images.
 
 ## [0.2.0] - 2026-11-10
 

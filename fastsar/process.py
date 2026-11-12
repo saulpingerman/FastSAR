@@ -63,6 +63,12 @@ then Taylor weighted, and a note says why, while weighting='sva' raises. Autofoc
 'spatially_variant', by map drift on blocks along the track, tied together by a smooth fit (the phase gradient modes
 are for one aperture). Area: the tasked extent along the track, and in ground range as far as the criterion holds.
 The slant plane, terrain focusing and the Radiometric block are for spotlight collections.
+
+On a caller's grid (grid=: fastsar.stack.ground_grid, or an earlier product for its pixels) the product is the image
+formed on that grid, on the ground plane: the SICD unweighted, the SIDD Taylor weighted (its default, apodization,
+sets its own sampling, and a note says so), with the autofocus where the grid's first axis is the collection's
+azimuth (a spotlight) or lies along its track (a moving beam). The quality areas, the slant plane, apodization and
+a dem are refused there, and the SICD carries no Radiometric block.
 """
 import contextlib
 import time
@@ -86,7 +92,7 @@ def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None
                  remap='nrl', remap_args=None, spacing=None, extent=None, sicd=None, mode='auto', backend='auto',
                  precision='float32', shadows_down=True, nesz_db=None, scene_sigma0_db=-10.0, black_sigma0_db=-10.0,
                  height=None, channel=0, troposphere=None, reader_options=None, target_db=-40.0,
-                 dem=None, geoid=None):
+                 dem=None, geoid=None, grid=None):
     """Form the image of a CPHD collection and write it as a SICD or a SIDD (see the module docstring).
 
     cphd: path. output: the file to write (NITF), or None to return the product without writing it.
@@ -128,6 +134,15 @@ def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None
         dem the product holds terrain (terrain.focus's info: what was applied, the range of its coefficients).
     geoid: the height of the geoid above the ellipsoid at the scene (m), added to the DEM's heights; a DEM file
         needs it (Copernicus DEM: the EGM2008 undulation; 0.0 for a DEM of ellipsoid heights; terrain.as_dem).
+    grid: an Earth-fixed ground grid (fastsar.stack.ground_grid, or an earlier product: the same pixels) in place
+        of the collection's own area, axes and spacing; the product is the image on that grid (a SICD on the
+        ground plane; a SIDD detected on it as formed). The quality areas, the slant plane, apodization, a dem,
+        spacing, extent and height do not apply and are refused when asked for; uniform or Taylor weighting does
+        (None: 'uniform' for a SICD, and 'taylor' for a SIDD, with a note, since its default 'sva' cannot be
+        applied), and the autofocus where the grid's first axis lies within 5 degrees of the collection's azimuth
+        (the default then; refused otherwise). A moving beam on a grid whose first axis is within 5 degrees of
+        its track is processed as on its own grid; on another grid the product is the image as formed there, not
+        at baseband, with a note. A SICD on a grid carries no Radiometric block.
 
     -> the product dict (form_cphd's entries on the product's grid: image, origin, e1, e2, spx, spy, plane, meta,
     notes, ...), with product, area, weighting, autofocus (the mode run), autofocus_info, radiometric (for a SICD:
@@ -163,6 +178,18 @@ def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None
             raise ValueError(f"remap {remap!r}: one of {sorted(k for k in _remap.REMAPS if k != 'linear')}, or a function")
     if weighting == 'sva' and product == 'sicd' and spacing is not None:
         raise ValueError("weighting='sva' sets the slant spacing itself (twice Nyquist): leave spacing=None")
+    if grid is not None:                                             # the grid is the area, the plane and the sampling
+        for name, v, ok, why in (
+                ('area', area, isinstance(area, str) and area == 'tasked', 'the grid is the processed area'),
+                ('plane', plane, plane in (None, 'ground'), "the product is on the grid's ground plane"),
+                ('weighting', weighting, weighting != 'sva',
+                 'apodization sets its own sampling (on the slant plane for a spotlight)'),
+                ('dem', dem, dem is None, "terrain focusing works on the collection's own axes along its line of sight"),
+                ('spacing', spacing, spacing is None, 'the grid gives it'),
+                ('extent', extent, extent is None, 'the grid gives it'),
+                ('height', height, height is None, 'the grid gives its plane')):
+            if not ok:
+                raise ValueError(f'{name}={v!r} does not apply with grid=: {why}')
     timing, st = {}, {}
     if dem is not None:                                              # a DEM that cannot be used fails before the read
         from . import terrain
@@ -191,15 +218,20 @@ def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None
                              'beam')
         spot = g['mode'] == 'spotlight'
         wt = weighting or ('sva' if product == 'sidd' else 'uniform')     # the same for a spotlight and a moving beam
+        if grid is not None and wt == 'sva':                         # a SIDD's default, which a grid rules out
+            wt = 'taylor'
+            g['notes'].append("weighting: this product's default, spatially variant apodization ('sva'), is not "
+                              "applied: it sets its own sampling, and the image is formed on the grid given. The "
+                              "image has weighting='taylor' instead.")
         if not spot:
             if plane == 'slant':
                 raise ValueError(f'plane={plane!r} is for spotlight collections; this one has a moving beam')
             from . import moving
             return moving.plan(g, st, dict(
-                product=product, weighting=wt, fallback=None if weighting else 'taylor',
-                autofocus='quadratic' if autofocus is None else autofocus, area=area,
-                spacing=spacing, extent=extent, cphd=cphd, channel=channel, nesz_db=nesz_db,
-                scene_sigma0_db=scene_sigma0_db, black_sigma0_db=black_sigma0_db))
+                product=product, weighting=wt, fallback=None if weighting or grid is not None else 'taylor',
+                autofocus='quadratic' if autofocus is None else autofocus, autofocus_given=autofocus is not None,
+                area=area, spacing=spacing, extent=extent, cphd=cphd, channel=channel, nesz_db=nesz_db,
+                scene_sigma0_db=scene_sigma0_db, black_sigma0_db=black_sigma0_db, grid=g.get('grid')))
         # apodization runs on the slant plane: an apodized SICD with no plane asked for is a slant-plane one
         apodized = product == 'sicd' and wt == 'sva' and plane is None
         pl = plane or ('slant' if apodized else 'ground')
@@ -207,6 +239,28 @@ def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None
             g['notes'].append("weighting='sva' runs on the slant plane and no plane was given: this SICD is on the "
                               "slant plane, not on the ground plane of the other SICDs")
         af = 'quadratic' if autofocus is None else autofocus
+        if grid is not None:
+            # the image as formed on the grid is the product; the autofocus works along the first axis, which must
+            # then be this collection's azimuth
+            c, e1, e2 = g['center'], g['e1'], g['e2']
+            los = c - g['ant'][len(g['ant']) // 2]
+            off = float(np.degrees(np.arctan2(abs(los @ e1), los @ e2)))
+            if autofocus is None and off > 5.0:
+                af = False
+                g['notes'].append(f"no autofocus: the grid's second axis is {off:.0f} degrees from the line of sight")
+            elif af and off > 5.0:
+                raise ValueError(f"autofocus={af!r} works along the grid's first axis, which is {off:.0f} degrees from "
+                                 "this collection's azimuth: give autofocus=False, or a grid along its line of sight")
+            K = g['S'].shape[1]
+            s = planes.sampling(planes.slant_frame(g['meta'], c, g['pulses']), g['ant'],
+                                (g['fmin'], g['fmin'] + (K - 1) * g['df']), c[None], e1, e2)
+            gs = g['grid']
+            if gs['spx'] > 1.0001 / s['bx'] or gs['spy'] > 1.0001 / s['by_full']:
+                g['notes'].append(f"the grid's spacing {gs['spx']:.3f} x {gs['spy']:.3f} m is coarser than the band of the "
+                                  f"data allows on its axes ({1 / s['bx']:.3f} x {1 / s['by_full']:.3f} m): the image is aliased")
+            st.update(spot=True, plane='ground', weighting=wt, autofocus=af, sampling=s, bounds=None, kept=None,
+                      valid=None, via_slant=False, margin=0, grid=True)
+            return dict(window=wt == 'taylor')
         if product == 'sicd' and pl == 'ground' and wt == 'sva':
             raise ValueError("weighting='sva' is applied on the slant plane, so a ground-plane SICD cannot have it: "
                              "leave plane unset or give plane='slant'")
@@ -280,7 +334,7 @@ def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None
 
     out = form_cphd(cphd, sicd, mode=mode, backend=backend, channel=channel, height=height, precision=precision,
                     target_db=target_db, troposphere=troposphere, reader_options=reader_options, axes='auto',
-                    extent=extent,
+                    extent=extent, grid=grid,
                     aperture='auto' if spacing is None else 'full', _plan=plan)
     lap('form')
     timing['read'] = st['read'] - st['start']                        # the file, to the phase history in memory
@@ -298,6 +352,9 @@ def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None
         else:
             from . import moving
             out, tight = moving.stages(out, st, product, lap, backend)
+        if grid is not None and product == 'sidd' and st['spot']:    # detected on the grid as formed
+            out['image'] = _xp.module(out['image']).abs(out['image'])
+            lap('detect', out['image'])
         out['timing'] = timing
         if product == 'sidd':
             out.update(remap=remap, remap_args=dict(remap_args or {}), shadows_down=bool(shadows_down))
@@ -339,6 +396,10 @@ def _radiometric(out, st, cphd, channel, area, black_sigma0_db):
     if not st['spot']:
         notes.append('No Radiometric block: the radiometric model covers spotlight collections, and this one has a '
                      'moving beam.')
+        return None
+    if st.get('grid'):
+        notes.append("No Radiometric block: the product is on a caller's grid (grid=), and the calibration is made "
+                     "for the collection's own area and axes.")
         return None
     if st['weighting'] == 'sva':
         notes.append('No Radiometric block: spatially variant apodization is not linear in the scene, so no one '

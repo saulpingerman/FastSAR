@@ -4,9 +4,11 @@ Methods and test results; the calls are in [processing-chain.md](processing-chai
 
 ## Interferometry and change detection
 
-Two passes formed onto one grid are coregistered by construction, and a scatterer on the grid surface has zero
-interferometric phase. No flat-earth phase needs removing, and the remaining phase measures the height above the grid
-surface. `pauli` gives double-bounce, volume and surface powers. Test results (`tests/test_insar.py`, X-band clutter
+Two passes formed onto one grid are coregistered as far as their geometry is known, and a scatterer on the grid
+surface then has zero interferometric phase. No flat-earth phase needs removing, and the remaining phase measures the
+height above the grid surface. With simulated tracks the geometry is exact. Real repeat collections are placed by
+their orbit and timing knowledge, which left six small-satellite spotlights 9 to 22 m apart on one grid: they need one
+translation each first, and a pair is coherent only inside the critical baseline ([stack.md](stack.md)). `pauli` gives double-bounce, volume and surface powers. Test results (`tests/test_insar.py`, X-band clutter
 at 5 km):
 
 - change detection: median coherence 0.981 on unchanged ground (true value 0.98) and 0.275 inside disturbed areas

@@ -50,6 +50,7 @@ C = 299792458.0
 SHEAR = 0.10       # largest shear of the range band, as a fraction of it, apodization accepts
 RANGE = 0.05       # largest change of the ground range band from its value at the swath center
 VARY = 0.10        # largest spread of the processed azimuth band over the scene
+ALONG = 5.0        # degrees between a caller's grid's first axis and the track within which the stages apply
 PAD = 0.06         # the rectangular weighting formed beyond the band kept: the soft edge of the per-pixel weights
 _KNOTS = 32        # pixels between the knots of the beam-center time
 
@@ -949,8 +950,15 @@ def plan(g, st, opt):
     """process_cphd's plan for a moving-beam collection: the weighting form_cphd applies, the grid, and what the
     stages after formation need, kept in st. g: form_cphd's geometry; opt: dict(product, weighting, autofocus,
     area, spacing, extent, cphd, channel, nesz_db, scene_sigma0_db, and optionally black_sigma0_db (the sigma zero
-    of area='black', dB; -10) and fallback (the weighting to use, with a note, where 'sva' cannot be applied: the
-    caller did not ask for 'sva' by name; None: raise)).
+    of area='black', dB; -10), fallback (the weighting to use, with a note, where 'sva' cannot be applied: the
+    caller did not ask for 'sva' by name; None: raise), grid (form_cphd's grid= in this collection's frame: the
+    area and the sampling are then the grid's) and autofocus_given (whether the caller named the autofocus)).
+
+    On a caller's grid. Where the grid's first axis lies within ALONG degrees of the track, the stages run as on
+    the collection's own grid, at the grid's spacing (a note says so when it is coarser than the band). On another
+    grid the product is the image as formed there with its weighting: the stages work along the track, so it is
+    not brought to baseband, an autofocus left to the default is not run, with a note, and one asked for by name
+    raises a ValueError.
 
     Spacing. 'taylor' and 'uniform' keep form_cphd's own (0.96 of the reciprocal of the nominal bands) unless the
     azimuth band of the image is wider than that samples (a footprint slower than the platform: an orbit, a
@@ -971,7 +979,23 @@ def plan(g, st, opt):
     fc = 0.5 * (fband[0] + fband[1])
     c, e1, e2 = g['center'], g['e1'], g['e2']
     bm = beam_model(ant, g['srp'], g['meta']['tx_time'], dsin)
-    if opt['extent'] is not None:
+    gs = opt.get('grid')
+    if gs is not None:                                               # the grid is the area and the sampling
+        b = np.array([-gs['shape'][0] * gs['spx'], gs['shape'][0] * gs['spx'],
+                      -gs['shape'][1] * gs['spy'], gs['shape'][1] * gs['spy']], np.float64) / 2
+        along = bm['flight'] - (bm['flight'] @ gs['normal']) * np.asarray(gs['normal'], np.float64)
+        off = float(np.degrees(np.arccos(np.clip(abs(along @ e1) / np.linalg.norm(along), 0.0, 1.0))))
+        if off > ALONG:
+            if af and opt.get('autofocus_given'):
+                raise ValueError(f"autofocus={af!r} works along the grid's first axis, which is {off:.0f} degrees from "
+                                 "this collection's track: give autofocus=False, or a grid along the track")
+            g['notes'].append(f"the grid's first axis is {off:.0f} degrees from the track: the product is the image as "
+                              'formed on the grid with its weighting, not at baseband and without autofocus (the '
+                              'stages of a moving beam work along the track)')
+            st.update(spot=False, plane='ground', weighting=wt, autofocus=False, beam=bm, margin=0, valid=None,
+                      as_formed=True)
+            return dict(window=wt == 'taylor', azimuth_window='taylor' if wt == 'taylor' else 'uniform')
+    elif opt['extent'] is not None:
         b = np.array([-opt['extent'][0], opt['extent'][0], -opt['extent'][1], opt['extent'][1]], np.float64) / 2
     else:
         d = g['corners'] - c
@@ -1054,7 +1078,12 @@ def plan(g, st, opt):
                      f'processed band, of which the band {bt:.4f} cycles/m is kept at every pixel')
         b1 = bt
     else:
-        if spacing is not None:
+        if gs is not None:
+            if gs['spx'] > 1.0001 / wide or gs['spy'] > 1.0001 / sp['b2'].max():
+                notes.append(f"the grid's spacing {gs['spx']:.3f} x {gs['spy']:.3f} m is coarser than the band of the "
+                             f"data allows on its axes ({1 / wide:.3f} x {1 / sp['b2'].max():.3f} m): the image is "
+                             'aliased')
+        elif spacing is not None:
             out['spacing'] = tuple(float(v) for v in np.broadcast_to(np.asarray(spacing, np.float64), (2,)))
             if out['spacing'][0] > 1.0001 / wide or out['spacing'][1] > 1.0001 / sp['b2'].max():
                 notes.append(f"spacing {out['spacing'][0]:.3f} x {out['spacing'][1]:.3f} m is coarser than the band "
@@ -1069,7 +1098,7 @@ def plan(g, st, opt):
         if area != 'tasked':                                         # on the tasked grid's own pixels
             spy = (out.get('spacing') or own)[1]
             out['bounds'] = (b[0], b[1], tasked[2] - np.ceil((tasked[2] - b[2]) / spy) * spy, b[3])
-    spx = (out.get('spacing') or own)[0]
+    spx = gs['spx'] if gs is not None else (out.get('spacing') or own)[0]
     if af and not smooth:
         notes.append('autofocus skipped: the beam center does not move smoothly along the track')
         af = False
@@ -1094,6 +1123,8 @@ def stages(out, st, product, lap, backend):
     from . import autofocus as afm, memory, weighting
     wt, af, mg = st['weighting'], st['autofocus'], st['margin']
     out['beam'], out['window'] = st['beam'], (wt, wt)
+    if st.get('as_formed'):                                          # a caller's grid off the track: the image as formed
+        return out, False
     nx, ny = out['image'].shape
     sizes = dict(ground=8 * nx * ny, valid=nx * ny if st['valid'] is not None else 0,
                  display=nx * ny if product == 'sidd' else 0)

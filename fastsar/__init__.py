@@ -15,10 +15,11 @@ from .bp import backproject, plane_points  # noqa: F401
 from .exact import ExactFormer  # noqa: F401
 from .cphd import form_cphd  # noqa: F401
 from .process import process_cphd  # noqa: F401
-from . import planes, weighting, remap, sidd, resample, rgiqe, moving  # noqa: F401
+from . import planes, weighting, remap, sidd, resample, rgiqe, moving, stack  # noqa: F401
 from . import terrain  # noqa: F401
+from .stack import process_stack  # noqa: F401
 from .memory import MemoryWarning  # noqa: F401
 
-__all__ = ['form_image', 'available_backends', 'ImageFormer', 'ExactFormer', 'form_cphd', 'process_cphd', 'backproject', 'plane_points',
+__all__ = ['form_image', 'available_backends', 'ImageFormer', 'ExactFormer', 'form_cphd', 'process_cphd', 'process_stack', 'backproject', 'plane_points',
            'MemoryWarning', 'io', 'autofocus', 'stripmap', 'burst', 'patches', 'quality', 'products', 'sim', 'planes', 'weighting', 'remap', 'sidd',
-           'resample', 'rgiqe', 'moving', 'terrain']
+           'resample', 'rgiqe', 'moving', 'terrain', 'stack']

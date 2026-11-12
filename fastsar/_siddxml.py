@@ -211,7 +211,11 @@ def build(f, version=3):
     classification (see classification), product_name, lut (the remap's name), shadow ('DOWN', ...), corners [4, 2]
     and valid_ll [n, 2] (latitude, longitude, degrees), ref_ecf [3], ref_pixel (row, col), spacing (row, col; m),
     t_coa (s), urow, ucol [3] (ECF), rows, cols, arp [3, n] (polynomial coefficients), valid_rc [n, 2] (pixels),
-    sicd (the SICD metadata of the complex image, for the collection and its geometry)). version: 3 or 2."""
+    sicd (the SICD metadata of the complex image, for the collection and its geometry)). version: 3 or 2.
+    A product made from several collections (an average of registered images) also gives collections (the SICD
+    metadata of each input, in order: one ExploitationFeatures Collection for each, while the product's own entries
+    and the projection stay those of sicd), and may give product_class and product_type (ProductCreation) and
+    extensions (a dict written as ProductCreationExtension parameters)."""
     sm = f['sicd']
     ex = exploitation(sm, f['urow'], f['ucol'], version)
     ism = classification(f['classification'], f['created'][:10])
@@ -224,20 +228,47 @@ def build(f, version=3):
         kids = [_c(sub, names, [cast(v) for v in p], index=f'{i + 1}:{labels[i]}' if labels else i + 1)
                 for i, p in enumerate(pts)]
         return _e(tag, kids, **({'size': len(kids)} if size else {}))
-    ci, tl = sm.CollectionInfo, sm.Timeline
-    pol = str(sm.ImageFormation.TxRcvPolarizationProc or 'UNKNOWN')
-    tx, rcv = pol.split(':') if ':' in pol else (pol, pol)
-    if version == 2:                            # version 2 enumerates V, H, RHC, LHC, OTHER and UNKNOWN
-        tx, rcv = (p if p in ('V', 'H', 'RHC', 'LHC', 'OTHER', 'UNKNOWN') else
-                   'OTHER' if p in ('X', 'Y', 'S', 'E') or p.startswith('OTHER') else 'UNKNOWN' for p in (tx, rcv))
-    core = str(ci.CoreName)
-    g, ph = ex['geometry'], ex['phenomenology']
+
+    def polarization(m):
+        pol = str(m.ImageFormation.TxRcvPolarizationProc or 'UNKNOWN')
+        tx, rcv = pol.split(':') if ':' in pol else (pol, pol)
+        if version == 2:                        # version 2 enumerates V, H, RHC, LHC, OTHER and UNKNOWN
+            tx, rcv = (p if p in ('V', 'H', 'RHC', 'LHC', 'OTHER', 'UNKNOWN') else
+                       'OTHER' if p in ('X', 'Y', 'S', 'E') or p.startswith('OTHER') else 'UNKNOWN' for p in (tx, rcv))
+        return tx, rcv
+
+    def collection(m, x, identifier):
+        ci, tl = m.CollectionInfo, m.Timeline
+        g, ph = x['geometry'], x['phenomenology']
+        tx, rcv = polarization(m)
+        return _e('Collection', [
+            _e('Information', [
+                _e('SensorName', str(ci.CollectorName)),
+                _e('RadarMode', [_e('sicommon:ModeType', str(ci.RadarMode.ModeType))]),
+                _e('CollectionDateTime', str(tl.CollectStart)), _e('CollectionDuration', float(tl.CollectDuration)),
+                _c('Resolution', ('Range', 'Azimuth'), x['resolution']),
+                _e('Polarization', [_e('TxPolarization', tx), _e('RcvPolarization', rcv)])]),
+            _e('Geometry', [_e(k, g[k]) for k in ('Azimuth', 'Slope', 'Squint', 'Graze', 'Tilt', 'DopplerConeAngle')]),
+            _e('Phenomenology', [_c('Shadow', ('Angle', 'Magnitude'), ph['Shadow']),
+                                 _c('Layover', ('Angle', 'Magnitude'), ph['Layover']),
+                                 _e('MultiPath', ph['MultiPath']), _e('GroundTrack', ph['GroundTrack'])])],
+            identifier=identifier)
+    tx, rcv = polarization(sm)
+    inputs = list(f.get('collections') or [sm])
+    names = [str(m.CollectionInfo.CoreName) for m in inputs]
+    if len(set(names)) < len(names):            # the identifiers of a product's collections are distinct
+        names = [f'{n}_{k + 1}' for k, n in enumerate(names)]
+    collections = [collection(m, ex if m is sm else exploitation(m, f['urow'], f['ucol'], version), n)
+                   for m, n in zip(inputs, names)]
+    creation = ([_e('ProductType', f['product_type'])] if f.get('product_type') else []) + [
+        _e('ProductCreationExtension', v, name=k) for k, v in (f.get('extensions') or {}).items()]
     root = _e('SIDD', [
         _e('ProductCreation', [
             _e('ProcessorInformation', [_e('Application', f['application']), _e('ProcessingDateTime', f['created']),
                                         _e('Site', 'Unknown')]),
             _e('Classification', **{f'ism:{k}': v for k, v in ism.items()}),
-            _e('ProductName', f['product_name']), _e('ProductClass', 'Detected Image')]),
+            _e('ProductName', f['product_name']), _e('ProductClass', f.get('product_class') or 'Detected Image')]
+           + creation),
         _e('Display', [
             _e('PixelType', 'MONO8I'), _e('NumBands', 1),
             _e('NonInteractiveProcessing', [
@@ -265,19 +296,7 @@ def build(f, version=3):
             _c('PixelFootprint', ('Row', 'Col'), [int(f['rows']), int(f['cols'])]),
             _e('ARPPoly', [_poly1(f'sicommon:{k}', c) for k, c in zip('XYZ', f['arp'])]),
             points('ValidData', 'Vertex', f['valid_rc'], ('Row', 'Col'), size=True, cast=int)]),
-        _e('ExploitationFeatures', [
-            _e('Collection', [
-                _e('Information', [
-                    _e('SensorName', str(ci.CollectorName)),
-                    _e('RadarMode', [_e('sicommon:ModeType', str(ci.RadarMode.ModeType))]),
-                    _e('CollectionDateTime', str(tl.CollectStart)), _e('CollectionDuration', float(tl.CollectDuration)),
-                    _c('Resolution', ('Range', 'Azimuth'), ex['resolution']),
-                    _e('Polarization', [_e('TxPolarization', tx), _e('RcvPolarization', rcv)])]),
-                _e('Geometry', [_e(k, g[k]) for k in ('Azimuth', 'Slope', 'Squint', 'Graze', 'Tilt', 'DopplerConeAngle')]),
-                _e('Phenomenology', [_c('Shadow', ('Angle', 'Magnitude'), ph['Shadow']),
-                                     _c('Layover', ('Angle', 'Magnitude'), ph['Layover']),
-                                     _e('MultiPath', ph['MultiPath']), _e('GroundTrack', ph['GroundTrack'])])],
-               identifier=core),
+        _e('ExploitationFeatures', collections + [
             _e('Product', [_c('Resolution', ('Row', 'Col'), ex['product_resolution']),
                            _e('Ellipticity', ex['ellipticity']),
                            _e('Polarization', [_e('TxPolarizationProc', tx), _e('RcvPolarizationProc', rcv)]),

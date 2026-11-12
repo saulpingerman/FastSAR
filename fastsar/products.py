@@ -49,8 +49,9 @@ def _box(x, w1, w2):
 
 def interferogram(a, b, la=1, lr=1):
     """Multilooked interferogram: a conj(b) averaged over la x lr boxes and decimated, complex (np.angle is the
-    interferometric phase). a and b must be formed on the same grid (coregistered), which backprojection onto one
-    set of points or one planar grid gives directly."""
+    interferometric phase). a and b must be formed on the same grid, which registers them as far as the geometry of
+    the two collections is known: exactly for simulated tracks, to the meters of orbit and timing knowledge for real
+    repeat passes, which need one translation first (fastsar.stack.register)."""
     x = np.asarray(a) * np.conj(np.asarray(b))
     nx, ny = (x.shape[0] // la) * la, (x.shape[1] // lr) * lr
     return x[:nx, :ny].reshape(nx // la, la, ny // lr, lr).mean((1, 3))
@@ -58,8 +59,11 @@ def interferogram(a, b, la=1, lr=1):
 
 def coherence(a, b, w1=5, w2=5):
     """Sample coherence |<a b*>| / sqrt(<|a|^2> <|b|^2>) over moving w1 x w2 windows, same shape as the images:
-    the coherent change detection statistic (low where the scene changed between passes). It is biased upward for
-    small windows, to about 1/sqrt(w1 w2) for incoherent pairs."""
+    the coherent change detection statistic (low where the scene changed between passes). It is biased upward: an
+    incoherent pair gives about 0.89 / sqrt(n) for n independent samples in the window, and the window holds
+    w1 w2 of those only when the pixels are a resolution cell apart. On images sampled at 0.7 of a cell, 7 x 7
+    pixels gave a median of 0.25, not 0.13. fastsar.stack.coherence measures that floor on the pair at hand,
+    keeps the common band of the two images and removes a fringe first."""
     a, b = np.asarray(a).astype(np.complex128), np.asarray(b).astype(np.complex128)
     num = np.abs(_box(a * np.conj(b), w1, w2))
     den = np.sqrt(_box(np.abs(a) ** 2, w1, w2) * _box(np.abs(b) ** 2, w1, w2))

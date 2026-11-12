@@ -94,7 +94,7 @@ def _image_area(cphd, meta):
 def form_cphd(cphd, sicd=None, *, mode='auto', backend='auto', window=True, spacing=None, channel=0, patch=1024,
               azimuth_fraction=0.8, extent=None, height=None, precision='float32', target_db=-40.0, info=None,
               autofocus=False, troposphere=None, reader_options=None, axes='track', aperture='auto',
-              azimuth_window=None, _plan=None):
+              azimuth_window=None, band=None, grid=None, shift=None, range_gate='auto', _plan=None):
     """Form the image of a CPHD collection (see the module docstring).
 
     cphd: path. sicd: the vendor's SICD (path, .xml metadata, or SICD metadata) for the footprint, spacing and
@@ -117,15 +117,31 @@ def form_cphd(cphd, sicd=None, *, mode='auto', backend='auto', window=True, spac
         grid axis whatever the squint); extent is then (across, along) the line of sight. 'auto': 'los' for a
         spotlight, 'track' for a moving beam.
     aperture: 'auto' (a spotlight without a sicd or a spacing: the central part of the aperture that makes the
-        azimuth resolution the ground range resolution), 'square' (that part whatever else is given) or 'full'.
+        azimuth resolution the ground range resolution), 'square' (that part whatever else is given), 'full', or
+        the pulses to use, (first, last + 1) of those read.
     azimuth_window: of a moving beam, each pixel's weighting of the pulses across its processed azimuth band: 'hann',
         'taylor' (nbar 4, 35 dB) or 'uniform'; None: 'hann' with window, else no per-pixel weighting.
+    band: the frequencies to use, (first, last) in Hz, or one such pair per pulse of the aperture [pulses, 2]: the
+        samples outside are given no weight, and the Taylor window (window=False: none) spans the band of each
+        pulse instead of the whole band. aperture=(first, last + 1) and band= are the selection a coherent pair is
+        formed with: each collection cut, before formation, to the look directions and the ground-range
+        wavenumbers both have, under one weighting (fastsar.stack.common_support gives both for both).
+    grid: an Earth-fixed ground grid (fastsar.stack.ground_grid, or a product of an earlier call: the same pixels)
+        in place of the collection's own: its plane, axes, spacing and shape; spacing, extent, height and axes
+        then do not apply, and the product records it (grid, and axes 'grid'). shift: (d1, d2) in meters along the
+        grid's e1 and e2: the image is formed on the grid displaced by it and recorded on the grid itself, which
+        registers a collection whose orbit knowledge is off by that much (fastsar.stack.register; the product's
+        frame is moved with it, so its geolocation is the grid's).
+    range_gate: 'auto' gates the phase history in range to the image's swath before formation where the cuda
+        backend's first level could not hold it otherwise (a note says so), True wherever the swath is under half
+        of the unambiguous range, False never (fastsar.ImageFormer).
     -> dict(image [nx, ny] complex64, origin [3] (local, pixel (0, 0)), e1, e2 (unit axes, local), spx, spy, mode,
     band (first and last frequency, Hz), bandwidth (spatial frequency support along e1 and e2, cycles/m), window,
     phase_error (autofocus: per pulse, rad, else None), meta (read_cphd's), notes, and the geometry of the grid:
     plane ('ground'), axes, center [3] (local), height (the plane's, local z), graze (rad, at the center), pulses
     (first, last + 1 of the pulses read that were used), dsin (a moving beam's processed spread of the sine of the
-    look angle about each pulse's SRP, else None)). Pixel (i, j) lies at
+    look angle about each pulse's SRP, else None); with grid=: grid (fastsar.stack.as_grid's dict, ECEF), shift,
+    source (the file) and form_options (the arguments that form it again)). Pixel (i, j) lies at
     origin + i spx e1 + j spy e2 in the local frame (io.local_to_ecf for ECF; products.geolocate for latitude and
     longitude)."""
     from .api import ImageFormer, _backend
@@ -134,8 +150,9 @@ def form_cphd(cphd, sicd=None, *, mode='auto', backend='auto', window=True, spac
         raise ValueError("mode must be 'auto', 'spotlight' or 'moving'")
     if axes not in ('track', 'los', 'auto'):
         raise ValueError("axes must be 'track', 'los' or 'auto'")
-    if aperture not in ('auto', 'square', 'full'):
-        raise ValueError("aperture must be 'auto', 'square' or 'full'")
+    if isinstance(aperture, str) and aperture not in ('auto', 'square', 'full') or \
+            not isinstance(aperture, str) and np.shape(aperture) != (2,):
+        raise ValueError("aperture must be 'auto', 'square', 'full' or the pulses (first, last + 1)")
     if azimuth_window not in (None, 'hann', 'taylor', 'uniform'):
         raise ValueError("azimuth_window must be 'hann', 'taylor', 'uniform' or None")
     backend = _backend(backend)                       # before the file is read
@@ -148,7 +165,18 @@ def form_cphd(cphd, sicd=None, *, mode='auto', backend='auto', window=True, spac
     if troposphere is not None:                   # else each reader's default: the file's delay (CPHD), the model (raw)
         kw['troposphere'] = troposphere
     kw.update(reader_options or {})
+    if band is not None and (np.ndim(band) not in (1, 2) or np.shape(band)[-1] != 2 or not np.all(np.isfinite(band))
+                             or np.min(band) <= 0 or np.any(np.diff(np.asarray(band, np.float64), axis=-1) <= 0)):
+        raise ValueError('band must be (first, last) frequencies in Hz, first < last, or one such pair per pulse')
+    if grid is not None and any(v is not None for v in (spacing, extent, height)):
+        raise ValueError('grid= gives the plane, the spacing and the shape: leave spacing, extent and height unset')
+    if shift is not None and grid is None:
+        raise ValueError('shift= displaces a grid: give grid=')
     col, meta = io.read_collection(cphd, **kw)
+    gl = None
+    if grid is not None:                          # the grid in this collection's frame (moved by -shift)
+        from . import stack
+        meta, gl = stack._enter(grid, shift, meta)
     S = col['S']
     P, K = S.shape
     f0, df = float(col['fmin']), float(col['df'])
@@ -185,7 +213,7 @@ def form_cphd(cphd, sicd=None, *, mode='auto', backend='auto', window=True, spac
             rows, cols = int(sm.ImageData.NumRows), int(sm.ImageData.NumCols)
             R_, C_ = np.meshgrid([0, rows - 1], [0, cols - 1], indexing='ij')
             corners = io.sicd_points(sm, R_.ravel(), C_.ravel(), meta)
-    if extent is not None:
+    if extent is not None or gl is not None:
         corners = None
     elif corners is None:
         raise ValueError('the CPHD has no planar image area: give a sicd or an extent')
@@ -203,9 +231,26 @@ def form_cphd(cphd, sicd=None, *, mode='auto', backend='auto', window=True, spac
         e2 = (center - ant[P // 2]) - ((center - ant[P // 2]) @ up) * up
         e2 /= np.linalg.norm(e2)
         e1 = np.cross(e2, up)
+    if gl is not None:                            # the grid's own center, plane (horizontal at the grid) and axes
+        center, e1, e2, up, axes = gl['center'], gl['e1'], gl['e2'], gl['normal'], 'grid'
+        hz = float(center[2])
+        graze = np.arcsin(np.clip(-((center - ant[P // 2]) / np.linalg.norm(center - ant[P // 2])) @ up, 0.05, 1.0))
+        los = center - ant[P // 2]
+        if autofocus and abs(los @ e1) > np.tan(np.radians(5.0)) * (los @ e2):
+            raise ValueError("autofocus estimates the phase error along the grid's first axis, which must be this "
+                             "collection's azimuth: the grid's second axis is "
+                             f'{np.degrees(np.arctan2(abs(los @ e1), los @ e2)):.0f} degrees from its line of sight')
     ref_r = np.asarray(meta['ref'], np.float64)
     used = (0, P)
-    if spot and (aperture == 'square' or (aperture == 'auto' and sm is None and spacing is None)):
+    if not isinstance(aperture, str):                 # the pulses given (a pair on one azimuth interval: fastsar.stack)
+        lo_, hi_ = (int(v) for v in aperture)
+        if not spot or not 0 <= lo_ < hi_ - 1 < P:
+            raise ValueError(f'aperture={aperture!r}: pulses (first, last + 1) of the {P} of a spotlight collection')
+        S, ant, srp, ref_r = S[lo_:hi_], ant[lo_:hi_], srp[lo_:hi_], ref_r[lo_:hi_]
+        used = (lo_, hi_)
+        notes.append(f'aperture: pulses {lo_} to {hi_ - 1} of {P}')
+        P = hi_ - lo_
+    elif spot and (aperture == 'square' or (aperture == 'auto' and sm is None and spacing is None)):
         # without the vendor's product or a spacing: square resolution, the azimuth resolution matched to the ground
         # range resolution by the central part of a longer aperture (the vendor's products do likewise); spacing=
         # forms the whole aperture
@@ -233,14 +278,46 @@ def form_cphd(cphd, sicd=None, *, mode='auto', backend='auto', window=True, spac
     # a caller's own grid (process_cphd): spacing and bounds (m from the center along e1 and e2) from the geometry
     plan = {} if _plan is None else (_plan(dict(S=S, ant=ant, fmin=f0, df=df, center=center, e1=e1, e2=e2, graze=graze,
                                                 corners=corners, mode=mode, meta=meta, sicd=sm, notes=notes,
-                                                pulses=used, srp=srp, dsin=dsin)) or {})
+                                                pulses=used, srp=srp, dsin=dsin, grid=gl)) or {})
     if plan.get('window') is not None:
         window = bool(plan['window'])
     if plan.get('azimuth_window') is not None:
         azimuth_window = plan['azimuth_window']
     if plan.get('axes') is not None:                  # any plane through the center (a slant-plane grid)
         e1, e2 = (np.asarray(v, np.float64) for v in plan['axes'])
-    if window:
+    bd, bwid = (f0, f0 + (K - 1) * df), K * df
+    if band is not None:
+        # the frequencies used: on each block of 64 pulses the window spans the block's own band, 0 outside it,
+        # and along the aperture it is a function of the look direction on the ground, not of the pulse's number:
+        # two collections cut to one support (fastsar.stack.common_support) then carry one weighting of it
+        fb = np.asarray(band, np.float64)
+        if fb.shape not in ((2,), (P, 2)):
+            raise ValueError(f'band: one (first, last) pair, or one per pulse of the aperture ({P}), got shape '
+                             f'{fb.shape}')
+        fb = np.clip(np.broadcast_to(fb, (P, 2)), f0, f0 + (K - 1) * df)
+        if np.any(fb[:, 1] - fb[:, 0] < 2 * df):
+            raise ValueError(f'band: no samples of this collection ({f0:.6g} to {bd[1]:.6g} Hz) on some pulse')
+        from .patches import _rows_with
+        fk, xg = f0 + df * np.arange(K), np.linspace(0.0, 1.0, 4097)
+        tw = _taylor(4097) if window else np.ones(4097, np.float32)
+        wp = np.ones(P, np.float32)
+        if spot and window:
+            u = center[None] - ant
+            ph = np.unwrap(np.arctan2(u @ e1, u @ e2))
+            wp = np.interp((ph - ph[0]) / (ph[-1] - ph[0]), xg, tw).astype(np.float32)
+
+        def _cut(sl, w):
+            w = w[:sl.stop - sl.start]
+            lo_, hi_ = fb[sl].mean(0)
+            wk = np.interp((fk - lo_) / (hi_ - lo_), xg, tw, left=0.0, right=0.0).astype(np.float32)
+            np.multiply(wp[sl, None], wk[None, :], out=w)
+            S[sl] *= w
+        _rows_with(_cut, P, lambda: np.empty((min(64, P), K), np.float32), chunk=64)
+        bd = (float(np.median(fb[:, 0])), float(np.median(fb[:, 1])))
+        bwid = bd[1] - bd[0]
+        notes.append(f'band: {bd[0] / 1e6:.1f} to {bd[1] / 1e6:.1f} MHz used of {f0 / 1e6:.1f} to '
+                     f'{(f0 + (K - 1) * df) / 1e6:.1f} MHz ({100 * bwid / ((K - 1) * df):.0f}%)')
+    elif window:
         wk = _taylor(K)
         wp = _taylor(P) if spot else np.ones(P, np.float32)
         from .patches import _rows_with
@@ -258,7 +335,9 @@ def form_cphd(cphd, sicd=None, *, mode='auto', backend='auto', window=True, spac
     else:
         ares = lam / (2 * dsin)
     # spacing
-    if plan.get('spacing') is not None:
+    if gl is not None:
+        spx, spy = gl['spx'], gl['spy']
+    elif plan.get('spacing') is not None:
         spx, spy = (float(v) for v in plan['spacing'])
     elif spacing is not None:
         sp_ = np.ravel(np.asarray(spacing, np.float64))
@@ -271,7 +350,9 @@ def form_cphd(cphd, sicd=None, *, mode='auto', backend='auto', window=True, spac
     else:
         spx, spy = 0.8 * 1.2 * ares, 0.8 * 1.2 * rres / np.cos(graze)          # 1.2: the Taylor window's broadening
     # grid
-    if plan.get('bounds') is not None:
+    if gl is not None:                                # its own shape and origin, set below
+        a1 = a2 = np.zeros(2)
+    elif plan.get('bounds') is not None:
         b = np.asarray(plan['bounds'], np.float64)
         a1, a2 = center @ e1 + b[:2], center @ e2 + b[2:]
     elif corners is None:
@@ -283,7 +364,9 @@ def form_cphd(cphd, sicd=None, *, mode='auto', backend='auto', window=True, spac
     nx = int(np.ceil((a1.max() - a1.min()) / spx)) + 1
     ny = int(np.ceil((a2.max() - a2.min()) / spy)) + 1
     origin = a1.min() * e1 + a2.min() * e2 + h * up
-    if plan.get('bounds') is not None:
+    if gl is not None:
+        (nx, ny), origin = gl['shape'], gl['origin']
+    elif plan.get('bounds') is not None:
         origin = center + b[0] * e1 + b[2] * e2
     # host memory: the history, the image and the mosaic's accumulation; past what is available, a clear error
     from . import memory as _mem
@@ -313,7 +396,10 @@ def form_cphd(cphd, sicd=None, *, mode='auto', backend='auto', window=True, spac
             img, phi = pga_autofocus(S, ant - c, f0, df, nx, ny, spx, spy, e1, e2, **kw)
             notes.append(f'autofocus: removed a phase error of {np.std(phi):.2f} rad rms (constant and linear terms excluded)')
         else:
-            img = ImageFormer(ant - c, f0, df, K, nx, ny, spx, spy, e1, e2, **kw)(S)
+            former = ImageFormer(ant - c, f0, df, K, nx, ny, spx, spy, e1, e2, range_gate=range_gate, **kw)
+            img = former(S)
+            if former.range_gate is not None:
+                notes.append(former.range_gate['note'])
         origin = c - (nx / 2.0) * spx * e1 - (ny / 2.0) * spy * e2
     else:
         sp = ((srp - ant) * d).sum(1) / np.linalg.norm(srp - ant, axis=1)        # beam center: each pulse's SRP
@@ -332,10 +418,16 @@ def form_cphd(cphd, sicd=None, *, mode='auto', backend='auto', window=True, spac
                                   awin='none' if awin == 'uniform' else awin, amask=awin in ('taylor', 'uniform'),
                                   umax=1.0 + float(plan.get('azimuth_pad') or 0.0), backend=backend,
                                   target_db=target_db, info=info)
+    # on a grid: the grid, and what forms the collection again on it displaced (stack.register)
+    on_grid = {} if gl is None else dict(grid=gl['grid'], shift=gl['shift'], source=cphd, form_options=dict(
+        sicd=sicd, mode=mode, backend=backend, window=window, channel=channel, patch=patch,
+        azimuth_fraction=azimuth_fraction, precision=precision, target_db=target_db, autofocus=autofocus,
+        troposphere=troposphere, reader_options=reader_options, aperture=aperture, azimuth_window=azimuth_window,
+        band=band, range_gate=range_gate))
     return dict(image=img, origin=origin, e1=e1, e2=e2, spx=float(spx), spy=float(spy), mode=mode,
-                band=(f0, f0 + (K - 1) * df), bandwidth=(1.0 / ares, 2 * K * df * np.cos(graze) / C),
+                band=bd, bandwidth=(1.0 / ares, 2 * bwid * np.cos(graze) / C),
                 window=(('taylor', 'taylor') if window else None) if spot else (
                     (awin, 'taylor' if window else 'uniform') if awin else None),
                 phase_error=phi if autofocus else None, meta=meta, notes=notes, plane='ground', axes=axes,
                 center=origin + (nx / 2.0) * spx * e1 + (ny / 2.0) * spy * e2, height=float(hz), graze=float(graze),
-                pulses=used, dsin=dsin)
+                pulses=used, dsin=dsin, **on_grid)

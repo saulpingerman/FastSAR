@@ -9,8 +9,8 @@
   remap='nrl', remap_args=None, spacing=None, extent=None, sicd=None, mode='auto', backend='auto',
   precision='float32',
   shadows_down=True, nesz_db=None, scene_sigma0_db=-10.0, black_sigma0_db=-10.0, height=None, channel=0,
-  troposphere=None, reader_options=None, target_db=-40.0, dem=None, geoid=None)`: from a CPHD file to a SICD or
-  SIDD ([product-options.md](product-options.md)). `plane=None` is `'ground'` for every product: the default SICD
+  troposphere=None, reader_options=None, target_db=-40.0, dem=None, geoid=None, grid=None)`: from a CPHD file to
+  a SICD or SIDD ([product-options.md](product-options.md)). `plane=None` is `'ground'` for every product: the default SICD
   is a ground-plane SICD (`Grid.Type` PLANE, `Grid.ImagePlane` GROUND, rows along ground range away from the
   radar, columns so that the array is the view from above), the image as FastSAR forms it. Most producers deliver
   slant-plane SICDs; `plane='slant'` gives one for a spotlight, and a tool that assumes a slant plane without
@@ -24,16 +24,29 @@
   product. A moving-beam collection takes the ground plane, the three weightings, `autofocus='quadratic'` or
   `'spatially_variant'` and the areas in ground range; where apodization cannot be applied to it, a SIDD whose
   weighting was not given is Taylor weighted with a note, and `weighting='sva'` raises
-  ([product-options.md](product-options.md#moving-beam-collections)). Returns the product dict (`form_cphd`'s
+  ([product-options.md](product-options.md#moving-beam-collections)). `grid`: as `form_cphd`'s, the image on an
+  Earth-fixed grid as the product; the quality areas, the slant plane, apodization and a `dem` are then refused,
+  a SIDD whose weighting was not given is Taylor weighted with a note, and a SICD carries no `Radiometric` block
+  ([stack.md](stack.md#the-common-grid)). Returns the product dict (`form_cphd`'s
   entries on the product's grid) with `product`, `area`, `weighting`, `autofocus`, `autofocus_info`,
   `radiometric` (a SICD's calibration, the content of its `Radiometric` block, or `None` where the collection
   supports none; `notes` says which source was used or why there is none:
   [product-options.md](product-options.md#radiometric-calibration)), `timing` (seconds per stage) and, when
   written, `path` and `metadata`.
+- `process_stack(cphds, output=None, *, product='mean', grid=None, reference=0, spacing=None, extent=None,
+  register='fourier', equalize='mean', weights=None, window=7, weighting='taylor', aperture='auto', dem=None,
+  remap='nrl', remap_args=None, shadows_down=True, backend='auto', precision='float32', max_shift=64,
+  range_gate=True, channel=0, troposphere=None, reader_options=None, target_db=-40.0)`: several collections of
+  one scene to one product ([stack.md](stack.md)). `product`: `'mean'` (a SIDD), or of two collections as a
+  coherent pair `'coherence'`, `'change'`, `'interferogram'` (GeoTIFFs) or `'coherent_sum'` (a SIDD); the pair is
+  formed from its common support ([stack.md](stack.md#coherent-pairs)). Returns the product dict of the
+  `stack` function of that name with `registrations`, `inputs`, `timing`, for a pair `support` and `baseline`,
+  and, when written, `path` and `metadata`.
 - `form_cphd(cphd, sicd=None, *, mode='auto', backend='auto', window=True, spacing=None, channel=0, patch=1024,
   azimuth_fraction=0.8, extent=None, height=None, precision='float32', target_db=-40.0, info=None,
-  autofocus=False, troposphere=None, reader_options=None, axes='track', aperture='auto', azimuth_window=None)`: the
-  image of a CPHD file ([processing-chain.md](processing-chain.md#2-form)).
+  autofocus=False, troposphere=None, reader_options=None, axes='track', aperture='auto', azimuth_window=None,
+  band=None, grid=None, shift=None, range_gate='auto')`: the image of a CPHD file
+  ([processing-chain.md](processing-chain.md#2-form)).
   `mode`: `'auto'`, `'spotlight'`, `'moving'`. `troposphere`: passed to `read_cphd` (default: the delay the file
   gives is removed; `'model'` removes a standard-atmosphere delay for files that give none). `sicd`: path, `.xml` or SICD metadata. `spacing`, `extent`: (along, across
   track) in m. `height`: grid height above the ellipsoid. Returns a dict: `image` [nx, ny] complex64, `origin`
@@ -41,19 +54,31 @@
   frequency support along e1, e2), `window`, `phase_error` (or None), `meta` (from `read_cphd`), `notes`, and the
   grid's geometry: `plane`, `axes`, `center`, `height`, `graze`, `pulses`, and `dsin` (a moving beam's processed
   spread of the sine of the look angle). `axes`: `'track'`, `'los'` (a spotlight:
-  e2 along the line of sight on the ground) or `'auto'`. `aperture`: `'auto'`, `'square'` or `'full'`.
-  `azimuth_window`: a moving beam's weighting of each pixel's processed azimuth band, `'hann'` (the default with
-  `window`), `'taylor'` or `'uniform'`.
-- `form_image(S, ant, fmin, df, nx, ny, spx, spy, e1, e2, *, algorithm='ffbp', backend='auto', precision='float32',
-  window=True, T='auto', ..., target_db=-40.0, ref=None, interp=None, upsample=None, center=None)`: a spotlight
+  e2 along the line of sight on the ground) or `'auto'`. `aperture`: `'auto'`, `'square'`, `'full'` or the pulses
+  (first, last + 1). `azimuth_window`: a moving beam's weighting of each pixel's processed azimuth band, `'hann'`
+  (the default with `window`), `'taylor'` or `'uniform'`. `band`: the frequencies to use, (first, last) in Hz or
+  one pair per pulse, weighted over that band; with `aperture`, the selection a coherent pair is formed from
+  (`stack.common_support`). `grid`: an Earth-fixed ground grid (`stack.ground_grid`, or an earlier product: its
+  pixels) in place of the collection's own; the output then has `grid`, `shift`, `source`, `form_options` and
+  `axes` `'grid'`. `shift`: (d1, d2) in m along the grid axes, the grid displaced by it
+  ([stack.md](stack.md#registration)). `range_gate`: `ImageFormer`'s.
+- `form_image(S, ant, fmin, df, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 1.0, 0.0), *, algorithm='ffbp',
+  backend='auto', precision='float32', window=True, T='auto', ..., target_db=-40.0, ref=None, interp=None,
+  upsample=None, center=None, range_gate='auto')`: a spotlight
   image on a grid centered on the frame origin ([algorithms.md](algorithms.md)). `algorithm`: `'ffbp'`, `'pfa'` or
   `'bp'` (exact backprojection, `ExactFormer`). `ref` [P]: the one-way range each pulse's samples are referenced to
   when it is not `|ant|` (a bistatic half path, a vendor's reference point). `precision`, `T`, `levels`, `pmax` and
   `target_db` apply to `'ffbp'`, `pfa_guard` and `pfa_support` to `'pfa'`; `interp` (`'cubic'` or `'linear'`), `upsample` and
   `center` (the point the grid is centered on) apply to `'bp'` only and raise `ValueError` with the others.
-- `ImageFormer(ant, fmin, df, K, nx, ny, spx, spy, e1, e2, *, backend='auto', precision='float32', ...,
-  aperture_weight=None, ref=None)`: plans and compiles once; `former(S)` forms each image. Arguments after `e2` are
-  keyword-only. Attributes `T`, `predicted_error_db`. `aperture_weight(points, pulses) -> W [n, m]` weights pulses
+- `ImageFormer(ant, fmin, df, K, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 1.0, 0.0), *, backend='auto',
+  precision='float32', ..., aperture_weight=None, ref=None, range_gate='auto')`: plans and compiles once;
+  `former(S)` forms each image.
+  Arguments after `e2` are keyword-only. Attributes `T`, `predicted_error_db`, `range_gate` (None, or what the
+  gate kept). `range_gate`: the history gated in range to the image's swath before formation: `'auto'` where the
+  cuda backend's first level could not hold its filter otherwise, `True` wherever the gate keeps under half of
+  the samples, `False` never ([stack.md](stack.md#the-range-gate)); `form_image` takes it too. On the cuda backend
+  the gate sizes its blocks to the device memory that is free and runs on the host where the device has no room
+  for it; the gate's `note` says so. `aperture_weight(points, pulses) -> W [n, m]` weights pulses
   per pixel. `memory()`: the bytes full speed needs and the bytes free, as
   `dict(backend, needed, available, full_speed, parts)`. `stage(S)`: the checks, scaling and upload of `S` ahead
   of formation on the JAX and TPU backends; `former(former.stage(S))` equals `former(S)`.
@@ -140,6 +165,44 @@ attribute access by the XML's element names (`sm.Grid.Row.SS`, `sm.ImageData.Num
 CPHD files are read and written by FastSAR itself; GeoTIFFs, DEMs and map projections other than `EPSG:4326` need
 rasterio.
 
+## `fastsar.stack`
+
+Several collections of one scene ([stack.md](stack.md)). The functions work where the images are (NumPy, CuPy,
+JAX) and return arrays of the same kind.
+
+- `ground_grid(center, extent, spacing, azimuth=0.0)`: an Earth-fixed ground grid, horizontal at `center`
+  (latitude, longitude, height): `dict(origin, e1, e2, spx, spy, shape, center, lat, lon, height, azimuth)`, ECEF.
+  `as_grid(grid)`: the same from a dict under other names or from a product.
+- `register(products, reference=0, *, apply='fourier', max_shift=64, tiles=4, box=5, highpass=32.0,
+  coherent=False, form=None)`: one translation per image against the reference; each product gets `registration`
+  (`shift`, `shift_px`, `significance`, `correlation`, `found`, `residual_rms`, `residual_median`,
+  `residual_worst`, `tile_residuals`, `tiles_used`) and `shift`. `apply`: `'fourier'`, `'reform'` or `None`.
+  `coherent`: the translation refined on the complex images; `registration` then has `coherent` (`found`,
+  `delta_px`, `tiles_used`, `quality`, `residual_px`, `gain`) and `detected`, `detected_px`.
+  `shift_image(out, shift, *, inplace=False)`: a product translated on its grid by a phase ramp on its spectrum.
+- `mean(products, *, equalize=None, weights=None, tile=32)`: the incoherent average; `image` (amplitude), `looks`,
+  `looks_single`, `looks_by_n`, `looks_ideal`, `looks_independent`, `brightness_spread_db`, `gains`, `inputs`.
+- `coherence(a, b, window=7, *, common_band=True, fringe='tiles', tile=384, floor=True)`: `image` (the coherence),
+  `median`, `mean`, `p90`, `above_0p5`, `above_0p7`, `floor` (the same of the displaced pair), `samples`,
+  `overlap`, `fringes`, `fringes_found`, `fringe`, `baseline`. `change(a, b, window=7, *, capable=0.9, lost=0.4,
+  ...)`: `image` (the intensity ratio, dB), `coherence`, `allowed` (the coherence the two brightnesses allow),
+  `capable_fraction`, `changed_fraction`, `coherent_fraction`, `ratio_sigma`.
+- `interferogram(a, b, window=7, *, fringe=True, dem=None, dem_step=4, floor=True)`: of a registered pair formed
+  on its common support: `image` (the phase, rad), `coherence`, `fringe`, `fringe_per_km`, `fringe_found`,
+  `phase_offset`, `height_of_ambiguity`, `height_per_radian`, `displacement_per_radian`, `wavelength`,
+  `topography`, `phase_std`, `flatness`, and the coherence's statistics and `floor`.
+  `coherent_sum(a, b, window=15, *, equalize=True, coherence_window=7, dark=0.01)`: `image` (complex), `gain`
+  (`signal`, `noise`, `snr`, `second`, `expected`, `incoherent`, `coherence`), `amplitude_factor`, `fringe`.
+- `baseline(a, b, point=None, aperture='square')`: from two CPHD files or products, `inside`, `overlap_range`,
+  `overlap_azimuth`, `overlap`, `azimuth_available`, `d_graze`, `d_azimuth`, `critical_graze`,
+  `critical_azimuth`, `height_of_ambiguity`, `days`. `common_support(a, b, point=None)`: the selection of each
+  collection that covers what both have, `pulses` and `bands` (`form_cphd`'s `aperture=` and `band=`), with
+  `phi`, `rho`, `azimuth_deg`, `azimuth_available_deg`, `azimuth_needed_deg`, `overlap_range`, `d_graze`,
+  `critical_graze`, `height_of_ambiguity`, `resolution`.
+  `geometry(source, channel=0)`: a collection's antenna positions, band and start without its samples.
+- `write_geotiff(path, out, bands=None)`: a stack product on its grid as a GeoTIFF in its UTM zone.
+- `process_stack`: as `fastsar.process_stack`.
+
 ## `fastsar.planes`, `fastsar.resample`, `fastsar.weighting`
 
 - `planes.to_slant(out, spacing, bounds=None, *, margin=0, valid=None, taps=8, knots=32)`: a ground-plane image on
@@ -213,7 +276,9 @@ plane; a DEM is a function `dem(lat, lon)` of heights above the WGS-84 ellipsoid
 ## `fastsar.sidd`, `fastsar.remap`
 
 - `sidd.write_sidd(path, out, *, remap='nrl', remap_args=None, valid=None, shadows_down=True, version=3,
-  product_name=None, classification='UNCLASSIFIED', sicd=None)`, `sidd.to_display(out, remap='nrl', valid=None,
+  product_name=None, classification='UNCLASSIFIED', sicd=None, collections=None, product_class=None,
+  product_type=None, extensions=None)` (`collections`: the SICD metadata of each input of a product made from
+  several collections, one `ExploitationFeatures` `Collection` each), `sidd.to_display(out, remap='nrl', valid=None,
   shadows_down=True, **remap_args)`, `sidd.shadows_down(out)`, `sidd.orient(array, transform)`.
 - `remap.remap(x, name='nrl', **kw)` and the named remaps `density`, `brighter`, `darker`, `highcontrast`, `pedf`,
   `nrl`, `log`, `linear`.
@@ -245,8 +310,9 @@ The stages after formation for a moving-beam image
 
 ## `fastsar.patches`
 
-- `form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1, e2, patch=(128, 128), beam=None, umax=1.0, awin=None, ...,
-  backend='cpu', exact=False, ..., amask=False)`: image on the grid `origin + i spx e1 + j spy e2`. `fx`:
+- `form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 1.0, 0.0), patch=(128, 128),
+  beam=None, umax=1.0, awin=None, ..., backend='cpu', ..., exact=False, ..., amask=False)`: image on the grid
+  `origin + i spx e1 + j spy e2`. `fx`:
   `dict(S, fmin, df, ref, band)`. `beam(idx, points) -> u`: normalized azimuth coordinate; pulses with |u| <=
   `umax` serve a patch. `amask`: the azimuth window is zero beyond `umax` instead of held at its edge value.
 - `form_stripmap(data, p, ...)`: mosaic of straight-track echoes; returns `(image, r, x)`.

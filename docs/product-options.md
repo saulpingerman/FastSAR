@@ -51,6 +51,11 @@ The options and their defaults:
   area or in place of the one it states.
 - `dem`, `geoid`: a DEM, with which the defocus of terrain off the image plane is removed before the autofocus
   ([terrain-informed focusing](#terrain-informed-focusing)), for a spotlight on either plane. The default is none.
+- `grid`: an Earth-fixed ground grid in place of the collection's own area, axes and spacing, so that several
+  collections of one scene share their pixels ([stack.md](stack.md#the-common-grid)). The product is then the
+  image on that grid: the quality areas, the slant plane, apodization and a `dem` do not apply (a SIDD is Taylor
+  weighted in place of its default, with a note), and the SICD carries no `Radiometric` block. `process_stack`
+  takes several collections to one product ([stack.md](stack.md)).
 
 The defaults by product:
 
