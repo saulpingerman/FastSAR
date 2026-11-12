@@ -187,7 +187,14 @@ def device(a, backend):
     'tpu', a NumPy array for the others ('cpu'; 'metal', whose stages after formation run on the host)."""
     if backend == 'cuda':
         import cupy
-        return cupy.asarray(a)
+        if kind(a) != 'numpy':
+            return cupy.asarray(a)
+        # a copy that is complete when this returns. cupy.asarray reads a page-locked source (the image a cuda former
+        # returns) after it returns, on the current stream, and the caller may go on to write that image. The stream
+        # is waited for first: the new array may be a block of the pool that a queued kernel still writes, and a
+        # synchronous copy does not queue behind the work of a stream other than the default one
+        cupy.cuda.get_current_stream().synchronize()
+        return cupy.asarray(a, blocking=True)
     if backend in ('jax', 'tpu'):
         import jax.numpy as jnp
         # a private copy of a NumPy array: on its CPU device JAX may keep the host buffer, and the caller may go on

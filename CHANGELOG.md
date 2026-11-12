@@ -34,6 +34,9 @@ was published on PyPI.
 - Writing a NITF file could fail with "BufferError: cannot close exported pointers exist" on a heavily loaded
   host, when a worker thread still held its last block of the file's memory map as the map was closed. The
   workers now reach the map through a holder that is emptied before the map is closed.
+- `fastsar._xp.device(a, 'cuda')` returned before a page-locked host array (the image a cuda former returns) had
+  been read, so that writing the host array afterwards changed the device copy. No path of 0.2.0 wrote it. The
+  copy is now complete when the call returns.
 - `docs/products.md` said that two passes formed onto one grid are coregistered by construction; that holds for
   the geometry as known, and real repeat collections lay 9 to 22 m apart. `products.coherence` gave its bias for
   independent pixels; the note now states the measured floor of oversampled images.

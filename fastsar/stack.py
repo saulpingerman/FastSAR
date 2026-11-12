@@ -1227,10 +1227,7 @@ def _on_device(image, backend, notes):
             notes.append(f'the GPU has no room for the stack stages of a {image.shape[0]} x {image.shape[1]} image '
                          f'({need / 1e9:.1f} GB): they ran on the host')
             return image
-        import cupy
-        # a synchronous copy: the former's image is page-locked memory, which cupy.asarray reads after it returns,
-        # and the image is given up (and its block reused) as soon as this returns
-        return cupy.asarray(image, blocking=True)
+        return _xp.device(image, 'cuda')                             # complete when it returns: the image is given up
     if backend in ('jax', 'tpu'):
         budget = _xp.jax_budget()
         if budget is not None and not memory.cuda_plan(dict(ground=need), budget, joined=True)['fits']:

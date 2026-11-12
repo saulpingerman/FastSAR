@@ -261,3 +261,35 @@ def test_cuda_range_gate_transfer(monkeypatch):
     monkeypatch.setattr(ffbp_cuda, '_to_device_now', torn)
     with pytest.raises(RuntimeError, match='did not reach the GPU'):
         former(S)
+
+
+@pytest.mark.cuda
+def test_device_copy_is_complete_when_it_returns(scene):
+    """_xp.device on the image a cuda former returns (page-locked host memory) while the device is busy: the copy is
+    complete when the call returns, so the host image written right afterwards does not reach it, on the default
+    stream and on a caller's (cupy.asarray reads a page-locked source after it returns: through 0.2.0 the device
+    copy then took what the host wrote)."""
+    import contextlib
+    import cupy as cp
+    from fastsar import _xp
+    from fastsar.resample_cuda import host_empty
+    c = scene.col
+    heavy = cp.random.standard_normal((4000, 4000), dtype=cp.float32)
+    rng = np.random.default_rng(2)
+    big = (rng.standard_normal((1024, 1024), np.float32) + 1j * rng.standard_normal((1024, 1024), np.float32)).astype(np.complex64)
+    for own in (False, True):
+        for k in range(4):
+            if k % 2:
+                img = fastsar.form_image(scene.S, c.ant, c.fmin, c.df, **GRID, backend='cuda')
+            else:
+                img = host_empty(big.shape, big.dtype)
+                img[:] = big
+            want = img.copy()
+            with cp.cuda.Stream(non_blocking=True) if own else contextlib.nullcontext():
+                for _ in range(3):
+                    heavy @ heavy                                    # work queued ahead of the copy
+                dev = _xp.device(img, 'cuda')
+                img[:] = 0
+                assert np.array_equal(cp.asnumpy(dev), want), (own, k)
+    assert _xp.device(dev, 'cuda') is dev
+    assert np.array_equal(cp.asnumpy(_xp.device(want[::2, 1::3], 'cuda')), want[::2, 1::3])      # any layout
