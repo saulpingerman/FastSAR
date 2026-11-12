@@ -1,37 +1,68 @@
 """From a CPHD file to a product on disk, with the choices a production processor offers:
 
-    fastsar.process_cphd('scene_CPHD.cphd', 'scene_SICD.nitf')                    # complex, slant plane, autofocus
+    fastsar.process_cphd('scene_CPHD.cphd', 'scene_SICD.nitf')                    # complex, ground plane, unweighted
+    fastsar.process_cphd('scene_CPHD.cphd', 'scene_SICD.nitf', plane='slant')     # complex, slant plane
     fastsar.process_cphd('scene_CPHD.cphd', 'scene_SIDD.nitf', product='sidd')    # detected, ground plane, SVA, NRL
+
+The default SICD is a ground-plane SICD, which is less common than a slant-plane one. FastSAR forms every spotlight
+image on the ground plane, and the default product is that image: Grid.Type PLANE and Grid.ImagePlane GROUND, rows
+along ground range away from the radar, columns so that the array is the view from above. Most producers deliver
+slant-plane SICDs (ImagePlane SLANT), and plane='slant' gives one. A reader that projects pixels through the
+metadata (the SICD projection model, as sarpy and sarkit implement it) handles both planes. Check any tool that
+assumes a slant plane without reading Grid.ImagePlane: one that takes Row.SS for a slant range spacing, that
+converts to ground range itself, or that derives one radiometric scale factor from another through a slant-plane
+pixel area. Ground is the default because it is the plane of formation: backprojection onto it is exact for any
+track, and the product is the image as formed, where the slant-plane product is that image resampled once more
+(docs/product-options.md, Planes, has the measured comparison).
 
 Product. 'sicd': the complex image (SICD); 'sidd': a detected, remapped 8-bit image (SIDD), laid out shadows down.
 Area. 'tasked': the image area of the file (or of the vendor SICD given). 'tasked_quality': everything at least as
-good as the tasked area; a number: everything at or above that RNIIRS; 'black': everything with a signal-to-noise
-ratio of at least 1 (fastsar.rgiqe: the radar generalized image quality equation on the collection's own antenna
-pattern and noise). The impulse response is the same over the whole image, the noise-equivalent sigma zero rises
-toward the edges, and pixels of the rectangular array outside the area are 0.
-Plane. 'slant' or 'ground'. The image is always formed on the ground plane, where backprojection is exact for any
-track, on axes along the line of sight; a slant-plane product is that image resampled (fastsar.planes), a
-ground-plane SICD is the image as formed, and a ground-plane SIDD is detected on the slant plane and projected.
+good as the tasked area; a number: everything at or above that RNIIRS; 'black': out to where terrain of sigma zero
+black_sigma0_db (-10 dB) sinks into the noise and the ambiguities (fastsar.rgiqe: the radar generalized image
+quality equation on the collection's own antenna pattern and noise; the RNIIRS kinds use the equation's own
+reference scene of 0 dB). The impulse response is the same over the whole image, the noise-equivalent sigma zero
+rises toward the edges, and pixels of the rectangular array outside the area are 0.
+Plane. 'ground' (the default) or 'slant' (a spotlight SICD). The image is always formed on the ground plane, on
+axes along the line of sight; a ground-plane SICD is the image as formed, a slant-plane SICD is that image
+resampled (fastsar.planes), and a SIDD is detected on the slant plane and projected to the ground. The one SICD
+that is on the slant plane without being asked is the apodized one (weighting='sva' with no plane given), since
+apodization runs there; a note in the product says so.
 Autofocus. 'quadratic' (one quadratic phase error over the aperture, by map drift), 'pga', 'spatially_variant'
 or 'spatially_variant_pga' (a phase error that varies over the scene), or False (fastsar.autofocus.image_autofocus).
-Weighting. 'taylor' (nbar 4, 35 dB, on the phase history), 'uniform', or 'sva' (spatially variant apodization,
-fastsar.weighting, on the slant plane at twice Nyquist: the unweighted resolution without the sidelobes).
+Weighting. 'uniform' (none: the default for a SICD, which leaves the choice of an apodization to whoever uses the
+complex image), 'taylor' (nbar 4, 35 dB, on the phase history), or 'sva' (spatially variant apodization,
+fastsar.weighting, on the slant plane at twice Nyquist: the unweighted resolution without the sidelobes; the
+default for a SIDD; a SICD with it is a slant-plane SICD, and plane='ground' with it is refused).
 Remap (SIDD). A name of fastsar.remap.REMAPS (the NGA MATLAB SAR Toolbox's: 'nrl', 'density', 'brighter', 'darker',
 'highcontrast', 'pedf', 'log') or a function.
 Terrain. dem: the surface's heights, with which the defocus of terrain off the image plane is computed from the
 collection geometry and removed before the data-driven autofocus (fastsar.terrain); the image stays on its plane.
+The correction is made on the ground image as formed, so it is the same for a ground-plane and a slant-plane
+product.
+Calibration (SICD). Where the CPHD file states the power of a 1 m^2 target (PTRef), a spotlight SICD with 'uniform'
+or 'taylor' weighting carries a Radiometric block: the noise level (from the file's PNRef, else measured from the
+phase history) and the polynomials that turn pixel power into RCS, sigma zero, beta zero and gamma zero
+(fastsar.rgiqe.calibration). A file without PTRef, an 'sva' product and a moving-beam collection get none. The
+product's notes say which source was used, or why there is no block.
 
-Defaults: the tasked area; a SICD on the slant plane with Taylor weighting and quadratic autofocus; for a SIDD the
-ground plane, spatially variant apodization and the NRL remap.
+Defaults, by product, for a spotlight and for a moving beam:
+
+    product   plane     weighting   autofocus     remap
+    'sicd'    'ground'  'uniform'   'quadratic'   -
+    'sidd'    'ground'  'sva'       'quadratic'   'nrl'
+
+and the tasked area for both. process_cphd(cphd, out, plane='slant', weighting='taylor') is the default SICD of
+FastSAR 0.2.0.
 
 A moving-beam collection (stripmap, sliding spotlight) is formed on the ground plane on axes along the track and
-brought to baseband there (fastsar.moving). Weighting: 'taylor' is the Taylor window along frequency and over each
-pixel's processed azimuth band, 'uniform' a rectangle over that band and no frequency window, 'sva' the uniform
-image at twice Nyquist of both bands, cut to the same rectangle at every pixel and apodized on the ground grid
-(refused where the squint or the swath leaves no rectangle). Autofocus: 'quadratic' or 'spatially_variant', by map
-drift on blocks along the track, tied together by a smooth fit (the phase gradient modes are for one aperture).
-Area: the tasked extent along the track, and in ground range as far as the criterion holds. Defaults: Taylor,
-quadratic autofocus, the tasked area. The slant plane is for spotlight collections.
+brought to baseband there (fastsar.moving). Weighting: 'uniform' is a rectangle over each pixel's processed azimuth
+band and no frequency window, 'taylor' the Taylor window along frequency and over that band, 'sva' the uniform
+image at twice Nyquist of both bands, cut to the same rectangle at every pixel and apodized on the ground grid.
+Apodization is refused where the squint or the swath leaves no rectangle: a SIDD whose weighting was not given is
+then Taylor weighted, and a note says why, while weighting='sva' raises. Autofocus: 'quadratic' or
+'spatially_variant', by map drift on blocks along the track, tied together by a smooth fit (the phase gradient modes
+are for one aperture). Area: the tasked extent along the track, and in ground range as far as the criterion holds.
+The slant plane, terrain focusing and the Radiometric block are for spotlight collections.
 """
 import contextlib
 import time
@@ -53,17 +84,26 @@ def _choice(name, value, allowed):
 
 def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None, autofocus=None, weighting=None,
                  remap='nrl', remap_args=None, spacing=None, extent=None, sicd=None, mode='auto', backend='auto',
-                 precision='float32', shadows_down=True, nesz_db=None, scene_sigma0_db=-10.0, height=None, channel=0,
-                 troposphere=None, reader_options=None, target_db=-40.0,
+                 precision='float32', shadows_down=True, nesz_db=None, scene_sigma0_db=-10.0, black_sigma0_db=-10.0,
+                 height=None, channel=0, troposphere=None, reader_options=None, target_db=-40.0,
                  dem=None, geoid=None):
     """Form the image of a CPHD collection and write it as a SICD or a SIDD (see the module docstring).
 
     cphd: path. output: the file to write (NITF), or None to return the product without writing it.
     product: 'sicd' or 'sidd'. area: 'tasked', 'tasked_quality', an RNIIRS (number) or 'black'.
-    plane: 'slant' or 'ground'; None: slant for a SICD, ground for a SIDD (and for any moving-beam collection).
+    plane: 'ground' or 'slant'; None: 'ground' (but 'slant' for a spotlight SICD with weighting='sva', which runs on
+        the slant plane; a note says so). The default SICD is therefore a ground-plane
+        SICD (Grid.Type PLANE, Grid.ImagePlane GROUND: the image as formed, rows along ground range away from the
+        radar, columns so that the array is the view from above). Most producers deliver slant-plane SICDs, and
+        plane='slant' (a spotlight SICD only) gives one; a tool that assumes a slant plane without reading
+        Grid.ImagePlane needs it.
     autofocus: 'quadratic', 'pga', 'spatially_variant', 'spatially_variant_pga' or False; None: 'quadratic'. A
         moving beam takes 'quadratic' and 'spatially_variant' (fastsar.moving.autofocus).
-    weighting: 'taylor', 'uniform' or 'sva'; None: 'taylor' for a SICD, 'sva' for a SIDD ('taylor' for a moving beam).
+    weighting: 'uniform', 'taylor' or 'sva'; None: 'uniform' for a SICD (no weighting: an apodization can still be
+        applied to the complex image), 'sva' for a SIDD, spotlight or moving beam. A spotlight SICD with 'sva' is on
+        the slant plane; with plane='ground' it raises a ValueError. A moving beam is apodized on its ground grid,
+        which a squint or a wide swath can rule out (fastsar.moving.plan): a SIDD whose weighting was not given is
+        then Taylor weighted, with a note, and weighting='sva' raises a ValueError.
     remap, remap_args: the SIDD's remap and its parameters (fastsar.sidd.to_display). shadows_down: lay a SIDD out
         with range increasing down the rows (False: the grid's own layout).
     spacing: the product's pixel spacing in meters: (azimuth, range) on the slant plane, (across, along the line of
@@ -77,6 +117,10 @@ def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None
         the track for a moving beam.
     sicd: the vendor's SICD (path, .xml or SICD metadata), whose footprint is then the tasked area.
     nesz_db, scene_sigma0_db: the noise level of the quality areas when the files give none (fastsar.rgiqe).
+    black_sigma0_db: the sigma zero (dB) whose signal-to-noise ratio of 1, ambiguities counted as noise, is the edge
+        of area='black': the area ends where the noise-equivalent sigma zero plus the ambiguity level reaches it.
+        The RNIIRS areas ('tasked_quality', a number) do not use it: their rating is the RGIQE's, for its reference
+        scene of 0 dB (co-polarized), as sarpy's PREDICTED_RNIIRS is.
     mode, backend, precision, height, channel, troposphere, reader_options, target_db: form_cphd's.
     dem: terrain-informed focusing of a spotlight (fastsar.terrain.focus): a DEM GeoTIFF (a path, or a list of
         tiles), a function dem(lat, lon) -> height above the WGS-84 ellipsoid in meters (products.read_dem's), or a
@@ -86,7 +130,9 @@ def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None
         needs it (Copernicus DEM: the EGM2008 undulation; 0.0 for a DEM of ellipsoid heights; terrain.as_dem).
 
     -> the product dict (form_cphd's entries on the product's grid: image, origin, e1, e2, spx, spy, plane, meta,
-    notes, ...), with product, area, weighting, autofocus (the mode run), autofocus_info, timing (seconds of each
+    notes, ...), with product, area, weighting, autofocus (the mode run), autofocus_info, radiometric (for a SICD:
+    the content of its Radiometric block, fastsar.rgiqe.calibration's dict, or None when the collection supports
+    none; notes says which), timing (seconds of each
     stage), and, when written, path and metadata (fastsar._sicdxml.SICD or fastsar._siddxml.SIDD). The image of a SIDD product is
     the detected amplitude (float32) on the product's own grid; the remap and the layout are applied when the file
     is written, and fastsar.sidd.to_display(out, out['remap'], **out['remap_args']) gives the same display values."""
@@ -102,6 +148,9 @@ def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None
     if not (isinstance(area, str) and area in ('tasked', 'tasked_quality', 'black')) and not (
             isinstance(area, (int, float, np.integer, np.floating)) and not isinstance(area, bool)):
         raise ValueError(f"area must be 'tasked', 'tasked_quality', 'black' or an RNIIRS, got {area!r}")
+    if not (isinstance(black_sigma0_db, (int, float, np.integer, np.floating)) and not isinstance(black_sigma0_db, bool)
+            and np.isfinite(black_sigma0_db)):
+        raise ValueError(f'black_sigma0_db must be a sigma zero in dB, got {black_sigma0_db!r}')
     if extent is not None and (np.size(extent) != 2 or np.min(extent) <= 0):
         raise ValueError(f'extent must be two positive lengths in meters, got {extent!r}')
     if spacing is not None and (np.size(spacing) not in (1, 2) or np.min(spacing) <= 0):
@@ -141,21 +190,29 @@ def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None
             raise ValueError('dem= (terrain-informed focusing) is for spotlight collections; this one has a moving '
                              'beam')
         spot = g['mode'] == 'spotlight'
-        pl = plane or ('slant' if product == 'sicd' and spot else 'ground')
-        wt = weighting or ('sva' if product == 'sidd' and spot else 'taylor')
-        af = ('quadratic' if spot else False) if autofocus is None else autofocus
+        wt = weighting or ('sva' if product == 'sidd' else 'uniform')     # the same for a spotlight and a moving beam
         if not spot:
-            if pl != 'ground':
-                raise ValueError(f'plane={pl!r} is for spotlight collections; this one has a moving beam')
+            if plane == 'slant':
+                raise ValueError(f'plane={plane!r} is for spotlight collections; this one has a moving beam')
             from . import moving
             return moving.plan(g, st, dict(
-                product=product, weighting=wt, autofocus='quadratic' if autofocus is None else autofocus, area=area,
+                product=product, weighting=wt, fallback=None if weighting else 'taylor',
+                autofocus='quadratic' if autofocus is None else autofocus, area=area,
                 spacing=spacing, extent=extent, cphd=cphd, channel=channel, nesz_db=nesz_db,
-                scene_sigma0_db=scene_sigma0_db))
+                scene_sigma0_db=scene_sigma0_db, black_sigma0_db=black_sigma0_db))
+        # apodization runs on the slant plane: an apodized SICD with no plane asked for is a slant-plane one
+        apodized = product == 'sicd' and wt == 'sva' and plane is None
+        pl = plane or ('slant' if apodized else 'ground')
+        if apodized:
+            g['notes'].append("weighting='sva' runs on the slant plane and no plane was given: this SICD is on the "
+                              "slant plane, not on the ground plane of the other SICDs")
+        af = 'quadratic' if autofocus is None else autofocus
         if product == 'sicd' and pl == 'ground' and wt == 'sva':
-            raise ValueError("weighting='sva' is applied on the slant plane: for a SICD give plane='slant'")
+            raise ValueError("weighting='sva' is applied on the slant plane, so a ground-plane SICD cannot have it: "
+                             "leave plane unset or give plane='slant'")
         if product == 'sidd' and pl == 'slant':
             raise ValueError("a SIDD is written on the ground plane: plane='ground'")
+        from . import rgiqe
         K = g['S'].shape[1]
         band = (g['fmin'], g['fmin'] + (K - 1) * g['df'])
         c, e1, e2 = g['center'], g['e1'], g['e2']
@@ -167,25 +224,41 @@ def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None
         else:
             d = g['corners'] - c
             b = np.array([(d @ e1).min(), (d @ e1).max(), (d @ e2).min(), (d @ e2).max()])
+        # what the calibration of a SICD takes: the support's area, the samples, the tasked area, and the sum of the
+        # aperture weights and of their squares
+        tasked = c + np.stack([b[[0, 1, 1, 0]], b[[2, 2, 3, 3]]], 1) @ np.stack([e1, e2])
+        n = g['S'].shape[0] * K
+        wp = wk = None
+        gains = (float(n), float(n))
+        if wt == 'taylor':
+            from .cphd import _taylor
+            wp, wk = (_taylor(m).astype(np.float64) for m in (g['S'].shape[0], K))
+            gains = (float(wp.sum() * wk.sum()), float((wp * wp).sum() * (wk * wk).sum()))
+        st['radio'] = (rgiqe.support_area(g['ant'], band, c), n, tasked) + gains + (
+            rgiqe.clutter_gain(g['ant'], g['fmin'], g['df'], K, c, wp, wk),)
+        # the radiometric model, before the history is trimmed, weighted or moved: its noise measurement and its
+        # check of the antenna block against the data take their pulses from the history in memory, not the file
+        tr = time.perf_counter()
+        valid = None
+        if area != 'tasked':
+            sup = planes.support(fr, g['ant'], band, *planes._slant_axes(fr, c[2]))
+            bw_area = (sup['k1_mid'][1] - sup['k1_mid'][0]) * (sup['k2'][1] - sup['k2'][0]) * abs(fr['normal'][2])
+            rad = rgiqe.Radiometry(cphd, g['meta'], channel=channel, pulses=g['pulses'], nesz_db=nesz_db,
+                                   sicd=g['sicd'], scene_sigma0_db=scene_sigma0_db, history=g['S'])
+            if not rad.has_antenna:
+                raise ValueError(f'area={area!r}: the file describes no antenna pattern, so the signal has no edge '
+                                 "to follow; only area='tasked' can be processed")
+            b = np.array(rgiqe.area_bounds(rad, area, c, e1, e2, bw_area, n, tasked=tasked,
+                                           black_sigma0_db=black_sigma0_db))
+            valid = (rad, bw_area, n, tasked)
+            g['notes'].extend(rad.notes)
+        if product == 'sicd' and wt != 'sva':
+            st['calibration'] = _calibration_model(cphd, g, channel, None if valid is None else valid[0])
+        st['model_s'] = time.perf_counter() - tr
         kept = None
         if wt == 'sva':
             lost, kept = _weighting.keystone(g['S'], g['ant'], g['fmin'], g['df'], c, fr['e1'], symmetric=False)
             g['notes'].append(f'keystone trim: {100 * lost:.1f}% of the samples dropped for a rectangular spectrum')
-        valid = None
-        if area != 'tasked':
-            from . import rgiqe
-            sup = planes.support(fr, g['ant'], band, *planes._slant_axes(fr, c[2]))
-            bw_area = (sup['k1_mid'][1] - sup['k1_mid'][0]) * (sup['k2'][1] - sup['k2'][0]) * abs(fr['normal'][2])
-            rad = rgiqe.Radiometry(cphd, g['meta'], channel=channel, pulses=g['pulses'], nesz_db=nesz_db,
-                                   sicd=g['sicd'], scene_sigma0_db=scene_sigma0_db)
-            if not rad.has_antenna:
-                raise ValueError(f'area={area!r}: the file describes no antenna pattern, so the signal has no edge '
-                                 "to follow; only area='tasked' can be processed")
-            tasked = c + np.stack([b[[0, 1, 1, 0]], b[[2, 2, 3, 3]]], 1) @ np.stack([e1, e2])
-            n = g['S'].shape[0] * K
-            b = np.array(rgiqe.area_bounds(rad, area, c, e1, e2, bw_area, n, tasked=tasked))
-            valid = (rad, bw_area, n, tasked)
-            g['notes'].extend(rad.notes)
         t1, t2 = np.linspace(b[0], b[1], 5), np.linspace(b[2], b[3], 5)
         s = planes.sampling(fr, g['ant'], band, c + (t1[:, None, None] * e1 + t2[None, :, None] * e2).reshape(-1, 3),
                             e1, e2)
@@ -201,7 +274,7 @@ def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None
                                       f'({need[0]:.3f} x {need[1]:.3f} m): the image is aliased')
         m = _MARGIN if via_slant else 0
         st.update(spot=True, plane=pl, weighting=wt, autofocus=af, sampling=s, bounds=b, kept=kept, valid=valid,
-                  via_slant=via_slant, margin=m)
+                  via_slant=via_slant, margin=m, ground=(c, e1, e2))
         return dict(spacing=sp, bounds=(b[0] - m * sp[0], b[1] + m * sp[0], b[2] - m * sp[1], b[3] + m * sp[1]),
                     window=wt == 'taylor')
 
@@ -212,13 +285,16 @@ def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None
     lap('form')
     timing['read'] = st['read'] - st['start']                        # the file, to the phase history in memory
     timing['form'] -= timing['read']
+    if st.get('model_s'):                                            # the radiometric model, built while planning
+        timing['form'] -= st['model_s']
+        timing['radiometry'] = st['model_s']
     if not cuda and not jaxdev:                                      # the stages that follow run where it lives;
         out['image'] = _xp.device(out['image'], backend)             # on a device, where its plan finds room
     out.update(product=product, area=area, weighting=st['weighting'], autofocus=None, autofocus_info=None)
     tight = False
     try:
         if st['spot']:
-            out, tight = _spotlight(out, st, product, area, spacing, lap, cuda, jaxdev)
+            out, tight = _spotlight(out, st, product, area, spacing, lap, cuda, jaxdev, black_sigma0_db)
         else:
             from . import moving
             out, tight = moving.stages(out, st, product, lap, backend)
@@ -242,6 +318,9 @@ def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None
     if tight == 'host':                                              # the page-locked blocks the images crossed through
         import cupy
         cupy.get_default_pinned_memory_pool().free_all_blocks()
+    if product == 'sicd':
+        out['radiometric'] = _radiometric(out, st, cphd, channel, area, black_sigma0_db)
+        lap('radiometry')
     if output is not None and product == 'sicd':
         from .products import write_sicd
         out['metadata'] = write_sicd(output, out)
@@ -251,7 +330,91 @@ def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None
     return out
 
 
-def _mask(out, st, area):
+def _radiometric(out, st, cphd, channel, area, black_sigma0_db):
+    """The calibration of a SICD product (rgiqe.calibration's dict), or None where the collection or the product
+    supports none. A note says which source it rests on, or why there is no Radiometric block."""
+    from . import rgiqe
+    from .products import sicd_meta
+    notes = out['notes']
+    if not st['spot']:
+        notes.append('No Radiometric block: the radiometric model covers spotlight collections, and this one has a '
+                     'moving beam.')
+        return None
+    if st['weighting'] == 'sva':
+        notes.append('No Radiometric block: spatially variant apodization is not linear in the scene, so no one '
+                     'factor turns its pixel power into RCS or sigma zero.')
+        return None
+    rad, why = st['calibration']
+    if rad is None:
+        notes.append(f'No Radiometric block: {why}')
+        return None
+    bw_area, n, tasked, coherent, noise, clutter = st['radio']
+    (c, e1, e2), b = st['ground'], st['bounds']
+    model, bw_model = st['valid'][:2] if st['valid'] is not None else (None, None)
+
+    def region(pts):
+        """The pixels that hold data: inside the ground rectangle that was formed (a slant-plane image is its
+        bounding rectangle in the slant plane, zero beyond it), and inside the quality area when one was asked."""
+        d = pts - c
+        x, y = d @ e1, d @ e2
+        with np.errstate(invalid='ignore'):
+            ok = (x >= b[0] - 1.0) & (x <= b[1] + 1.0) & (y >= b[2] - 1.0) & (y <= b[3] + 1.0)
+        if model is not None:
+            ok &= rgiqe.area_mask(model, pts, area, bw_model, n, tasked=tasked, black_sigma0_db=black_sigma0_db)[0]
+        return ok
+    notes.extend(v for v in rad.notes if v not in notes)
+    try:
+        shape = tuple(out['image'].shape)
+        sm = sicd_meta(dict(out, image=np.broadcast_to(np.complex64(0), shape), radiometric=None))[0]
+        cal = rgiqe.calibration(rad, sm, n, bw_area, coherent, noise, clutter=clutter, tasked=tasked, region=region)
+    except ValueError as e:
+        notes.append(f'No Radiometric block: {e}.')
+        return None
+    if cal['constant']:
+        follow = ('The model has no trusted antenna pattern (the data contradict the antenna block as the file '
+                  'points it and with each boresight on its scene reference point, or the file has none), so the '
+                  'scale factors are written as constants, their values at the scene reference point, without a '
+                  f"gain's variation over the image ({cal['gain_span_db']:.1f} dB by the antenna block as read).")
+    else:
+        over = '' if cal['tasked_residual_db'] is None or model is None else \
+            f" ({cal['tasked_residual_db']:.2f} dB over the tasked area)"
+        how = ('with each boresight on its scene reference point' if rad.pointing == 'reference point' else
+               'as the file points it')
+        follow = (f"Polynomials of order {cal['order']} follow the gain of the file's antenna pattern, {how}, over "
+                  f"the pixels that hold data, where it spans {cal['gain_span_db']:.1f} dB, to within "
+                  f"{cal['residual_db']:.2f} dB{over}.")
+    noise_from = ('the noise level on its PNRef' if cal['source'] == 'cphd' else
+                  'the file states no PNRef, so the noise level is the noise power measured from the phase history '
+                  '(a calibrated signal with a measured noise level)' if cal['noise_db'] is not None else
+                  'the file states no PNRef and no noise could be measured from the phase history, so no noise level '
+                  'is written')
+    notes.append(f"Radiometric block: the scale factors rest on PTRef of the CPHD file; {noise_from}. {follow}"
+                 + ('' if cal['nesz_db'] is None else ' The noise-equivalent sigma zero at the scene '
+                    f"{'reference' if cal['constant'] else 'center'} point is {cal['nesz_db']:.1f} dB."))
+    return cal
+
+
+def _calibration_model(cphd, g, channel, model):
+    """The radiometric model a SICD's calibration rests on -> (Radiometry, None), or (None, why there is none).
+    model: the model of a quality area, used when it rests on the file's own levels. The noise measurement and the
+    footprint check take their pulses from g['S'], the history as read."""
+    from . import rgiqe
+    try:
+        pt, _ = rgiqe.reference_levels(cphd, g['meta'], channel)
+    except (ValueError, OSError):                                   # not a CPHD file
+        pt = None
+    if pt is None:
+        return None, ('the file states no reference target level (PTRef), so its pixel power cannot be tied to RCS '
+                      'or sigma zero.')
+    if getattr(model, 'level_source', None) in ('cphd', 'cphd+measured'):
+        return model, None
+    try:                                                             # the file's own levels, whatever the area used
+        return rgiqe.Radiometry(cphd, g['meta'], channel=channel, pulses=g['pulses'], history=g['S']), None
+    except ValueError as e:
+        return None, f'{e}.'
+
+
+def _mask(out, st, area, black_sigma0_db=-10.0):
     """The ground pixels [nx, ny] inside a quality area: the model on a coarse lattice, bilinear between its nodes."""
     from . import rgiqe
     from .patches import _rows
@@ -261,7 +424,7 @@ def _mask(out, st, area):
     ki = planes._knots(nx, max(4, int(min(50.0 / spx, nx / 48))))
     kj = planes._knots(ny, max(4, int(min(50.0 / spy, ny / 48))))
     pts = o + (ki * spx)[:, None, None] * e1 + (kj * spy)[None, :, None] * e2
-    m, info = rgiqe.area_mask(rad, pts, area, bw_area, n, tasked=tasked)
+    m, info = rgiqe.area_mask(rad, pts, area, bw_area, n, tasked=tasked, black_sigma0_db=black_sigma0_db)
     # the margin over the threshold where the model gives it (a smooth boundary between the nodes), else the mask
     f = np.asarray(info['level'], np.float64) if info.get('level') is not None else np.asarray(m, np.float64) - 0.5
     from .resample import KnotMap
@@ -354,7 +517,7 @@ def _detect(img, where):
     return out
 
 
-def _spotlight(out, st, product, area, spacing, lap, cuda, jaxdev=False):
+def _spotlight(out, st, product, area, spacing, lap, cuda, jaxdev=False, black_sigma0_db=-10.0):
     s, wt, mg = st['sampling'], st['weighting'], st['margin']
     out['window'] = (wt, wt)
     nx, ny = out['image'].shape
@@ -424,7 +587,7 @@ def _spotlight(out, st, product, area, spacing, lap, cuda, jaxdev=False):
         out.update(autofocus=st['autofocus'] if info.get('applied', True) else None, autofocus_info=info)
         release()
         lap('autofocus', out['image'])
-    valid = None if st['valid'] is None else _mask(out, st, area)
+    valid = None if st['valid'] is None else _mask(out, st, area, black_sigma0_db)
     if not st['via_slant']:                                          # a ground-plane SICD: the image as formed
         if valid is not None and _xp.kind(out['image']) == 'cupy':
             import cupy

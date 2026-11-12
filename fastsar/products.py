@@ -24,8 +24,10 @@ moving-beam mosaics of form_cphd; for an orbit it holds as long as the track ove
 
 Amplitude. form_image and form_cphd sum the phase history without normalization: a point scatterer whose samples
 have amplitude a peaks at a sum(w), and noise of power s^2 per sample gives a mean pixel power s^2 sum(w^2), with w
-the window over pulses times the window over frequency (both ones for window=False). CPHD carries no radiometric
-calibration, so the pixels are in the phase history's units; beta0 or sigma0 need the vendor's calibration constant.
+the window over pulses times the window over frequency (both ones for window=False). The pixels are therefore in
+the phase history's units. Where the CPHD file states the per-sample power of a 1 m^2 target (PTRef), process_cphd
+ties them to RCS and sigma zero and write_sicd writes the SICD Radiometric block (fastsar.rgiqe.calibration); a
+file without PTRef (Capella's) gives no calibration, and beta0 or sigma0 then need the vendor's constant.
 """
 import numpy as np
 from . import _deps
@@ -214,7 +216,10 @@ def sicd_meta(out):
     An image as formed keeps backprojection's phase: the band of each axis is centered at its spatial frequency,
     KCtr, modulo the sampling rate, and DeltaK1 and DeltaK2 are that center less and plus half of ImpRespBW, or the
     whole sampled band when it wraps. A baseband image (planes.deramp) has its band where its support entry says,
-    or centered at zero. Times count from the collection start, moved to the first pulse if that precedes it. There is no radiometric calibration (see the module
+    or centered at zero. Times count from the collection start, moved to the first pulse if that precedes it.
+    A Radiometric block (NoiseLevel, RCSSFPoly, SigmaZeroSFPoly, BetaZeroSFPoly, GammaZeroSFPoly) is written when
+    the product carries a calibration (out['radiometric'] from process_cphd: fastsar.rgiqe.calibration's dict) made
+    for this scene center point and these row and column vectors; otherwise there is none (see the module
     docstring)."""
     from datetime import datetime, timezone
     from .io import local_to_ecf
@@ -316,6 +321,10 @@ def sicd_meta(out):
     if (out.get('terrain') or {}).get('applied'):   # focused with a DEM's heights, on the same plane
         from .terrain import _record
         _record(sm, out['terrain'])
+    cal = out.get('radiometric')
+    if cal and cal.get('rcs') is not None and all(np.allclose(cal[k], v, rtol=0, atol=tol) for k, v, tol in (
+            ('scp', scp, 1e-3), ('urow', urow, 1e-9), ('ucol', ucol, 1e-9))):     # made in this image's coordinates
+        _sicdxml.insert(sm.element, _sicdxml.radiometric(cal))
     return sm, a
 
 

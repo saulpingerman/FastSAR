@@ -2,7 +2,8 @@
 closed form, a straight track and simulated targets from 300 m below to 300 m above the plane (the squinted
 spotlight on a curved track of test_planes, flown to either side); the correction against the targets' on-plane
 responses and against exact backprojection at their true heights; the layover map; the DEM's conventions; the
-devices; and process_cphd(dem=) to a SICD."""
+devices; and process_cphd(dem=) to a SICD: the default ground-plane product and the slant-plane one, with the
+Radiometric block of a calibrated collection, whose scale the correction leaves as it is."""
 import dataclasses
 import io as _io
 import sys
@@ -260,8 +261,12 @@ def test_against_exact_backprojection_at_the_true_height(scene):
 
 def test_exact_route(scene):
     """The documented route to an image on the surface itself: read_cphd's history backprojected at
-    surface_points. The target 100 m above the plane, smeared over 40 pixels in the plane's image, has the
-    on-plane response at its own pixel."""
+    surface_points with the collection's own reference ranges (ref=meta['ref']). The target 100 m above the plane,
+    smeared over 40 pixels in the plane's image, has the on-plane response at its own pixel, and the chip is the
+    one of this module's exact reference (the history form_cphd re-referenced to the grid center) as a complex
+    image. A collection whose samples are referenced to a range that is not the distance from the antenna to the
+    scene center (Capella's: the mean of the two legs of a bistatic path, 0.14 mm longer) needs the argument:
+    without it the chip is off by that range, 0.055 rad at X band."""
     out, pix, hp = scene['out'], scene['pix'], scene['hp']
     col, meta = io.read_cphd(scene['path'], meta=True)
     ref = _measure(out['image'], out, pix[3])
@@ -269,12 +274,27 @@ def test_exact_route(scene):
     i0, j0 = int(round(pix[k, 0])), int(round(pix[k, 1]))
     I, J = np.meshgrid(np.arange(i0 - 20, i0 + 20), np.arange(j0 - 20, j0 + 20), indexing='ij')
     pts = terrain.surface_points(out, terrain.as_dem(hp + HTS[k]), I, J)
-    chip = fastsar.backproject(col['S'], col['ant'], col['fmin'], col['df'], pts, backend='cpu', window=False)
+    p0, p1 = out['pulses']
+    assert (p0, p1) == (0, len(col['ant'])) and np.shape(meta['ref']) == (p1,)
+    route = lambda S, r: fastsar.backproject(S[p0:p1], col['ant'][p0:p1], col['fmin'], col['df'], pts, backend='cpu',
+                                             window=False, **({} if r is None else dict(ref=r[p0:p1])))
+    chip = route(col['S'], meta['ref'])
     m = quality.point_target(chip, (20, 20), out['spx'], out['spy'], half=16)
     assert abs(m['i'] - (pix[k, 0] - i0 + 20)) < 0.05 and abs(m['j'] - (pix[k, 1] - j0 + 20)) < 0.05
     assert m['res_az'] == pytest.approx(ref['res_az'], rel=0.02)
     assert m['res_rg'] == pytest.approx(ref['res_rg'], rel=0.02)
     assert abs(m['pslr_az'] - ref['pslr_az']) < 0.3 and m['peak'] == pytest.approx(ref['peak'], rel=0.02)
+    exact = scene['bp'](pts)
+    db = lambda a: 20 * np.log10(np.abs(a - exact).max() / np.abs(exact).max())
+    assert db(chip) < -60, db(chip)
+    # the same collection as a file whose samples are referenced 0.14 mm beyond the antenna's distance
+    more = 1.4e-4
+    f = col['fmin'] + col['df'] * np.arange(col['S'].shape[1])
+    S2 = col['S'] * np.exp(4j * np.pi * f * more / C)[None, :]
+    with_ref, without = db(route(S2, np.asarray(meta['ref']) + more)), db(route(S2, None))
+    phase = 4 * np.pi * (f[0] + f[-1]) / 2 * more / C
+    assert with_ref < -60 and abs(without - 20 * np.log10(phase)) < 1.0, (with_ref, without, phase)
+    assert 0.04 < phase < 0.07
 
 
 def test_flat_dem_changes_nothing(scene):
@@ -519,13 +539,95 @@ def test_process_cphd_with_a_dem(scene, tmp_path):
     assert abs(m1['i'] - rc[0]) < 0.1 and abs(m1['j'] - rc[1]) < 0.1, (m1['i'] - rc[0], m1['j'] - rc[1])
     # the SICD's rows run along range: axis 1 of its array is azimuth
     assert m1['pslr_rg'] < -12 and m1['pslr_az'] < -12 and m0['pslr_rg'] > -5 and m1['peak'] > 1.5 * m0['peak']
-    # the slant-plane product carries it too, and a moving beam or a file without its datum is refused at once
-    with warnings.catch_warnings():
-        warnings.simplefilter('ignore', terrain.TerrainWarning)
-        s = fastsar.process_cphd(path, dem=hp + 30.0, backend='cpu')
-    stages = list(s['timing'])
-    assert s['plane'] == 'slant' and s['terrain']['applied'] and stages.index('terrain') < stages.index('autofocus')
+    # the default product (the ground plane, unweighted) and the slant-plane one carry it too: the correction is
+    # made on the ground image, before the autofocus and before any resampling; a moving beam or a file without
+    # its datum is refused at once
+    for more, plane in ((dict(), 'ground'), (dict(plane='slant'), 'slant')):
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', terrain.TerrainWarning)
+            s = fastsar.process_cphd(path, dem=hp + 30.0, backend='cpu', **more)
+        stages = list(s['timing'])
+        assert (s['plane'], s['weighting']) == (plane, 'uniform') and s['terrain']['applied']
+        assert stages.index('baseband') < stages.index('terrain') < stages.index('autofocus')
+        assert ('to_slant' in stages) == (plane == 'slant')
+        assert plane == 'ground' or stages.index('autofocus') < stages.index('to_slant')
+        # the same correction: of the ground image itself by default, of one formed 24 pixels wider for the slant
+        # plane's interpolation, whose coefficients span a little more
+        assert s['terrain']['quadratic_rad'] == pytest.approx(o['terrain']['quadratic_rad'],
+                                                              rel=1e-9 if plane == 'ground' else 0.1)
+        assert plane != 'ground' or np.array_equal(s['image'], o['image'])
     with pytest.raises(ValueError, match='geoid='):
         fastsar.process_cphd(path, dem='dem.tif', backend='cpu')
     with pytest.raises(ValueError, match='spotlight'):
         fastsar.process_cphd(path, dem=hp, mode='moving', backend='cpu')
+
+
+PT_REF, PN_REF = 3.0e-4, 2.0           # power per sample of a 1 m^2 point at the scene center; noise power per sample
+BEAM = (3.0e4, 2.0e-3, -3.0e-3)        # one-way dB per squared direction cosine; where the beam peaks
+
+
+@pytest.mark.parametrize('plane', ['ground', 'slant'])
+def test_dem_with_the_radiometric_block(tmp_path, plane):
+    """A calibrated collection (PTRef, PNRef and an antenna beam in its file) with terrain off the plane, as the
+    default ground-plane SICD and as the slant-plane one: the SICD carries the terrain step and the Radiometric
+    block together and passes sarkit; the block is the one of the product without a DEM, coefficient for
+    coefficient, because the correction is a phase over the azimuth spectrum and changes no scale; and the
+    target 30 m above the plane, which reads 6 dB under its RCS in the plane's image, reads its RCS through the
+    written RCSSFPoly once focused. The gain of a raised target is the beam's at its true position, and the
+    factor is the beam's at the plane point it lays over onto."""
+    col = _collect(20.0, False)
+    geo = _product(col)
+    fr = planes._frame(geo)
+    e1, e2 = _los_axes(col.ant)
+    lay = SPOT[:, :1] * e1 + SPOT[:, 1:] * e2                         # where the targets appear, on the plane
+    tg = planes.slant_to_ground(fr, *planes.ground_to_slant(fr, lay), HTS)
+    gain = lambda pos: sim.beam_gain(col, pos, BEAM).mean(0)        # the amplitude gain, averaged over the pulses
+    path = str(tmp_path / 'c.cphd')
+    sim.write_cphd(path, col, sim.simulate(col, tg, np.sqrt(PT_REF) * gain(tg)), LAT, LON, H0, heading=HEADING,
+                   scene=160.0, pt_ref=PT_REF, pn_ref=PN_REF, beam=BEAM)
+    kw = dict(backend='cpu', extent=(170.0, 170.0), **({} if plane == 'ground' else dict(plane='slant')))
+    base = fastsar.process_cphd(path, str(tmp_path / 'b.nitf'), **kw)
+    hp = _plane_height(base) if plane == 'ground' else H0
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', terrain.TerrainWarning)
+        o = fastsar.process_cphd(path, str(tmp_path / 't.nitf'), dem=H0 + 30.0, **kw)
+    assert (o['plane'], o['weighting'], o['autofocus_info']['mode']) == (plane, 'uniform', 'quadratic')
+    assert o['terrain']['applied'] and o['terrain']['height'][1] == pytest.approx(30.0, abs=0.05), (o['terrain'], hp)
+    cal, cal0 = o['radiometric'], base['radiometric']
+    assert cal is not None and cal['source'] == 'cphd' and not cal['constant'] and cal['order'] >= 1
+    assert sum(n.startswith('Radiometric block:') for n in o['notes']) == 1
+    assert sum(n.startswith('terrain: focused with the DEM') for n in o['notes']) == 1
+    for key in ('rcs', 'sigma0', 'beta0', 'gamma0'):                 # the block of the product without a DEM
+        np.testing.assert_allclose(cal[key], cal0[key], rtol=1e-12)
+    assert cal['noise_db'] == cal0['noise_db'] and cal['nesz_db'] == pytest.approx(cal0['nesz_db'], abs=1e-9)
+    from fastsar import _sicdxml
+    sm, sm0 = _sicdxml.read(str(tmp_path / 't.nitf')), _sicdxml.read(str(tmp_path / 'b.nitf'))
+    assert sm.to_xml_bytes() == o['metadata'].to_xml_bytes()
+    assert sm.Grid.ImagePlane == plane.upper() and sm.ImageFormation.Processing[0].Type == 'TERRAIN PHASE CORRECTION'
+    assert sm0.ImageFormation.Processing is None and sm0.Radiometric is not None
+    rad = sm.Radiometric
+    assert rad.NoiseLevel.NoiseLevelType == 'ABSOLUTE'
+    for tag, key in (('RCSSFPoly', 'rcs'), ('SigmaZeroSFPoly', 'sigma0'), ('BetaZeroSFPoly', 'beta0'),
+                     ('GammaZeroSFPoly', 'gamma0')):
+        np.testing.assert_allclose(getattr(rad, tag).get_array(), cal[key], rtol=1e-12)
+        np.testing.assert_allclose(getattr(sm0.Radiometric, tag).get_array(), cal[key], rtol=1e-12)
+    assert _sarkit_errors(sm) in (None, []) and _sarkit_errors(sm0) in (None, [])
+    # the scale: the energy of the image, and the RCS of the targets through the written polynomial
+    e, e0 = (float(np.sum(np.abs(v['image']).astype(np.float64) ** 2)) for v in (o, base))
+    assert abs(10 * np.log10(e / e0)) < 0.05, 10 * np.log10(e / e0)
+
+    def rcs(product, meta, k):
+        """The RCS (dB m^2) the product states for target k, less what the beam makes of a target that is not
+        where it appears: peak power times RCSSFPoly at the peak, over the gain at the true position relative to
+        the gain at the layover point."""
+        rc = meta.project_ground_to_image(sim.to_ecf(lay[k], LAT, LON, H0, HEADING)[None])[0][0]
+        pix = products.sicd_meta(product)[1]
+        m = quality.point_target(pix, (int(round(rc[0])), int(round(rc[1]))), half=32, up=16)
+        x = (m['i'] - meta.ImageData.SCPPixel.Row) * meta.Grid.Row.SS
+        y = (m['j'] - meta.ImageData.SCPPixel.Col) * meta.Grid.Col.SS
+        sf = np.polynomial.polynomial.polyval2d(x, y, meta.Radiometric.RCSSFPoly.get_array())
+        return 10 * np.log10(m['peak'] ** 2 * sf) - 20 * np.log10(gain(tg[k:k + 1])[0] / gain(lay[k:k + 1])[0])
+    on_plane, raised, before = rcs(base, sm0, 3), rcs(o, sm, 4), rcs(base, sm0, 4)
+    print(f'{plane}: RCS of the target on the plane {on_plane:+.2f} dB m^2; of the one 30 m above it {before:+.2f} dB '
+          f'without the DEM and {raised:+.2f} dB with it')
+    assert abs(on_plane) < 0.1 and before < -3.0 and abs(raised) < 0.35, (on_plane, before, raised)

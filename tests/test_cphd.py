@@ -292,16 +292,21 @@ def test_form_cphd_moving_srp():
             check(bad, f'target {n}: form_cphd ({name}) against the direct sum ({2 * H} x {2 * H} pixels)',
                   rel_db(out['image'][i - H:i + H, j - H:j + H], refp), limit)
     assert not bad, 'FAILED: ' + '; '.join(bad)
-    # process_cphd on a moving beam: on the ground plane, at baseband, with a Taylor window over the processed
-    # azimuth band, as a SICD and as a SIDD laid out shadows down; quadratic autofocus leaves the focused collection
-    # as it came. The slant plane is for spotlight collections; tests/test_moving.py has the other options
-    # (nothing is written here)
-    ref = fastsar.form_cphd('strip.cphd', backend='cpu', extent=(60.0, 50.0), azimuth_window='taylor',
-                            _plan=lambda g: dict(fit_patch=True))    # process_cphd's patch, for the same rounding
-    po = fastsar.process_cphd('strip.cphd', backend='cpu', extent=(60.0, 50.0))
-    assert po['mode'] == 'moving' and po['plane'] == 'ground' and po['weighting'] == 'taylor' and po['autofocus'] is None
-    assert po['baseband'] and po['window'] == ('taylor', 'taylor') and po['image'].shape == img.shape
-    assert np.abs(np.abs(po['image']) - np.abs(ref['image'])).max() < 2e-3 * np.abs(ref['image']).max()
+    # process_cphd on a moving beam: on the ground plane, at baseband, as a SICD (unweighted by default: a rectangle
+    # over the processed azimuth band and no frequency window; weighting='taylor' is the Taylor window over that band
+    # and along frequency) and as a SIDD laid out shadows down; quadratic autofocus leaves the focused collection as
+    # it came, and there is no Radiometric block. The slant plane is for spotlight collections; tests/test_moving.py
+    # has the other options (nothing is written here)
+    for name, kw in (('uniform', {}), ('taylor', dict(weighting='taylor'))):
+        ref = fastsar.form_cphd('strip.cphd', backend='cpu', extent=(60.0, 50.0), azimuth_window=name,
+                                window=name == 'taylor',
+                                _plan=lambda g: dict(fit_patch=True))    # process_cphd's patch, for the same rounding
+        po = fastsar.process_cphd('strip.cphd', backend='cpu', extent=(60.0, 50.0), **kw)
+        assert po['mode'] == 'moving' and po['plane'] == 'ground' and po['weighting'] == name and po['autofocus'] is None
+        assert po['baseband'] and po['window'] == (name, name) and po['image'].shape == img.shape
+        assert np.abs(np.abs(po['image']) - np.abs(ref['image'])).max() < 2e-3 * np.abs(ref['image']).max()
+        assert po['radiometric'] is None
+        assert sum('No Radiometric block' in n and 'moving beam' in n for n in po['notes']) == 1
     pc = fastsar.process_cphd('strip.cphd', backend='cpu', extent=(60.0, 50.0), spacing=(0.5, 0.7))
     assert pc['spx'] == 0.5 and pc['spy'] == 0.7 and pc['image'].shape != img.shape       # the spacing asked for
     assert any('aliased' in n for n in pc['notes']) and any('autofocus skipped' in n for n in pc['notes'])

@@ -1,20 +1,25 @@
 """The SICD metadata products.sicd_meta builds, against the rules SICD sets between its fields and against sarkit's
 consistency checker (Python 3.11 or later; the rules are also asserted here without it): every product of form_cphd
-(track axes and line-of-sight axes, with and without a window) and of process_cphd (slant and ground plane; Taylor,
-uniform and SVA weighting; autofocus on and off) of simulated collections flown both ways, one of them squinted
+(track axes and line-of-sight axes, with and without a window) and of process_cphd (its default; slant and ground
+plane; Taylor, uniform and SVA weighting; autofocus on and off; with the Radiometric block of a calibrated collection;
+focused with a DEM, on both planes, with that block)
+of simulated collections flown both ways, one of them squinted
 past 45 degrees so that its band is off-center and wraps around the sampling rate; a collection whose first pulse
-precedes its stated start; and, when the files are on this machine, two real collections with their vendor SICDs.
+precedes its stated start; the products of a moving beam (its default, the three weightings, autofocus that was
+applied, an area in ground range); and, when the files are on this machine, two real collections with their vendor
+SICDs.
 Needs sarpy only through sarkit's own dependencies."""
 import dataclasses
 import io as _io
 import os
 import sys
+import warnings
 
 import numpy as np
 import pytest
 
 import fastsar
-from fastsar import products, sim
+from fastsar import products, sim, terrain
 
 LAT, LON, H0, HEADING = 40.79, -77.86, 351.0, 30.0
 TG = np.array([[0.0, 0.0, 0.0], [20.0, 0.0, 0.0], [0.0, 15.0, 0.0], [-18.0, -22.0, 0.0], [12.0, -9.0, 0.0]])
@@ -83,7 +88,9 @@ def cphd(request, tmp_path_factory):
     ant[:, 2] += -100.0 * y ** 2 + 6.0 * y
     col = dataclasses.replace(col, ant=ant[::-1].copy() if left else ant)
     path = str(tmp_path_factory.mktemp('consistency') / 'c.cphd')
-    sim.write_cphd(path, col, sim.simulate(col, TG, np.ones(len(TG))), LAT, LON, H0, heading=HEADING, scene=140.0)
+    # with reference levels and an antenna beam, so that the SICDs of process_cphd carry a Radiometric block
+    sim.write_cphd(path, col, sim.simulate(col, TG, np.ones(len(TG))), LAT, LON, H0, heading=HEADING, scene=140.0,
+                   pt_ref=1.0, pn_ref=1.0e-3, beam=(3.0e4, 2.0e-3, -3.0e-3))
     return path, request.node.callspec.id if hasattr(request.node, 'callspec') else str(squint), squint
 
 
@@ -107,10 +114,13 @@ def test_form_cphd_products(cphd):
     assert any(seen) and not all(seen)          # bands that wrap around the sampling rate, and bands that fit
 
 
-CASES = {'slant, Taylor': {}, 'slant, uniform, no autofocus': dict(weighting='uniform', autofocus=False),
-         'slant, SVA': dict(weighting='sva'), 'ground, Taylor': dict(plane='ground'),
+CASES = {'default (ground, uniform)': {}, 'slant, Taylor': dict(plane='slant', weighting='taylor'),
+         'slant, uniform, no autofocus': dict(plane='slant', weighting='uniform', autofocus=False),
+         'slant, SVA': dict(plane='slant', weighting='sva'), 'ground, Taylor': dict(plane='ground', weighting='taylor'),
          'ground, uniform, no autofocus': dict(plane='ground', weighting='uniform', autofocus=False),
-         'slant, Taylor, phase gradient autofocus': dict(autofocus='pga')}
+         'slant, Taylor, phase gradient autofocus': dict(plane='slant', weighting='taylor', autofocus='pga'),
+         'default, focused with a DEM': dict(dem=H0 + 25.0),
+         'slant, Taylor, focused with a DEM': dict(plane='slant', weighting='taylor', dem=H0 + 25.0)}
 
 
 def test_process_cphd_products(cphd, tmp_path):
@@ -118,16 +128,75 @@ def test_process_cphd_products(cphd, tmp_path):
     if squint == 55.0:
         pytest.skip('the processing chain is exercised at moderate squint; form_cphd covers the squinted grid')
     for name, kw in CASES.items():
-        out = fastsar.process_cphd(path, backend='cpu', **kw)
+        with warnings.catch_warnings():                              # the DEM of these cases is off the scene height
+            warnings.simplefilter('ignore', terrain.TerrainWarning)
+            out = fastsar.process_cphd(path, backend='cpu', **kw)
         sm, a, wraps = check(out, name)
+        # the terrain step and the Radiometric block in one SICD
+        assert ('dem' in kw) == bool((out.get('terrain') or {}).get('applied')), name
+        proc = sm.ImageFormation.Processing
+        assert (proc is not None and proc[0].Type == 'TERRAIN PHASE CORRECTION') == ('dem' in kw), name
         assert sm.ImageFormation.AzAutofocus == ('GLOBAL' if out.get('autofocus') else 'NO')
         assert kw.get('autofocus') is not False or sm.ImageFormation.AzAutofocus == 'NO'
-    # as written: the file's own XML passes as the metadata did
-    f = str(tmp_path / 'p.nitf')
-    sm = fastsar.process_cphd(path, f, backend='cpu')['metadata']
+        assert sm.Grid.ImagePlane == kw.get('plane', 'ground').upper()
+        assert sm.Grid.Row.WgtType.WindowName == kw.get('weighting', 'uniform').upper()
+        # the Radiometric block of every linear product, with polynomials that follow the beam, passes with the rest
+        rad = sm.Radiometric
+        assert (rad is not None) == (kw.get('weighting') != 'sva'), name
+        if rad is not None:
+            assert rad.NoiseLevel.NoiseLevelType == 'ABSOLUTE' and rad.NoiseLevel.NoisePoly.get_array().shape == (1, 1)
+            shapes = {getattr(rad, k).get_array().shape for k in ('RCSSFPoly', 'SigmaZeroSFPoly', 'BetaZeroSFPoly',
+                                                                 'GammaZeroSFPoly')}
+            assert len(shapes) == 1 and min(shapes.pop()) >= 2, name
+    # as written: the file's own XML passes as the metadata did, for the default product and a slant-plane one
     from fastsar import _sicdxml
-    back = _sicdxml.read(f)
-    assert back.to_xml_bytes() == sm.to_xml_bytes() and not sarkit_errors(back)
+    for kw in ({}, dict(plane='slant', weighting='taylor')):
+        f = str(tmp_path / 'p.nitf')
+        sm = fastsar.process_cphd(path, f, backend='cpu', **kw)['metadata']
+        back = _sicdxml.read(f)
+        assert back.to_xml_bytes() == sm.to_xml_bytes() and not sarkit_errors(back)
+        assert back.Radiometric is not None and back.Radiometric.RCSSFPoly[0, 0] > 0
+
+
+def test_moving_beam_products(monkeypatch, tmp_path):
+    """The SICDs of process_cphd on a moving beam, a simulated stripmap read through moving_sim's stand-in for the
+    CPHD reader: its default (the ground plane, unweighted), the Taylor window, the apodized image, autofocus that
+    was applied (SV) and autofocus off, and an area in ground range. Each passes; none carries a Radiometric block
+    or a terrain step; the file written is the metadata checked."""
+    import moving_sim as ms
+    from fastsar import _sicdxml, io
+    monkeypatch.setattr(io, '_open_cphd', ms.Reader)
+    P = 2600
+    rng = np.random.default_rng(3)
+    tg = np.stack([rng.uniform(-13, 13, 36), np.linspace(-105, 105, 36) + rng.uniform(-0.3, 0.3, 36), np.zeros(36)], 1)
+    amp = rng.uniform(0.5, 1.0, len(tg)) * np.exp(2j * np.pi * rng.uniform(size=len(tg)))
+    ms.collection('focused.cphd', tg, amp, P=P)
+    ms.collection('blurred.cphd', tg, amp, P=P, phase=5.0 * ((np.arange(P) - P / 2) / 500.0) ** 2)
+    k = 2 * np.cos(np.radians(30.0)) / ms.C
+    ms.collection('wide.cphd', tg[::6], amp[::6], antenna=(9600.0, 1.0e5), toa=k * 95.0, toae=k * 120.0, df=0.75e6)
+    long, short = (240.0, 50.0), (60.0, 50.0)
+    cases = {'default (uniform)': ('blurred.cphd', dict(extent=long)),
+             'Taylor': ('blurred.cphd', dict(extent=long, weighting='taylor')),
+             'SVA': ('blurred.cphd', dict(extent=long, weighting='sva')),
+             'uniform, no autofocus': ('focused.cphd', dict(extent=long, autofocus=False)),
+             'spatially variant autofocus': ('blurred.cphd', dict(extent=long, autofocus='spatially_variant')),
+             'black area': ('wide.cphd', dict(extent=short, area='black', nesz_db=-20.0, autofocus=False))}
+    try:
+        for name, (path, kw) in cases.items():
+            f = str(tmp_path / 'm.nitf')
+            out = fastsar.process_cphd(path, f, backend='cpu', **kw)
+            sm = check(out, f'moving beam, {name}')[0]
+            assert out['mode'] == 'moving' and sm.Grid.ImagePlane == 'GROUND' and sm.Grid.Type == 'PLANE'
+            assert sm.Grid.Row.WgtType.WindowName == kw.get('weighting', 'uniform').upper() == out['weighting'].upper()
+            assert sm.ImageFormation.AzAutofocus == ('SV' if out['autofocus'] else 'NO')
+            assert bool(out['autofocus']) == (path == 'blurred.cphd'), name
+            assert sm.Radiometric is None and out['radiometric'] is None and sm.ImageFormation.Processing is None
+            back = _sicdxml.read(f)
+            assert back.to_xml_bytes() == out['metadata'].to_xml_bytes() and not sarkit_errors(back)
+            if 'area' in kw:
+                assert (out['image'] == 0).any() and any('ground range with' in n for n in out['notes'])
+    finally:
+        ms.FILES.clear()
 
 
 def test_first_pulse_before_the_start(cphd):
@@ -165,8 +234,10 @@ def test_real_collections(name, request):
     runs = {'form_cphd, track axes': lambda: F(cphd_path, backend='cuda'),
             'form_cphd, line-of-sight axes': lambda: F(cphd_path, backend='cuda', axes='los'),
             'process_cphd': lambda: P(cphd_path, backend='cuda'),
-            'process_cphd, vendor SICD': lambda: P(cphd_path, sicd=sicd_path, backend='cuda'),
-            'process_cphd, SVA': lambda: P(cphd_path, backend='cuda', weighting='sva'),
+            'process_cphd, slant, Taylor': lambda: P(cphd_path, backend='cuda', plane='slant', weighting='taylor'),
+            'process_cphd, vendor SICD': lambda: P(cphd_path, sicd=sicd_path, backend='cuda', plane='slant',
+                                                   weighting='taylor'),
+            'process_cphd, SVA': lambda: P(cphd_path, backend='cuda', plane='slant', weighting='sva'),
             'process_cphd, ground, uniform': lambda: P(cphd_path, backend='cuda', plane='ground', weighting='uniform',
                                                        autofocus=False)}
     for what, run in runs.items():

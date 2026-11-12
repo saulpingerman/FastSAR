@@ -21,22 +21,28 @@ was published on PyPI.
   `terrain.phase_error` and `terrain.coefficients` the exact model, and `terrain.surface_points` the points at
   which `fastsar.backproject` forms the image on the surface itself
   ([docs/product-options.md](docs/product-options.md#terrain-informed-focusing)). Spotlight collections only;
-  results without a `dem` are unchanged.
+  results without a `dem` are unchanged. The correction is made on the ground image as formed, before any
+  resampling, so it serves the default ground-plane SICD, the slant-plane SICD and the SIDD alike, and it leaves
+  the scale factors of the `Radiometric` block as they are.
 - `process_cphd` on moving-beam collections (stripmap, sliding spotlight) takes the weightings, autofocus and the
   quality areas that 0.2.0 refused there ([docs/product-options.md](docs/product-options.md#moving-beam-collections)):
-  - `weighting='taylor'` (the Taylor window along frequency and over each pixel's processed azimuth band),
-    `'uniform'` (a rectangle over that band, no frequency window) and `'sva'` (the uniform image at twice Nyquist
-    of both bands, cut to the same rectangle at every pixel and apodized on the ground grid). Apodization is
-    refused, with the reason, where the squint shears the range band by more than 10% of its width, the ground
+  - `weighting='uniform'` (a rectangle over each pixel's processed azimuth band, no frequency window),
+    `'taylor'` (the Taylor window along frequency and over that band) and `'sva'` (the uniform image at twice
+    Nyquist of both bands, cut to the same rectangle at every pixel and apodized on the ground grid). Apodization
+    is refused, with the reason, where the squint shears the range band by more than 10% of its width, the ground
     range band changes by more than 5% across the swath, or the azimuth band differs by more than 10% over the
-    scene.
+    scene. The defaults are a spotlight's, `'uniform'` for a SICD and `'sva'` for a SIDD; a SIDD whose weighting
+    was not given is Taylor weighted where apodization is refused, with a note that says why, and
+    `weighting='sva'` raises a `ValueError` there.
   - `autofocus='quadratic'` and `'spatially_variant'`: map drift on blocks along the track no longer than half
     the footprint of the synthetic aperture, each under the guard of the spotlight modes, tied together by a
     robust local fit along the track and across the swath, and removed with a cross-faded correction
     (`moving.autofocus`). The guard's contrast test measures its scatter over cells along and across the track,
     as many as the corrected rows hold. The phase gradient modes are refused on a moving beam.
   - `area='tasked_quality'`, an RNIIRS and `'black'`: the tasked extent along the track, and in ground range as
-    far as the criterion holds for the moving beam's own gain and receive windows.
+    far as the criterion holds for the moving beam's own gain and receive windows. `'black'` ends at
+    `black_sigma0_db` as for a spotlight, and the areas follow the pointing the data chose for the antenna
+    pattern (below): where no pattern is trusted they are refused with a spotlight's reason.
 - `fastsar.moving`: the baseband step of a moving-beam image, exact at every pixel on both axes for any squint or
   slide of the beam (`baseband`), the spectrum of the image from the collection (`spectrum`), `band_limit` and
   `autofocus`, on NumPy, CuPy and JAX arrays. On JAX's device everything is float32, complex64 or int32, as a TPU
@@ -45,14 +51,88 @@ was published on PyPI.
   (`FASTSAR_JAX_BLOCK_MB`), with an image the device cannot hold kept on the host and passed through it.
 - `form_cphd(..., azimuth_window=)`: the per-pixel azimuth window of a moving beam, `'hann'` (the default, as
   before), `'taylor'` or `'uniform'`; `patches.form_mosaic(..., amask=)` cuts a window at the edge of the band.
+- Radiometric calibration in the SICD. `process_cphd` writes the `Radiometric` block of a spotlight SICD when the
+  CPHD file supports it, and only then: `NoiseLevel` (ABSOLUTE) and `RCSSFPoly`, `SigmaZeroSFPoly`,
+  `BetaZeroSFPoly` and `GammaZeroSFPoly`, by SICD's definitions. With `PTRef` and `PNRef` in the file both the
+  signal and the noise level are calibrated; with `PTRef` alone (Umbra) the noise level is the noise power
+  measured from the phase history, and the product's notes say so; without `PTRef` (Capella) there is no block,
+  and the notes say why. An `'sva'` product and a moving-beam collection get none. The factors follow the antenna
+  gain over the image as 2-D polynomials, since the image is not corrected for the antenna pattern, and the notes
+  state their order and residual. `out['radiometric']` holds what was written;
+  `rgiqe.calibration`, `rgiqe.reference_levels` and `rgiqe.support_area` are the pieces
+  ([docs/product-options.md](docs/product-options.md#radiometric-calibration), with the simulator's accuracy
+  and the comparison with a vendor's SICD). The radiometric model's time is the `radiometry` entry of `timing`
+  (for the quality areas it was part of `form`).
+- The antenna pattern's pointing is decided by the data (`Radiometry.pointing`, `Radiometry.footprint`). The
+  beam's footprint is measured from the range-Doppler power of a few hundred pulses and compared with the modeled
+  gain. The file's antenna frames are used where they pass (the fitted beam center within 0.4 of a half-power
+  radius of the modeled one). Where they fail, the same pattern is tried with each pulse's boresight on that
+  pulse's scene reference point, where a tracking beam is steered, and used if it passes. Where neither passes
+  the model has no trusted pattern: the quality areas other than `'tasked'` raise a `ValueError` and the scale
+  factors of the `Radiometric` block are constants. A scene that shows no footprint keeps the file's pointing,
+  with a note that it is unverified. A moving beam is checked the same way, once, on the pulses of the middle of
+  the strip: its echoes are referred to each pulse's own scene reference point, so the model takes the antenna's
+  frame at the pulses it measured and the ground around their reference point (on a Capella stripmap the file's
+  frames pass with the fitted center on the modeled one, at a correlation of 0.85). A beam whose center turns
+  between the measured blocks of pulses (a sliding spotlight) shows no one footprint and is not checked: the
+  file's pointing is kept, unverified. Of seven Umbra collections
+  five fail as their files point them (0.65 to 1.00 radii; the frames put the boresight 1.4 to 1.6 km ahead of
+  the scene reference point) and pass on the reference point (0.12 to 0.31), and two lie halfway and pass
+  neither (0.44 to 0.55); on one of the five the black area
+  moves from 7.90 x 9.45 km to 7.75 x 9.05 km, centered on the reference point, and the tasked-quality area from
+  7.65 x 6.75 km to 5.95 x 6.70 km. The tolerance was set against the brightness of the formed images, which
+  follows the gain on the reference point at +0.70 to +0.80 dB per dB over ground of low texture for the five,
+  and the gain as the file points it at +0.31 and +0.45 for the two
+  ([docs/product-options.md](docs/product-options.md#the-antenna-patterns-pointing)).
+- The beam's width is measured from the same footprint (`Radiometry.footprint['width']`): the measured width over
+  that of the modeled two-way beam, along the antenna's X and Y axes, where the clutter stands 6 dB over the
+  noise in the map. It is a record and does not change the model. A pattern applied once where the antenna
+  applies it on transmit and on receive would read 1.41; the seven Umbra collections read 1.07 across the track
+  (standard deviation 0.07) and 1.05 along it (0.05).
+- The clutter factor of the `Radiometric` block uses the samples' own density in spatial frequency
+  (`rgiqe.clutter_gain`): pulses spaced unevenly in angle moved a simulated sigma zero by up to 0.1 dB under a
+  Taylor window.
+- `sim.write_cphd(..., pt_ref=, pn_ref=, beam=)` writes the reference levels and an antenna block, and
+  `sim.beam_gain` gives the matching gain of simulated scatterers.
 
 ### Changed
 
-- `process_cphd` on a moving beam. The product is at baseband (0.2.0 gave the image as formed), and its SICD
-  states a band centered at zero. `weighting='taylor'`, the default, weights the azimuth band with the Taylor
-  window in place of `form_cphd`'s Hann window (a main lobe 18% narrower, a peak sidelobe 3.5 dB lower), and
-  `'uniform'` with a rectangle over each pixel's band in place of every pulse of a patch. Autofocus is
-  `'quadratic'` by default, as for a spotlight. The default spacing along the track follows the azimuth band of
+- The defaults of `process_cphd` (a change of behavior from 0.2.0). The default SICD is now on the ground plane
+  and unweighted: `plane=None` is `'ground'` for every product, and `weighting=None` is `'uniform'` for a SICD
+  (`'sva'` for a SIDD, as before). 0.2.0 wrote a slant-plane SICD with Taylor weighting, and
+  `process_cphd(cphd, output, plane='slant', weighting='taylor')` reproduces it. The ground plane is the plane
+  FastSAR forms on, so the default product is the image as formed (`Grid.Type` PLANE, `Grid.ImagePlane` GROUND,
+  rows along ground range away from the radar, the view from above); most producers deliver slant-plane SICDs,
+  and [docs/product-options.md](docs/product-options.md#the-ground-plane-sicd-the-default) lists what a consumer
+  that assumes one should check. No weighting leaves the choice of an apodization to the user of the complex
+  image. Since apodization runs on the slant plane, a SICD with `weighting='sva'` and no `plane` is a slant-plane
+  SICD as before, with a note in the product that says so; `plane='ground'` with `'sva'` raises a `ValueError`.
+  The defaults of a SIDD and of `form_cphd` are unchanged. A moving-beam collection takes the same defaults (the
+  next entry).
+- The noise measurement of `rgiqe.Radiometry` is bounded and no longer reads the file a second time from
+  `process_cphd`: about 8 million samples at most (64 pulses of an Umbra collection with 120,736 samples per
+  pulse, 0.03 dB from the level of 512), taken from the phase history in memory (`Radiometry(..., history=)`). On
+  that collection the whole radiometric model, with the check of the antenna block, takes 0.55 to 1.2 s (0.6 to
+  1.3 s of CPU) where that of 0.2.0 took 0.8 to 3.6 s (1.5 to 4.2 s of CPU), in a process held to 16 cores on a
+  machine at a load of 67; on a machine oversubscribed several times over, 0.4 to 0.9 s where it took 52 to 181 s.
+- `area='black'` ends where a scene of sigma zero -10 dB has a signal-to-noise ratio of 1, ambiguities counted as
+  noise: where the noise-equivalent sigma zero plus the ambiguity level reaches -10 dB. In 0.2.0 the reference was
+  the RGIQE's scene (0 dB for a co-polarized channel), which put the edge about 10 dB further down the beam, past
+  where most terrain shows anything. `process_cphd`, `rgiqe.area_mask` and `rgiqe.area_bounds` take
+  `black_sigma0_db=-10.0`, and `black_sigma0_db=0.0` gives the area of 0.2.0 for a co-polarized channel. The
+  RNIIRS areas (`'tasked_quality'`, a number) keep the RGIQE's reference, so that an RNIIRS computed here is the
+  one sarpy's `PREDICTED_RNIIRS` states; `'black'` therefore no longer contains every RNIIRS area, only those whose
+  threshold needs an SNR of at least 10 dB of the reference scene. `Radiometry.snr(..., sigma0_db=)` gives the
+  ratio for a scene of any sigma zero. The areas of a moving beam, new in this version, use the same reference.
+- `process_cphd` on a moving beam (a change of behavior from 0.2.0, which wrote `form_cphd`'s image: Taylor
+  weighting along frequency, a Hann window over the azimuth band, no autofocus). The defaults are now those of a
+  spotlight: the SICD is unweighted (`'uniform'`: a rectangle over each pixel's azimuth band in place of every
+  pulse of a patch, and no frequency window), the SIDD is apodized (`'sva'`, or Taylor weighted with a note
+  where apodization is refused), and autofocus is `'quadratic'`. `weighting='taylor'` weights the azimuth band
+  with the Taylor window in place of the Hann window (a main lobe 18% narrower, a peak sidelobe 3.5 dB lower).
+  The product is at baseband (0.2.0 gave the image as formed), and its SICD states a band centered at zero. The
+  SICD of 0.2.0 is `products.write_sicd(path, form_cphd(cphd))`; the nearest product of `process_cphd` is
+  `weighting='taylor', autofocus=False`. The default spacing along the track follows the azimuth band of
   the image, which is wider than the beam's Doppler band over the platform's speed wherever the footprint moves
   slower than the platform (1.10 times on a Capella stripmap, 5.8 times on a sliding spotlight; 0.2.0 sampled
   both for the narrower band), and the `bandwidth` entry of the product states that band. An autofocus that was

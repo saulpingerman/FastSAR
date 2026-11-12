@@ -6,14 +6,18 @@ CPHD reader.
     (nbar 4, 35 dB) 1.184 wide with a -35 dB peak sidelobe, uniform 0.886 and -13.26 dB, on a broadside stripmap, a
     squinted one and a sliding spotlight; the product at baseband on both axes. Apodization: no sidelobe above
     -30 dB of its target around the main lobe, which keeps the unweighted width; refused where the squint shears
-    the spectrum.
+    the spectrum. The defaults, which are a spotlight's: an unweighted SICD and an apodized SIDD, the SIDD Taylor
+    weighted with a note where apodization is ruled out and was not asked for by name.
 (b) Autofocus. A quadratic phase error over slow time injected into the phase history (2, 5 and 15 rad at the edge
     of a synthetic aperture), an error that changes along the track, and targets above the focus plane seen from a
     curved track (one height, and a height that changes across the swath): the impulse response returns to the
-    error-free one. A focused collection comes back unchanged.
+    error-free one. A focused collection comes back unchanged. These are measured on Taylor-weighted images, whose
+    main lobe the product's own sampling resolves; the unweighted default is tested for the same recovery.
 (c) Areas. With an antenna block in the file, the area in ground range against the two-way gain computed here
-    from the beam's formula, the receive window and its extension, a window that holds nothing beyond the tasked
-    swath, and a file without an antenna pattern.
+    from the beam's formula, the edge of 'black' at the sigma zero asked for (black_sigma0_db), the receive window
+    and its extension, a window that holds nothing beyond the tasked swath, a file without an antenna pattern, and
+    the check of the antenna block against the beam's footprint in the phase history: the pointing it chooses for
+    a beam whose reference point moves, and the refusal of the areas when no pattern is trusted.
 (d) The backends give the same products. On JAX's device, where everything is float32: the baseband phase of an
     orbit at 600 km over tens of kilometers of ground against the phase in double, and the stages with a device
     budget of a fifth of a megabyte (blocks of a few rows or columns, an image kept on the host) against the
@@ -107,20 +111,70 @@ def test_weighting_impulse_responses(strip):
 
 
 def test_default_product(strip):
-    """The default: Taylor on both axes at form_cphd's own spacing (finer where a sliding beam widens the band),
-    quadratic autofocus that leaves a focused collection as it came."""
+    """The defaults are a spotlight's. A SICD: the ground plane, no weighting (a rectangle over each pixel's
+    processed azimuth band and no frequency window) at form_cphd's own spacing (finer where a sliding beam widens
+    the band), quadratic autofocus, the tasked area, no Radiometric block. A SIDD: spatially variant apodization,
+    quadratic autofocus, the NRL remap, shadows down. Each is the product of the same options spelled out, and
+    weighting='taylor' is the Taylor window on both axes."""
     name, c = strip
-    o = fastsar.process_cphd(name + '.cphd', backend='cpu', extent=EXT)
-    ref = fastsar.form_cphd(name + '.cphd', backend='cpu', extent=EXT, azimuth_window='taylor', spacing=(o['spx'], o['spy']),
-                            _plan=lambda g: dict(fit_patch=True))    # process_cphd's patch, for the same rounding
-    assert o['weighting'] == 'taylor' and o['autofocus'] is None and o['autofocus_info']['applied'] is False
-    assert o['image'].shape == ref['image'].shape
-    assert np.abs(np.abs(o['image']) - np.abs(ref['image'])).max() < 2e-3 * np.abs(ref['image']).max()
-    # the band of the image along the track: the processed Doppler band, widened by a slide or a squint
-    assert any('azimuth band of the image' in n for n in o['notes']) == (name != 'broadside')
-    assert 0.9 < o['spx'] / (0.96 * c.ares) < (0.98 if name != 'broadside' else 1.02)
-    r = responses(o, c, half=12)
-    assert np.abs(r[:, 0] / 1.184 - 1).max() < 0.03, r[:, 0]
+    run = lambda **kw: fastsar.process_cphd(name + '.cphd', backend='cpu', extent=EXT, **kw)
+    o = run()
+    assert (o['product'], o['plane'], o['weighting'], o['area']) == ('sicd', 'ground', 'uniform', 'tasked')
+    assert o['mode'] == 'moving' and o['autofocus_info']['mode'] == 'quadratic' and 'autofocus' in o['timing']
+    assert o['radiometric'] is None and sum('No Radiometric block' in n and 'moving beam' in n for n in o['notes']) == 1
+    assert not any(n.startswith('weighting:') for n in o['notes'])
+    same = run(plane='ground', weighting='uniform', autofocus='quadratic', area='tasked')
+    assert np.array_equal(same['image'], o['image'])
+    plain = run(autofocus=False)
+    for wt, p in (('uniform', plain), ('taylor', run(weighting='taylor'))):
+        ref = fastsar.form_cphd(name + '.cphd', backend='cpu', extent=EXT, azimuth_window=wt, window=wt == 'taylor',
+                                spacing=(p['spx'], p['spy']),
+                                _plan=lambda g: dict(fit_patch=True))    # process_cphd's patch, for the same rounding
+        assert p['weighting'] == wt and p['window'] == (wt, wt) and p['autofocus'] is None and p['baseband']
+        assert p['image'].shape == ref['image'].shape == o['image'].shape
+        assert np.abs(np.abs(p['image']) - np.abs(ref['image'])).max() < 2e-3 * np.abs(ref['image']).max()
+        # the band of the image along the track: the processed Doppler band, widened by a slide or a squint
+        assert any('azimuth band of the image' in n for n in p['notes']) == (name != 'broadside')
+        assert 0.9 < p['spx'] / (0.96 * c.ares) < (0.98 if name != 'broadside' else 1.02)
+        if wt == 'taylor':                 # a focused collection comes back as it came, and its main lobe is Taylor's
+            assert p['autofocus_info']['applied'] is False
+            r = responses(p, c, half=12)
+            assert np.abs(r[:, 0] / 1.184 - 1).max() < 0.03, r[:, 0]
+    # the unweighted default with autofocus: the focused collection stays focused (the estimate of a band that ends
+    # in a step, at 0.96 of the sampling rate, is a few hundredths of a radian, and its correction changes little)
+    info = o['autofocus_info']
+    assert np.abs(info['estimates'][np.isfinite(info['estimates'])]).max() < 0.1, info['estimates']
+    assert np.abs(o['image'] - plain['image']).max() < 0.03 * np.abs(plain['image']).max()
+
+
+def test_default_sidd(strip):
+    """The default SIDD of a moving beam is apodized, as a spotlight's is. Where apodization is ruled out (a squint
+    of 3 degrees, which shears the range band by more than a tenth of its width; a spacing given, where it sets
+    its own) and was not asked for by name, the image is Taylor weighted and a note says why; weighting='sva'
+    raises there (test_apodization, test_errors)."""
+    name, c = strip
+    run = lambda **kw: fastsar.process_cphd(name + '.cphd', backend='cpu', extent=EXT, product='sidd', **kw)
+    s = run()
+    said = [n for n in s['notes'] if n.startswith('weighting:')]
+    assert (s['product'], s['plane'], s['area'], s['remap'], s['shadows_down']) == ('sidd', 'ground', 'tasked', 'nrl', True)
+    assert s['autofocus_info']['mode'] == 'quadratic'
+    if name == 'squinted':
+        assert s['weighting'] == 'taylor' and s['window'] == ('taylor', 'taylor') and len(said) == 1, s['notes']
+        assert 'shears the range band' in said[0] and "'sva'" in said[0] and "weighting='taylor'" in said[0]
+        assert not any('apodization: formed' in n for n in s['notes'])
+    else:
+        assert s['weighting'] == 'sva' and s['window'] == ('sva', 'sva') and not said, s['notes']
+        assert any('apodization: formed' in n for n in s['notes'])
+    same = run(weighting=s['weighting'])                             # the same product, asked for by name
+    assert np.array_equal(same['image'], s['image']) and same['spx'] == s['spx']
+    assert [n for n in s['notes'] if n not in said] == same['notes']
+    from fastsar import sidd
+    pix = sidd.to_display(s)
+    assert pix.dtype == np.uint8 and pix.max() > 200
+    # a spacing: apodization sets its own, so the default gives way to Taylor at the spacing asked for
+    g = run(spacing=0.5)
+    said = [n for n in g['notes'] if n.startswith('weighting:')]
+    assert g['weighting'] == 'taylor' and g['spx'] == g['spy'] == 0.5 and len(said) == 1 and 'a spacing was given' in said[0]
 
 
 def test_apodization(strip):
@@ -164,6 +218,7 @@ def test_errors(strip):
 # ---------------------------------------------------------------------------------------------- (b) autofocus
 LONG = (240.0, 50.0)
 PL = 2600
+TAYLOR = dict(weighting='taylor')  # the weighting these are measured with: the product's sampling resolves its lobe
 
 
 def scene():
@@ -178,14 +233,14 @@ def scene():
 def focused():
     tg, amp = scene()
     c = ms.collection('long.cphd', tg, amp, P=PL)
-    ref = fastsar.process_cphd('long.cphd', backend='cpu', extent=LONG, autofocus=False)
+    ref = fastsar.process_cphd('long.cphd', backend='cpu', extent=LONG, autofocus=False, **TAYLOR)
     return c, ref, responses(ref, c, half=12)
 
 
 def test_autofocus_leaves_a_focused_collection(focused):
     c, ref, r0 = focused
     for mode in ('quadratic', 'spatially_variant'):
-        o = fastsar.process_cphd('long.cphd', backend='cpu', extent=LONG, autofocus=mode)
+        o = fastsar.process_cphd('long.cphd', backend='cpu', extent=LONG, autofocus=mode, **TAYLOR)
         info = o['autofocus_info']
         assert o['autofocus'] is None and not info['applied'] and info['mode'] == mode and 'autofocus' in o['timing']
         assert len(info['starts']) == 3 and info['counted'].all() and np.abs(info['estimates']).max() < 0.05
@@ -199,8 +254,8 @@ def test_autofocus_recovers_a_slow_time_error(focused, rad):
     tg, amp = scene()
     s = (np.arange(PL) - PL / 2) / (c.aperture / 2)                  # slow time in half apertures
     ms.collection('quad.cphd', tg, amp, P=PL, phase=rad * s ** 2)
-    blurred = responses(fastsar.process_cphd('quad.cphd', backend='cpu', extent=LONG, autofocus=False), c, 12, 10)
-    o = fastsar.process_cphd('quad.cphd', backend='cpu', extent=LONG)
+    blurred = responses(fastsar.process_cphd('quad.cphd', backend='cpu', extent=LONG, autofocus=False, **TAYLOR), c, 12, 10)
+    o = fastsar.process_cphd('quad.cphd', backend='cpu', extent=LONG, **TAYLOR)
     info, r = o['autofocus_info'], responses(o, c, 12, 10)
     print(f'  {rad} rad: estimates {info["estimates"].round(2)}, fit {info["fit"].round(2)}, width '
           f'{np.median(blurred[:, 0]):.3f} -> {np.median(r[:, 0]):.3f} (focused {np.median(r0[:, 0]):.3f}), sidelobe '
@@ -214,12 +269,38 @@ def test_autofocus_recovers_a_slow_time_error(focused, rad):
     assert info['contrast_after'] > info['contrast_before'] and (o['image'] == 0).sum() == (ref['image'] == 0).sum()
 
 
+@pytest.mark.parametrize('rad', [2.0, 15.0])
+def test_autofocus_recovers_an_error_on_the_default_product(rad):
+    """The default SICD is unweighted: the same slow-time error is estimated and removed from it. Its main lobe is
+    0.886 of the reciprocal band on pixels of 0.96, so the width of one target is measured to a tenth and the
+    median over the strip to a percent."""
+    tg, amp = scene()
+    c = ms.collection('long.cphd', tg, amp, P=PL)
+    r0 = responses(fastsar.process_cphd('long.cphd', backend='cpu', extent=LONG, autofocus=False), c, 12)
+    s = (np.arange(PL) - PL / 2) / (c.aperture / 2)
+    ms.collection('quad_u.cphd', tg, amp, P=PL, phase=rad * s ** 2)
+    blurred = responses(fastsar.process_cphd('quad_u.cphd', backend='cpu', extent=LONG, autofocus=False), c, 12, 10)
+    o = fastsar.process_cphd('quad_u.cphd', backend='cpu', extent=LONG)
+    info, r = o['autofocus_info'], responses(o, c, 12, 10)
+    print(f'  unweighted, {rad} rad: fit {info["fit"].round(2)}, width {np.median(blurred[:, 0]):.3f} -> '
+          f'{np.median(r[:, 0]):.3f} (focused {np.median(r0[:, 0]):.3f}), sidelobe {np.median(r[:, 2]):.1f} dB '
+          f'({np.median(r0[:, 2]):.1f})')
+    assert o['weighting'] == 'uniform' and o['autofocus'] == 'quadratic' and info['applied'] and info['applied_blocks'].all()
+    assert np.abs(info['fit'] / rad - 1).max() < 0.05
+    assert np.median(blurred[:, 0]) > 1.08 * np.median(r0[:, 0])
+    assert abs(np.median(r[:, 0]) / np.median(r0[:, 0]) - 1) < 0.015 and np.abs(r[:, 0] / r0[:, 0] - 1).max() < 0.2
+    # the peak sample of a lobe narrower than a pixel changes with the target's place between the pixels, which a
+    # slow-time error that grows along the strip moves: by a tenth for one target, by a percent in the median
+    assert abs(np.median(r[:, 2]) - np.median(r0[:, 2])) < 1.0
+    assert abs(np.median(r[:, 4] / r0[:, 4]) - 1) < 0.02 and np.abs(r[:, 4] / r0[:, 4] - 1).max() < 0.2
+
+
 def test_autofocus_follows_an_error_along_the_track(focused):
     c, ref, r0 = focused
     tg, amp = scene()
     s = (np.arange(PL) - PL / 2) / (c.aperture / 2)
     ms.collection('vary.cphd', tg, amp, P=PL, phase=4.0 * s ** 2 + 0.3 * s ** 3)     # 4 rad +- 0.9 along the strip
-    o = fastsar.process_cphd('vary.cphd', backend='cpu', extent=LONG)
+    o = fastsar.process_cphd('vary.cphd', backend='cpu', extent=LONG, **TAYLOR)
     info, r = o['autofocus_info'], responses(o, c, 12, 10)
     print(f'  along track: estimates {info["estimates"].round(2)}, fit {info["fit"].round(2)}, width {r[:, 0].max():.3f}')
     assert info['applied'] and info['fit'][0] < 3.7 and info['fit'][-1] > 4.3 and abs(info['fit'][1] - 4.0) < 0.2
@@ -233,13 +314,13 @@ def test_autofocus_recovers_a_height_offset(heights):
     tg, amp = scene()
     kw = dict(P=PL, curve=1.7e-4)
     c = ms.collection('curved.cphd', tg, amp, **kw)
-    r0 = responses(fastsar.process_cphd('curved.cphd', backend='cpu', extent=LONG, autofocus=False), c, 12)
+    r0 = responses(fastsar.process_cphd('curved.cphd', backend='cpu', extent=LONG, autofocus=False, **TAYLOR), c, 12)
     h = np.full(len(tg), 40.0) if heights == 'level' else 20.0 + 2.0 * tg[:, 0]
     up = tg + np.stack([h * np.tan(c.graze), 0 * h, h], 1)           # the same image points, on the ground plane
     ms.collection('raised.cphd', up, amp, **kw)
     # the layover of a raised target follows the local direction across the curved track: a few rows along it
-    blurred = responses(fastsar.process_cphd('raised.cphd', backend='cpu', extent=LONG, autofocus=False), c, 12, 4)
-    o = fastsar.process_cphd('raised.cphd', backend='cpu', extent=LONG)
+    blurred = responses(fastsar.process_cphd('raised.cphd', backend='cpu', extent=LONG, autofocus=False, **TAYLOR), c, 12, 4)
+    o = fastsar.process_cphd('raised.cphd', backend='cpu', extent=LONG, **TAYLOR)
     info, r = o['autofocus_info'], responses(o, c, 12, 4)
     print(f'  {heights}: fit {info["fit"].round(2)}, slope {info["slope"].round(2)}, width {np.median(blurred[:, 0]):.3f} '
           f'(max {blurred[:, 0].max():.3f}) -> {np.median(r[:, 0]):.3f} (max {r[:, 0].max():.3f}), sidelobe '
@@ -256,18 +337,21 @@ def test_products_on_disk(tmp_path):
     from fastsar import _sicdxml
     tg, amp = scene()
     c = ms.collection('disk.cphd', tg, amp, P=PL, phase=5.0 * ((np.arange(PL) - PL / 2) / 500.0) ** 2)
-    o = fastsar.process_cphd('disk.cphd', str(tmp_path / 'm.nitf'), backend='cpu', extent=LONG)
-    sm = _sicdxml.read(str(tmp_path / 'm.nitf'))
-    assert o['path'] == str(tmp_path / 'm.nitf') and o['autofocus'] == 'quadratic'
-    assert sm.Grid.ImagePlane == 'GROUND' and sm.Grid.Type == 'PLANE' and sm.ImageFormation.AzAutofocus == 'SV'
-    assert sm.Grid.Row.WgtType.WindowName == 'TAYLOR' and sm.Grid.Col.WgtType.WindowName == 'TAYLOR'
-    assert sm.Grid.Row.DeltaKCOAPoly[0, 0] == 0 and sm.Grid.Col.DeltaKCOAPoly[0, 0] == 0
-    assert abs(sm.Grid.Col.ImpRespBW / (2 * c.dsin / c.lam) - 1) < 0.01          # columns along the track
-    assert abs(sm.Grid.Row.ImpRespBW / (2 * c.K * c.df / C * np.cos(c.graze)) - 1) < 0.01
-    assert (int(sm.ImageData.NumRows), int(sm.ImageData.NumCols)) == o['image'].shape[::-1]
-    d = fastsar.process_cphd('disk.cphd', str(tmp_path / 'd.nitf'), backend='cpu', extent=LONG, product='sidd',
-                             weighting='sva')
-    assert d['weighting'] == 'sva' and d['autofocus'] == 'quadratic' and (tmp_path / 'd.nitf').stat().st_size > d['image'].size
+    for wt, kw in (('uniform', {}), ('taylor', TAYLOR)):                # the default, and the Taylor window
+        o = fastsar.process_cphd('disk.cphd', str(tmp_path / 'm.nitf'), backend='cpu', extent=LONG, **kw)
+        sm = _sicdxml.read(str(tmp_path / 'm.nitf'))
+        assert o['path'] == str(tmp_path / 'm.nitf') and o['autofocus'] == 'quadratic' and o['weighting'] == wt
+        assert sm.Grid.ImagePlane == 'GROUND' and sm.Grid.Type == 'PLANE' and sm.ImageFormation.AzAutofocus == 'SV'
+        assert sm.Grid.Row.WgtType.WindowName == wt.upper() and sm.Grid.Col.WgtType.WindowName == wt.upper()
+        assert sm.Grid.Row.DeltaKCOAPoly[0, 0] == 0 and sm.Grid.Col.DeltaKCOAPoly[0, 0] == 0
+        assert abs(sm.Grid.Col.ImpRespBW / (2 * c.dsin / c.lam) - 1) < 0.01          # columns along the track
+        assert abs(sm.Grid.Row.ImpRespBW / (2 * c.K * c.df / C * np.cos(c.graze)) - 1) < 0.01
+        assert (int(sm.ImageData.NumRows), int(sm.ImageData.NumCols)) == o['image'].shape[::-1]
+        assert sm.Radiometric is None and o['radiometric'] is None  # the radiometric model is a spotlight's
+    for kw in (dict(), dict(weighting='sva')):                       # the default SIDD is the apodized one
+        d = fastsar.process_cphd('disk.cphd', str(tmp_path / 'd.nitf'), backend='cpu', extent=LONG, product='sidd', **kw)
+        assert d['weighting'] == 'sva' and d['autofocus'] == 'quadratic'
+        assert (tmp_path / 'd.nitf').stat().st_size > d['image'].size
 
 
 # ---------------------------------------------------------------------------------------------- (c) areas
@@ -301,42 +385,216 @@ def swath(o):
     return np.array(out)
 
 
-def antenna_strip(name, toa_m, toae_m):
+def antenna_strip(name, toa_m, toae_m, **kw):
     """A stripmap with an antenna block and receive windows of +-toa_m (extended: +-toae_m) meters of ground range."""
     k = 2 * np.cos(np.radians(30.0)) / C
     return ms.collection(name, FAR, antenna=ANT, toa=k * toa_m, toae=None if toae_m is None else k * toae_m,
-                         df=0.75e6)
+                         df=0.75e6, **kw)
 
 
 def test_areas_follow_the_gain_in_range():
-    """A wide receive window: 'black' ends where the two-way gain equals the noise-equivalent sigma zero, an RNIIRS
-    where the gain gives the ratio it needs, and 'tasked_quality' where the gain falls below its least value in
-    the tasked swath; each to one step of the model's lattice across the track (3 m, 0.8 dB of this beam)."""
+    """A wide receive window: 'black' ends where terrain of black_sigma0_db (-10 dB) has a signal-to-noise ratio of
+    1, that is, where the two-way gain equals the noise-equivalent sigma zero over that sigma zero; an RNIIRS
+    where the gain gives the ratio its reference scene of 0 dB needs, whatever black_sigma0_db is; and
+    'tasked_quality' where the gain falls below its least value in the tasked swath; each to one step of the
+    model's lattice across the track (3 m, 0.8 dB of this beam)."""
     from fastsar import rgiqe
     c = antenna_strip('ant.cphd', 95.0, 120.0)
     t = fastsar.process_cphd('ant.cphd', backend='cpu', extent=EXT, autofocus=False)
     bw = t['bandwidth'][0] * t['bandwidth'][1]
-    for area, level in (('black', -10.0), (4.8, -10.0 + 10 * np.log10(rgiqe.rniirs_to_snr(bw, 4.8))),
-                        ('tasked_quality', gain_db(c, [-25.0, 25.0]).min())):
-        o = fastsar.process_cphd('ant.cphd', backend='cpu', extent=EXT, area=area, nesz_db=-10.0, autofocus=False)
+    rniirs = -10.0 + 10 * np.log10(rgiqe.rniirs_to_snr(bw, 4.8))
+    width = {}
+    for area, kw, level in (('black', dict(nesz_db=-20.0), -10.0),                       # the default: -10 dB
+                            ('black', dict(nesz_db=-20.0, black_sigma0_db=-12.0), -8.0),
+                            ('black', dict(nesz_db=-10.0, black_sigma0_db=0.0), -10.0),  # the RGIQE's reference scene
+                            (4.8, dict(nesz_db=-10.0), rniirs), (4.8, dict(nesz_db=-10.0, black_sigma0_db=-30.0), rniirs),
+                            ('tasked_quality', dict(nesz_db=-10.0), gain_db(c, [-25.0, 25.0]).min())):
+        o = fastsar.process_cphd('ant.cphd', backend='cpu', extent=EXT, area=area, autofocus=False, **kw)
         sw = swath(o)
         g = gain_db(c, sw.mean(0))
-        print(f'  area {area}: ground range {sw.mean(0).round(1)} m, gain there {g.round(2)} dB (criterion {level:.2f} dB)')
+        print(f'  area {area} {kw}: ground range {sw.mean(0).round(1)} m, gain there {g.round(2)} dB (criterion {level:.2f} dB)')
         assert o['area'] == area and o['image'].shape[0] == t['image'].shape[0] and np.ptp(sw, 0).max() < 2 * o['spy']
         assert sw[:, 0].max() <= -25 + o['spy'] and sw[:, 1].min() >= 25 - o['spy']          # never short of the tasked swath
         assert np.abs(g - level).max() < 1.0, (area, sw, g, level)
+        # a few point targets show no footprint to check the antenna block against: the pattern as the file has it
+        assert sum('could not be checked' in n and 'unverified' in n for n in o['notes']) == 1, o['notes']
         if area == 'tasked_quality':                                 # the tasked swath is where its own quality ends
             assert o['image'].shape == t['image'].shape and any('No ground range beyond' in n for n in o['notes'])
             continue
         assert (o['image'] == 0).any() and any('ground range with' in n for n in o['notes'])
+        if area == 'black':
+            assert sum(f"sigma zero {kw.get('black_sigma0_db', -10.0):.1f} dB" in n for n in o['notes']) == 1
+        width[area, tuple(kw.values())] = np.ptp(sw.mean(0))
         j = ms.to_pixels(o, o['meta'], c.tg)
         inside = (c.tg[:, 0] > sw[1, 0] + 2) & (c.tg[:, 0] < sw[1, 1] - 2)
         assert all(abs(o['image'][round(a), round(b)]) > 0 for (a, b), ok in zip(j, inside) if ok)
+    # a brighter reference ends sooner; the same ratio of noise to reference is the same area; an RNIIRS ignores it
+    assert width['black', (-20.0, -12.0)] < width['black', (-20.0,)] - 3
+    assert abs(width['black', (-10.0, 0.0)] - width['black', (-20.0,)]) < 1e-6
+    assert abs(width[4.8, (-10.0, -30.0)] - width[4.8, (-10.0,)]) < 1e-6
+    # at the default, a noise level of -10 dB leaves nothing beyond the tasked swath, where the gain is 4.6 dB down
+    o = fastsar.process_cphd('ant.cphd', backend='cpu', extent=EXT, area='black', nesz_db=-10.0, autofocus=False)
+    assert o['image'].shape == t['image'].shape and sum('No ground range beyond the tasked swath' in n for n in o['notes']) == 1
+
+
+def pointed(monkeypatch, pointing):
+    """rgiqe.Radiometry's check of the antenna block replaced by one that finds the given pointing, as the data of
+    a scene with clutter would decide it; the frames are turned onto the reference points for 'reference point' as
+    the check does. -> the list of the models that ran the check."""
+    from fastsar import rgiqe
+    ran = []
+
+    def check(self, fp):
+        ran.append(self)
+        self.footprint = dict(status='consistent' if pointing else 'inconsistent')
+        self.pointing = pointing
+        if pointing == 'reference point':
+            self._repoint()
+    monkeypatch.setattr(rgiqe.Radiometry, '_check_footprint', check)
+    return ran
+
+
+def test_areas_follow_the_pointing_the_data_chose(monkeypatch):
+    """The antenna block's pointing is checked once, on the pulses of the middle of the strip, and the models of
+    the other positions take it over. 'reference point': each boresight on its pulse's own scene reference point,
+    which is where this simulator's beam is, so the area of a file whose frames are turned 8 m off in ground range
+    is the one of the frames as simulated; with the frames as that file states them it lies 8 m to the side. None
+    (the data contradict the pattern either way): every area but the tasked one is refused, with the reason of a
+    spotlight."""
+    from fastsar import rgiqe
+    c = antenna_strip('point.cphd', 95.0, 120.0)
+    kw = dict(backend='cpu', extent=EXT, area='black', nesz_db=-20.0, autofocus=False)
+    ran = pointed(monkeypatch, 'file')
+    ref = swath(fastsar.process_cphd('point.cphd', **kw)).mean(0)
+    assert len(ran) == 1 and ran[0].moving and ran[0].pulses_used < c.P      # once, on a stretch of the pulses
+    # the same echoes in a file whose antenna frames look 8 m farther in ground range than the beam does
+    d = ms.FILES['point.cphd']
+    turn = 8.0 * np.sin(c.graze) / c.r0                              # the direction cosine across the track
+    zb = ms.unit(c.srp - c.ant)
+    xa = ms.unit(c.d - np.einsum('ij,ij->i', c.d, zb)[:, None] * zb)
+    ya = ms.unit(c.ya - turn * zb)                                   # the boresight xa x ya, turned by `turn`
+    rot = np.stack([ms.N, ms.E, ms.U], 1)
+    ms.FILES['turned.cphd'] = dict(d, pvp=dict(d['pvp'], TxACY=ya @ rot.T, RcvACY=ya @ rot.T))
+    off = swath(fastsar.process_cphd('turned.cphd', **kw)).mean(0)
+    print(f'  ground range of the black area: {ref.round(1)} m; frames turned, as the file points them {off.round(1)} m')
+    assert np.abs(np.abs(off - ref) - 8.0).max() < 3.5 and np.ptp(off - ref) < 3.5
+    del ran[:]
+    pointed(monkeypatch, 'reference point')
+    o = fastsar.process_cphd('turned.cphd', **kw)
+    on = swath(o).mean(0)
+    print(f'  with each boresight on its scene reference point {on.round(1)} m')
+    assert np.abs(on - ref).max() < 0.5 * o['spy'] + 1e-6
+    pointed(monkeypatch, None)
+    for area in ('black', 4.8, 'tasked_quality'):
+        with pytest.raises(ValueError) as e:
+            fastsar.process_cphd('turned.cphd', **dict(kw, area=area))
+        assert str(e.value) == rgiqe._untrusted(area) and 'does not describe the beam the data show' in str(e.value)
+    t = fastsar.process_cphd('turned.cphd', **dict(kw, area='tasked'))               # the tasked area needs no pattern
+    assert t['area'] == 'tasked' and not (t['image'] == 0).all()
+
+
+def lit_strip(name, finufft, n=24000, seed=11):
+    """antenna_strip's collection with clutter in place of its point targets: n scatterers over 220 m of ground
+    range and 440 m along the track, seen through the beam the file's antenna block states on both of its axes
+    (the boresight of each pulse on that pulse's scene reference point), with a little noise. The echoes are
+    referred to each pulse's own reference point, as a moving beam's are."""
+    c = antenna_strip(name, 95.0, 120.0)
+    rng = np.random.default_rng(seed)
+    pos = np.stack([rng.uniform(-110, 110, n), rng.uniform(-220, 220, n), np.zeros(n)], 1)
+    amp = np.exp(2j * np.pi * rng.uniform(size=n))
+    zb = ms.unit(c.srp - c.ant)
+    xa = ms.unit(c.d - np.einsum('ij,ij->i', c.d, zb)[:, None] * zb)
+    S = np.empty((c.P, c.K), np.complex128)
+    fref = c.f0 + (c.K // 2) * c.df
+    for p in range(c.P):
+        w = pos - c.ant[p]
+        R = np.linalg.norm(w, axis=1)
+        gain = 10.0 ** (-0.1 * (ANT[0] * (w @ xa[p] / R) ** 2 + ANT[1] * (w @ c.ya[p] / R) ** 2)) * (c.ref[p] / R) ** 2
+        dr = R - c.ref[p]
+        S[p] = finufft.nufft1d1(4 * np.pi * c.df / C * dr, amp * gain * np.exp(-4j * np.pi * fref / C * dr), c.K,
+                                eps=1e-9, isign=-1, nthreads=1)
+    S += 0.02 * np.abs(S).std() * (rng.standard_normal(S.shape) + 1j * rng.standard_normal(S.shape))
+    ms.FILES[name] = dict(ms.FILES[name], S=S.astype(np.complex64))
+    return c
+
+
+def test_the_data_decide_the_pointing_of_a_moving_beam(need, monkeypatch):
+    """The check of the antenna block against the beam's footprint in the phase history, on a stripmap whose
+    scene shows one. The footprint of a moving beam travels with the pulses, so the model takes the antenna's
+    frame at the pulses of the measured block and the ground around their reference point: the frames as
+    simulated pass with the fitted center on the modeled one. With the frame of the middle of the stretch, as for
+    a beam held on one point, the fitted center of the same data lies the distance flown in between away, a
+    whole half-power radius here.
+    A file whose frames are turned across the track fails as stated and passes with each boresight on its pulse's
+    reference point; process_cphd says which pointing its areas used, and gives the area of the frames as
+    simulated either way."""
+    from fastsar import rgiqe
+    finufft = need('finufft')
+    c = lit_strip('lit.cphd', finufft)
+    col, meta = io.read_cphd('lit.cphd', meta=True)
+    lo, hi = 200, 1200                                               # the pulses of a pixel in the middle of the strip
+    model = lambda path: rgiqe.Radiometry(path, meta, pulses=(lo, hi), nesz_db=-20.0, history=col['S'][lo:hi])
+    rad = model('lit.cphd')
+    fp = rad.footprint
+    print(f"  moving beam: {fp['status']}, {fp['ratio']:.2f} radii ({fp['offset_m']:.1f} m), correlation {fp['correlation']:.2f}")
+    assert rad.moving and rad.pointing == 'file' and fp['status'] == 'consistent' and fp['ratio'] < 0.25, fp
+    assert fp['correlation'] > 0.55 and sum('agrees with the antenna block as the file points it' in n for n in rad.notes) == 1
+    # the model of a beam held on one point, on the same data
+    with monkeypatch.context() as mp:
+        mp.setattr(rgiqe, '_MOVING_SRP', np.inf)
+        held = model('lit.cphd')
+    flown = 145 * c.dy                                               # from the stretch's middle pulse to the block's
+    print(f"  as a beam held on one point: {held.footprint['status']}, {held.footprint['ratio']:.2f} radii "
+          f"({held.footprint['offset_m']:.1f} m; {flown:.1f} m flown)")
+    assert not held.moving and held.footprint['ratio'] > 0.6 and abs(held.footprint['offset_m'] - flown) < 0.35 * flown
+    # frames turned 1.2 half-power radii across the track in the file, the beam where it was
+    turn = 1.2 * fp['radius']
+    zb = ms.unit(c.srp - c.ant)
+    xa = ms.unit(c.d - np.einsum('ij,ij->i', c.d, zb)[:, None] * zb)
+    ya = ms.unit(c.ya - turn * zb)
+    rot = np.stack([ms.N, ms.E, ms.U], 1)
+    d = ms.FILES['lit.cphd']
+    ms.FILES['lit_turned.cphd'] = dict(d, pvp=dict(d['pvp'], TxACY=ya @ rot.T, RcvACY=ya @ rot.T))
+    turned = model('lit_turned.cphd')
+    ft = turned.footprint
+    print(f"  frames turned: as the file points them {ft['file']['ratio']:.2f} radii, on the reference points "
+          f"{ft['reference_point']['ratio']:.2f}")
+    assert turned.pointing == 'reference point' and ft['file']['status'] == 'inconsistent'
+    assert abs(ft['file']['ratio'] - 1.2) < 0.3 and ft['reference_point']['ratio'] < 0.25
+    kw = dict(backend='cpu', extent=EXT, area='black', nesz_db=-20.0, autofocus=False)
+    a, b = fastsar.process_cphd('lit.cphd', **kw), fastsar.process_cphd('lit_turned.cphd', **kw)
+    assert sum('agrees with the antenna block as the file points it' in n for n in a['notes']) == 1
+    assert sum('With each boresight on its scene reference point' in n and 'is used with that pointing' in n
+               for n in b['notes']) == 1
+    assert a['image'].shape == b['image'].shape and np.array_equal(a['image'] == 0, b['image'] == 0)
+    assert np.abs(swath(a).mean(0) - swath(b).mean(0)).max() < 1e-6 and (a['image'] == 0).any()
+
+
+def test_a_beam_that_turns_is_not_checked():
+    """A sliding spotlight steers its beam along the track. The blocks of pulses of the footprint measurement are
+    added into one map in the echoes' own coordinates, where such a beam's footprint does not stay in place, so the
+    check is not made: the file's pointing is kept, the note says why, and the areas are processed. A stripmap,
+    whose beam center keeps its direction from the platform, is checked (the tests above)."""
+    from fastsar import rgiqe
+    c = antenna_strip('slides.cphd', 95.0, 120.0, slide=2.0, P=2400)
+    col, meta = io.read_cphd('slides.cphd', meta=True)
+    rad = rgiqe.Radiometry('slides.cphd', meta, pulses=(400, 2000), nesz_db=-20.0, history=col['S'][400:2000])
+    fp = rad.footprint
+    assert rad.moving and rad.pointing == 'file' and fp['status'] == 'unchecked', fp
+    assert 'turns by' in fp['reason'] and 'sliding spotlight' in fp['reason'] and fp['ratio'] is None
+    assert sum('could not be checked' in n and 'turns by' in n and 'unverified' in n for n in rad.notes) == 1
+    straight = antenna_strip('straight.cphd', 95.0, 120.0)
+    _, m2 = io.read_cphd('straight.cphd', meta=True)
+    fixed = rgiqe.Radiometry('straight.cphd', m2, pulses=(200, 1200), nesz_db=-20.0)
+    assert fixed.moving and 'turns by' not in fixed.footprint['reason']      # point targets: no footprint to see
+    o = fastsar.process_cphd('slides.cphd', backend='cpu', extent=EXT, area='black', nesz_db=-20.0, autofocus=False)
+    assert sum('could not be checked' in n and 'turns by' in n for n in o['notes']) == 1
+    assert (o['image'] == 0).any() and any('ground range with' in n for n in o['notes'])
 
 
 def test_areas_end_at_the_receive_window():
     c = antenna_strip('win.cphd', 26.0, 45.0)                        # the extension reaches 45 m, the gain farther
-    o = fastsar.process_cphd('win.cphd', backend='cpu', extent=EXT, area='black', nesz_db=-10.0, autofocus=False)
+    o = fastsar.process_cphd('win.cphd', backend='cpu', extent=EXT, area='black', nesz_db=-20.0, autofocus=False)
     sw = swath(o)
     print(f'  black, extension +-45 m: ground range {sw.mean(0).round(1)} m')
     assert np.abs(np.abs(sw) - 45).max() < 6 and any('TOAE1' in n for n in o['notes'])
@@ -344,7 +602,8 @@ def test_areas_end_at_the_receive_window():
     antenna_strip('tight.cphd', 25.0, None)
     t = fastsar.process_cphd('tight.cphd', backend='cpu', extent=EXT, autofocus=False)
     for area in ('black', 4.0, 'tasked_quality'):
-        o = fastsar.process_cphd('tight.cphd', backend='cpu', extent=EXT, area=area, nesz_db=-10.0, autofocus=False)
+        o = fastsar.process_cphd('tight.cphd', backend='cpu', extent=EXT, area=area, autofocus=False,
+                                 nesz_db=-20.0 if area == 'black' else -10.0)
         assert sum('holds no ground range beyond the tasked swath' in n for n in o['notes']) == 1, o['notes']
         assert o['image'].shape == t['image'].shape and np.allclose(o['origin'], t['origin'])
         assert np.abs(np.abs(o['image']) - np.abs(t['image'])).max() < 2e-3 * np.abs(t['image']).max()
@@ -360,7 +619,7 @@ def test_backends_agree(backend):
     antenna_strip('be_ant.cphd', 95.0, 120.0)
     for name, kw in (('be.cphd', dict(extent=LONG)), ('be.cphd', dict(extent=LONG, weighting='sva')),
                      ('be.cphd', dict(extent=LONG, weighting='uniform', autofocus='spatially_variant', product='sidd')),
-                     ('be_ant.cphd', dict(extent=EXT, area='black', nesz_db=-10.0))):
+                     ('be_ant.cphd', dict(extent=EXT, area='black', nesz_db=-20.0))):
         if backend == 'jax' and 'product' in kw:                     # each grid compiles its own programs
             continue
         ref = fastsar.process_cphd(name, backend='cpu', **kw)
@@ -551,7 +810,7 @@ def test_small_jax_device_gives_the_same_product(monkeypatch):
     ms.collection('sj.cphd', tg, amp, P=PL, phase=5.0 * ((np.arange(PL) - PL / 2) / 500.0) ** 2)
     antenna_strip('sj_ant.cphd', 95.0, 120.0)
     for name, kw in (('sj.cphd', dict(extent=LONG)), ('sj.cphd', dict(extent=LONG, weighting='sva')),
-                     ('sj_ant.cphd', dict(extent=EXT, area='black', nesz_db=-10.0))):
+                     ('sj_ant.cphd', dict(extent=EXT, area='black', nesz_db=-20.0))):
         monkeypatch.undo()
         monkeypatch.delenv('FASTSAR_JAX_BLOCK_MB', raising=False)
         ref = fastsar.process_cphd(name, backend='jax', **kw)

@@ -1,23 +1,47 @@
 # Product options: area, plane, autofocus, weighting, SICD and SIDD
 
-`process_cphd` goes from a CPHD file to a product on disk in one call. `form_cphd` remains the formation step
-underneath it and keeps its own defaults.
+`process_cphd` goes from a CPHD file to a product on disk in one call, for a spotlight and for a moving-beam
+collection (stripmap, sliding spotlight). `form_cphd` remains the formation step underneath it and keeps its own
+defaults. A spotlight SICD is radiometrically calibrated where the file supports it
+([Radiometric calibration](#radiometric-calibration)).
 
 ```python
 import fastsar
-fastsar.process_cphd('scene_CPHD.cphd', 'scene_SICD.nitf')                    # complex image, slant plane
+fastsar.process_cphd('scene_CPHD.cphd', 'scene_SICD.nitf')                    # complex image, ground plane, unweighted
+fastsar.process_cphd('scene_CPHD.cphd', 'scene_SICD.nitf', plane='slant')     # complex image, slant plane
 fastsar.process_cphd('scene_CPHD.cphd', 'scene_SIDD.nitf', product='sidd')    # detected image, ground plane
 out = fastsar.process_cphd('scene_CPHD.cphd', product='sidd', area='black', remap='density')   # nothing written
 ```
 
+> **The default SICD is a ground-plane SICD.**
+>
+> FastSAR forms every image on the ground plane, and unless asked otherwise `process_cphd` writes that image.
+> The file says so: `Grid.Type` is `PLANE` and `Grid.ImagePlane` is `GROUND`. Rows run along ground range away
+> from the radar, and columns run so that the array is the view from above.
+>
+> This is less common than the alternative. Most producers deliver slant-plane SICDs (`ImagePlane` `SLANT`), and
+> `plane='slant'` gives one for a spotlight collection.
+>
+> A reader that projects pixels through the metadata (the SICD projection model, as sarpy and sarkit implement it)
+> handles both planes. Check any tool that assumes a slant plane without reading `Grid.ImagePlane`
+> ([the list is below](#the-ground-plane-sicd-the-default)).
+>
+> Ground is the default because it is the plane of formation. Backprojection onto the ground plane is exact for any
+> track, and the ground-plane product is the image as formed, where the slant-plane product is that image
+> resampled once more ([the measured comparison](#forming-on-the-ground-or-on-the-slant-plane-and-projecting)).
+
 The options and their defaults:
 
 - `product`: `'sicd'` (complex image, the default) or `'sidd'` (detected, remapped 8-bit image).
-- `area`: `'tasked'` (default), `'tasked_quality'`, an RNIIRS value, or `'black'`.
-- `plane`: `'slant'` or `'ground'`. The default is the slant plane for a SICD and the ground plane for a SIDD.
-- `autofocus`: `'quadratic'` (default), `'pga'`, `'spatially_variant'`, `'spatially_variant_pga'` or `False`.
-- `weighting`: `'taylor'`, `'uniform'` or `'sva'`. The default is Taylor for a SICD and spatially variant
-  apodization for a SIDD (Taylor for both on a moving beam).
+- `area`: `'tasked'` (default), `'tasked_quality'`, an RNIIRS value, or `'black'` (out to where terrain of
+  `black_sigma0_db`, -10 dB by default, sinks into the noise and the ambiguities).
+- `plane`: `'ground'` (the default) or `'slant'` (a spotlight SICD only). One SICD is on the slant plane without
+  being asked: the apodized one of a spotlight (`weighting='sva'`), because its apodization runs there.
+- `autofocus`: `'quadratic'` (default), `'pga'`, `'spatially_variant'`, `'spatially_variant_pga'` or `False`. A
+  moving beam takes `'quadratic'` and `'spatially_variant'`.
+- `weighting`: `'uniform'`, `'taylor'` or `'sva'`. The default is no weighting (`'uniform'`) for a SICD, so that
+  whoever uses the complex image can still choose an apodization, and spatially variant apodization (`'sva'`) for
+  a SIDD, for a spotlight and for a moving beam alike.
 - `remap`: for a SIDD, one of the remaps of the NGA MATLAB SAR Toolbox (`'nrl'` by default).
 - `spacing`: the product's pixel spacing. The default follows the bandwidth of the data: 0.96 of the reciprocal
   of the band for a complex product, half of it with `'sva'`, and 0.7 of the finer ground resolution for a SIDD
@@ -26,23 +50,44 @@ The options and their defaults:
 - `extent`: the sides of the tasked area in meters about the scene center, for a collection that states no image
   area or in place of the one it states.
 - `dem`, `geoid`: a DEM, with which the defocus of terrain off the image plane is removed before the autofocus
-  ([terrain-informed focusing](#terrain-informed-focusing)). The default is none.
+  ([terrain-informed focusing](#terrain-informed-focusing)), for a spotlight on either plane. The default is none.
 
-Some combinations are refused with a `ValueError` before the image is formed: a SIDD on the slant plane, a
-ground-plane SICD with `'sva'` (apodization runs on the slant plane), and a `spacing` with `'sva'` for a SICD
-(apodization fixes the spacing at twice Nyquist). Without an `output` nothing is written, and the image of a SIDD
-product is returned as the detected amplitude; `sidd.to_display(out, out['remap'])` gives its display values.
+The defaults by product:
+
+| `product` | `plane` | `weighting` | `autofocus` | `area` | `remap` |
+|---|---|---|---|---|---|
+| `'sicd'` | `'ground'` | `'uniform'` | `'quadratic'` | `'tasked'` | |
+| `'sidd'` | `'ground'` | `'sva'` | `'quadratic'` | `'tasked'` | `'nrl'` |
+
+These hold for a spotlight and for a moving-beam collection. FastSAR 0.2.0 wrote a slant-plane SICD with Taylor
+weighting by default; `process_cphd(cphd, output, plane='slant', weighting='taylor')` is that product.
+
+A spotlight SICD with `weighting='sva'` and no `plane` comes out on the slant plane, with a note in the product
+that says so. Some combinations are refused with a `ValueError` before the image is formed: a SIDD on the slant
+plane, a spotlight SICD with `'sva'` and an explicit `plane='ground'` (apodization runs on the slant plane), and a
+`spacing` with `'sva'` for a SICD (apodization fixes the spacing at twice Nyquist). Without an `output`
+nothing is written, and the image of a spotlight SIDD product is returned as the detected amplitude;
+`sidd.to_display(out, out['remap'])` gives its display values.
 
 A moving-beam collection (stripmap, sliding spotlight) is formed on the ground plane on axes along the track.
 The weightings, autofocus and the quality areas apply to it in the forms that
-[Moving-beam collections](#moving-beam-collections) describes; the slant plane is for spotlight collections, and
-`plane='slant'` on a moving beam raises a `ValueError`.
+[Moving-beam collections](#moving-beam-collections) describes, with the defaults of the table. Three things
+differ from a spotlight:
+
+- The slant plane is for spotlight collections: `plane='slant'` on a moving beam raises a `ValueError`. Its
+  apodized products are on the ground grid, the SICD included.
+- Apodization needs a spectrum that is a rectangle on the grid's axes, which a squint or a wide swath can rule
+  out. Where it is ruled out and `weighting` was not given, the SIDD is Taylor weighted and a note in the product
+  says why; `weighting='sva'` given by name raises a `ValueError` with the same reason.
+- Terrain-informed focusing (`dem`) and the `Radiometric` block are a spotlight's: a `dem` raises a `ValueError`,
+  and the SICD carries no block, with a note.
 
 ## Speed
 
 The stages after formation take the image as a NumPy, CuPy or JAX array and run where it lives, so a GPU or TPU
-run keeps the image on the device from formation until the file is written. Seconds for the default products of
-two collections, from the CPHD file on disk (in the page cache) to the product file, second run:
+run keeps the image on the device from formation until the file is written. Seconds for two products of two
+collections, the slant-plane SICD with Taylor weighting (`plane='slant', weighting='taylor'`) and the default SIDD,
+from the CPHD file on disk (in the page cache) to the product file, second run:
 
 | Collection, product | Processor | Read | Form | After formation | Write | Total |
 |---|---|---|---|---|---|---|
@@ -56,8 +101,8 @@ two collections, from the CPHD file on disk (in the page cache) to the product f
 | | 48 CPU cores | 1.16 | 35.4 | 17.8 | 3.6 | 57.9 |
 
 "After formation" is the baseband step, quadratic autofocus, the resampling to the slant plane and, for the SIDD,
-apodization, detection and the projection to the ground; the SIDD's write includes the remap. The CPHD files are
-8.7 GB (Umbra) and 9.2 GB (Capella).
+apodization, detection and the projection to the ground; the SIDD's write includes the remap. The default SICD, on
+the ground plane, has no resampling stage. The CPHD files are 8.7 GB (Umbra) and 9.2 GB (Capella).
 
 The same two products on a cloud instance, for another Capella spotlight collection (2025-01-15), second run, in
 seconds:
@@ -96,8 +141,8 @@ resampling to the slant plane includes a mask of valid ground pixels.
 Each stage compiles once per image shape: 45, 28 and 110 s for the resampling to the slant plane of the three
 sizes, 8 to 14 s for the projection to the ground, and 30 to 50 s for the autofocus estimate.
 
-The default products of a small Umbra spotlight collection (a 0.64 GB CPHD file) on the same TPU v5e, second run,
-in seconds:
+The same two products of a small Umbra spotlight collection (a 0.64 GB CPHD file) on the same TPU v5e, second
+run, in seconds:
 
 | Product | Read | Form | After formation | Write | Total |
 |---|---|---|---|---|---|
@@ -110,8 +155,8 @@ The first run of each product, which compiles, takes 103 and 84 s.
 
 FastSAR forms every spotlight image on a ground plane, where backprojection is exact for any track. A planar
 slant grid is exact only for a straight track: on an orbit, the range history of a slant-plane pixel departs from
-that of the ground point it stands for, and a long aperture defocuses. The slant-plane product is therefore the
-ground image resampled.
+that of the ground point it stands for, and a long aperture defocuses. The ground-plane product, the default, is
+the image as formed. The slant-plane product is the ground image resampled.
 
 The slant plane is the plane through the scene center point that holds the antenna's position and velocity at the
 center of aperture. A pixel at azimuth a and range r shows the ground point that has, at the center of aperture,
@@ -148,10 +193,35 @@ ignores phase altogether, is 0.56). FastSAR therefore
 forms on the ground plane always, and derives the slant-plane product from it by the range and range-rate map,
 which is exact at the center of aperture for any track.
 
-A ground-plane SICD is the image as formed, at baseband, on axes along the line of sight. Its rows run along
-ground range away from the radar whatever the squint. It is sampled for the whole extent of its spectrum along
-the line of sight, which under squint is wider than the range band alone, so that the product's spectrum does not
-wrap.
+### The ground-plane SICD (the default)
+
+A ground-plane SICD is the image as formed, at baseband, on axes along the line of sight. Its metadata state
+`Grid.Type` PLANE and `Grid.ImagePlane` GROUND, and the row and column unit vectors lie in the ground plane at the
+scene center point. Its rows run along ground range away from the radar whatever the squint, and its columns run
+so that row x column points up (the view from above, for either look side). It is sampled for the whole extent of
+its spectrum along the line of sight, which under squint is wider than the range band alone, so that the product's
+spectrum does not wrap.
+
+Most producers deliver slant-plane SICDs, so software written against their products may assume one. A consumer
+of the ground-plane product should check the following.
+
+- Projection. A reader that uses the SICD projection model with the grid's own unit vectors (sarpy's
+  `point_projection`, sarkit) needs nothing: in the tests below sarpy places each target within 0.05 pixel on
+  both planes.
+- Spacings and bandwidths. `Grid.Row.SS` is a ground range spacing and `Grid.Row.ImpRespBW` a ground-plane
+  bandwidth. A tool that takes them for slant range (c / 2B for the range resolution, or a division by the cosine
+  of the grazing angle to reach the ground) applies the slant-to-ground factor twice.
+- Pixel area. A tool that derives one radiometric quantity from another through the slant-plane area of a pixel,
+  1 / (`Row.ImpRespBW` x `Col.ImpRespBW`), has the ground-plane area here. FastSAR writes all four scale factors
+  of the `Radiometric` block itself, so none needs deriving ([Radiometric calibration](#radiometric-calibration)).
+- Spectrum. Under squint the spectrum of the ground-plane image is a parallelogram: its extent across the line of
+  sight is the azimuth band, and its position along the line of sight shifts with the azimuth frequency. A taper
+  applied along rows and along columns separately assumes a rectangle. To apodize a squinted collection after
+  the fact, take `plane='slant'`, whose spectrum is the usual one.
+- Pairs. An interferogram or a change detection against a vendor's slant-plane image needs both on one grid:
+  `plane='slant'`, or `sicd=` with the vendor's file.
+
+`plane='slant'` gives the slant-plane SICD for any of these.
 
 In `tests/test_planes.py` and `tests/test_process.py`, on a simulated collection with a 20 to 25 degree squint
 and a curved track, flown to either side, each target falls within 0.05 pixel of the position sarpy's projection
@@ -203,13 +273,25 @@ where PN is the noise power per sample, PTRef the per-sample power of a 1 m^2 ta
 G(x) the two-way antenna gain relative to that point (averaged over the aperture, with the R^-4 spreading loss), and
 x_k the first two azimuth ambiguities of x on either side, whose echoes count as noise. Points whose echo falls
 outside the receive window TOA1..TOA2 get an SNR of zero. The reference sigma0 defaults to 0 dB for a co-polarized
-channel and -6.02 dB for a cross-polarized one, as in sarpy.
+channel and -6.02 dB for a cross-polarized one, as in sarpy. Because the ambiguities are counted as noise, the
+ratio is one of signal to noise and clutter: it is at least 1 exactly where the noise-equivalent sigma zero plus
+the ambiguity level, NESZ(x) + sigma0 sum_k G(x_k) / G(x), is at most sigma0.
 
 ### Noise level
 
 The level at the scene reference point comes from the first source available (`level_source`; `notes` lists what
-was assumed). A measurement reads 512 pulses and fits the noise floor in the extended delay swath beside the scene
-when the file saves one; otherwise it takes the lowest cell of a range-Doppler power map.
+was assumed). A measurement takes up to 512 pulses and fits the noise floor in the extended delay swath beside the
+scene when the file saves one; otherwise it takes the lowest cell of a range-Doppler power map. Its cost is
+bounded: about 8 million samples are transformed at most (fewer blocks of pulses when a pulse is long, each pulse
+with its whole band; 64 pulses of an Umbra collection with 120,736 samples per pulse, which give the level of 512
+to 0.03 dB), on all cores, and `process_cphd` hands it the phase history it has already read, so the file is not
+read a second time (`Radiometry(..., history=)`). On that Umbra collection, in a fresh process held to 16 cores
+on a 48-core machine that other jobs kept at a load of about 67, the measurement took 0.2 to 0.65 s of wall time
+(0.3 to 0.75 s of CPU), the check of the antenna block 0.26 s, and the whole radiometric model 0.55 to 1.2 s (0.6
+to 1.3 s of CPU, the first call the slowest). The model of 0.2.0, which read 512 pulses from the file and had no
+such check, took 0.8 to 3.6 s (1.5 to 4.2 s of CPU) under the same conditions. A machine with no other load was
+not available. When the machine was oversubscribed several times over (a load of 100 and more) the measurement of
+0.2.0 took 52 to 181 s and the new one 0.4 to 0.9 s.
 
 1. `nesz_db` given by the caller (`'argument'`).
 2. The Radiometric block of a SICD of the same collection (`'sicd'`).
@@ -225,7 +307,27 @@ area is the connected region around the scene reference point, joined with the t
 - `'tasked'`: the tasked polygon.
 - `'tasked_quality'`: where the RNIIRS is at least the tasked one (given, from the SICD, or the model's minimum).
 - a number: where the predicted RNIIRS is at least that number.
-- `'black'`: where the SNR is at least 1, with the range swath opened to the extended window TOAE1..TOAE2.
+- `'black'`: where a scene of sigma zero `black_sigma0_db` (-10 dB by default) has an SNR of at least 1, that is,
+  where the noise-equivalent sigma zero plus the ambiguity level is at or below -10 dB. The range swath is opened
+  to the extended window TOAE1..TOAE2.
+
+The two criteria use different reference scenes, on purpose.
+
+| | Reference sigma zero | Why |
+|---|---|---|
+| RNIIRS (`'tasked_quality'`, a number) | 0 dB co-polarized, -6.02 dB cross-polarized: the RGIQE's own, sarpy's convention | An RNIIRS is a rating against a fixed scene. With the RGIQE's reference, a value computed here is the one sarpy's `PREDICTED_RNIIRS` states for the same image, and a tasked RNIIRS read from a vendor's SICD means the same thing in the model. |
+| `'black'` | `black_sigma0_db`, -10 dB by default | The black edge is a statement about the ground: where terrain of an ordinary brightness is no longer above the noise and the ambiguities. A 0 dB scene is brighter than most terrain, so its SNR of 1 lies well past the last pixels that show anything. |
+
+With the default the black area ends where the SNR of the RGIQE's reference scene is about 10 dB, not 0 dB. It
+keeps most of what the wider area shows, at less area to form, less time and a smaller file
+(the [measurements](#the-black-area-at--10-db) are below). `black_sigma0_db=0.0` gives the area out to an SNR of 1
+of a 0 dB scene, which was the black area of 0.2.0 for a co-polarized channel.
+
+How the areas nest: every area contains the tasked one; a lower RNIIRS threshold gives a larger area; a lower
+`black_sigma0_db` gives a larger black area. `'black'` contains the area of every RNIIRS threshold that needs an
+SNR of at least 10 dB of the reference scene (the 10 dB between the two references; 4 dB for a cross-polarized
+channel). A threshold that needs less, such as a low RNIIRS at a large bandwidth area or a tasked quality that is
+met at a low SNR, gives an area that reaches beyond `'black'` across the beam.
 
 ### Example
 
@@ -249,15 +351,305 @@ lo1, hi1, lo2, hi2 = rgiqe.area_bounds(rad, 'black', c, e1, e2, bw_area, samples
 - Gain polynomials are trusted to 15 dB one-way below their peak; beyond that no area criterion is met.
 - An `'uncalibrated'` level rests on the assumed scene sigma0; a range-Doppler noise level is an upper bound.
 - Ambiguities assume a uniform scene and are placed with the mid-aperture geometry; range ambiguities are ignored.
-- A low RNIIRS threshold at a large bandwidth area needs an SNR below 1, and its area can exceed `'black'`.
+- An RNIIRS threshold that needs an SNR of the reference scene below 10 dB gives an area that exceeds `'black'`
+  at its default of -10 dB.
+- The pattern's pointing is checked against the data to about 0.2 half-power radii of the two-way beam at best,
+  and passes within 0.4. A collection whose footprint fits neither the file's pointing nor the scene reference
+  point within that tolerance has no trusted pattern: its SICD carries constant calibration factors, and no
+  quality area beyond the tasked one is processed (`area` other than `'tasked'` raises a `ValueError`). Two of
+  seven Umbra collections are such, halfway between the two pointings.
 
-`process_cphd(..., area=)` takes the same four kinds. The image is formed over the bounding rectangle of the area
-on the ground axes, with one impulse response everywhere and a noise-equivalent sigma zero that rises toward the
-edges, and the pixels outside the area are set to 0. For a file that describes no antenna pattern the model cannot
-predict where the signal fades, and an `area` other than `'tasked'` raises a `ValueError`. The model's beam is
-the one the file's antenna block states; where a producer's stated boresight differs from the true beam, the
-area is displaced with it. On a moving beam the areas extend in ground range only
-([below](#areas-in-ground-range)).
+`process_cphd(..., area=, black_sigma0_db=-10.0)` takes the same four kinds. The image is formed over the bounding
+rectangle of the area on the ground axes, with one impulse response everywhere and a noise-equivalent sigma zero
+that rises toward the edges, and the pixels outside the area are set to 0. For a file that describes no antenna
+pattern the model cannot predict where the signal fades, and an `area` other than `'tasked'` raises a
+`ValueError`. The model's beam has the pattern the file's antenna block states and the pointing the data decide
+([below](#the-antenna-patterns-pointing)); where no pointing agrees with the data, an `area` other than
+`'tasked'` raises a `ValueError` that says so. On a moving beam the areas extend in ground range only, by the
+same criteria and the same check of the pointing ([below](#areas-in-ground-range)).
+
+### The antenna pattern's pointing
+
+The areas and the calibration both rest on the two-way gain over the ground, so `Radiometry` checks the antenna
+block against the data before it uses it, and the data decide how the pattern is pointed (`rad.pointing`, with
+the numbers in `rad.footprint` and a sentence in `rad.notes`).
+
+The measurement is the beam's footprint in the phase history: the range-Doppler power map of the pulses the noise
+measurement uses (64 to 512 of them, from the history `process_cphd` has read). Each cell of delay and Doppler is
+a patch of ground, and the model's map is the two-way gain over a ground lattice binned into the same cells, with
+the azimuth ambiguities folded in and a fitted noise floor. The fit moves the modeled beam to where the two maps
+(their logarithms) correlate best. A pointing passes when the fitted beam center lies within 0.4 of a half-power
+radius of the two-way beam from the modeled one. That is 2 to 3 dB of gain at the half-power radius, and twice
+the 0.2 radii by which scene content alone moves the fitted center
+([how the tolerance was set](#the-pointing-and-the-width-against-the-images)).
+
+1. `'file'`: the antenna frames as the file states them, when they pass.
+2. `'reference point'`: when they fail, the same pattern (its shape, its orientation about the boresight and any
+   electrical boresight terms) with each pulse's boresight turned onto that pulse's scene reference point, which is
+   where a spotlight or a moving beam is steered. If that passes it is used, and the note gives both offsets.
+3. `None`: neither passes, and the model has no trusted pattern. The areas other than `'tasked'` are refused and
+   the SICD's scale factors are written as constants.
+
+Where the check cannot be made the file's pointing is kept, and the note says that it is unverified and why: a
+scene of a few point scatterers shows no footprint, and neither does one whose clutter is under the noise in the
+range-Doppler map.
+
+A moving beam (stripmap, sliding spotlight) is checked the same way, with two differences that follow from its
+geometry. Each pulse has its own scene reference point, the echoes are referred to it, and the footprint moves
+over the ground with the pulses, so the model takes the antenna's position and frame at the pulses of the
+measured block and looks at the ground around their reference point; with the frame of another part of the
+aperture the modeled footprint is displaced by the distance flown in between. And the check is made once, on the
+pulses that form the middle of the strip, and serves every position along the track
+([Areas in ground range](#areas-in-ground-range)). The second pointing, each boresight on its pulse's reference
+point, is the natural one for a beam that is steered there.
+
+The blocks of pulses of one measurement are added into one map in the echoes' own coordinates, delay and Doppler
+about each pulse's reference point. The footprint of a stripmap stays in place there. That of a beam steered
+along the track does not: where the beam center turns, as seen from the platform, by more than 0.2 half-power
+radii between the first block and the last (a sliding spotlight, a squint that drifts), the blocks show no one
+footprint, the check is not made, and the file's pointing is used with the note that it is unverified.
+
+On a simulated stripmap with clutter under the beam its file states (`tests/test_moving.py`) the fitted center
+lies 0.06 radii from the modeled one. With the frame of the middle pulse of the stretch, as for a beam held on
+one point, it lies 1.00 radii away, the 35 m flown between that pulse and the measured block. With the file's
+frames turned 1.2 radii across the track the file's pointing reads 1.19 radii and the reference points 0.06,
+and the areas are those of the frames as simulated. On a Capella stripmap (2024-11-27; the 15,944 pulses of
+the middle of the strip) the file's frames pass with the fitted center on the modeled one to the search's step
+of a sixteenth of a radius, at a correlation of 0.85 (the frame of the stretch's middle pulse would put it 1.8
+km away, 0.69 radii); the footprint is 1.40 and 0.97 times as wide as the modeled two-way beam along the
+antenna's X and Y axes. On a Capella sliding spotlight (2024-08-29) the beam center turns by 17 radii over the
+pulses of a pixel, and the check is not made.
+
+Seven Umbra spotlight collections (2024-05 to 2025-01, satellites 05 to 08) and two Capella ones, by this rule:
+
+| Collection | As the file points it | On the reference point | Pointing used |
+|---|---|---|---|
+| Umbra-07, 2024-09-10 | 2.00 km, 1.00 radii | 0.51 km, 0.26 | reference point |
+| UMBRA-06, 2024-05-28 | 1.62 km, 0.83 | 0.37 km, 0.19 | reference point |
+| UMBRA-06, 2024-07-14 | 1.24 km, 0.65 | 0.40 km, 0.21 | reference point |
+| UMBRA-06, 2024-07-28 | 1.31 km, 0.70 | 0.22 km, 0.12 | reference point |
+| UMBRA-06, 2024-10-26 | 1.08 km, 0.71 | 0.47 km, 0.31 | reference point |
+| UMBRA-08, 2024-11-12 | 0.97 km, 0.49 | 1.09 km, 0.55 | none |
+| UMBRA-05, 2025-01-19 | 0.82 km, 0.44 | 0.87 km, 0.47 | none |
+| Capella, 2025-03-13 | 1.22 km, 0.46 | 0.61 km, 0.23 | reference point |
+| Capella, 2025-01-19 | no fit | | file, unverified |
+
+The offsets are those of the fitted beam center from the modeled one, in kilometers on the ground and in
+half-power radii. In all seven Umbra files the per-vector frames (`TxACX`, `TxACY` and the same for receive, with
+ACY along the velocity; `TxEB` and `RcvEB` zero; pattern arrays that peak within 2e-4 of their origin, 1e-3 along
+X for UMBRA-05) put the boresight 0.15 to 0.18 degrees ahead of the scene reference point along the track, 1.4 to
+1.6 km on the ground, and the data put the beam 0.8 to 2.0 km from there, toward the reference point in every
+one. Five fail as the file points them and pass on the reference point. Two lie about halfway between the two
+pointings and pass neither: their SICDs carry constant scale factors, and their quality areas are refused. The
+first Capella collection fails as its file points it, by a small margin, and passes on the reference point; it
+states no `PTRef`, so only its quality areas depend on the choice. The second Capella collection gives no fit: at
+a range of 931 km its clutter stands 1.9 dB above the noise in the map.
+
+One observation on the Umbra frames, which is not used as a rule: the stated offset is the rotation of the line
+of sight over 0.19 to 0.21 s in each of the seven files. With the frames taken 0.20 s later than stamped the
+boresight falls on the reference point in all seven (to 2e-4 along ACY), and the fitted offsets are 0.12 to 0.48
+radii, against 0.44 to 1.00 as stamped and 0.12 to 0.55 on the reference point. The delay that fits each file
+best scatters from 0.10 to 0.27 s (mean 0.17 s, standard deviation 0.06 s, which is the fit's noise), so the
+footprints agree with one common delay near 0.2 s and cannot tell it from a boresight on the reference point.
+
+### The beam's width
+
+The same map gives the beam's width. With the modeled beam at its fitted center, the model is widened along the
+antenna's X and Y axes until it fits the map best (least squares of the logarithms, over the noise floor of the
+measurement, with one scale), and `rad.footprint['width']` holds the two factors: the measured footprint's width
+over that of the modeled two-way beam. It is a record for the reader and changes nothing in the model. It is
+`None` where the clutter stands less than 6 dB over the noise floor in the map. On simulated clutter the factors
+come back within 0.15 of 1 under the stated beam, and 1.40 to 1.42 times larger where the file states a pattern
+of twice the roll-off in dB, for which 1.41 is expected (`tests/test_calibration.py`).
+
+The width answers one question about a file directly: whether its `AntPattern` is the one-way gain the standard
+asks for, applied once on transmit and once on receive. A two-way pattern stored as one-way, or a model that
+applied a pattern twice where the antenna applies it once, would make the measured footprint 1.41 times as wide
+as the modeled one. In the seven Umbra files the transmit and the receive pattern are two entries with the same
+content: the same `GainZero` (46.0 to 49.3 dB), the same gain array in dB whose peak is `GainZero` and whose
+half-power width is 0.51 to 0.58 degrees, and the same per-vector frames. The two Capella files name one pattern
+for both. The model evaluates the transmit and the receive pattern once each, adds their dB, and refers the sum
+to the gain toward the scene reference point, so the absolute level of the arrays drops out.
+
+| Collection | Across track | Along track | From 1,024 pulses |
+|---|---|---|---|
+| Umbra-07, 2024-09-10 | 1.050 | 1.025 | 1.06, 1.03 |
+| UMBRA-06, 2024-05-28 | 1.075 | 1.050 | 1.06, 1.04 |
+| UMBRA-06, 2024-07-14 | 1.125 | 1.025 | 1.12, 1.04 |
+| UMBRA-06, 2024-07-28 | 1.100 | 1.050 | 1.11, 1.04 |
+| UMBRA-06, 2024-10-26 | 1.150 | 1.075 | 1.15, 1.06 |
+| UMBRA-08, 2024-11-12 | 0.950 | 1.000 | 0.96, 1.01 |
+| UMBRA-05, 2025-01-19 | 1.050 | 1.150 | 1.06, 1.16 |
+| Capella, 2025-03-13 | not measured | | 1.29, 1.01 |
+
+The first two columns are `rad.footprint['width']` from the 64 or 128 pulses of the noise measurement (X is
+across the track in these files and Y along it); the last is the same fit on 1,024 pulses with both widths
+searched together. Over the seven Umbra collections the footprint is 1.07 times as wide as the modeled two-way
+beam across the track (standard deviation 0.07) and 1.05 times along it (0.05): the pattern is applied as it
+should be, once each way, and the beam is a few percent wider than the stored arrays, whose own polynomial
+(`GainPoly`) is 5 to 10% wider along X than the array beside it. The Capella collection's clutter stands 4.7 dB over the
+floor; from 1,024 pulses its width across the track is 1.29 with an interval of 1.02 to 1.90, and 1.01 along it
+(0.92 to 1.12).
+
+### The pointing and the width against the images
+
+A second measurement of the same beam, which does not use the range-Doppler map, set the tolerance. For each of
+the seven Umbra collections the default ground-plane SICD was formed, and its brightness (the noise level taken
+out, cells of 200 m, the half of the cells with the least texture) was fitted with the file's two-way pattern
+placed at a free center, with the azimuth ambiguities of each cell added.
+
+- The center that fits the image lies 0.02 to 0.35 radii from the reference point and 0.61 to 0.97 radii from the
+  file's boresight, in all seven. It lies 0.04 to 0.33 radii (0.18 on average) from the center the range-Doppler
+  map gives, which is the scatter of either estimate.
+- For the five collections that pass on the reference point, the brightness of the low-texture ground follows the
+  modeled gain there with a slope of +0.70 to +0.80 dB per dB (1 for uniform ground under a perfect model; the
+  ambiguities, the few percent of width and the residual pointing take the rest). Over all cells, towns
+  included, the slope is +0.51 to +0.67: texture attenuates it. The width that fits these images best is 1.15
+  to 1.30 across the track and 1.05 to 1.15 along it, from cells that reach 1.3 radii from the center.
+- For the two collections that lie halfway, the gain as the file points it gives slopes of +0.45 and +0.31 over
+  a modeled span of 22 dB, and the gain on the reference point +1.05 and +0.54. A tolerance of half a radius
+  accepted the file's pointing for these two (0.49 and 0.44 radii) and wrote polynomials spanning 23 dB over
+  images whose brightness follows a third to a half of that. At 0.4 neither pointing passes.
+
+On the first collection the quality areas change with the pointing as follows (across by along the line of
+sight, and the pixels of the SIDD):
+
+| Area | As the file points it | On the reference point |
+|---|---|---|
+| `'tasked_quality'` | 7.65 x 6.75 km, 51.6 km^2, 192 Mpx (RNIIRS 3.72) | 5.95 x 6.70 km, 39.9 km^2, 148 Mpx (RNIIRS 4.28) |
+| `'black'` | 7.90 x 9.45 km, 74.7 km^2, 285 Mpx | 7.75 x 9.05 km, 70.1 km^2, 267 Mpx |
+
+The RNIIRS is the least over the tasked area, which is the threshold of `'tasked_quality'`: with the file's
+pointing the modeled gain fell 19.6 dB within the tasked area, on the reference point 9.9 dB. The black area is
+now centered on the reference point (-3.8 to +3.95 km across, -4.4 to +4.65 km along) where it reached from -4.7
+to +3.2 km and from -3.3 to +6.15 km.
+
+### The black area at -10 dB
+
+Two spotlight collections with tasked areas of 5 by 5 km, at a reference of 0 dB, which was that of 0.2.0, and at
+the default, with the pattern pointed as the data decide (both on the reference point; with the files' pointing,
+as in 0.2.0, the areas at 0 dB were 8.30 x 11.35 km and 11.85 x 7.95 km). Sizes are across by along the line of sight,
+and the pixels are those of the SIDD that `process_cphd(product='sidd', area='black')` plans:
+
+| Collection | `black_sigma0_db=0.0` | `black_sigma0_db=-10.0` (default) |
+|---|---|---|
+| Umbra, 2024-09-10 | 8.15 x 11.10 km, 90.5 km^2, 348 Mpx | 7.75 x 9.05 km, 70.1 km^2, 267 Mpx |
+| Capella, 2025-03-13 | 11.80 x 7.95 km, 93.8 km^2, 1,634 Mpx | 6.00 x 7.90 km, 47.4 km^2, 816 Mpx |
+
+The Umbra area shrinks along the line of sight and hardly across it. Across the beam its edge is where the azimuth
+ambiguities reach the signal, and their level follows the scene's own sigma zero, so that edge does not move with
+the reference. The Capella collection has a noise-equivalent sigma zero of -13.8 dB at the scene center (an
+uncalibrated level, from the measured clutter-to-noise ratio), and its area halves.
+
+## Radiometric calibration
+
+A spotlight SICD from `process_cphd` carries the SICD `Radiometric` block when the CPHD file supports it, and only
+then. The product's `notes` say which source was used or why there is no block, and `out['radiometric']` holds
+what was written (`None` without a block).
+
+| The CPHD file states | The SICD carries |
+|---|---|
+| `PTRef` and `PNRef` | `NoiseLevel` and the four scale factor polynomials: a calibrated signal and a calibrated noise level |
+| `PTRef` only (Umbra) | the same, with the noise level measured from the phase history: a calibrated signal and a measured noise level, and the note says so |
+| no `PTRef` (Capella) | no `Radiometric` block |
+
+No block is ever written from an assumed scene brightness. Two kinds of product have none whatever the file
+states: one with `weighting='sva'`, because apodization is not linear in the scene (the peak of an isolated point
+survives it, the clutter and noise levels do not, and a reader such as sarpy derives the missing factors from any
+one that is present), and one of a moving-beam collection, which the model does not cover.
+
+**What is written.** `NoiseLevel` has the type ABSOLUTE and a constant `NoisePoly`, the thermal noise power of a
+pixel in dB. `RCSSFPoly`, `SigmaZeroSFPoly`, `BetaZeroSFPoly` and `GammaZeroSFPoly` are polynomials in SICD's image
+coordinates (meters from the scene center point along rows and along columns) whose values, multiplied by pixel
+power, give RCS in m^2, sigma zero, beta zero and gamma zero.
+
+**Where the numbers come from.** FastSAR's formers sum the weighted phase history without normalization. Let
+PTRef be the per-sample power of a 1 m^2 point at the scene reference point, PN the noise power per sample
+(`PNRef / BNRef`, or the measurement), w the aperture weights of the N samples the image uses, rho the density of
+those samples in the ground plane's spatial frequencies (N / A when they are spread evenly over a support of area
+A, `rgiqe.support_area`) and G(x) the two-way antenna gain at the ground point x relative to the reference point,
+with the spreading loss (`Radiometry.gain_db`). Then
+
+```
+peak power of a point of 1 m^2             (sum w)^2 PTRef G(x)
+mean power of clutter of sigma zero 1      sum(w^2 rho) PTRef G(x)
+mean power of thermal noise                sum(w^2) PN
+
+RCSSF(x)       = 1 / ((sum w)^2 PTRef G(x))
+SigmaZeroSF(x) = 1 / (sum(w^2 rho) PTRef G(x))
+BetaZeroSF(x)  = SigmaZeroSF(x) / cos(SlopeAng)
+GammaZeroSF(x) = SigmaZeroSF(x) / sin(GrazeAng)
+NoisePoly      = 10 log10(sum(w^2) PN)
+```
+
+For `'uniform'` the sums over w are N; for `'taylor'` they are those of the two Taylor windows, and RCSSF /
+SigmaZeroSF is about 1.52 times its unweighted value. The density is taken sample by sample
+(`rgiqe.clutter_gain`): the pulses of a squinted or curved track are not evenly spaced in angle, which moves the
+clutter sum by up to 0.1 dB under a Taylor window. The noise-equivalent sigma zero, the noise power times
+SigmaZeroSF, is PN A / (N PTRef G(x)) for samples spread evenly, whatever the weighting. The baseband step,
+autofocus, terrain-informed focusing and the resampling to the slant plane do not change the scale, and the
+factors belong to the ground point: a ground-plane and a slant-plane SICD of one collection state the same values
+at the same place, each in its own coordinates. A product focused with a `dem` carries the block of the product
+without one, coefficient for coefficient ([below](#terrain-informed-focusing)).
+
+The image is not corrected for the antenna pattern (`ImageBeamComp` NO), so the factors rise toward the edges as
+1 / G(x). Each polynomial is a constant times one fit of 1 / G(x) over the image by least squares in the relative
+error, of the lowest order (the same in both coordinates, at most 8) that stays within 0.1 dB of the model on a
+lattice finer than the one fitted. The note states the order and the residual. Order 8 follows a gain that falls
+by about 30 dB over the image; where an area asked for reaches further down the beam, the residual stated is
+larger than 0.1 dB. A file with `PTRef` and no antenna pattern gets constant factors.
+
+**The pattern's pointing is the one the data decide.** The variation of the factors over the image is only as
+good as the modeled gain, so the factors follow the pattern as `Radiometry` has pointed it
+([the rule](#the-antenna-patterns-pointing)): as the file states it where that agrees with the beam's footprint in
+the phase history, with each boresight on its scene reference point where the file's pointing fails and that one
+passes, and not at all where neither does. In the last case the scale factors are written as constants, their
+values at the scene reference point, as the vendors' own SICDs carry them (`out['radiometric']['constant']`).
+The note in the product says which pointing was used and gives the offsets.
+
+**For a consumer.** All four factors are written, so none needs deriving. SICD's relations between sigma zero,
+beta zero and gamma zero hold exactly, with the angles of the scene center point. The relation between RCS and
+beta zero through the area of a resolution cell, which sarpy computes as 1 / (`Row.ImpRespBW` x `Col.ImpRespBW`)
+and takes for a slant-plane area, does not carry over to a ground-plane SICD: those are ground-plane bandwidths
+there, and the bounding rectangle of a support that squint shears. Read the polynomial of the quantity wanted.
+
+**Measured.** In `tests/test_calibration.py` a simulated collection flown both ways, with an antenna beam that
+peaks off the scene center and with PTRef and PNRef in its file, is processed on both planes with both weightings,
+and the polynomials of each written file are read and evaluated by sarpy. Point targets of 0.5 to 8 m^2 come back
+within 0.07 dB of their RCS, clutter of -13 dB within 0.02 dB of its sigma zero (beta zero and gamma zero
+likewise), and the noise power within 0.02 dB of `NoisePoly`. The fits are of order 5 or 6 and follow 10 to 11 dB
+of gain to 0.03 to 0.08 dB. A unit point target and unit-variance noise through the formers give the sum of the
+weights to within 0.07 dB and the sum of their squares to 0.03 dB on both planes, with autofocus on and off: the
+formers' own accuracy, with no normalization to correct for. sarkit's consistency check passes with the block
+present, also beside the terrain step of a product focused with a DEM (`tests/test_sicd_consistency.py`).
+
+Against the vendor's SICD of one Umbra spotlight collection (2024-09-10; PTRef, no PNRef), over the same ground
+through each file's own projection and its own block. The vendor's factors are constant over its image (to
+0.06 dB). FastSAR's follow the file's pattern with the boresights on the scene reference point, which the data
+chose over the file's pointing (0.26 against 1.00 half-power radii); the gain falls 9.9 dB over the tasked
+rectangle and the fit is of order 6, to 0.03 dB.
+
+- At the scene center the two agree: over the central 500 m FastSAR's sigma zero is 0.4 dB above the vendor's
+  (-8.4 against -8.8 dB).
+- Over 64 boxes of 500 m within 2 km of the center FastSAR less vendor is +1.95 dB on average, with a standard
+  deviation of 1.18 dB and a range of +0.05 to +4.82 dB (slant-plane product: +1.94, 1.22, +0.03 to +4.72). The
+  difference is the modeled gain, which the vendor's constant factors leave in the image. The footprint in the
+  phase history has the width of the modeled two-way beam (1.05 and 1.03), and over ground of low texture the
+  image darkens by 0.78 dB per dB of the modeled gain
+  ([above](#the-pointing-and-the-width-against-the-images)); over all cells, with the town at the scene center,
+  the slope is +0.54. The residual pointing (0.26 radii) leaves the factors uncertain by about 1.5 dB at the half-power
+  radius.
+- With constant factors (`rgiqe.calibration(..., constant=True)`) the same boxes differ by +0.06 dB on average
+  (standard deviation 0.26 dB, range -0.85 to +1.00). With the file's pointing they differed by -1.5 to +9.9 dB.
+- Noise. The vendor's `NoisePoly` times its sigma zero factor is -71.5 dB, and its `theoretical_nesz_db`
+  parameter states -30.8 dB. FastSAR's noise level, measured from the phase history, gives a noise-equivalent
+  sigma zero of -24.8 dB at the scene center point. The darkest 100 m cells of the image lie at -18 dB by the
+  vendor's block, an upper bound.
+
+A Capella spotlight collection (2025-03-13) states neither PTRef nor PNRef, so its FastSAR SICD has no
+`Radiometric` block, the note says why, and the step costs nothing. The vendor's SICD of that collection states a
+sigma zero factor of -67.8 dB and a noise level of 49.4 dB at its scene center point, a noise-equivalent sigma
+zero of -18.4 dB, from calibration data that the CPHD file does not carry.
 
 ## Autofocus on the image
 
@@ -356,6 +748,10 @@ out = fastsar.process_cphd('scene_CPHD.cphd', 'scene_SICD.nitf',
 out['terrain']                     # applied, quadratic_rad, height, offset, relief, layover, block, order, ...
 ```
 
+That call writes the default product, a ground-plane SICD. The correction is made on the ground image as formed,
+after the baseband step and before the autofocus and any resampling, so `plane='slant'` and `product='sidd'` take
+the same corrected image through their own stages. It is for spotlight collections.
+
 **What it corrects.** The fast formers focus on a horizontal plane at the scene height. A scatterer at height
 `h` above the plane appears at the plane point that has its range and range rate at the center of aperture
 (layover, which `products.geolocate` and `geocode_image` undo when given a height). On a curved track it is
@@ -435,8 +831,16 @@ points = terrain.surface_points(out, dem, i, j)                          # [512,
 col, meta = io.read_cphd('scene_CPHD.cphd', meta=True)
 p0, p1 = out['pulses']                                                   # the pulses the image used
 chip = fastsar.backproject(col['S'][p0:p1], col['ant'][p0:p1], col['fmin'], col['df'], points,
-                           backend='cuda')
+                           ref=meta['ref'][p0:p1], backend='cuda')
 ```
+
+`ref` is the range each pulse's samples are referenced to, as the file has it (`meta['ref']`). Without it
+`backproject` takes the distance from the antenna to the frame's origin, which is not the reference of every
+collection: the samples of a Capella collection are referenced to the mean of the two legs of the path from the
+transmit to the receive position, 0.14 mm longer, and leaving the argument out puts 0.055 rad on such an image.
+In `tests/test_terrain.py` the route as written here gives the chip of an independent exact reference to -60 dB
+of its peak, on a collection referenced to the antenna's distance and on one referenced 0.14 mm beyond it, where
+the call without `ref` is off by the 0.055 rad.
 
 **Simulated** (`tests/test_terrain.py`). A squinted spotlight at 10 km on a curved track with a jerk, flown to
 either side, with point targets 30, 100 and 300 m above and below the plane: phases of 12, 40 and 120 rad at
@@ -448,6 +852,14 @@ within 0.13 dB, 0.98 of its peak, and lie within 0.04 pixel of their layover poi
 from exact backprojection at their true height by -19 to -26 dB of the peak, from -1 to -4 dB uncorrected. At
 100 m the widths are within 4 to 8% and the peak 0.89 to 0.94, at 300 m within 37 to 50% and 0.65 to 0.71. What
 remains there is the range walk of the limitations below, which is most of a range cell at 300 m.
+
+The same collection written with `PTRef`, `PNRef` and an antenna beam, as the default ground-plane SICD and as
+the slant-plane one: the SICD carries the terrain step and the `Radiometric` block together, the block is that of
+the product without a DEM, coefficient for coefficient, and the energy of the image is unchanged (the correction
+is a phase over the azimuth spectrum). Through the written `RCSSFPoly` the target on the plane reads +0.03 dB
+(+0.06 on the slant plane) of its RCS, and the target 30 m above it reads -5.9 dB in the plane's image and -0.1
+dB once focused with the DEM. A raised target is seen with the beam's gain at its true position and scaled by
+the factor at the plane point it lays over onto, which the comparison takes out.
 
 **Measured on Kilauea.** Two Capella spotlights of the caldera, formed with the default square-resolution
 aperture: one broadside at 931 km (2.9 degrees of aperture, -1.65 rad per 100 m of height, a 17,489 by 17,093
@@ -537,13 +949,21 @@ its options to that image with `fastsar.moving`. What applies to which mode:
 
 | Option | Spotlight | Stripmap, sliding spotlight |
 |---|---|---|
-| `plane` | slant or ground | ground (`'slant'` is refused) |
-| `weighting='taylor'`, `'uniform'` | on the phase history | frequency window on the phase history, azimuth window per pixel over its processed band |
+| `plane` | ground (the default) or slant | ground (`'slant'` is refused) |
+| `weighting='uniform'`, `'taylor'` | on the phase history | frequency window on the phase history, azimuth window per pixel over its processed band |
 | `weighting='sva'` | on the slant plane | on the ground grid, where the spectrum is a rectangle on its axes (see the limits below) |
 | `autofocus='quadratic'` | one error for the image | blocks along the track, tied together by a smooth fit |
 | `autofocus='spatially_variant'` | blocks and a polynomial over the scene | the same blocks along the track, with a parabola across the swath |
 | `autofocus='pga'`, `'spatially_variant_pga'` | yes | refused: one phase function per aperture, and every block has its own |
 | `area` other than `'tasked'` | in both directions | in ground range; the tasked extent along the track |
+| `dem` | terrain-informed focusing | refused |
+| `Radiometric` block of the SICD | where the file states `PTRef` | none, with a note |
+
+The defaults are the same for both: an unweighted SICD and an apodized SIDD, on the ground plane, with quadratic
+autofocus and the tasked area. One rule is the moving beam's own. Where apodization cannot be applied to a
+collection (the limits are [below](#weighting)) and `weighting` was not given, the SIDD is Taylor weighted
+instead, and a note in the product, which begins with `weighting:`, gives the reason; `weighting='sva'` given by
+name raises a `ValueError` with that reason. `out['weighting']` states the weighting the image has.
 
 ### The spectrum of the image and baseband
 
@@ -590,11 +1010,12 @@ band across the swath.
 
 ### Weighting
 
-`'taylor'` is the Taylor window (nbar 4, 35 dB) along frequency and, at each pixel, over its processed azimuth
-band, zero outside it: what Taylor weighting means for a spotlight, applied to the pulses a pixel takes.
+`'uniform'`, the default of a SICD, is a rectangle over each pixel's processed azimuth band and no frequency
+window. `'taylor'` is the Taylor window (nbar 4, 35 dB) along frequency and, at each pixel, over its processed
+azimuth band, zero outside it: what Taylor weighting means for a spotlight, applied to the pulses a pixel takes.
 `form_cphd` itself keeps the Hann window it has always applied there (`azimuth_window='hann'`), whose main lobe
 is 22% wider and whose first sidelobe is 3.5 dB higher; `azimuth_window='taylor'` or `'uniform'` selects the
-others. `'uniform'` is a rectangle over the processed azimuth band and no frequency window. The weights enter the
+others. The weights enter the
 final stage of the factorized backprojection of each patch, per subaperture and tile with their slope across the
 tile. Measured on a simulated broadside stripmap, a 3 degree squinted one and a sliding spotlight
 (`tests/test_moving.py`; widths in units of the reciprocal band, azimuth then range):
@@ -617,13 +1038,17 @@ pixel is left with the same band, the processed band at the center frequency, wi
 Doppler centroid. `weighting.sva` runs on that image, and 24 rows formed beyond each end are dropped. The product
 is on the ground grid at those spacings.
 
-What does not fit the rectangle is refused with a `ValueError` that names the reason:
+What does not fit the rectangle is not apodized. `weighting='sva'` then raises a `ValueError` that names the
+reason, and a SIDD whose weighting was left to the default is Taylor weighted with that reason in its notes:
 
 - a squint that shears the range band by more than 10% of its width across the azimuth band (`moving.SHEAR`);
 - a ground range band that changes by more than 5% across the swath (`moving.RANGE`);
 - a processed azimuth band that differs by more than 10% over the scene (`moving.VARY`), as under a beam whose
   speed over the ground changes;
 - a beam center that does not move smoothly (an SRP that steps).
+
+A `spacing` has the same effect, since apodization sets its own: with `weighting='sva'` it raises, and with the
+default of a SIDD the image is Taylor weighted at the spacing asked for.
 
 Inside these limits an isolated point keeps its apodized sidelobes: on an ideal rectangle, a shear of 10% and a
 range sampling 5% off twice Nyquist both leave the highest pixel outside the main lobe at -48 dB, where the exact
@@ -632,7 +1057,8 @@ collections of `tests/test_moving.py` the highest pixel within 24 pixels of a ta
 its main lobe, is at -42 to -53 dB of the peak on the broadside stripmap, -44 to -46 dB on the sliding spotlight
 and -42 to -51 dB under a squint of 0.5 degrees, against -17 to -18 dB unweighted; the 3 dB widths are 0.83 to
 0.90 of the reciprocal bands (0.886 unweighted) and the peaks keep their unweighted amplitude within 5%. A squint
-of 3 degrees shears the range band of that collection by 11% and is refused.
+of 3 degrees shears the range band of that collection by 11%: `weighting='sva'` is refused, and the default SIDD
+of that collection is the Taylor-weighted one.
 
 ### Autofocus along the track
 
@@ -673,7 +1099,8 @@ it with a correction that follows the strip.
 swath, the blocks corrected and their contrast gains. The default for a moving beam is `'quadratic'`, as for a
 spotlight.
 
-In `tests/test_moving.py`, on a simulated strip of three blocks with 36 point targets, a quadratic error of 2, 5
+In `tests/test_moving.py`, on a simulated strip of three blocks with 36 point targets and Taylor weighting, whose
+main lobe the product's own sampling resolves, a quadratic error of 2, 5
 and 15 rad at the edge of the synthetic aperture, injected into the phase history, is estimated as 2.00, 5.03 and
 15.35 rad. The azimuth width goes from 1.358, 2.902 and 7.764 reciprocal bands back to 1.190, 1.189 and 1.192
 (1.187 focused) and the peak sidelobe from -32.8, -25.2 and -0.6 dB to -34.1, -34.1 and -33.8 dB (-34.4 focused).
@@ -684,17 +1111,32 @@ grows from -6 to 46 m across the swath is fitted with 6.0 rad per half swath, an
 3.12 to 1.22. A focused collection comes back bit for bit. A slow-time error that grows along the strip also
 moves the scatterers along the track (its linear part over each aperture); autofocus does not undo that.
 
+The unweighted image, the default SICD, is corrected the same way: errors of 2 and 15 rad are estimated as 1.97
+and 15.32 rad, and the median azimuth width goes from 0.991 and 7.713 reciprocal bands back to 0.895 and 0.897
+(0.892 focused), with the peak sidelobe at -13.3 dB (-13.2). Its main lobe is narrower than a pixel of the
+default spacing, so the width of a single target is measured to a tenth there and the median to a percent. On
+the focused strip the estimate of the unweighted image is not zero but -0.03 to -0.04 rad in every block (a band
+that ends in a step, sampled at 0.96 of its width); it passes the guard with a contrast gain of 0.015%, and the
+correction changes the image by 1% of its peak. With Taylor weighting the same strip is estimated at under 0.01
+rad and left alone.
+
 ### Areas in ground range
 
 `area='tasked_quality'`, an RNIIRS value and `'black'` keep the tasked extent along the track and extend the
-product across it, in ground range, as far as the criterion holds; the criteria and the order of the noise
+product across it, in ground range, as far as the criterion holds; the criteria, the two reference scenes
+(`black_sigma0_db`, -10 dB by default, for `'black'`; the RGIQE's 0 dB for an RNIIRS) and the order of the noise
 sources are those of [Processed area by image quality](#processed-area-by-image-quality). The model is
 evaluated for the moving beam: at seven positions along the track, on the line across the track through each,
 with the pulses that the pixels there are formed from. Each pulse's reference is its own SRP, so the gain of a
 ground point is the antenna's two-way pattern in elevation and in azimuth, averaged in amplitude over those
 pulses, with the spreading loss; the delay windows are those pulses' TOA1..TOA2 (TOAE1..TOAE2 for `'black'`).
-The noise level at the beam center comes once, from the pulses of the middle position. The mask is read between
-the seven lines, and pixels outside the area are 0.
+The noise level at the beam center comes once, from the pulses of the middle position, taken from the phase
+history in memory. The mask is read between the seven lines, and pixels outside the area are 0.
+
+The antenna pattern's pointing is the one the data decide ([the rule](#the-antenna-patterns-pointing)), checked
+once, on the same pulses of the middle position, and used at all seven. Where neither the file's frames nor the
+boresights on the reference points agree with the footprint, the areas are refused with the `ValueError` of a
+spotlight; where the scene shows no footprint the file's pointing is used and a note says that it is unverified.
 
 An area that reaches less than one step of the model's lattice beyond the tasked swath is the tasked area
 itself, on the tasked grid, with a note that says whether the receive window or the criterion ends it there. A
@@ -702,9 +1144,13 @@ file without an antenna pattern is refused as for a spotlight. In
 `tests/test_moving.py` a simulated stripmap carries an antenna block whose one-way gain falls by 10^5 dB per squared
 direction cosine across the track, and the areas end where the two-way gain computed from that formula meets the
 criterion, to one step of the model's lattice across the track (3 m there, 50 m by default): `'black'` at +-56 m
-of ground range (gain -9.6 and -9.7 dB for a noise-equivalent sigma zero of -10 dB), an RNIIRS of 4.8 at -44 and
-+43 m (-7.2 dB for the -7.5 dB it needs), `'tasked_quality'` at the tasked +-25 m. With an extended window of
-+-45 m `'black'` ends there, and with a window that ends at the tasked swath all three give the tasked area.
+of ground range (gain -9.6 and -9.7 dB for a noise-equivalent sigma zero of -20 dB, 10 dB under the reference of
+-10 dB) and at +-47 m with `black_sigma0_db=-12.0` (-7.7 and -7.8 dB for the -8 dB it needs), an RNIIRS of 4.8 at
+-44 and +44 m (-7.1 and -7.2 dB for the -7.5 dB it needs at a noise-equivalent sigma zero of -10 dB, whatever
+`black_sigma0_db` is), `'tasked_quality'` at the tasked +-25 m. With an extended window of +-45 m `'black'` ends
+there, and with a window that ends at the tasked swath all three give the tasked area. With the frames of the
+file turned 8 m off in ground range the area moves by 8 m as the file points them and stays where it was with
+the boresights on the reference points.
 
 ### Real collections
 
@@ -736,10 +1182,11 @@ deviation of the intensity over its mean) from 34.7 to 44.7. The sidelobes that 
 neighboring scatterers: the highest pixel within 32 pixels outside the main lobe is at -15 to -16 dB for all
 three.
 
-Autofocus on the collection as it came: six blocks of 4,096 rows (3.2 km; the footprint is 10.4 km) give -0.27,
+Autofocus (`'quadratic'`, the default) on the Taylor-weighted image of the collection as it came: six blocks of
+4,096 rows (3.2 km; the footprint is 10.4 km) give -0.27,
 -0.25, -0.25, -0.14, -0.67 and -0.72 rad (standard errors 0.04 to 0.37), the fit runs from -0.24 to -0.59 rad,
 three of the six blocks are corrected, the contrast goes from 21.203 to 21.212 and the median azimuth width of 30
-points from 1.146 to 1.142 m: the collection is in focus to half a radian, and the default does no harm. With a
+points from 1.146 to 1.142 m: the collection is in focus to half a radian, and autofocus does no harm. With a
 quadratic error injected into the phase history (radians at the edge of a pixel's aperture):
 
 | Injected | Contrast, blurred | Azimuth width, blurred | Fit over the six blocks | Contrast after | Azimuth width after |
@@ -757,9 +1204,20 @@ source of the list above: the clutter-to-noise ratio measured from 512 pulses (t
 map) with the assumed mean scene sigma zero of -10 dB. The full-bandwidth window TOA1..TOA2 of the pulses that
 form a pixel is narrower than the tasked swath, so `'tasked_quality'` (a model minimum of RNIIRS 4.20 in the
 tasked swath) and an RNIIRS of 4.5 give the tasked area, with the note that the receive window holds nothing
-beyond it. `'black'` opens the swath to the extended window TOAE1..TOAE2 and finds a signal-to-noise ratio of at
-least 1 from -3,550 to +3,300 m about the swath center, 6.9 km of ground range for the 5.1 km tasked (75.6 Mpx
-for 55.5).
+beyond it. `'black'` opens the swath to the extended window TOAE1..TOAE2 and, at its default of -10 dB, finds a
+signal-to-noise ratio of at least 1 from -3,550 to +2,650 m about the swath center, 6.2 km of ground range for
+the 5.1 km tasked. With `black_sigma0_db=0.0`, the reference of 0.2.0's spotlight areas, it reaches from -3,550
+to +3,300 m, 6.9 km (75.6 Mpx for 55.5): the near edge is the end of the extended window either way, and the far
+edge follows the reference. The antenna block passes the check of its pointing as the file states it
+([above](#the-antenna-patterns-pointing)).
+
+The default products of the whole strip, on the same GPU while other jobs held about 60 GB of its memory. The SICD,
+unweighted: 107,568 by 4,388 pixels of 0.767 by 1.192 m (472 Mpx) in 183 s, of which formation 165 s, the
+baseband step 1.2 s, autofocus 12 s (a correction was applied) and the write 2.5 s. The SIDD, apodized: 202,356
+by 8,423 pixels of 0.408 by 0.621 m (1,704 Mpx) in 535 s, of which formation 397 s, the baseband step 21 s,
+autofocus 48 s, apodization 40 s and the write with its remap 28 s; the device had 35.9 GB for stages that take
+36.1 GB with the image on it, so they ran on the host, and the note says so. Both files pass sarkit's
+consistency checks.
 
 **Sliding spotlight** (2024-08-29, HH, 300 MHz, 111,132 pulses in 10.7 s, grazing angle 61 degrees, tasked area 5
 by 5 km; a 1 by 3 km cut at the center, formed from the whole band). The footprint moves at 1.3 km/s under a
@@ -776,7 +1234,8 @@ are the rest.
   azimuth width 0.209 m (1.35), range width 0.924 m (0.89) with a peak range sidelobe of -19.7 dB. The squint at
   the ends of the cut shears the range band by about 7% of its width, within the limit; a cut much longer along the
   track, or half the bandwidth, passes it and is refused.
-- Autofocus on the collection as it came: three blocks give -1.64, -1.65 and -1.54 rad, each consistent over its
+- Autofocus on the Taylor-weighted image of the collection as it came: three blocks give -1.64, -1.65 and -1.54
+  rad, each consistent over its
   sets, and the fit runs from -1.65 to -1.58 rad. The contrast gain of the whole image, 0.4%, is within its
   jackknife scatter (0.8%, a few bright points carry it), but the median gain of the 5,000 cells is 0.08% with a
   standard error of 0.01%: the correction is applied (one block of three is given back, its own contrast not
@@ -795,22 +1254,24 @@ are the rest.
   the guard returns the image as it came. With the guard's parts as 16 sets of columns, as for a spotlight, the
   5 rad case was declined on half the band (a 1,507 column image: a gain of 3.3% against a scatter of 2.5%, and
   a median over 16 sets within its error); over the cells its median gain is ten standard errors.
-- Areas, with the same noise source as the stripmap. `'tasked_quality'` (a model minimum of RNIIRS 5.58): -1,650
+- Areas, with the same noise source as the stripmap. `'tasked_quality'` (a model minimum of RNIIRS 5.62): -1,650
   to +1,500 m of ground range about the swath center for the tasked +-1,500 m. An RNIIRS of 4.5: -1,650 to
-  +2,150 m. `'black'`: -3,150 to +4,100 m, 7.3 km of ground range, in the extended window.
+  +2,150 m. `'black'`: -3,150 to +4,100 m, 7.3 km of ground range, where the extended window ends, at the default
+  of -10 dB as at 0 dB. The beam is steered along the track, so the pointing of its antenna block is not
+  checked against the footprint, and the note in the product says that the pattern is used unverified.
 
 **Speed.** Seconds per stage for the stripmap cut, second call, with megapixels per second in parentheses, on an
 Nvidia RTX PRO 6000 that other jobs were using and on 16 of the host's 48 cores:
 
 | Product | Arrays | Form | Baseband | Autofocus | Apodization | Mask |
 |---|---|---|---|---|---|---|
-| Taylor SICD, 55.5 Mpx | CuPy | 8.0 | 0.058 (954) | 0.66 (84) | | |
+| Taylor SICD (`weighting='taylor'`), 55.5 Mpx | CuPy | 8.0 | 0.058 (954) | 0.66 (84) | | |
 | | JAX on the same GPU | | 0.63 (88) | 0.49 (112) | | |
 | | NumPy | | 2.7 (20) | 3.2 (17) | | |
 | Apodized SICD, 201.8 Mpx | CuPy | 17.5 | 0.38 (527) | 1.21 (166) | 0.097 (2,077) | |
 | | JAX | | 2.25 (90) | 0.90 (224) | 0.163 (1,235) | |
 | | NumPy | | 8.2 (25) | 19.7 (10) | 9.8 (20) | |
-| Taylor SICD of the `'black'` area, 75.6 Mpx | CuPy | 5.6 | 0.066 (1,147) | 0.24 (322) | | 0.109 (694) |
+| Taylor SICD of the `'black'` area at `black_sigma0_db=0.0`, 75.6 Mpx | CuPy | 5.6 | 0.066 (1,147) | 0.24 (322) | | 0.109 (694) |
 | | JAX | | 0.98 (77) | 0.37 (203) | | 0.132 (574) |
 | | NumPy | | 1.6 (47) | 1.9 (40) | | 0.24 (319) |
 
@@ -830,9 +1291,11 @@ device the same stages hold 8.6 GB at their peak.
 
 ## Display orientation and SIDD output
 
-A SIDD from `process_cphd` is detected on the slant plane (after apodization, when that is the weighting) and
-projected with a cubic kernel to square ground pixels on axes along the line of sight, so that range runs straight
-down the rows. The default pixel is 0.7 of the finer ground resolution.
+A spotlight SIDD from `process_cphd` is detected on the slant plane (after apodization, when that is the
+weighting) and projected with a cubic kernel to square ground pixels on axes along the line of sight, so that
+range runs straight down the rows. The default pixel is 0.7 of the finer ground resolution. The SIDD of a moving
+beam is its ground image on axes along the track, apodized there when that is the weighting, detected and laid
+out by the rule below ([Moving-beam collections](#moving-beam-collections)).
 
 A detected image is laid out with the radar at the top. Ground range increases down the rows, so shadows, which
 fall away from the radar, point down, and the view is the one from above rather than its mirror image (row x col

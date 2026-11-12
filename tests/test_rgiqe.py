@@ -149,6 +149,12 @@ def swath(col, rad, toa):
     return x[ok].min(), x[ok].max()
 
 
+def in_window(col, X, toa):
+    """Whether every pulse has the echo of the ground points X [n1, n2, 3] within toa of the reference delay."""
+    r = np.linalg.norm(X[None] - col.apc[:, None, None], axis=-1)
+    return (np.abs(2 * (r - np.linalg.norm(REF - col.apc, axis=-1)[:, None, None]) / C) <= toa).all(0)
+
+
 def square(rad, half):
     return ground(rad, half * np.array([-1.0, -1.0, 1.0, 1.0]), half * np.array([-1.0, 1.0, 1.0, -1.0]))
 
@@ -266,7 +272,7 @@ def test_gain_polynomial_is_held_beyond_its_lobe():
     assert list(poly._evaluate(far, clamp=True)['clamped']) == [False, True, True]
     assert not arr._evaluate(far, clamp=True)['clamped'].any()
     assert np.all(poly.snr(far, BA, N, ambiguities=False) > [1.0, 0.05, 0.05])   # the SNR itself stays defined there
-    mask, _ = rgiqe.area_mask(poly, far[None], 'black', BA, N, ambiguities=False)
+    mask, _ = rgiqe.area_mask(poly, far[None], 'black', BA, N, ambiguities=False, black_sigma0_db=0.0)
     assert list(mask[0]) == [True, False, False]                    # but no area criterion is met
     assert rgiqe._Pattern.from_poly([[3.0]]) is None                # a constant is no pattern
     up = rgiqe._Pattern.from_poly([[0.0, 0.0, -2e4, 0.0, 4e8], [0.0] * 5, [-2e4, 0.0, 0.0, 0.0, 0.0]])
@@ -340,6 +346,32 @@ def test_noise_from_the_doppler_band(sgn):
     with pytest.raises(ValueError, match='frequency-domain'):
         col.reader.cphd_meta.Global.DomainType = 'TOA'
         rgiqe.Radiometry(col.reader, col.meta)
+
+
+def test_noise_measurement_is_bounded_and_takes_the_history_given(monkeypatch):
+    """The measurement transforms at most about _NOISE_BUDGET samples (fewer blocks of pulses for long pulses, each
+    with its whole band), and with the phase history given it reads nothing from the file."""
+    P, K, period, toa = 512, 1024, 400e-6, 60e-6
+    S, clutter = phase_history(P, K, 1.0 / period, toa, 3.0, 40.0, -1, np.random.default_rng(21), doppler=0.4)
+    col = collection('array', P=P, K=K, toa=toa, period=period, pt_ref=2e-3, signal=S)
+    full = rgiqe.Radiometry(col.reader, col.meta)
+    assert full.measurement['pulses'] == 512 and full.footprint is not None
+    read = []
+    chip = col.reader.read_chip
+    col.reader.read_chip = lambda *a, **k: read.append(a) or chip(*a, **k)
+    given = rgiqe.Radiometry(col.reader, col.meta, history=S)
+    assert not read and given.measurement['noise'] == full.measurement['noise']
+    assert given.measurement['clutter'] == full.measurement['clutter'] and given._blocks['history'] is None
+    part = rgiqe.Radiometry(col.reader, col.meta, pulses=(100, 400), history=S[100:400])   # the pulses the image uses
+    assert not read and part.measurement['pulses'] == 256 and abs(part.noise_per_sample / 3.0 - 1) < 0.1
+    monkeypatch.setattr(rgiqe, '_NOISE_BUDGET', 128 * K * 2.5)      # room for two blocks
+    two = rgiqe.Radiometry(col.reader, col.meta)
+    assert two.measurement['pulses'] == 256 and len(read) == 2
+    assert abs(two.noise_per_sample / full.noise_per_sample - 1) < 0.05
+    monkeypatch.setattr(rgiqe, '_NOISE_BUDGET', 1.0)                # never less than one block of 64, from mid-aperture
+    one = rgiqe.Radiometry(col.reader, col.meta)
+    assert one.measurement['pulses'] == 64 and read[-1][0] == (224, 288)
+    assert abs(one.noise_per_sample / full.noise_per_sample - 1) < 0.15
 
 
 @pytest.mark.parametrize('collector, sgn, phase', [(None, -1, -1), (None, 1, 1), ('Capella-12', 1, -1), ('capella', -1, -1)])
@@ -464,11 +496,11 @@ class Field:
     def _nesz_ref(self, bandwidth_area, samples):
         return 0.01
 
-    def _fields(self, points, bandwidth_area, samples, ambiguities=True):
-        s = self.f(points[..., 0], points[..., 1])
+    def _fields(self, points, bandwidth_area, samples, ambiguities=True, sigma0_db=None):
+        s = self.f(points[..., 0], points[..., 1])                  # the SNR of whichever scene the criterion asks
         return s, np.ones(s.shape), np.ones(s.shape), np.zeros(s.shape, bool)
 
-    def snr(self, points, bandwidth_area, samples, ambiguities=True, *, extended=False):
+    def snr(self, points, bandwidth_area, samples, ambiguities=True, *, extended=False, sigma0_db=None):
         return self._fields(points, bandwidth_area, samples)[0]
 
 
@@ -579,24 +611,27 @@ def test_area_kinds():
     assert abs(info['nesz_ref_db'] + 20.0) < 1e-9 and info['level_source'] == 'argument'
     assert abs(info['center_snr_db'] - 10 * np.log10(float(rad.snr(rad.ref_point[None], BA, N)[0]))) < 1e-9
     gain, window = expected(col, pts)
-    snr = gain / 0.01                                               # without ambiguities
+    snr = gain / 0.01                                               # of the reference scene, without ambiguities
+    dark = gain / 0.1                                               # of a scene of -10 dB, which 'black' asks about
     masks = {}
     for kind in (4.8, 4.4, 4.0, 'black'):
         m, info = rgiqe.area_mask(rad, pts, kind, BA, N, tasked=tasked, ambiguities=False)
         thr = 1.0 if kind == 'black' else float(rgiqe.rniirs_to_snr(BA, kind))
-        want = (snr >= thr) & (window if kind != 'black' else np.ones_like(window)) | inside
-        edge = np.abs(snr / thr - 1) < 0.02                         # leave the points on the contour to rounding
-        assert np.array_equal(m[~edge], want[~edge]) or kind == 'black'
+        of = dark if kind == 'black' else snr
+        want = (of >= thr) & (window if kind != 'black' else in_window(col, pts, 30e-6)) | inside
+        edge = np.abs(of / thr - 1) < 0.02                          # leave the points on the contour to rounding
+        assert np.array_equal(m[~edge], want[~edge])
         assert m[inside].all() and info['snr_threshold'] == thr and m.sum() > inside.sum()
+        assert info['black_sigma0_db'] == (-10.0 if kind == 'black' else None)
         masks[kind] = m
     assert (masks[4.8] <= masks[4.4]).all() and (masks[4.4] <= masks[4.0]).all()
     assert masks[4.8].sum() < masks[4.4].sum() < masks[4.0].sum()
-    # 'black': an SNR of at least 1, with the range swath opened to the extended delay window
+    # 'black': an SNR of at least 1 for a scene of -10 dB, with the range swath opened to the extended delay window
     m, info = rgiqe.area_mask(rad, pts, 'black', BA, N, tasked=tasked, ambiguities=False)
     assert info['criterion'] == 'snr' and any('TOAE1..TOAE2' in n for n in info['notes'])
     rows = np.flatnonzero(m.any(1))
     near, far = swath(col, rad, 15e-6)                              # about 3.6 km either way
-    assert g[rows[0]] < near - 500 and g[rows[-1]] > far + 500 and (snr[m & ~inside] >= 0.98).all()
+    assert g[rows[0]] < near - 500 and g[rows[-1]] > far + 500 and (dark[m & ~inside] >= 0.98).all()
     near_e, far_e = swath(col, rad, 30e-6)
     assert near_e <= g[rows[0]] and g[rows[-1]] <= far_e
     rows = np.flatnonzero(masks[4.0].any(1))
@@ -673,33 +708,94 @@ def test_area_bounds():
     x = x[snr >= rgiqe.rniirs_to_snr(BA, 4.0)]                      # where RNIIRS 4.0 holds across the line of sight
     assert x.max() > 4000 and x.max() <= q[3] <= x.max() + 120 and x.min() - 120 <= q[2] <= x.min()
     assert near - 60 <= q[0] <= near and far <= q[1] <= far + 60
-    k = rgiqe.area_bounds(rad, 'black', *args, tasked=tasked, ambiguities=False)
+    k = rgiqe.area_bounds(rad, 'black', *args, tasked=tasked, ambiguities=False, black_sigma0_db=0.0)
     assert k[0] < q[0] - 500 and k[1] > q[1] + 500 and k[2] <= q[2] and k[3] >= q[3]
+    d = rgiqe.area_bounds(rad, 'black', *args, tasked=tasked, ambiguities=False)     # -10 dB: inside the 0 dB one
+    assert all(a <= b for a, b in zip((k[0], d[1], k[2], d[3]), (d[0], k[1], d[2], k[3])))
+    assert d[3] < k[3] - 500 and d[2] > k[2] + 500 and d[0] < q[0] - 500 and d[1] > q[1] + 500
+    x = np.arange(-9000.0, 9000.0, 10.0)
+    x = x[rad.nesz_db(ground(rad, np.zeros(len(x)), x), BA, N) <= -10.0]         # the -10 dB NESZ contour, across
+    assert x.max() <= d[3] <= x.max() + 120 and x.min() - 120 <= d[2] <= x.min()
     amb = rgiqe.area_bounds(rad, 4.0, *args, tasked=tasked)
     assert amb[3] < q[3] - 200 and amb[2] > q[2] + 200 and amb[3] >= 1500.0
 
 
 def test_areas_nest_and_bounds_enclose_them():
-    """Tasked, tasked quality, falling RNIIRS thresholds and 'black' each contain the one before (the thresholds here
-    need an SNR above 1), and area_bounds is the extent of area_mask with a step of padding."""
+    """Tasked, tasked quality and falling RNIIRS thresholds each contain the one before, and so does 'black' when
+    its reference is the RGIQE's own (0 dB: the thresholds here need an SNR above 1). With its default of -10 dB,
+    'black' contains the RNIIRS areas whose thresholds need an SNR of at least 10 of the reference scene and not
+    those that need less. area_bounds is the extent of area_mask with a step of padding."""
     col = collection('array', toa=15e-6, toae=30e-6)
     rad = rgiqe.Radiometry(col.reader, col.meta, nesz_db=-20.0)
     tasked = square(rad, 1450.0)
     g = np.arange(-12000.0, 12001.0, 200.0)
     pts = ground(rad, g[:, None], g[None, :])
     assert rgiqe.rniirs_to_snr(BA, 4.0) > 1.0
-    last = None
+    last, masks = None, {}
     for kind in ('tasked', 'tasked_quality', 4.4, 4.0, 'black'):
-        m, info = rgiqe.area_mask(rad, pts, kind, BA, N, tasked=tasked)
+        m, info = rgiqe.area_mask(rad, pts, kind, BA, N, tasked=tasked, black_sigma0_db=0.0)
         assert m.any() and info['border'] == (False,) * 4
         assert np.array_equal(info['level'] >= 0, m) and info['level'].dtype == np.float32
         if last is not None:
             assert (last <= m).all() and last.sum() < m.sum()
-        last = m
-        b = rgiqe.area_bounds(rad, kind, rad.ref_point, rad.range_dir, rad.cross_dir, BA, N, tasked=tasked, step=200.0)
+        last = masks[kind] = m
+        b = rgiqe.area_bounds(rad, kind, rad.ref_point, rad.range_dir, rad.cross_dir, BA, N, tasked=tasked, step=200.0,
+                              black_sigma0_db=0.0)
         rows, cols = np.flatnonzero(m.any(1)), np.flatnonzero(m.any(0))
         for lo, hi, first, end in ((b[0], b[1], g[rows[0]], g[rows[-1]]), (b[2], b[3], g[cols[0]], g[cols[-1]])):
             assert first - 200.001 <= lo <= first and end <= hi <= end + 200.001
+    dark, info = rgiqe.area_mask(rad, pts, 'black', BA, N, tasked=tasked)
+    assert info['black_sigma0_db'] == -10.0 and (dark <= masks['black']).all() and dark.sum() < masks['black'].sum()
+    assert (masks['tasked'] <= dark).all() and np.array_equal(info['level'] >= 0, dark)
+    high = float(rgiqe.snr_to_rniirs(BA, 10.5))                     # a threshold that needs a little over 10 dB
+    m, _ = rgiqe.area_mask(rad, pts, high, BA, N, tasked=tasked)
+    assert (m <= dark).all() and m.sum() > masks['tasked'].sum()
+    assert (masks[4.0] & ~dark).any() and (masks[4.4] & ~dark).any()            # these need an SNR of 1.2 and 2.0
+    b = rgiqe.area_bounds(rad, 'black', rad.ref_point, rad.range_dir, rad.cross_dir, BA, N, tasked=tasked, step=200.0)
+    rows, cols = np.flatnonzero(dark.any(1)), np.flatnonzero(dark.any(0))
+    for lo, hi, first, end in ((b[0], b[1], g[rows[0]], g[rows[-1]]), (b[2], b[3], g[cols[0]], g[cols[-1]])):
+        assert first - 200.001 <= lo <= first and end <= hi <= end + 200.001
+
+
+def test_black_is_the_nesz_contour_of_its_reference():
+    """'black' ends where a scene of black_sigma0_db has an SNR of 1: without ambiguities, on the contour where the
+    noise-equivalent sigma zero equals it; with them, where the noise-equivalent sigma zero plus the ambiguity level
+    of such a scene does. The default is -10 dB, a lower reference gives a larger area, and the RNIIRS kinds, which
+    keep the RGIQE's reference, do not move with it."""
+    col = collection('array', toa=15e-6, toae=30e-6)
+    rad = rgiqe.Radiometry(col.reader, col.meta, nesz_db=-20.0)
+    g = np.arange(-9000.0, 9001.0, 100.0)
+    pts = ground(rad, g[:, None], g[None, :])
+    window = in_window(col, pts, 30e-6)
+    gain = expected(col, pts)[0]
+    nesz = 0.01 / gain                                              # -20 dB at the reference point
+    np.testing.assert_allclose(rad.nesz_db(pts, BA, N), 10 * np.log10(nesz), atol=0.01)
+    amb = sum(np.nan_to_num(expected(col, rad._ambiguity(pts, k), power=True)[0]) for k in (-2, -1, 1, 2)) / gain
+    assert amb[window].max() > 1.0 and amb.min() < 1e-3             # from negligible to above the signal
+    masks = {}
+    for ref in (-10.0, -5.0, 0.0):
+        sigma = 10.0 ** (0.1 * ref)
+        for ambiguities in (False, True):
+            level = nesz + sigma * amb if ambiguities else nesz     # as a sigma zero
+            m, info = rgiqe.area_mask(rad, pts, 'black', BA, N, ambiguities=ambiguities, black_sigma0_db=ref)
+            edge = np.abs(10 * np.log10(level / sigma)) < 0.05      # leave the points on the contour to rounding
+            assert np.array_equal(m[~edge], ((level <= sigma) & window)[~edge]), (ref, ambiguities)
+            assert info['black_sigma0_db'] == ref and info['snr_threshold'] == 1.0 and info['criterion'] == 'snr'
+            s = rad.snr(pts, BA, N, ambiguities, extended=True, sigma0_db=ref)
+            np.testing.assert_allclose(s[window], (sigma / level)[window], rtol=5e-3)
+            masks[ref, ambiguities] = m
+    for ambiguities in (False, True):
+        a, b, c = (masks[ref, ambiguities] for ref in (-10.0, -5.0, 0.0))
+        assert (a <= b).all() and (b <= c).all() and a.sum() < b.sum() < c.sum() and a.any()
+        assert np.array_equal(rgiqe.area_mask(rad, pts, 'black', BA, N, ambiguities=ambiguities)[0], a)    # the default
+    assert (masks[-10.0, True] <= masks[-10.0, False]).all() and masks[-10.0, True].sum() < masks[-10.0, False].sum()
+    # the reference scene of the RGIQE is another matter: its SNR, and the areas rated by it, stay where they were
+    np.testing.assert_allclose(rad.snr(pts, BA, N, extended=True), rad.snr(pts, BA, N, extended=True, sigma0_db=0.0))
+    for kind in (4.4, 'tasked_quality'):
+        a, b = (rgiqe.area_mask(rad, pts, kind, BA, N, tasked=square(rad, 1450.0), black_sigma0_db=v)[0] for v in (-10.0, 0.0))
+        assert np.array_equal(a, b)
+    with pytest.raises(ValueError, match='black_sigma0_db'):
+        rgiqe.area_mask(rad, pts, 'black', BA, N, black_sigma0_db=np.nan)
 
 
 def test_given_noise_level_and_arguments():
@@ -721,4 +817,5 @@ def test_given_noise_level_and_arguments():
     with pytest.raises(ValueError, match='ground grid'):
         rgiqe.area_mask(rad, X, 'black', BA, N)
     assert set(rgiqe.__all__) == {'rniirs', 'information_density', 'snr_to_rniirs', 'rniirs_to_snr', 'Radiometry',
-                                  'area_mask', 'area_bounds'}
+                                  'area_mask', 'area_bounds', 'reference_levels', 'support_area', 'clutter_gain',
+                                  'calibration'}

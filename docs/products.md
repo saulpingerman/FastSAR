@@ -38,20 +38,35 @@ Test results:
 
 Real-data geolocation is in [real-data.md](real-data.md#geolocation).
 
-## Amplitude
+## Amplitude and radiometric calibration
 
 Images are not normalized. A scatterer of sample amplitude a peaks at a times the window sum (a Np K for the mean-1
 Taylor windows; 0.996 Np K measured in `tests/test_chain.py`). Noise of power s^2 per sample gives s^2 times the sum
-of the squared window. CPHD has no radiometric calibration; beta0 and sigma0 need the vendor's constant.
+of the squared window. The pixels are therefore in the units of the phase history.
+
+A CPHD file can tie those units to RCS: `PTRef` is the per-sample power of a 1 m^2 target at the scene reference
+point, and `PNRef` the noise power. Where a file states `PTRef` (Umbra's do, Capella's do not), `process_cphd`
+writes the SICD `Radiometric` block of a spotlight product: the noise level and the polynomials that turn pixel
+power into RCS, sigma zero, beta zero and gamma zero
+([product-options.md](product-options.md#radiometric-calibration) has the definitions and what was measured).
+The polynomials follow the antenna pattern only where the data confirm how it is pointed: the beam's footprint
+in the phase history must lie within 0.4 of a half-power radius of the pattern as the file points it, or with
+each boresight on its scene reference point. A collection whose footprint fits neither gets constant factors, and
+no quality area beyond the tasked one ([the check](product-options.md#the-antenna-patterns-pointing)).
+Without `PTRef` there is no block, and beta0 or sigma0 need the vendor's constant. `form_cphd` and `write_sicd`
+alone do not calibrate.
 
 ## SICD output
 
-`write_sicd(path, out)` builds the metadata with `sicd_meta`: a PLANE grid on the ground plane or, for a
-slant-plane product of `process_cphd`, the slant plane; rows along range away from the radar and columns so that
+`write_sicd(path, out)` builds the metadata with `sicd_meta`: a PLANE grid on the ground plane (`form_cphd`'s
+images, and the default SICD of `process_cphd`) or, for a slant-plane product of `process_cphd(plane='slant')`,
+the slant plane; rows along range away from the radar and columns so that
 row x column points up (the view from above, for either look side); `AzAutofocus` GLOBAL or SV when autofocus
 ran; the aperture position as a polynomial in time and one center-of-aperture time, so
-SICD's projection is the model of `geolocate`. Impulse response parameters are nominal; there is no Radiometric
-block. The file is written by FastSAR's own NITF writer (no SAR-format library is needed), and `tests/` read it back
+SICD's projection is the model of `geolocate`. Impulse response parameters are nominal. A `Radiometric` block is
+written for a product that carries a calibration (`out['radiometric']`, which `process_cphd` sets where the CPHD
+file supports it); a `form_cphd` output has none. The file is written by FastSAR's own NITF writer (no SAR-format
+library is needed), and `tests/` read it back
 with sarpy and sarkit. ImageFormAlgo is OTHER, which sarpy's `is_valid` rejects; sarkit's consistency check passes. In
 `tests/test_chain.py` the round trip keeps every pixel, and sarpy's projection of the peaks agrees with
 `geolocate` to better than a micrometer.

@@ -128,7 +128,8 @@ def collection(path, targets, amp=None, *, P=1400, dy=0.25, r0=5e3, graze_deg=30
     par = NS(Identifier='VV', FxC=fc, Polarization=NS(TxPol='V', RcvPol='V'), TgtRefLevel=None, NoiseLevel=None,
              Antenna=None)
     meta = NS(Data=NS(Channels=[NS(NumVectors=P, NumSamples=K, Identifier='VV')]), Channel=NS(Parameters=[par]),
-              Global=NS(DomainType='FX', SGN=-1), CollectionID=NS(CollectorName='SIMULATED', RadarMode=NS(ModeType='STRIPMAP')),
+              Global=NS(DomainType='FX', SGN=-1, Timeline=NS(CollectionStart='2026-01-01T00:00:00.000000Z')),
+              CollectionID=NS(CollectorName='SIMULATED', CoreName='SIMULATED', RadarMode=NS(ModeType='STRIPMAP')),
               SceneCoordinates=NS(IARP=NS(ECF=XYZ(ecf(srp[P // 2]))), ImageArea=None, ReferenceSurface=None),
               Antenna=None, SupportArray=None)
     if toa is not None:

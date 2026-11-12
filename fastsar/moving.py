@@ -828,7 +828,11 @@ def _range_area(g, bm, b, opt, step=50.0, limit=30e3):
     form_cphd's weighting at the swath center). Each pulse's reference is its own SRP, so the gain of a ground
     point is the two-way pattern in elevation and in azimuth, averaged in amplitude over those pulses, with the
     spreading loss, and the delay windows are the pulses' own. The noise level at the beam center comes once, from
-    the middle position's pulses, by Radiometry's order of sources. b: the tasked rectangle (lo1, hi1, lo2, hi2), m
+    the middle position's pulses, by Radiometry's order of sources, and so does the check of the antenna block
+    against the beam's footprint in the phase history (Radiometry.pointing: the frames as the file states them,
+    each boresight on its pulse's SRP, or no trusted pattern, with which every area but 'tasked' is refused as for
+    a spotlight). 'black' ends where a scene of sigma zero opt['black_sigma0_db'] (-10 dB) has a signal-to-noise
+    ratio of 1, ambiguities counted as noise (rgiqe.area_mask). b: the tasked rectangle (lo1, hi1, lo2, hi2), m
     from g['center'] along e1 and e2.
     -> (the area's bounding rectangle, valid: dict(along, across (m from the center), level [lines, across]: the
     margin of rgiqe.area_mask, >= 0 inside the area); the tasked rectangle and None when the area reaches less
@@ -846,13 +850,19 @@ def _range_area(g, bm, b, opt, step=50.0, limit=30e3):
     bw, ns = sp['b1'] * sp['b2'], sp['pulses'] * K               # the support's area on the ground, samples summed
     span = lambda n: (int(sp['first'][n]), int(sp['first'][n] + sp['pulses'][n]))
     kw = dict(channel=opt['channel'], sicd=g['sicd'], scene_sigma0_db=opt['scene_sigma0_db'])
-    rad = rgiqe.Radiometry(opt['cphd'], g['meta'], pulses=span(n0), nesz_db=opt['nesz_db'], **kw)
+    black = float(opt.get('black_sigma0_db', -10.0))
+    # the middle position's pulses, from the history in memory: the noise level and the check of the antenna block
+    # against the beam's footprint (Radiometry.pointing), which the other positions take over
+    rad = rgiqe.Radiometry(opt['cphd'], g['meta'], pulses=span(n0), nesz_db=opt['nesz_db'],
+                           history=g['S'][slice(*span(n0))], **kw)
     if not rad.has_antenna:
         raise ValueError(f'area={area!r}: the file describes no antenna pattern, so the signal has no edge '
                          "to follow; only area='tasked' can be processed")
+    if rad.pointing is None:                                         # the data contradict the antenna block
+        raise ValueError(rgiqe._untrusted(area))
     level = 10 * np.log10(rad._nesz_ref(bw[n0], ns[n0]))
-    rads = [rad if n == n0 else rgiqe.Radiometry(opt['cphd'], g['meta'], pulses=span(n), nesz_db=level, **kw)
-            for n in range(_LINES)]
+    rads = [rad if n == n0 else rgiqe.Radiometry(opt['cphd'], g['meta'], pulses=span(n), nesz_db=level, adopt=rad,
+                                                 **kw) for n in range(_LINES)]
     step = float(min(step, (b[3] - b[2]) / 16))
     line = lambda n, y: c + t1[n] * e1 + y[:, None] * e2
     quality = None
@@ -875,7 +885,8 @@ def _range_area(g, bm, b, opt, step=50.0, limit=30e3):
         for n in range(_LINES):
             tasked = c + (t1[n] + step * np.array([-1.0, 1.0, 1.0, -1.0]))[:, None] * e1 + np.array(
                 [b[2], b[2], b[3], b[3]])[:, None] * e2
-            m, info = rgiqe.area_mask(rads[n], line(n, y)[None], area, bw[n], ns[n], tasked, quality)
+            m, info = rgiqe.area_mask(rads[n], line(n, y)[None], area, bw[n], ns[n], tasked, quality,
+                                      black_sigma0_db=black)
             lev[n] = info['level'][0]
             edge |= (m[0, 0], m[0, -1])
         grow = edge & (ext < limit)
@@ -888,7 +899,7 @@ def _range_area(g, bm, b, opt, step=50.0, limit=30e3):
     src = dict(argument='the noise level given', sicd="the SICD's noise level", cphd="the file's PTRef and PNRef",
                uncalibrated='the clutter-to-noise ratio measured from the data and the assumed scene sigma zero')
     what = (f'RNIIRS at least {info["threshold"]:.2f}' if info['criterion'] == 'rniirs'
-            else 'a signal-to-noise ratio of at least 1')
+            else f'a signal-to-noise ratio of at least 1 for a scene of sigma zero {black:.1f} dB')
     what += f' ({src.get(rad.level_source, "PTRef and the noise measured from the data")})'
     if more < step:                                                  # why not: the delay window, or the criterion
         y2 = np.array([b[2] - 2 * step, b[3] + 2 * step])
@@ -937,16 +948,20 @@ _MARGIN = 24                  # rows formed beyond the area at each end for apod
 def plan(g, st, opt):
     """process_cphd's plan for a moving-beam collection: the weighting form_cphd applies, the grid, and what the
     stages after formation need, kept in st. g: form_cphd's geometry; opt: dict(product, weighting, autofocus,
-    area, spacing, extent, cphd, channel, nesz_db, scene_sigma0_db).
+    area, spacing, extent, cphd, channel, nesz_db, scene_sigma0_db, and optionally black_sigma0_db (the sigma zero
+    of area='black', dB; -10) and fallback (the weighting to use, with a note, where 'sva' cannot be applied: the
+    caller did not ask for 'sva' by name; None: raise)).
 
     Spacing. 'taylor' and 'uniform' keep form_cphd's own (0.96 of the reciprocal of the nominal bands) unless the
     azimuth band of the image is wider than that samples (a footprint slower than the platform: an orbit, a
     sliding spotlight; a squint), and a given spacing is used as it is. 'sva': exactly half the reciprocal of
     the processed azimuth band and of the ground range band at the swath center, on a grid whose rows number a
     multiple of four. An area beyond the tasked swath is formed on the tasked grid's own pixel lattice.
-    Apodization is refused (ValueError) where the rectangle of the module docstring does not hold: the processed
-    azimuth band differs over the scene by more than VARY, the squint shears the range band by more than SHEAR of
-    it, or the ground range band changes across the swath by more than RANGE."""
+    Apodization is refused where the rectangle of the module docstring does not hold: the processed azimuth band
+    differs over the scene by more than VARY, the squint shears the range band by more than SHEAR of it, or the
+    ground range band changes across the swath by more than RANGE; and where a spacing is given, since it sets its
+    own. With opt['fallback'] the product then takes that weighting and a note says why; without it a ValueError
+    does."""
     wt, af, area, spacing = opt['weighting'], opt['autofocus'], opt['area'], opt['spacing']
     if af:
         _modes(af)
@@ -963,31 +978,41 @@ def plan(g, st, opt):
         b = np.array([(d @ e1).min(), (d @ e1).max(), (d @ e2).min(), (d @ e2).max()])
     notes, valid, tasked = g['notes'], None, b
     if area != 'tasked':
+        import time
+        tr = time.perf_counter()
         b, valid = _range_area(g, bm, b, opt)
-    # the spectrum over the rectangle that sets the sampling: the area's for apodization, whose band every pixel
-    # must hold, else the tasked one, so that a wider area lies on the tasked product's own pixels
-    over = b if wt == 'sva' else tasked
-    t1, t2 = np.linspace(over[0], over[1], 7), np.linspace(over[2], over[3], 5)
-    pts = c + (t1[:, None, None] * e1 + t2[None, :, None] * e2).reshape(-1, 3)
-    sp = spectrum(bm, ant, fband, K, pts, e1, e2)
-    use = sp['full'] if sp['full'].any() else sp['pulses'] > 1
-    if not use.any():
-        raise ValueError('no pulse of the collection illuminates the area: check the extent')
+        st['model_s'] = time.perf_counter() - tr                     # process_cphd's 'radiometry' stage
     smooth = bm['drift'] <= 0.05
-    b1 = float(np.median(sp['b1'][use]))                             # the processed azimuth band, cycles/m
-    b2 = float(np.interp(0.5 * (over[2] + over[3]), t2, sp['b2'].reshape(len(t1), len(t2)).mean(0)))
-    wide = float((sp['b1'] * fband[1] / fc + 2 * np.abs(sp['k1c']) * (fband[1] - fc) / fc)[use].max())
     lam = C / (f0 + K / 2 * df)
     own = (0.96 * lam / (2 * dsin), 0.96 * C / (2 * K * df) / np.cos(g['graze']))        # form_cphd's spacing
+
+    def bands(over):
+        """The spectrum over the rectangle that sets the sampling -> (spectrum at 7 x 5 points, the points that
+        count, the processed azimuth band (cycles/m), the ground range band at the swath center, the widest
+        azimuth band of the image)."""
+        t1, t2 = np.linspace(over[0], over[1], 7), np.linspace(over[2], over[3], 5)
+        pts = c + (t1[:, None, None] * e1 + t2[None, :, None] * e2).reshape(-1, 3)
+        sp = spectrum(bm, ant, fband, K, pts, e1, e2)
+        use = sp['full'] if sp['full'].any() else sp['pulses'] > 1
+        if not use.any():
+            raise ValueError('no pulse of the collection illuminates the area: check the extent')
+        b2 = float(np.interp(0.5 * (over[2] + over[3]), t2, sp['b2'].reshape(len(t1), len(t2)).mean(0)))
+        wide = float((sp['b1'] * fband[1] / fc + 2 * np.abs(sp['k1c']) * (fband[1] - fc) / fc)[use].max())
+        return sp, use, float(np.median(sp['b1'][use])), b2, wide
+    # the area's rectangle for apodization, whose band every pixel must hold, else the tasked one, so that a wider
+    # area lies on the tasked product's own pixels
+    sp, use, b1, b2, wide = bands(b if wt == 'sva' else tasked)
     pad, margin, out = 0.0, 0, {}
     if wt == 'sva':
-        if spacing is not None:
-            raise ValueError("weighting='sva' sets the spacing itself (twice Nyquist): leave spacing=None")
         why = None
         vary = float(np.ptp(sp['b1'][use]) / b1)
         shear = float(np.abs(sp['shear'][use]).max() * b1 / b2)
         rng = float(np.abs(sp['b2'] / b2 - 1).max())
-        if not smooth:
+        if spacing is not None:
+            if not opt.get('fallback'):
+                raise ValueError("weighting='sva' sets the spacing itself (twice Nyquist): leave spacing=None")
+            why = 'it sets the spacing itself (twice Nyquist), and a spacing was given'
+        elif not smooth:
             why = 'the beam center does not move smoothly along the track, so the image has no one baseband'
         elif vary > VARY and not sp['full'].any():
             why = (f'no pixel is seen across the whole processed band (the collection is shorter than a synthetic '
@@ -1003,8 +1028,17 @@ def plan(g, st, opt):
         elif rng > RANGE:
             why = (f'the ground range band changes by {100 * rng:.1f}% across the swath (cos of the grazing angle); '
                    f'the limit is {100 * RANGE:.0f}%')
-        if why:
+        if why and not opt.get('fallback'):
             raise ValueError("weighting='sva' needs a spectrum that is a rectangle on the grid's axes: " + why)
+        if why:                                                      # 'sva' was not asked for by name
+            wt = opt['fallback']
+            if spacing is None:
+                why = "it needs a spectrum that is a rectangle on the grid's axes, and " + why
+            notes.append(f"weighting: this product's default, spatially variant apodization ('sva'), is not applied: "
+                         f'{why}. The image has weighting={wt!r} instead.')
+            if area != 'tasked':
+                sp, use, b1, b2, wide = bands(tasked)
+    if wt == 'sva':
         bt = float(sp['b1'][use].min())
         # half the band kept, its soft edge and the squint's shift at the first frequency, in units of the half band
         # the pulses of |u| <= 1 give there

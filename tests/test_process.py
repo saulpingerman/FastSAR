@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 
 import fastsar
-from fastsar import quality, sim
+from fastsar import products, quality, sim
 
 pytestmark = pytest.mark.needs('sarpy')
 
@@ -60,7 +60,7 @@ def rows_along_range(sm):
 def test_sicd(cphd, plane):
     d, ecf = cphd
     f = d / f'{plane}.nitf'
-    o = fastsar.process_cphd(str(d / 'c.cphd'), str(f), plane=plane, backend='cpu')
+    o = fastsar.process_cphd(str(d / 'c.cphd'), str(f), plane=plane, weighting='taylor', backend='cpu')
     assert o['plane'] == plane and o['product'] == 'sicd' and o['weighting'] == 'taylor' and o['path'] == str(f)
     assert o['image'].dtype == np.complex64 and o['baseband'] and {'read', 'form', 'baseband', 'write'} <= set(o['timing'])
     sm, pix, off, pslr = read_sicd(f, ecf)
@@ -71,27 +71,89 @@ def test_sicd(cphd, plane):
     assert pix.shape == (o['image'].shape[1], o['image'].shape[0])
 
 
-def test_default_is_the_slant_plane_and_nothing_is_written_without_an_output(cphd):
+def test_defaults(cphd):
+    """What process_cphd gives when nothing is asked for. A SICD: the ground plane, no weighting, quadratic
+    autofocus, the tasked area. A SIDD: the ground plane, spatially variant apodization, quadratic autofocus, the
+    NRL remap, shadows down. Each is the product of the same options spelled out, and the default SICD of 0.2.0 is
+    plane='slant', weighting='taylor'."""
     d, ecf = cphd
-    o = fastsar.process_cphd(str(d / 'c.cphd'), backend='cpu')
-    assert o['plane'] == 'slant' and 'path' not in o and 'metadata' not in o and o['area'] == 'tasked'
-    e1, e2 = o['e1'], o['e2']
-    assert abs(e1 @ e2) < 1e-12 and np.cross(e1, e2)[2] > 0 and (o['image'] == 0).mean() < 0.35
+    p, f = str(d / 'c.cphd'), d / 'default.nitf'
+    o = fastsar.process_cphd(p, str(f), backend='cpu')
+    assert (o['product'], o['plane'], o['weighting'], o['area']) == ('sicd', 'ground', 'uniform', 'tasked')
+    assert o['autofocus_info']['mode'] == 'quadratic' and 'autofocus' in o['timing'] and 'to_slant' not in o['timing']
+    sm, pix, off, pslr = read_sicd(f, ecf)
+    assert sm.Grid.ImagePlane == 'GROUND' and sm.Grid.Type == 'PLANE'
+    assert sm.Grid.Row.WgtType.WindowName == 'UNIFORM' and sm.Grid.Col.WgtType.WindowName == 'UNIFORM'
+    up = sm.GeoData.SCP.ECF.get_array() / np.linalg.norm(sm.GeoData.SCP.ECF.get_array())
+    urow, ucol = sm.Grid.Row.UVectECF.get_array(), sm.Grid.Col.UVectECF.get_array()
+    assert abs(urow @ up) < 4e-3 and abs(ucol @ up) < 4e-3            # both axes on the ground (geocentric up: 0.2 deg)
+    assert rows_along_range(sm) > 0.7 and from_above(sm)             # rows away from the radar, the view from above
+    assert np.abs(off).max() < 0.05 and -14.5 < pslr.max() < -11.5   # the unweighted aperture's sidelobes
+    same = fastsar.process_cphd(p, plane='ground', weighting='uniform', autofocus='quadratic', area='tasked', backend='cpu')
+    assert np.array_equal(same['image'], o['image'])
+    s = fastsar.process_cphd(p, product='sidd', backend='cpu')
+    assert (s['product'], s['plane'], s['weighting'], s['area']) == ('sidd', 'ground', 'sva', 'tasked')
+    assert s['autofocus_info']['mode'] == 'quadratic' and s['remap'] == 'nrl' and s['shadows_down'] is True
+    same = fastsar.process_cphd(p, product='sidd', plane='ground', weighting='sva', autofocus='quadratic', remap='nrl',
+                                backend='cpu')
+    assert np.array_equal(same['image'], s['image'])
+    old = fastsar.process_cphd(p, plane='slant', weighting='taylor', backend='cpu')
+    assert (old['plane'], old['weighting'], old['autofocus_info']['mode']) == ('slant', 'taylor', 'quadratic')
+    assert old['image'].shape != o['image'].shape and 'to_slant' in old['timing']
+
+
+SICD_OPTIONS = [(pl, w) for pl in ('ground', 'slant') for w in ('uniform', 'taylor')] + [('slant', 'sva')]
+
+
+@pytest.mark.parametrize('plane, weighting', SICD_OPTIONS, ids=[f'{pl}-{w}' for pl, w in SICD_OPTIONS])
+@pytest.mark.parametrize('autofocus', ['quadratic', False])
+def test_explicit_sicd_options_are_kept(cphd, plane, weighting, autofocus):
+    """Every plane and weighting of a SICD, with and without autofocus, when asked for by name: the product and its
+    metadata state what was asked, whatever the defaults are."""
+    d, ecf = cphd
+    f = d / 'explicit.nitf'
+    o = fastsar.process_cphd(str(d / 'c.cphd'), str(f), plane=plane, weighting=weighting, autofocus=autofocus,
+                             backend='cpu')
+    assert (o['product'], o['plane'], o['weighting']) == ('sicd', plane, weighting)
+    assert (o['autofocus_info'] is not None) == bool(autofocus) and ('autofocus' in o['timing']) == bool(autofocus)
+    sm, pix, off, pslr = read_sicd(f, ecf)
+    assert sm.Grid.ImagePlane == plane.upper() and sm.Grid.Type == 'PLANE' and from_above(sm)
+    assert sm.Grid.Row.WgtType.WindowName == sm.Grid.Col.WgtType.WindowName == weighting.upper()
+    assert sm.ImageFormation.AzAutofocus == ('GLOBAL' if o['autofocus'] else 'NO')
+    assert np.abs(off).max() < (0.1 if weighting == 'sva' else 0.05)
+    assert pslr.max() < {'uniform': -11.5, 'taylor': -27, 'sva': -24}[weighting]
+    assert weighting != 'uniform' or pslr.max() > -14.5
+    assert rows_along_range(sm) > (0.99 if plane == 'slant' else 0.7)
+
+
+def test_nothing_is_written_without_an_output(cphd):
+    d, ecf = cphd
+    for plane in ('slant', 'ground'):
+        o = fastsar.process_cphd(str(d / 'c.cphd'), plane=plane, backend='cpu')
+        assert o['plane'] == plane and 'path' not in o and 'metadata' not in o and o['area'] == 'tasked'
+        e1, e2 = o['e1'], o['e2']
+        assert abs(e1 @ e2) < 1e-12 and np.cross(e1, e2)[2] > 0 and (o['image'] == 0).mean() < 0.35
 
 
 def test_sva_sicd(cphd):
     d, ecf = cphd
     f = d / 'sva.nitf'
-    ref = fastsar.process_cphd(str(d / 'c.cphd'), weighting='uniform', backend='cpu')
-    o = fastsar.process_cphd(str(d / 'c.cphd'), str(f), weighting='sva', backend='cpu')
+    ref = fastsar.process_cphd(str(d / 'c.cphd'), plane='slant', weighting='uniform', backend='cpu')
+    o = fastsar.process_cphd(str(d / 'c.cphd'), str(f), plane='slant', weighting='sva', backend='cpu')
+    assert o['plane'] == 'slant' and not any('no plane was given' in n for n in o['notes'])
     sm, pix, off, pslr = read_sicd(f, ecf)
     assert sm.Grid.Row.WgtType.WindowName == 'SVA' and np.abs(off).max() < 0.1
     assert pslr.max() < -24                                          # the unweighted aperture's: -13 dB
     assert 0.45 < o['spx'] / ref['spx'] < 0.62 and abs(o['spy'] / ref['spy'] - 0.5 / 0.96) < 0.03   # twice Nyquist
     assert any('keystone' in n for n in o['notes'])
+    # with no plane given an apodized SICD comes out on the slant plane, where apodization runs, and says so
+    same = fastsar.process_cphd(str(d / 'c.cphd'), weighting='sva', backend='cpu')
+    assert same['plane'] == 'slant' and same['weighting'] == 'sva' and np.array_equal(same['image'], o['image'])
+    assert sum('slant plane' in n and 'no plane was given' in n for n in same['notes']) == 1
+    assert products.sicd_meta(same)[0].Grid.ImagePlane == 'SLANT'
 
 
-@pytest.mark.parametrize('weighting', [None, 'taylor'])
+@pytest.mark.parametrize('weighting', [None, 'taylor', 'uniform', 'sva'])
 def test_sidd(cphd, weighting):
     from sarpy.io.product.converter import open_product
     from sarpy.geometry import point_projection
@@ -177,10 +239,11 @@ def test_quality_area_masks_the_product(cphd, monkeypatch):
             seen['kw'] = kw
 
     def bounds(rad, kind, center, e1, e2, bw, n, tasked=None, **kw):
-        seen.update(center=center, e1=e1, e2=e2, kind=kind)
+        seen.update(center=center, e1=e1, e2=e2, kind=kind, bounds=kw)
         return (-60.0, 60.0, -45.0, 45.0)
 
     def mask(rad, pts, kind, bw, n, tasked=None, **kw):
+        seen['mask'] = kw
         q = pts - seen['center']
         level = (1.0 - np.hypot((q @ seen['e1']) / 60.0, (q @ seen['e2']) / 45.0)).astype(np.float32)   # an ellipse
         return level >= 0, dict(level=level)
@@ -189,22 +252,26 @@ def test_quality_area_masks_the_product(cphd, monkeypatch):
     monkeypatch.setattr(rgiqe, 'area_mask', mask)
     g = fastsar.process_cphd(str(d / 'c.cphd'), plane='ground', area='black', autofocus=False, backend='cpu')
     assert seen['kind'] == 'black' and 'stand-in model' in g['notes']
+    assert seen['bounds'] == seen['mask'] == dict(black_sigma0_db=-10.0)             # the reference of the black edge
     nx, ny = g['image'].shape
     I, J = np.meshgrid(np.arange(nx), np.arange(ny), indexing='ij')
     q = g['origin'] + I[..., None] * g['spx'] * g['e1'] + J[..., None] * g['spy'] * g['e2'] - seen['center']
     r = np.hypot((q @ seen['e1']) / 60.0, (q @ seen['e2']) / 45.0)
     assert not g['image'][r > 1.03].any() and (g['image'][r < 0.97] != 0).mean() > 0.999
     assert abs((g['image'] != 0).mean() - np.pi / 4) < 0.03          # the ellipse inscribed in its rectangle
-    s = fastsar.process_cphd(str(d / 'c.cphd'), area=4.5, autofocus=False, backend='cpu')
+    s = fastsar.process_cphd(str(d / 'c.cphd'), plane='slant', area=4.5, autofocus=False, backend='cpu')
     assert seen['kind'] == 4.5 and s['plane'] == 'slant' and 0.2 < (s['image'] != 0).mean() < np.pi / 4 + 0.03
+    fastsar.process_cphd(str(d / 'c.cphd'), area='black', black_sigma0_db=-3.0, autofocus=False, backend='cpu')
+    assert seen['bounds'] == seen['mask'] == dict(black_sigma0_db=-3.0)
 
 
-def test_autofocus_modes(cphd):
+@pytest.mark.parametrize('kw', [dict(), dict(plane='slant', weighting='taylor')], ids=['default', 'slant-taylor'])
+def test_autofocus_modes(cphd, kw):
     d, ecf = cphd
-    ref = fastsar.process_cphd(str(d / 'c.cphd'), autofocus=False, backend='cpu')
+    ref = fastsar.process_cphd(str(d / 'c.cphd'), autofocus=False, backend='cpu', **kw)
     assert ref['autofocus'] is None and ref['autofocus_info'] is None and 'autofocus' not in ref['timing']
     for mode in ('quadratic', 'pga', 'spatially_variant'):
-        o = fastsar.process_cphd(str(d / 'c.cphd'), autofocus=mode, backend='cpu')
+        o = fastsar.process_cphd(str(d / 'c.cphd'), autofocus=mode, backend='cpu', **kw)
         assert o['autofocus_info']['mode'] == mode and 'autofocus' in o['timing']
         # a focused collection stays focused: the image is the one without autofocus to within a few percent
         e = np.abs(o['image'] - ref['image']).max() / np.abs(ref['image']).max()
@@ -216,7 +283,7 @@ def test_backends_agree(cphd, backend):
     if backend not in fastsar.available_backends() + ['jax']:
         pytest.skip(f'no {backend} backend on this machine')
     d, ecf = cphd
-    for kw in (dict(), dict(product='sidd')):
+    for kw in (dict(), dict(plane='slant', weighting='taylor'), dict(product='sidd')):
         ref = fastsar.process_cphd(str(d / 'c.cphd'), backend='cpu', **kw)
         o = fastsar.process_cphd(str(d / 'c.cphd'), backend=backend, **kw)
         assert isinstance(o['image'], np.ndarray) and o['image'].shape == ref['image'].shape
@@ -224,10 +291,13 @@ def test_backends_agree(cphd, backend):
         assert np.abs(o['image'] - ref['image']).max() < 2e-2 * np.abs(ref['image']).max()
 
 
+# products of one image (the default SICD) and of several, for the tests of devices too small to hold them
+PLACED = [dict(), dict(plane='slant', weighting='taylor'), dict(product='sidd'), dict(plane='slant', weighting='sva'),
+          dict(plane='ground', weighting='taylor'), dict(product='sidd', autofocus=False, remap='log')]
+
+
 @pytest.mark.cuda
-@pytest.mark.parametrize('kw', [dict(), dict(product='sidd'), dict(weighting='sva'), dict(plane='ground'),
-                                dict(product='sidd', autofocus=False, remap='log')],
-                         ids=['sicd', 'sidd', 'sva', 'ground', 'sidd-log'])
+@pytest.mark.parametrize('kw', PLACED, ids=['default', 'sicd', 'sidd', 'sva', 'ground', 'sidd-log'])
 def test_small_gpu_gives_the_same_product(cphd, kw, monkeypatch, tmp_path):
     """A GPU with too little memory for the images of a product (FASTSAR_CUDA_BLOCK_MB: a megabyte to count on, or
     half the product's need) gives the product of a GPU with room: the images stay on the host and cross the
@@ -272,15 +342,14 @@ def test_errors(cphd):
                       (dict(product='sidd', spacing=(0.5, 0.4)), 'square'), (dict(extent=(10.0,)), 'extent'),
                       (dict(weighting='hamming'), 'weighting'), (dict(autofocus='sharpen'), 'autofocus'),
                       (dict(area='everything'), 'area'), (dict(area=True), 'area'), (dict(spacing=-1.0), 'spacing'),
+                      (dict(area='black', black_sigma0_db='dark'), 'black_sigma0_db'),
                       (dict(product='sidd', plane='slant'), 'ground plane'),
                       (dict(plane='ground', weighting='sva'), 'slant plane')):
         with pytest.raises(ValueError, match=match):
             fastsar.process_cphd(p, backend='cpu', **kw)
 
 
-@pytest.mark.parametrize('kw', [dict(), dict(product='sidd'), dict(weighting='sva'), dict(plane='ground'),
-                                dict(product='sidd', autofocus=False, remap='log')],
-                         ids=['sicd', 'sidd', 'sva', 'ground', 'sidd-log'])
+@pytest.mark.parametrize('kw', PLACED, ids=['default', 'sicd', 'sidd', 'sva', 'ground', 'sidd-log'])
 def test_small_jax_device_gives_the_same_product(cphd, kw, monkeypatch, tmp_path):
     """A JAX device with too little memory for the images of a product (FASTSAR_JAX_BLOCK_MB: a megabyte to count
     on, or part of the product's need) gives the product of a device with room: the images stay on the host and
