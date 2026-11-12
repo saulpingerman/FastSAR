@@ -15,20 +15,24 @@ higher across the aperture. To first order in h, with w the unit normal of the s
 component) and A_w the component along w of the antenna's acceleration relative to the scene,
     phi(t) = 2 pi h A_w t^2 / (lambda R w_z),
 t from the COA: the track's curvature out of the slant plane times the height. For a straight track every point of
-the circle about the track through y has the range history of y, and phi is zero exactly. At the edge of an
-aperture that subtends the angle dtheta (azimuth resolution lambda / (2 dtheta)) the phase is
-    pi / 2 (h / lambda) dtheta^2 (R / rho) / w_z,        rho = v^2 / A_w,
-rho being the radius of curvature of the track out of the slant plane (for an orbit about the orbit's radius over
-the cosine of the angle between w and the nadir): proportional to the height, to the square of the aperture at a
-given wavelength, and to R / rho, about a tenth from low Earth orbit. coefficients computes the phase from the
-positions themselves, with no expansion.
+the circle about the track through y has the range history of y, and phi is zero exactly. At the ends of an
+aperture of length L flown at speed v (broadside: L / R is the angle it subtends, lambda / (2 L / R) the azimuth
+resolution) the phase is
+    pi / 2 (h / lambda) (L / R)^2 (R / rho) / w_z,        rho = v^2 / A_w,
+rho being the radius of curvature of the track out of the slant plane: proportional to the height, to the square
+of the aperture at a given wavelength, and to R / rho, which from a circular orbit of radius r is about
+R R_e / r^2 times w_z at broadside (R_e the Earth's radius): a tenth from low Earth orbit. On two spotlights from
+orbit the closed form is within 1.1% of the exact phase, which coefficients computes from the positions
+themselves, with no expansion.
 
 Image. On the baseband ground image on axes along the line of sight (planes.deramp; axis 0 azimuth), pulse p of a
 scatterer imaged at y lies at the azimuth frequency xi_p = spx e1 . (u_p - u_COA) 2 fc / c cycles per pixel, u the
 unit vector from the antenna to y, and the image's spectrum along axis 0 carries exp(1j * phi_p) there
 (autofocus.quadratic's convention and sign). phi is fitted by a polynomial in v, the offset of xi from the center
 of the band of the aperture in half band widths (terms 0 to `order`: the constant and the linear term put the
-scatterer at y with the phase of its range at the COA, which is where and how SICD's projection expects it).
+scatterer at y with the phase of its range at the COA, which is where and how SICD's projection expects it). The
+quadratic term carries the phase from orbit, where the cubic is a hundredth of it or less; a short range and a
+track with a jerk need more terms (the simulated collection of the tests: order 6 to 8, the cubic the largest).
 
 Correction (focus). The height of the surface each pixel shows is found on a lattice by solving the layover
 relation (heights); the polynomial's coefficients, exact functions of position and height, follow from it; and the
@@ -40,8 +44,12 @@ enter geolocation as they did (products.geolocate, geocode_image). It is not an 
 Limits. One correction serves the heights that share a pixel: in layover (several surface points at one range and
 Doppler) their mean is used, weighted by the ground area each contributes, and within a strip the height is
 averaged along azimuth over half a block, so that cliffs keep a residual. The phase is taken at the center
-frequency: over the band it varies by B / (2 fc) of itself, which the axis-0 correction leaves. The DEM's own
-errors remain, for the data-driven autofocus that runs after it. Moving-beam collections are not handled.
+frequency: over the band it varies by B / (2 fc) of itself (the range error behind it, phi lambda / (4 pi), walks
+the response across range), which a correction along axis 0 leaves: negligible while |phi| B / (2 fc) stays under
+a quarter of a radian, 8 rad of phase at a 3% band. The DEM's own errors remain, for the data-driven autofocus
+that runs after it. Moving-beam collections are not handled: the model holds for them pixel by pixel with the
+pulses that illuminate the pixel and their own center of aperture, and the correction would run per patch of the
+mosaic on its track axes.
 
 Formation onto the surface itself is the exact kernel's work: fastsar.backproject at surface_points.
 """
@@ -91,7 +99,8 @@ def as_dem(dem, geoid=None):
     try:
         h = float(dem) + n
     except (TypeError, ValueError):
-        raise ValueError(f'dem must be a GeoTIFF path, a function of (lat, lon) or a height in meters, got {dem!r}') from None
+        raise ValueError('dem must be a GeoTIFF path, a function of (lat, lon) or a height in meters, '
+                         f'got {dem!r}') from None
     if not np.isfinite(h):
         raise ValueError(f'dem must be a finite height in meters, got {dem!r}')
     return lambda lat, lon: np.full(np.broadcast(lat, lon).shape, h)
@@ -107,7 +116,8 @@ def _scene(out):
     nx, ny, o, e1, e2, spx, spy = planes._grid(out)
     if abs(e1[2]) > 1e-9 or abs(e2[2]) > 1e-9:
         raise ValueError('terrain focusing takes an image on a horizontal plane of the local frame')
-    return (nx, ny, o, e1, e2, spx, spy), planes._frame(out), planes._used(out), 0.5 * (out['band'][0] + out['band'][1])
+    fc = 0.5 * (out['band'][0] + out['band'][1])
+    return (nx, ny, o, e1, e2, spx, spy), planes._frame(out), planes._used(out), fc
 
 
 def _some(ant, n):
@@ -147,7 +157,7 @@ def _band(grid, fr, ant, fc):
 
 
 def _fit(xi, phi, band, order):
-    """Least-squares coefficients [..., order + 1] of phi in powers of v = (xi - f0) / hf, and the largest residual."""
+    """Least-squares coefficients [..., order + 1] of phi in powers of v = (xi - f0) / hf; the largest residual."""
     v = (xi - band[0]) / band[1]
     A = v[..., None] ** np.arange(order + 1)
     c = (np.linalg.pinv(A) @ phi[..., None])[..., 0]
@@ -228,7 +238,7 @@ def heights(out, dem, *, post=None):
     a, r = planes.ground_to_slant(fr, Y)
     at = lambda h: planes.slant_to_ground(fr, a, r, o[2] + h)
 
-    def above(s, t):                                    # the DEM above the plane on the lattice s x t (m along e1, e2)
+    def above(s, t):                                    # the DEM above the plane on the lattice s x t (m on e1, e2)
         lat, lon, hp = ecf_to_geodetic(local_to_ecf(o + s[:, None, None] * e1 + t[None, :, None] * e2, out['meta']))
         return np.asarray(dem(lat, lon), np.float64) - hp
     s0, s1, t0, t1 = 0.0, (nx - 1) * spx, 0.0, (ny - 1) * spy
@@ -355,7 +365,7 @@ def focus(out, dem, *, order=None, block=None, post=None, tol=0.05, check=True):
     hf = min(band[1], 0.5)
     blur = (np.abs(c) * keep[:, None, None]).sum(0).max() / (2 * np.pi * hf)
     B = int(block) if block is not None else max(32, 2 * int(round(32.0 / spx)), 16 * int(np.ceil(blur / 2)))
-    B = min(B + B % 2, nx - nx % 2) if nx >= 32 else nx
+    B = max(1, min(B, nx))
     st = af._starts(nx, B, max(1, B // 2))
     raw = np.sin(np.pi * (np.arange(B) + 0.5) / B) ** 2
     tot = np.zeros(nx)
@@ -382,9 +392,9 @@ def focus(out, dem, *, order=None, block=None, post=None, tol=0.05, check=True):
     out['image'] = af._apply_strips(img, st, B, (n - B) // 2, win.astype(np.float32), V, coef)
     info.update(applied=True, powers=tuple(int(p) for p in keep), block=B,
                 edge_rad=np.stack([c.reshape(len(c), -1).min(1), c.reshape(len(c), -1).max(1)], 1))
-    notes.append(f"terrain: focused with the DEM, quadratic phase {info['quadratic_rad'][0]:+.2f} to "
-                 f"{info['quadratic_rad'][1]:+.2f} rad at the band edge for surface heights {info['height'][0]:+.0f} to "
-                 f"{info['height'][2]:+.0f} m about the image plane")
+    q, hh = info['quadratic_rad'], info['height']
+    notes.append(f'terrain: focused with the DEM, quadratic phase {q[0]:+.2f} to {q[1]:+.2f} rad at the band edge for '
+                 f'surface heights {hh[0]:+.0f} to {hh[2]:+.0f} m about the image plane')
     return info
 
 

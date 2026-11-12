@@ -3,6 +3,26 @@
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The date of a version is the day it
 was published on PyPI.
 
+## [Unreleased]
+
+### Added
+
+- Terrain-informed focusing (`fastsar.terrain`, `process_cphd(..., dem=, geoid=)`). A scatterer above or below the
+  image plane is displaced (layover) and, on a curved track, defocused by a phase across the aperture that is
+  proportional to its height and to the track's curvature out of the slant plane. `terrain.focus` computes that
+  phase from the antenna positions and a DEM, with nothing estimated from the image, and removes it from the
+  baseband ground image before the data-driven autofocus: per column and cross-faded along azimuth, on the device
+  that holds the image (NumPy, CuPy, JAX). The image stays on its plane, with its geolocation and its SICD
+  projection; the product records the step in `out['terrain']`, a note, `timing['terrain']` and an
+  `ImageFormation.Processing` element of the SICD. `dem` is a GeoTIFF (or a list of tiles), a function of
+  latitude and longitude, or a number; a file needs `geoid`, the geoid's height above the ellipsoid at the scene
+  (`terrain.as_dem`), and a DEM whose median over the image is off the scene height by more than its relief
+  explains raises `terrain.TerrainWarning`. `terrain.heights` gives the surface each pixel shows through layover,
+  `terrain.phase_error` and `terrain.coefficients` the exact model, and `terrain.surface_points` the points at
+  which `fastsar.backproject` forms the image on the surface itself
+  ([docs/product-options.md](docs/product-options.md#terrain-informed-focusing)). Spotlight collections only;
+  results without a `dem` are unchanged.
+
 ## [0.2.0] - 2026-11-10
 
 ### Added

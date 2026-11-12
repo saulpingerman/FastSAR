@@ -71,13 +71,14 @@ def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None
     mode, backend, precision, height, channel, troposphere, reader_options, target_db: form_cphd's.
     dem: terrain-informed focusing of a spotlight (fastsar.terrain.focus): a DEM GeoTIFF (a path, or a list of
         tiles), a function dem(lat, lon) -> height above the WGS-84 ellipsoid in meters (products.read_dem's), or a
-        number (a surface of that ellipsoid height). None: the scene is taken to lie on the image plane.
+        number (a surface of that ellipsoid height). None: the scene is taken to lie on the image plane. With a
+        dem the product holds terrain (terrain.focus's info: what was applied, the range of its coefficients).
     geoid: the height of the geoid above the ellipsoid at the scene (m), added to the DEM's heights; a DEM file
         needs it (Copernicus DEM: the EGM2008 undulation; 0.0 for a DEM of ellipsoid heights; terrain.as_dem).
 
     -> the product dict (form_cphd's entries on the product's grid: image, origin, e1, e2, spx, spy, plane, meta,
     notes, ...), with product, area, weighting, autofocus (the mode run), autofocus_info, timing (seconds of each
-    stage), with a dem terrain (what terrain.focus applied: its info), and, when written, path and metadata (fastsar._sicdxml.SICD or fastsar._siddxml.SIDD). The image of a SIDD product is
+    stage), and, when written, path and metadata (fastsar._sicdxml.SICD or fastsar._siddxml.SIDD). The image of a SIDD product is
     the detected amplitude (float32) on the product's own grid; the remap and the layout are applied when the file
     is written, and fastsar.sidd.to_display(out, out['remap'], **out['remap_args']) gives the same display values."""
     from .api import _backend
@@ -105,7 +106,7 @@ def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None
     if weighting == 'sva' and product == 'sicd' and spacing is not None:
         raise ValueError("weighting='sva' sets the slant spacing itself (twice Nyquist): leave spacing=None")
     timing, st = {}, {}
-    if dem is not None:                                              # a DEM that cannot be used fails before the file is read
+    if dem is not None:                                              # a DEM that cannot be used fails before the read
         from . import terrain
         st['dem'] = terrain.as_dem(dem, geoid)
     t0 = time.perf_counter()
@@ -128,7 +129,8 @@ def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None
         """The formation grid, from the geometry form_cphd read: the area's bounds and the sampling its spectrum asks."""
         st['read'] = time.perf_counter()
         if dem is not None and g['mode'] != 'spotlight':
-            raise ValueError('dem= (terrain-informed focusing) is for spotlight collections; this one has a moving beam')
+            raise ValueError('dem= (terrain-informed focusing) is for spotlight collections; this one has a moving '
+                             'beam')
         spot = g['mode'] == 'spotlight'
         pl = plane or ('slant' if product == 'sicd' and spot else 'ground')
         wt = weighting or ('sva' if product == 'sidd' and spot else 'taylor')
