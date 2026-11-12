@@ -261,7 +261,7 @@ def heights(out, dem, *, post=None):
             hit = (g0 * g1 <= 0) & (g0 != g1)
             dg = np.where(hit, g0 - g1, 1.0)
             w = np.where(hit, 1.0 / np.maximum(np.abs(dg) / step, 0.05), 0.0)     # ground area per pixel, at most 20
-            num += w * (h - step + step * g0 / dg)
+            num += np.where(hit, w * (h - step + step * g0 / dg), 0.0)
             den += w
             cnt += hit & (g1 != 0)                                         # a crossing at a scan height counts once
         g0 = g1
@@ -290,13 +290,15 @@ def surface_points(out, dem, i, j, *, post=None):
     return planes.slant_to_ground(fr, a, r, o[2] + _at(hm, i, j))
 
 
-def focus(out, dem, *, order=4, block=None, post=None, tol=0.05, check=True):
+def focus(out, dem, *, order=None, block=None, post=None, tol=0.05, check=True):
     """Remove the terrain's defocus from a ground-plane spotlight image (see the module docstring).
 
     out: form_cphd(axes='los')'s output, or process_cphd's ground image: brought to baseband in place if it is not
     (planes.deramp), and its image (a NumPy, CuPy or JAX array) replaced by the corrected one, on the same device.
     dem: dem(lat, lon) -> height above the WGS-84 ellipsoid in meters (as_dem makes one of a GeoTIFF or a number).
-    order: the degree of the polynomial in azimuth frequency (2 to 6); terms that stay under tol / 10 are dropped.
+    order: the degree of the polynomial in azimuth frequency, 2 to 8; None: the lowest that fits the model within
+        tol / 5 at the heights of the scene (2 from orbit; more for a short range or a track with a jerk). Terms
+        that stay under tol / 10 are dropped.
     block: rows of a strip of the correction (default: about 64 m, at least 32 rows and eight times the blur).
     post: heights' lattice spacing (m). tol: nothing is applied when the phase stays below it everywhere (rad).
     check: warn (TerrainWarning, and a note) when the median of the DEM over the image is further from the image
@@ -308,11 +310,11 @@ def focus(out, dem, *, order=4, block=None, post=None, tol=0.05, check=True):
     each term's coefficient [len(powers), 2] (rad at the band edge); quadratic_rad: the same of the quadratic term;
     height: (least, median, greatest) of the surface above the image plane (m); offset, relief: the median and
     the standard deviation of the DEM above the plane at the pixels' own positions (m); layover, outside: heights';
-    block, post; fit_rad: the largest misfit of the polynomial and of its model over the image (rad))."""
+    block, post; order; fit_rad: the largest misfit of the polynomial and of its model over the image (rad))."""
     from . import autofocus as af
     import scipy.fft as sfft
-    if not 2 <= int(order) <= 6:
-        raise ValueError(f'order must be 2 to 6, got {order!r}')
+    if order is not None and not 2 <= int(order) <= 8:
+        raise ValueError(f'order must be 2 to 8, got {order!r}')
     grid, fr, ant, fc = _scene(out)
     planes.deramp(out)
     img = out['image']
@@ -324,7 +326,7 @@ def focus(out, dem, *, order=4, block=None, post=None, tol=0.05, check=True):
     info = dict(applied=False, reason=None, band=band, powers=(), edge_rad=np.zeros((0, 2)), quadratic_rad=(0.0, 0.0),
                 height=(float(h.min()), float(np.median(h)), float(h.max())), offset=float(np.median(own)),
                 relief=float(own.std()), layover=hm['layover'], outside=hm['outside'], block=None, post=hm['post'],
-                fit_rad=0.0)
+                order=None, fit_rad=0.0)
     out['terrain'] = info
     notes = out.setdefault('notes', [])
     if check and abs(info['offset']) > 10.0 + 3 * info['relief']:
@@ -335,9 +337,12 @@ def focus(out, dem, *, order=4, block=None, post=None, tol=0.05, check=True):
         notes.append('terrain: ' + msg)
     if hm['outside'] > 0:
         notes.append(f"terrain: {100 * hm['outside']:.1f}% of the image is outside the DEM and is left as it is")
-    model = _Model(grid, fr, ant, fc, band, int(order), float(h.min()), float(h.max()))
+    for n in range(2, 9) if order is None else [int(order)]:
+        model = _Model(grid, fr, ant, fc, band, n, float(h.min()), float(h.max()))
+        if model.res <= tol / 5:
+            break
     c = model(hm['i'][:, None], hm['j'][None, :], h)                           # [order + 1, ni, nj]
-    info['fit_rad'] = max(model.res, model.err)
+    info.update(order=n, fit_rad=max(model.res, model.err))
     top = np.abs(c).reshape(len(c), -1).max(1)
     info['quadratic_rad'] = (float(c[2].min()), float(c[2].max()))
     if top.sum() < tol:
