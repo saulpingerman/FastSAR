@@ -3,7 +3,9 @@ simulated spotlight collection with an antenna beam that peaks off the scene cen
 PNRef, and processed on both planes with both linear weightings. Point targets of known RCS, clutter of known sigma
 zero and noise of known power per sample come back through the written file's own polynomials, read and evaluated
 by sarpy, within 0.1 dB. Then the levels of support: PTRef with a measured noise level, no PTRef, apodized
-products (a moving beam is in test_cphd.py). Needs sarpy and finufft."""
+products (a moving beam is in test_cphd.py); and the check of the antenna block against the beam's footprint in
+the phase history, which withholds the gain's variation from the factors when the two disagree. Needs sarpy and
+finufft."""
 import dataclasses
 
 import numpy as np
@@ -54,11 +56,14 @@ def scene(request, tmp_path_factory):
     kw = dict(heading=HEADING, scene=140.0, pt_ref=PT_REF, pn_ref=PN_REF, beam=BEAM)
     S = echoes(col, TG, np.sqrt(RCS * PT_REF) * sim.beam_gain(col, TG, BEAM))
     sim.write_cphd(str(d / 'targets.cphd'), col, S, LAT, LON, H0, **kw)
-    n = int(DENSITY * 190.0 ** 2)
-    pos = np.column_stack([rs.uniform(-95.0, 95.0, (n, 2)), np.zeros(n)])
+    n = int(DENSITY * 280.0 ** 2)                                    # clutter over most of the unambiguous scene
+    pos = np.column_stack([rs.uniform(-140.0, 140.0, (n, 2)), np.zeros(n)])
     amp = np.sqrt(SIGMA0 / DENSITY * PT_REF) * np.exp(2j * np.pi * rs.uniform(size=n))
     gain = np.concatenate([sim.beam_gain(col, pos[a:a + 4096], BEAM) for a in range(0, n, 4096)], axis=1)
     sim.write_cphd(str(d / 'clutter.cphd'), col, echoes(col, pos, amp * gain), LAT, LON, H0, **kw)
+    # the same scene under a beam that peaks on the other side of the scene center than the file says
+    gain = np.concatenate([sim.beam_gain(col, pos[a:a + 4096], (BEAM[0], -BEAM[1], -BEAM[2])) for a in range(0, n, 4096)], 1)
+    sim.write_cphd(str(d / 'displaced.cphd'), col, echoes(col, pos, amp * gain), LAT, LON, H0, **kw)
     noise = (rs.standard_normal(S.shape) + 1j * rs.standard_normal(S.shape)) * np.sqrt(PN_REF / 2.0)
     sim.write_cphd(str(d / 'noise.cphd'), col, noise, LAT, LON, H0, **kw)
     sim.write_cphd(str(d / 'unmeasured.cphd'), col, S + noise, LAT, LON, H0, **dict(kw, pn_ref=None))
@@ -96,6 +101,7 @@ def test_known_levels_come_back_from_the_written_factors(scene, plane, weighting
     o = fastsar.process_cphd(str(d / 'targets.cphd'), str(f), **kw)
     cal = o['radiometric']
     assert cal['source'] == 'cphd' and cal['residual_db'] < 0.1 and 1 <= cal['order'] <= 6 and cal['gain_span_db'] > 3.0
+    assert not cal['constant']                                       # a few point targets: no footprint to check against
     assert any('Radiometric block' in n and 'PTRef' in n and 'PNRef' in n for n in o['notes'])
     sm, pix = sarpy_sicd(f)
     rad = sm.Radiometric
@@ -212,9 +218,59 @@ def test_levels_of_support(scene, tmp_path):
     assert rgiqe.reference_levels(str(d / 'uncalibrated.cphd'), full['meta']) == (None, None)
 
 
-def test_support_area_and_weights(scene):
-    """The area the samples fill in the ground plane's spatial frequencies, against the energy of a point target's
-    response (its integral over the ground is the peak power times sum(w^2) samples / (sum(w)^2 area))."""
+def test_footprint_against_the_antenna_block(scene, tmp_path):
+    """The beam's footprint in the phase history (the range-Doppler power of a few hundred pulses) against the
+    antenna block: clutter under the beam the file states agrees with it; the same clutter under a beam that peaks
+    on the other side of the scene center does not, the fitted move of the beam has the direction and about the
+    size of the true one, and the SICD's factors are then written as constants; point targets or noise alone give
+    no footprint to check. With the phase history given, the file is not read for it."""
+    d, col, ecf, pn, _ = scene
+    c, meta = io.read_cphd(str(d / 'clutter.cphd'), meta=True)
+    rad = rgiqe.Radiometry(str(d / 'clutter.cphd'), meta)
+    assert rad.level_source == 'cphd' and rad.footprint is None      # PNRef: nothing was measured yet
+    f = rad.measure_footprint()
+    assert f is rad.footprint and f['status'] == 'consistent' and f['ratio'] < 0.5 and f['fitted_correlation'] > 0.6
+    assert sum('agrees with the antenna block' in n for n in rad.notes) == 1
+    assert 60.0 < f['radius_m'] < 85.0                               # the two-way half-power radius: 71 m at 10 km
+    given = rgiqe.Radiometry(str(d / 'clutter.cphd'), meta, history=c['S'])   # measured while it is built
+    assert given.footprint['status'] == 'consistent' and given._blocks['history'] is None
+    assert given.footprint['offset'] == pytest.approx(f['offset'], abs=2e-4)   # the file's samples, or the history's
+    c2, meta2 = io.read_cphd(str(d / 'displaced.cphd'), meta=True)
+    off = rgiqe.Radiometry(str(d / 'displaced.cphd'), meta2, history=c2['S'])
+    g = off.footprint
+    assert g['status'] == 'inconsistent' and g['ratio'] > 0.5 and g['fitted_correlation'] > g['correlation'] + 0.1
+    assert sum('does not agree with the antenna block' in n for n in off.notes) == 1
+    true = 2 * np.array(BEAM[1:])                                    # the move that puts the model's beam on the data's
+    assert np.dot(g['offset'], true) > 0.5 * true @ true and np.hypot(*g['offset']) < 1.2 * np.hypot(*true)
+    for name in ('targets.cphd', 'noise.cphd'):
+        _, m = io.read_cphd(str(d / name), meta=True)
+        assert rgiqe.Radiometry(str(d / name), m).measure_footprint()['status'] == 'unchecked', name
+    # the product: factors that follow the beam where it was found where the file says, constants where it was not
+    p = tmp_path / 'p.nitf'
+    o = fastsar.process_cphd(str(d / 'clutter.cphd'), str(p), backend='cpu')
+    assert not o['radiometric']['constant'] and o['radiometric']['order'] >= 1
+    assert any('agrees with the antenna block' in n for n in o['notes'])
+    o = fastsar.process_cphd(str(d / 'displaced.cphd'), str(p), backend='cpu')
+    cal = o['radiometric']
+    n = (o['pulses'][1] - o['pulses'][0]) * col.K
+    assert cal['constant'] and cal['order'] == 0 and cal['residual_db'] is None and cal['rcs'].shape == (1, 1)
+    assert cal['rcs'][0, 0] == pytest.approx(1 / (n ** 2 * PT_REF)) and cal['gain_span_db'] > 3.0
+    assert any('does not agree' in n for n in o['notes']) and any('written as constants' in n for n in o['notes'])
+    rad = sarpy_sicd(p)[0].Radiometric
+    assert rad.RCSSFPoly.get_array().shape == (1, 1) and rad.SigmaZeroSFPoly.get_array().shape == (1, 1)
+    assert rad.NoiseLevel.NoisePoly.get_array()[0, 0] == pytest.approx(cal['noise_db'])
+    # by hand: the fit of the gain is left to the caller of rgiqe.calibration
+    sm = products.sicd_meta(dict(o, radiometric=None))[0]
+    ant = 0.5 * (o['meta']['tx'] + o['meta']['rcv'])[o['pulses'][0]:o['pulses'][1]]
+    area = rgiqe.support_area(ant, o['band'], o['center'])
+    assert rgiqe.calibration(off, sm, n, area)['constant'] and not rgiqe.calibration(off, sm, n, area, constant=False)['constant']
+
+
+def test_support_area_and_clutter_gain(scene):
+    """The energy of a point target's response, integrated over the ground, is its peak power times the ratio of the
+    factors for RCS and for sigma zero: the clutter gain (the squared weights times the samples' density in spatial
+    frequency) over the squared sum of the weights. For samples spread evenly that is sum(w^2) samples / (sum(w)^2
+    support area); the pulses of this curved, squinted track are not, which moves it by up to 0.1 dB."""
     d, col, ecf, pn, _ = scene
     for weighting in ('uniform', 'taylor'):
         o = fastsar.process_cphd(str(d / 'targets.cphd'), weighting=weighting, autofocus=False, backend='cpu')
@@ -222,8 +278,10 @@ def test_support_area_and_weights(scene):
         ant = 0.5 * (o['meta']['tx'] + o['meta']['rcv'])[o['pulses'][0]:o['pulses'][1]]
         area = rgiqe.support_area(ant, o['band'], o['center'])
         cal = o['radiometric']
-        wf = float(cal['rcs'][0, 0] / cal['sigma0'][0, 0] * area)   # sum(w^2) samples / sum(w)^2
-        assert abs(wf - (1.0 if weighting == 'uniform' else 1.5234)) < 2e-3
+        cell = float(cal['rcs'][0, 0] / cal['sigma0'][0, 0])        # m^2: the response's energy over its peak power
+        even = (1.0 if weighting == 'uniform' else 1.5234) / area
+        assert abs(db(cell / even)) < 0.15 and (weighting == 'uniform' or abs(db(cell / even)) > 0.03)
+        assert rgiqe.clutter_gain(ant, o['band'][0], col.df, col.K, o['center']) == pytest.approx(n * n / area, rel=0.01)
         img = o['image']
         nx, ny = img.shape                                          # the target at the scene center, the most isolated
         w = np.abs(img[nx // 2 - 8:nx // 2 + 9, ny // 2 - 8:ny // 2 + 9])
@@ -231,8 +289,9 @@ def test_support_area_and_weights(scene):
         h = 40
         energy = float((np.abs(img[i - h:i + h, j - h:j + h]) ** 2).sum() * o['spx'] * o['spy'])
         peak = quality.point_target(img, (i, j), half=32, up=16)['peak'] ** 2
-        print(f'{weighting}: support area {area:.4f}, wf {wf:.4f}, energy / peak against wf / area {db(energy / peak * area / wf):+.3f} dB')
-        assert abs(db(energy / peak * area / wf)) < 0.2, (weighting, db(energy / peak * area / wf))
+        print(f'{weighting}: support area {area:.4f}, energy / peak against the factors {db(energy / peak / cell):+.3f} dB, '
+              f'against evenly spread samples {db(energy / peak / even):+.3f} dB')
+        assert abs(db(energy / peak / cell)) < 0.1, (weighting, db(energy / peak / cell))
 
 
 def test_fit_follows_a_steep_gain_and_says_what_it_reaches():
@@ -276,7 +335,7 @@ def test_fit_follows_a_steep_gain_and_says_what_it_reaches():
         cal = rgiqe.calibration(m, sicd(), n, area)
         assert (cal['residual_db'] <= 0.1) == reached, (depth, cal['order'], cal['residual_db'])
         assert cal['noise_db'] == pytest.approx(10 * np.log10(n * 5.0))
-        assert cal['sigma0'][0, 0] / cal['rcs'][0, 0] == pytest.approx(area)            # unweighted
+        assert cal['sigma0'][0, 0] / cal['rcs'][0, 0] == pytest.approx(area)            # unweighted, spread evenly
         if not reached:                                              # 60 dB over the image: beyond any such fit
             assert cal['order'] <= 8 and cal['gain_span_db'] > 60.0
             continue
@@ -296,6 +355,9 @@ def test_fit_follows_a_steep_gain_and_says_what_it_reaches():
     plain = rgiqe.calibration(Model(1.0), sicd(), n, area)
     np.testing.assert_allclose(weighted['rcs'], plain['rcs'] / 0.64, rtol=1e-12)
     np.testing.assert_allclose(weighted['sigma0'], plain['sigma0'] / 0.9, rtol=1e-12)
+    dense = rgiqe.calibration(Model(1.0), sicd(), n, area, clutter=1.25 * n * n / area)     # the samples' own density
+    np.testing.assert_allclose(dense['sigma0'], plain['sigma0'] / 1.25, rtol=1e-12)
+    np.testing.assert_allclose(dense['rcs'], plain['rcs'], rtol=1e-12)
     assert weighted['noise_db'] == pytest.approx(plain['noise_db'] + 10 * np.log10(0.9))
     assert weighted['nesz_db'] == pytest.approx(plain['nesz_db'])                    # the weighting cancels in it
     np.testing.assert_allclose(plain['beta0'], plain['sigma0'] / np.cos(np.radians(40.0)), rtol=1e-12)

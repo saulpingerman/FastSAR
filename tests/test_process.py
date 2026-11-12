@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 
 import fastsar
-from fastsar import quality, sim
+from fastsar import products, quality, sim
 
 pytestmark = pytest.mark.needs('sarpy')
 
@@ -140,11 +140,17 @@ def test_sva_sicd(cphd):
     f = d / 'sva.nitf'
     ref = fastsar.process_cphd(str(d / 'c.cphd'), plane='slant', weighting='uniform', backend='cpu')
     o = fastsar.process_cphd(str(d / 'c.cphd'), str(f), plane='slant', weighting='sva', backend='cpu')
+    assert o['plane'] == 'slant' and not any('no plane was given' in n for n in o['notes'])
     sm, pix, off, pslr = read_sicd(f, ecf)
     assert sm.Grid.Row.WgtType.WindowName == 'SVA' and np.abs(off).max() < 0.1
     assert pslr.max() < -24                                          # the unweighted aperture's: -13 dB
     assert 0.45 < o['spx'] / ref['spx'] < 0.62 and abs(o['spy'] / ref['spy'] - 0.5 / 0.96) < 0.03   # twice Nyquist
     assert any('keystone' in n for n in o['notes'])
+    # with no plane given an apodized SICD comes out on the slant plane, where apodization runs, and says so
+    same = fastsar.process_cphd(str(d / 'c.cphd'), weighting='sva', backend='cpu')
+    assert same['plane'] == 'slant' and same['weighting'] == 'sva' and np.array_equal(same['image'], o['image'])
+    assert sum('slant plane' in n and 'no plane was given' in n for n in same['notes']) == 1
+    assert products.sicd_meta(same)[0].Grid.ImagePlane == 'SLANT'
 
 
 @pytest.mark.parametrize('weighting', [None, 'taylor', 'uniform', 'sva'])
@@ -338,8 +344,7 @@ def test_errors(cphd):
                       (dict(area='everything'), 'area'), (dict(area=True), 'area'), (dict(spacing=-1.0), 'spacing'),
                       (dict(area='black', black_sigma0_db='dark'), 'black_sigma0_db'),
                       (dict(product='sidd', plane='slant'), 'ground plane'),
-                      (dict(plane='ground', weighting='sva'), 'slant plane'),
-                      (dict(weighting='sva'), "plane='slant'")):       # the default plane of a SICD is the ground
+                      (dict(plane='ground', weighting='sva'), 'slant plane')):
         with pytest.raises(ValueError, match=match):
             fastsar.process_cphd(p, backend='cpu', **kw)
 

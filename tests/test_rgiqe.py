@@ -348,6 +348,32 @@ def test_noise_from_the_doppler_band(sgn):
         rgiqe.Radiometry(col.reader, col.meta)
 
 
+def test_noise_measurement_is_bounded_and_takes_the_history_given(monkeypatch):
+    """The measurement transforms at most about _NOISE_BUDGET samples (fewer blocks of pulses for long pulses, each
+    with its whole band), and with the phase history given it reads nothing from the file."""
+    P, K, period, toa = 512, 1024, 400e-6, 60e-6
+    S, clutter = phase_history(P, K, 1.0 / period, toa, 3.0, 40.0, -1, np.random.default_rng(21), doppler=0.4)
+    col = collection('array', P=P, K=K, toa=toa, period=period, pt_ref=2e-3, signal=S)
+    full = rgiqe.Radiometry(col.reader, col.meta)
+    assert full.measurement['pulses'] == 512 and full.footprint is not None
+    read = []
+    chip = col.reader.read_chip
+    col.reader.read_chip = lambda *a, **k: read.append(a) or chip(*a, **k)
+    given = rgiqe.Radiometry(col.reader, col.meta, history=S)
+    assert not read and given.measurement['noise'] == full.measurement['noise']
+    assert given.measurement['clutter'] == full.measurement['clutter'] and given._blocks['history'] is None
+    part = rgiqe.Radiometry(col.reader, col.meta, pulses=(100, 400), history=S[100:400])   # the pulses the image uses
+    assert not read and part.measurement['pulses'] == 256 and abs(part.noise_per_sample / 3.0 - 1) < 0.1
+    monkeypatch.setattr(rgiqe, '_NOISE_BUDGET', 128 * K * 2.5)      # room for two blocks
+    two = rgiqe.Radiometry(col.reader, col.meta)
+    assert two.measurement['pulses'] == 256 and len(read) == 2
+    assert abs(two.noise_per_sample / full.noise_per_sample - 1) < 0.05
+    monkeypatch.setattr(rgiqe, '_NOISE_BUDGET', 1.0)                # never less than one block of 64, from mid-aperture
+    one = rgiqe.Radiometry(col.reader, col.meta)
+    assert one.measurement['pulses'] == 64 and read[-1][0] == (224, 288)
+    assert abs(one.noise_per_sample / full.noise_per_sample - 1) < 0.15
+
+
 @pytest.mark.parametrize('collector, sgn, phase', [(None, -1, -1), (None, 1, 1), ('Capella-12', 1, -1), ('capella', -1, -1)])
 def test_noise_uses_the_phase_sign_of_the_reader(collector, sgn, phase):
     """The delay axis of the measurement follows the phase sign fastsar.io reads the file with (Capella files
@@ -791,4 +817,5 @@ def test_given_noise_level_and_arguments():
     with pytest.raises(ValueError, match='ground grid'):
         rgiqe.area_mask(rad, X, 'black', BA, N)
     assert set(rgiqe.__all__) == {'rniirs', 'information_density', 'snr_to_rniirs', 'rniirs_to_snr', 'Radiometry',
-                                  'area_mask', 'area_bounds', 'reference_levels', 'support_area', 'calibration'}
+                                  'area_mask', 'area_bounds', 'reference_levels', 'support_area', 'clutter_gain',
+                                  'calibration'}

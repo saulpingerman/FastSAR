@@ -15,7 +15,8 @@
   columns so that the array is the view from above), the image as FastSAR forms it. Most producers deliver
   slant-plane SICDs; `plane='slant'` gives one, and a tool that assumes a slant plane without reading
   `Grid.ImagePlane` needs it ([what to check](product-options.md#the-ground-plane-sicd-the-default)).
-  `weighting=None` is `'uniform'` for a SICD and `'sva'` for a SIDD (`'taylor'` for a moving-beam collection);
+  `weighting=None` is `'uniform'` for a SICD and `'sva'` for a SIDD (`'taylor'` for a moving-beam collection); a
+  SICD with `weighting='sva'` and no `plane` is on the slant plane, where apodization runs, and its notes say so;
   `autofocus=None` is `'quadratic'` for a spotlight. Returns the product dict (`form_cphd`'s entries on the
   product's grid) with `product`, `area`, `weighting`, `autofocus`, `autofocus_info`, `radiometric` (a SICD's
   calibration, the content of its `Radiometric` block, or `None` where the collection supports none; `notes` says
@@ -145,16 +146,21 @@ rasterio.
 ## `fastsar.rgiqe`, `fastsar.doctor`
 
 - `rgiqe.Radiometry(cphd_path, meta, *, channel=0, pulses=None, nesz_db=None, sicd=None, sigma0_db=None,
-  scene_sigma0_db=-10.0, eval_pulses=64)` with `gain_db`, `nesz_db`, `snr`, `rniirs`;
+  scene_sigma0_db=-10.0, eval_pulses=64, history=None)` with `gain_db`, `nesz_db`, `snr`, `rniirs`; `history`
+  is the phase history already read, from which the noise is measured in place of the file; `footprint` (and
+  `measure_footprint()`) is the check of the antenna block against the beam's footprint in the data: a dict
+  with `status` (`'consistent'`, `'inconsistent'`, `'unchecked'`), `correlation`, `fitted_correlation`, `offset`,
+  `offset_m`, `radius_m`, `ratio`;
   `rgiqe.area_mask(rad, points, kind, bandwidth_area, samples, tasked=None, tasked_rniirs=None, *,
   ambiguities=True, black_sigma0_db=-10.0)` and `rgiqe.area_bounds(rad, kind, center, e1, e2, bandwidth_area,
   samples, ..., black_sigma0_db=-10.0)`: `'black'` ends where a scene of `black_sigma0_db` has an SNR of 1, and the
   RNIIRS kinds keep the RGIQE's reference of 0 dB;
   `rgiqe.rniirs`, `information_density`, `snr_to_rniirs`, `rniirs_to_snr`
 - `rgiqe.calibration(rad, sicd, samples, bandwidth_area, coherent=None, noise=None, *, tasked=None, region=None,
-  tolerance_db=0.1, max_order=8)`: the content of the SICD `Radiometric` block of an image, as a dict: `noise_db`
-  (the constant of `NoisePoly`), `rcs`, `sigma0`, `beta0`, `gamma0` (polynomial coefficients in SICD's image
-  coordinates), `order`, `residual_db`, `nesz_db`, `source`. `rgiqe.reference_levels(cphd_path, meta, channel=0)`:
+  tolerance_db=0.1, max_order=8, constant=None)`: the content of the SICD `Radiometric` block of an image, as a
+  dict: `noise_db` (the constant of `NoisePoly`), `rcs`, `sigma0`, `beta0`, `gamma0` (polynomial coefficients in
+  SICD's image coordinates), `order`, `residual_db`, `nesz_db`, `source`, `constant` (the factors written without
+  the gain's variation: by default when `rad.footprint` is `'inconsistent'`). `rgiqe.reference_levels(cphd_path, meta, channel=0)`:
   (PTRef, PNRef / BNRef) of a CPHD file, `None` for one it does not state. `rgiqe.support_area(ant, band, point)`:
   the ground-plane area of an image's spatial-frequency support
   ([product-options.md](product-options.md#processed-area-by-image-quality)).

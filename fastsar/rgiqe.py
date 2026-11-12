@@ -38,12 +38,14 @@ import numpy as np
 
 
 __all__ = ['rniirs', 'information_density', 'snr_to_rniirs', 'rniirs_to_snr', 'Radiometry', 'area_mask', 'area_bounds',
-           'reference_levels', 'support_area', 'calibration']
+           'reference_levels', 'support_area', 'clutter_gain', 'calibration']
 
 C = 299792458.0
 RNIIRS_FIT = (3.4761, 0.4357)          # RNIIRS = a0 + a1 log2(information density), sarpy's fit of 2022-02-01
 _FLOOR_DB = 15.0                       # one-way depth below the peak to which an antenna gain polynomial is trusted
 _NOISE_BLOCKS, _NOISE_BLOCK_PULSES = 4, 128
+_NOISE_BUDGET = 8e6                    # about the most phase-history samples the noise measurement transforms
+_FOOTPRINT_RATIO = 0.5                 # measured against modeled beam center, in half-power radii: beyond it, they disagree
 _CELL_SAMPLES = 1000                   # least number of power samples averaged into a cell of the range-Doppler map
 
 
@@ -241,10 +243,26 @@ class Radiometry:
 
     The antenna gain is evaluated on at most eval_pulses pulses spread over the aperture (fewer for large point
     sets, never under 8), from the gain arrays of the file when it has them and from its gain polynomials otherwise.
+
+    history: the phase history of the pulses used [pulses, samples], as read_cphd returned it (before any window);
+    a noise measurement then takes its pulses from it and does not read the file a second time.
+
+    footprint (when the noise was measured, else None until measure_footprint is called) compares the beam the
+    antenna block describes with the beam in the data: the range-Doppler power map of the measured pulses against
+    the modeled gain over the ground, binned into the same cells. It is a dict: status ('consistent',
+    'inconsistent' or 'unchecked'), correlation (of the logarithms of the measured map and of the model as the
+    file states it, with a fitted scale and floor), fitted_correlation (with the beam moved to where it fits
+    best), offset (that move: the direction cosines along the antenna's X and Y axes to add to every direction),
+    offset_m (its size on the ground at the reference range), radius, radius_m (the half-power radius of the two-way
+    beam) and ratio (offset over radius). The status is 'inconsistent' when the fitted beam center lies more than
+    half a half-power radius from the modeled one, which is a gain error of about 3 dB at the half-power radius;
+    scene content alone moves the fitted center by some 0.2 radii (seven Umbra collections). Then the modeled
+    gain should not be relied on away from the reference point: a note says so, and calibration writes constant
+    scale factors. 'unchecked': no antenna pattern, or a scene of a few point scatterers, or no fit.
     """
 
     def __init__(self, cphd_path, meta, *, channel=0, pulses=None, nesz_db=None, sicd=None, sigma0_db=None,
-                 scene_sigma0_db=-10.0, eval_pulses=64):
+                 scene_sigma0_db=-10.0, eval_pulses=64, history=None):
         if hasattr(cphd_path, 'cphd_meta'):
             r = cphd_path
         else:
@@ -321,7 +339,8 @@ class Radiometry:
                 e['gref'][i] = sum(float(self._oneway(k, i, e['srp'][i][None], np.array([e['rt' if k == 'tx' else 'rr'][i]]))[0][0])
                                    for k in ('tx', 'rcv'))
         # the noise level
-        self.noise_per_sample = self.clutter_per_sample = self.area_eff = self.measurement = None
+        self.noise_per_sample = self.clutter_per_sample = self.area_eff = self.measurement = self.footprint = None
+        self._blocks = dict(reader=r, ch=ch, pv=pv, fsel=fsel, history=history, tx=tx, rcv=rcv, srp=srp)
         self.pt_ref = self.sicd_rniirs = self._nesz_fixed = None
         self.scene_sigma0_db = float(scene_sigma0_db)
         tgt, nl = getattr(par, 'TgtRefLevel', None), getattr(par, 'NoiseLevel', None)
@@ -345,10 +364,11 @@ class Radiometry:
             if str(getattr(getattr(m, 'Global', None), 'DomainType', 'FX')) != 'FX' or not v1:
                 raise ValueError('the noise level can be measured only from a frequency-domain CPHD 1.x file; '
                                  'give nesz_db or a SICD with a Radiometric block')
-            K = int(m.Data.Channels[ch].NumSamples)
-            self.measurement = _measure_noise(r, ch, pv, fsel, K)
+            K = int(m.Data.Channels[ch].NumSamples) if history is None else int(np.shape(history)[1])
+            self.measurement = _measure_noise(r, ch, pv, fsel, K, history)
             self.noise_per_sample, self.clutter_per_sample = self.measurement['noise'], self.measurement['clutter']
             self.notes.append(self.measurement['note'])
+            self._check_footprint(self.measurement['footprint'])
             if self._ant is not None and self.clutter_per_sample > 0:
                 self.area_eff = self._effective_area()
             if pt is not None:
@@ -367,6 +387,149 @@ class Radiometry:
                                   'zero is the assumed mean scene sigma zero of '
                                   f'{self.scene_sigma0_db:.1f} dB divided by the clutter-to-noise ratio measured '
                                   'from the data, and is only as good as that assumption.')
+
+        if history is not None:                                     # used here only: the caller goes on to change it
+            self.measure_footprint()
+            self._blocks['history'] = None
+
+    def measure_footprint(self):
+        """Measure the beam's footprint from the phase history and compare it with the antenna model, when a noise
+        measurement has not done so already (a file with PNRef, or a level that was given) -> self.footprint."""
+        if self.footprint is None:
+            b = self._blocks
+            try:
+                K = int(np.shape(b['history'])[1]) if b['history'] is not None else \
+                    int(b['reader'].cphd_meta.Data.Channels[b['ch']].NumSamples)
+                fp = _measure_noise(b['reader'], b['ch'], b['pv'], b['fsel'], K, b['history'])['footprint']
+            except (AttributeError, KeyError, TypeError, ValueError, IndexError):   # no samples to measure from
+                fp = None
+            self._check_footprint(fp)
+        return self.footprint
+
+    def _pattern_db(self, k, u, v, i):
+        """One-way gain (dB) of the antenna k at the direction cosines u, v along its axes, at evaluation pulse i."""
+        a = self._ant[k]
+        g = 0.0
+        for p, sx, sy in ((a['array'], a['eb'][i, 0], a['eb'][i, 1]), (a['elem'], 0.0, 0.0)):
+            if p is not None:
+                g = g + p(u - sx, v - sy)
+        return g
+
+    def _check_footprint(self, fp):
+        """Set self.footprint from the measured range-Doppler map fp (_measure_noise's) and add its note."""
+        out = dict(status='unchecked', correlation=None, fitted_correlation=None, offset=None, offset_m=None,
+                   radius=None, radius_m=None, ratio=None)
+        self.footprint = out
+        if fp is None or self._ant is None:
+            return out
+        b, e = self._blocks, self._e
+        i = len(e['rt']) // 2
+        D = np.asarray(fp['power'], np.float64)
+        ndf, nt = D.shape
+        nb, edges = int(fp['nb']), np.asarray(fp['edges'], np.float64)
+        # the two-way beam about its peak: the half-power radius, in direction cosines
+        gp = np.linspace(-0.02, 0.02, 161)
+        U, V = np.meshgrid(gp, gp, indexing='ij')
+        two = self._pattern_db('tx', U, V, i) + self._pattern_db('rcv', U, V, i)
+        if not np.isfinite(two).all() or np.ptp(two) < 6.0:
+            return out
+        inside = two >= two.max() - 3.0
+        radius = float(np.sqrt(inside.sum() * (gp[1] - gp[0]) ** 2 / np.pi))
+        if not 1e-4 < radius < 0.015:
+            return out
+        # a ground lattice out to three radii, with its direction cosines and its delay and Doppler cells
+        r0 = float(e['rt'][i])
+        half = 3.0 * radius * r0 / max(np.sin(self.graze), 0.2)
+        g = np.linspace(-half, half, 121)
+        X = (self.ref_point + g[:, None, None] * self.range_dir + g[None, :, None] * self.cross_dir).reshape(-1, 3)
+        j0 = int(fp['start']) - int(b['fsel'][0])
+        j1 = j0 + nb - 1
+
+        def dtau(j):
+            return (np.linalg.norm(X - b['tx'][j], axis=1) + np.linalg.norm(X - b['rcv'][j], axis=1)
+                    - np.linalg.norm(b['srp'][j] - b['tx'][j]) - np.linalg.norm(b['srp'][j] - b['rcv'][j])) / C
+        d0, d1 = dtau(j0), dtau(j1)
+        tmid = 0.5 * (d0 + d1)
+        nu = fp['sgn'] * fp['f0'] * (d1 - d0) / max(nb - 1, 1)       # cycles per pulse
+        # each lattice point is shared between the four cells about it (the lattice is no finer than the cells):
+        # Doppler cell c holds the bins c nb / ndf .. (c + 1) nb / ndf - 1 and wraps, delay cell k is edges[k]..[k+1]
+        fd = (nu % 1.0) * ndf - 0.5
+        ft = (tmid - edges[0]) / (edges[1] - edges[0]) - 0.5
+        d_lo, t_lo = np.floor(fd).astype(int), np.floor(ft).astype(int)
+        wd, wt = fd - d_lo, ft - t_lo
+        splat = []
+        for dd, wdd in ((0, 1.0 - wd), (1, wd)):
+            for dt, wtt in ((0, 1.0 - wt), (1, wt)):
+                kt = t_lo + dt
+                ok = (kt >= 0) & (kt < nt)
+                splat.append((np.where(ok, ((d_lo + dd) % ndf) * nt + np.clip(kt, 0, nt - 1), ndf * nt), wdd * wtt))
+        dc = {}
+        for k in ('tx', 'rcv'):
+            a, pos = self._ant[k], e[k][i]
+            rng = np.linalg.norm(X - pos, axis=1)
+            dc[k] = ((X - pos) @ a['ax'][i] / rng, (X - pos) @ a['ay'][i] / rng, rng)
+        weight = (r0 * float(e['rr'][i]) / (dc['tx'][2] * dc['rcv'][2])) ** 2
+        if fp.get('extended') is not None:                          # the part of the band an echo keeps, by its delay
+            (a1, a2), (e1, e2) = fp['window'], fp['extended']
+            with np.errstate(divide='ignore', invalid='ignore'):
+                tap = np.where(tmid < a1, (tmid - e1) / (a1 - e1), np.where(tmid > a2, (e2 - tmid) / (e2 - a2), 1.0))
+            weight = weight * np.clip(np.nan_to_num(tap, nan=1.0), 0.0, 1.0)
+
+        same = bool(self._ant['same'])
+
+        def predict(ox=0.0, oy=0.0):
+            gdb = 2.0 * self._pattern_db('tx', dc['tx'][0] + ox, dc['tx'][1] + oy, i) if same else sum(
+                self._pattern_db(k, dc[k][0] + ox, dc[k][1] + oy, i) for k in ('tx', 'rcv'))
+            v = 10.0 ** (0.1 * gdb) * weight
+            return sum(np.bincount(ix, weights=v * wv, minlength=ndf * nt + 1) for ix, wv in splat)[:ndf * nt].reshape(ndf, nt)
+
+        logd = np.log(np.maximum(D, 1e-300 + 1e-12 * D.max()))
+        floor = 0.2 * float(np.percentile(D, 5))
+        A = D.ravel()
+
+        def corr(M):
+            """Correlation of the logarithms of the map and of the model with the scale and floor that fit it best."""
+            m = M.ravel()
+            if not m.any():
+                return -1.0
+            sc, fl = np.linalg.lstsq(np.stack([m, np.ones(m.size)], 1), A, rcond=None)[0]
+            q = np.log(max(sc, 1e-300) * M + max(fl, floor, 1e-300)) - 0.0
+            q, d = q - q.mean(), logd - logd.mean()
+            den = np.sqrt((q * q).sum() * (d * d).sum())
+            return float((q * d).sum() / den) if den > 0 else -1.0
+
+        M0 = predict()
+        foot = M0 >= 0.25 * M0.max()
+        if foot.sum() < 8 or np.median(D[foot]) < 0.02 * np.percentile(D[foot], 95):   # a few point scatterers
+            return out
+        c0 = corr(M0)
+        best = (c0, 0.0, 0.0)
+        for span, step in ((1.5 * radius, radius / 4), (radius / 4, radius / 16)):
+            cx, cy = best[1], best[2]
+            for ox in np.arange(cx - span, cx + span + 1e-12, step):
+                for oy in np.arange(cy - span, cy + span + 1e-12, step):
+                    v = corr(predict(ox, oy))
+                    if v > best[0]:
+                        best = (v, float(ox), float(oy))
+        off = float(np.hypot(best[1], best[2]))
+        out.update(correlation=c0, fitted_correlation=best[0], offset=(best[1], best[2]), offset_m=off * r0,
+                   radius=radius, radius_m=radius * r0, ratio=off / radius)
+        if best[0] < 0.5:
+            return out
+        out['status'] = 'inconsistent' if off > _FOOTPRINT_RATIO * radius and best[0] - c0 > 0.02 else 'consistent'
+        if out['status'] == 'inconsistent':
+            self.notes.append(
+                f"The beam's footprint in the phase history does not agree with the antenna block of the file: fitted "
+                f"to the range-Doppler power of the measured pulses, its center lies {off * r0 / 1e3:.2f} km from the "
+                f"modeled one, {off / radius:.2f} of the half-power radius of the two-way beam ({radius * r0 / 1e3:.2f} "
+                f"km), and the correlation rises from {c0:.2f} to {best[0]:.2f}. The modeled gain is not to be relied "
+                'on away from the scene reference point.')
+        else:
+            self.notes.append(
+                f"The beam's footprint in the phase history agrees with the antenna block: its fitted center lies "
+                f"{off * r0 / 1e3:.2f} km from the modeled one, {off / radius:.2f} of the half-power radius of the "
+                'two-way beam.')
+        return out
 
     def _antenna(self, r, m, par, pv, fi, t_tx, t_rcv):
         """The transmit and receive patterns and their per-pulse axes (local frame) and steering, or None."""
@@ -606,30 +769,48 @@ def _line_fit(tau, prof, lo, hi):
     return c
 
 
-def _measure_noise(r, ch, pv, fsel, K):
+def _measure_noise(r, ch, pv, fsel, K, history=None):
     """Noise and clutter power per phase-history sample of the pulses fsel, from a few blocks of consecutive pulses.
 
-    Each block is compressed in range (a unitary transform over the K samples, so white noise keeps its per-sample
+    Each block is compressed in range (a unitary transform over the samples, so white noise keeps its per-sample
     power in every delay bin) and the powers are averaged into a range profile. Thermal noise is taken, where the
     file saves an extended delay swath well beyond the scene (TOAE1, TOAE2), from straight lines fitted to the
     profile on either side of the scene and continued under it: after compression against a pulse of finite length
     the noise floor falls linearly toward the ends of the saved swath. Otherwise, and as an upper bound in every
     case, it is the least cell of a coarse, smoothed range-Doppler power map of the scene swath, which sees the
     noise wherever the pulse repetition frequency exceeds the Doppler band of the beam. Clutter is the rest of the
-    power in the scene swath TOA1..TOA2, expressed per sample."""
+    power in the scene swath TOA1..TOA2, expressed per sample.
+
+    Cost. Up to _NOISE_BLOCKS blocks of _NOISE_BLOCK_PULSES pulses are transformed, and fewer or shorter blocks
+    when a pulse is long, so that about _NOISE_BUDGET samples are: two blocks for a pulse of 31,250 samples, one
+    from 62,500, and one of 64 pulses beyond that. Every pulse keeps its whole band, since the floor's shape in
+    delay, which the fit relies on, is that of the whole band. A block holds over a million noise samples, a
+    statistical error of the noise power under 0.1%; on an Umbra collection of 120,736 samples per pulse 64 pulses
+    give the level of 512 to 0.03 dB. history: the pulses fsel as read_cphd returned them [len(fsel), K]
+    (FastSAR's sign: a later echo has the phase exp(-j 2 pi f delay)); they are used in place of reading the
+    pulses from the file a second time.
+
+    -> dict(noise, clutter, method, ..., footprint): footprint is the range-Doppler power map of the same blocks
+    over a delay window three times the scene swath wide (within the saved delays), for the comparison with the
+    antenna model (Radiometry.footprint), or None when the window holds too few bins."""
     from scipy import fft as sfft
     names = pv.dtype.names
-    sgn = _phase_sign(r.cphd_meta)                                  # the delay axis mirrors with the wrong sign
+    sgn = -1 if history is not None else _phase_sign(r.cphd_meta)   # the delay axis mirrors with the wrong sign
     first, span = int(fsel[0]), int(fsel[-1]) - int(fsel[0]) + 1
     nb = int(min(_NOISE_BLOCK_PULSES, span))
-    starts = np.unique(np.rint(np.linspace(first, first + span - nb, max(1, min(_NOISE_BLOCKS, span // nb)))).astype(int))
+    if nb * int(K) > _NOISE_BUDGET and nb >= 128:                   # a long pulse: half a block
+        nb //= 2
+    nblk = int(max(1, min(_NOISE_BLOCKS, span // nb, _NOISE_BUDGET // (nb * int(K)))))
+    starts = np.unique(np.rint(np.linspace(first, first + span - nb, nblk)).astype(int)) if nblk > 1 else \
+        np.array([first + (span - nb) // 2])                        # one block: the middle of the aperture
     rows = np.concatenate([np.arange(p, p + nb) for p in starts])
     scss = float(np.mean(_pvp(pv, 'SCSS')[rows]))
-    tau = np.fft.fftfreq(K, scss)
+    Ku, k0 = int(K), 0
+    tau = np.fft.fftfreq(Ku, scss)
     t1, t2 = float(np.mean(_pvp(pv, 'TOA1')[rows])), float(np.mean(_pvp(pv, 'TOA2')[rows]))
     sw = (tau >= t1) & (tau <= t2)
     if sw.sum() < 8:
-        sw = np.ones(K, bool)
+        sw = np.ones(Ku, bool)
     nsw, total = int(sw.sum()), len(rows) * int(sw.sum())
     nd, nr = max(min(32, nb // 4), 1), max(min(16, nsw // 8), 1)
     while nd * nr * _CELL_SAMPLES > total and nr > 1:
@@ -637,46 +818,76 @@ def _measure_noise(r, ch, pv, fsel, K):
     while nd * nr * _CELL_SAMPLES > total and nd > 4:
         nd //= 2
     w = np.hanning(nb + 2)[1:-1]
-    prof, cells = np.zeros(K), np.zeros((nd, nr))
+    prof, cells = np.zeros(Ku), np.zeros((nd, nr))
+    # the footprint map: Doppler cells by delay cells over a window about the scene swath
+    ext = 'TOAE1' in names and 'TOAE2' in names
+    e1, e2 = (float(np.mean(_pvp(pv, 'TOAE1')[rows])), float(np.mean(_pvp(pv, 'TOAE2')[rows]))) if ext else (t1, t2)
+    lo, hi = max(e1, t1 - (t2 - t1), float(tau.min())), min(e2, t2 + (t2 - t1), float(tau.max()))
+    fwi = np.flatnonzero((tau >= lo) & (tau < hi))
+    nt, ndf = int(min(48, len(fwi) // 4)), int(min(32, nb))
+    while nb % ndf:
+        ndf -= 1
+    fmap = None
+    if nt >= 8 and ndf >= 8 and hi > lo:
+        edges = np.linspace(lo, hi, nt + 1)
+        order = np.argsort(tau[fwi], kind='stable')
+        fwi = fwi[order]
+        bounds = np.searchsorted(tau[fwi], edges[:-1], side='left')
+        fmap = np.zeros((ndf, nt))
     for p0 in starts:
-        s = np.asarray(r.read_chip((int(p0), int(p0) + nb), (0, K), index=ch)).reshape(nb, K)
-        rc = sfft.ifft(s, axis=1, workers=-1) * np.sqrt(K) if sgn < 0 else sfft.fft(s, axis=1, workers=-1) / np.sqrt(K)
+        if history is not None:
+            s = np.asarray(history[int(p0) - first:int(p0) - first + nb, k0:k0 + Ku])
+        else:
+            s = np.asarray(r.read_chip((int(p0), int(p0) + nb), (k0, k0 + Ku), index=ch)).reshape(nb, Ku)
+        rc = sfft.ifft(s, axis=1, workers=-1) * np.sqrt(Ku) if sgn < 0 else sfft.fft(s, axis=1, workers=-1) / np.sqrt(Ku)
         del s
-        prof += (rc.real.astype(np.float64) ** 2 + rc.imag.astype(np.float64) ** 2).sum(0)
+        pw = rc.real * rc.real
+        pw += rc.imag * rc.imag
+        prof += pw.sum(0, dtype=np.float64)
         rd = sfft.fft(rc[:, sw] * w[:, None].astype(rc.real.dtype), axis=0, workers=-1)
         pw = (rd.real ** 2 + rd.imag ** 2) / float(np.sum(w * w))
-        del rc, rd
+        del rd
         pw = pw[:nd * (nb // nd), :nr * (nsw // nr)].reshape(nd, nb // nd, nr, nsw // nr)
         cells += pw.mean((1, 3), dtype=np.float64)
         del pw
+        if fmap is not None:
+            rd = sfft.fft(rc[:, fwi] * w[:, None].astype(rc.real.dtype), axis=0, workers=-1)
+            pw = (rd.real.astype(np.float64) ** 2 + rd.imag.astype(np.float64) ** 2).reshape(ndf, nb // ndf, -1).sum(1)
+            fmap += np.add.reduceat(pw, bounds, axis=1)
+            del rd, pw
+        del rc
     prof /= len(rows)
     cells /= len(starts)
     if nd >= 6:
         cells = (np.roll(cells, 1, 0) + cells + np.roll(cells, -1, 0)) / 3
     rd_min = float(cells.min())
-    model, method, ext = None, 'range-Doppler minimum', None
-    if 'TOAE1' in names and 'TOAE2' in names:
-        e1, e2 = float(np.mean(_pvp(pv, 'TOAE1')[rows])), float(np.mean(_pvp(pv, 'TOAE2')[rows]))
+    model, method, ext_level = None, 'range-Doppler minimum', None
+    if ext:
         e1, e2, width = max(e1, float(tau.min())), min(e2, float(tau.max())), t2 - t1
         lines = [c for c in (_line_fit(tau, prof, e1 + 0.15 * (t1 - e1), t1 - width) if t1 - width - e1 > 0.6 * width else None,
                              _line_fit(tau, prof, t2 + width, e2 - 0.15 * (e2 - t2)) if e2 - t2 - width > 0.6 * width else None)
                  if c is not None]
         if lines:
             m = np.min([np.polyval(c, tau[sw]) for c in lines], axis=0)
-            ext = float(m.mean())
-            if np.isfinite(ext) and 0 < ext <= 1.05 * rd_min and m.min() > 0:
+            ext_level = float(m.mean())
+            if np.isfinite(ext_level) and 0 < ext_level <= 1.05 * rd_min and m.min() > 0:
                 model, method = m, 'extended swath'
     if model is None:
         model = np.full(nsw, rd_min)
     noise = float(model.mean())
-    clutter = float(np.maximum(prof[sw] - model, 0).sum() / K)
+    clutter = float(np.maximum(prof[sw] - model, 0).sum() / Ku)
     how = ('straight lines fitted to the range-compressed power in the extended delay swath on either side of the '
            'scene and continued under it' if method == 'extended swath' else
            'the least cell of a smoothed %d x %d range-Doppler power map of the scene swath, an upper bound' % (nd, nr))
     note = (f'The noise power per sample ({noise:.4g}) was measured from {len(rows)} pulses in {len(starts)} blocks as {how}. '
             f'The clutter power per sample from the scene swath is {clutter:.4g}.')
-    return dict(noise=noise, clutter=clutter, method=method, rd_min=rd_min, extended=ext, pulses=len(rows),
-                swath=(t1, t2), profile_mean=float(prof.mean()), note=note)
+    foot = None
+    if fmap is not None:
+        f0 = float(np.mean(_pvp(pv, 'SC0' if 'SC0' in names else 'FX1')[rows])) + k0 * scss
+        foot = dict(power=fmap / len(starts), edges=edges, nb=nb, start=int(starts[len(starts) // 2]), sgn=sgn, f0=f0,
+                    window=(t1, t2), extended=(e1, e2) if ext else None)
+    return dict(noise=noise, clutter=clutter, method=method, rd_min=rd_min, extended=ext_level, pulses=len(rows),
+                swath=(t1, t2), profile_mean=float(prof.mean()), note=note, footprint=foot, samples=Ku)
 
 
 def _ring(tasked):
@@ -928,6 +1139,24 @@ def support_area(ant, band, point):
     return float(0.5 * abs(np.sum(x * np.roll(y, -1) - y * np.roll(x, -1))))
 
 
+def clutter_gain(ant, fmin, df, K, point, pulse_weights=None, frequency_weights=None):
+    """The mean pixel power of clutter of sigma zero 1 whose samples have unit power for a 1 m^2 point, in an image
+    that sums the samples with the weights w_p w_k: the sum over the samples of w^2 times the density of the samples
+    in the ground plane's spatial frequencies (samples per cycle^2 / m^2) at the ground point `point` [3]. A sample
+    of pulse p at frequency f fills the cell (2 f / c) (2 df / c) |u_p x du_p|, u_p the horizontal part of the unit
+    vector from the antenna (ant [P, 3]) to the point and du_p its step from pulse to pulse. For samples spread
+    evenly over the support this is samples sum(w^2) / support_area; pulses spaced unevenly in angle (a squinted or
+    curved track) move it by up to 0.1 dB under a Taylor window. Weights default to ones."""
+    u = np.asarray(point, np.float64) - np.asarray(ant, np.float64)
+    u = (u / np.linalg.norm(u, axis=1, keepdims=True))[:, :2]
+    du = np.gradient(u, axis=0)
+    cell_p = np.abs(u[:, 0] * du[:, 1] - u[:, 1] * du[:, 0])
+    cell_k = (2 * (fmin + df * np.arange(int(K))) / C) * (2 * df / C)
+    wp = np.ones(len(u)) if pulse_weights is None else np.asarray(pulse_weights, np.float64)
+    wk = np.ones(int(K)) if frequency_weights is None else np.asarray(frequency_weights, np.float64)
+    return float((wp * wp / np.maximum(cell_p, 1e-300)).sum() * (wk * wk / cell_k).sum())
+
+
 def _fit_2d(u, v, f, order):
     """Least squares in the relative error of a polynomial of the given order in each of u and v (in [-1, 1]) to the
     positive values f: coefficients [order + 1, order + 1] in powers of u and v."""
@@ -941,8 +1170,8 @@ def _fit_2d(u, v, f, order):
     return T @ c @ T.T
 
 
-def calibration(rad, sicd, samples, bandwidth_area, coherent=None, noise=None, *, tasked=None, region=None,
-                tolerance_db=0.1, max_order=8):
+def calibration(rad, sicd, samples, bandwidth_area, coherent=None, noise=None, *, clutter=None, tasked=None,
+                region=None, tolerance_db=0.1, max_order=8, constant=None):
     """The content of the SICD Radiometric block of an image of the collection, from the collection's own levels.
 
     rad: a Radiometry with the file's PTRef (level_source 'cphd': with its PNRef; 'cphd+measured': with the noise
@@ -950,7 +1179,9 @@ def calibration(rad, sicd, samples, bandwidth_area, coherent=None, noise=None, *
     image's SICD metadata (fastsar._sicdxml.SICD), whose projection gives each pixel's ground point. samples: the
     number of phase-history values the image sums (pulses x samples per pulse). bandwidth_area: the ground-plane
     area of their spatial-frequency support (support_area). coherent, noise: the sum of the aperture weights over
-    the samples and the sum of their squares (both `samples` for an unweighted image, the default).
+    the samples and the sum of their squares (both `samples` for an unweighted image, the default). clutter: the
+    sum of the squared weights times the samples' density in spatial frequency (clutter_gain); default samples
+    noise / bandwidth_area, its value for samples spread evenly over the support.
 
     The formers sum the weighted samples without normalization. With PTRef the per-sample power of a 1 m^2 point at
     the scene reference point, PN the noise power per sample and G(x) the two-way gain at the ground point x
@@ -958,11 +1189,11 @@ def calibration(rad, sicd, samples, bandwidth_area, coherent=None, noise=None, *
     image has
 
         peak power of a point of 1 m^2             coherent^2 PTRef G(x)
-        mean power of clutter of sigma zero 1      samples noise PTRef G(x) / bandwidth_area
+        mean power of clutter of sigma zero 1      clutter PTRef G(x)
         mean power of thermal noise                noise PN
 
-    so pixel power times 1 / (coherent^2 PTRef G(x)) is RCS in m^2, and times bandwidth_area / (samples noise
-    PTRef G(x)) it is sigma zero. Beta zero is sigma zero / cos(SlopeAng) and gamma zero sigma zero / sin(GrazeAng),
+    so pixel power times 1 / (coherent^2 PTRef G(x)) is RCS in m^2, and times 1 / (clutter PTRef G(x)) it is
+    sigma zero. Beta zero is sigma zero / cos(SlopeAng) and gamma zero sigma zero / sin(GrazeAng),
     SICD's relations, with the angles of the scene center point. The four factors are properties of the ground
     point, the same for a ground-plane and a slant-plane image of it. Each is written as a polynomial in SICD's
     image coordinates (meters from the scene center point along rows and along columns), a constant times one fit
@@ -973,13 +1204,16 @@ def calibration(rad, sicd, samples, bandwidth_area, coherent=None, noise=None, *
     for the residual there. region: a function of lattice points [n1, n2, 3] (local) -> the mask of those to fit
     and to judge: the pixels that hold data (default: all of them; a slant-plane image is zero beyond the ground
     that was formed, and the polynomials mean nothing there). Points where the antenna pattern is not known are
-    left out.
+    left out. constant: write the factors as constants, their values at the scene reference point (G = 1), without
+    the modeled gain's variation over the image; None: when the beam's footprint in the data does not agree with
+    the antenna model (rad.footprint['status'] == 'inconsistent'), in which case the variation would be wrong.
 
     -> dict(source (rad.level_source), noise_db (thermal noise power of a pixel, dB: NoisePoly, a constant; None
     without a noise power), rcs, sigma0, beta0, gamma0 (coefficients [n + 1, n + 1], exponent of the row coordinate
     first), order, residual_db (largest error of the fit over the region), tasked_residual_db (over the tasked
     area, or None), gain_span_db (the range of G over the region), nesz_db (noise-equivalent sigma zero at the
-    scene center point, or None), scp, urow, ucol (the frame the polynomials are in, ECF))."""
+    scene center point, or None), constant (whether the factors were written without the gain's variation; order is
+    then 0 and residual_db None), scp, urow, ucol (the frame the polynomials are in, ECF))."""
     from .io import ecf_to_local
     if getattr(rad, 'pt_ref', None) is None:
         raise ValueError('the calibration needs the PTRef of the CPHD file '
@@ -1004,12 +1238,14 @@ def calibration(rad, sicd, samples, bandwidth_area, coherent=None, noise=None, *
         return ((r - r0) * ssr / hx)[ok], ((c - c0) * ssc / hy)[ok], 1.0 / ev['gain'][ok], \
             None if inside is None else inside[ok]
 
+    if constant is None:
+        constant = (getattr(rad, 'footprint', None) or {}).get('status') == 'inconsistent'
     u, v, f, _ = lattice(33)
     uu, vv, ff, inside = lattice(64)                               # the fit is judged between its own nodes
     if len(f) < 4 or len(ff) < 4:
         raise ValueError('the antenna pattern is known at too few points of the image for a fit of the scale factors')
-    best = None
-    for order in range(0, int(max_order) + 1):
+    best = (None, 0, np.ones((1, 1)), np.zeros(len(ff))) if constant else None
+    for order in range(0, 0 if constant else int(max_order) + 1):
         if (order + 1) ** 2 > len(f):
             break
         coef = _fit_2d(u, v, f, order)
@@ -1024,14 +1260,14 @@ def calibration(rad, sicd, samples, bandwidth_area, coherent=None, noise=None, *
     k = np.arange(order + 1)
     inv_gain = coef / (hx ** k[:, None] * hy ** k[None, :])         # 1 / G in meters from the scene center point
     rcs = 1.0 / (coherent ** 2 * rad.pt_ref)
-    sigma = float(bandwidth_area) / (n * noise * rad.pt_ref)
+    sigma = 1.0 / ((n * noise / float(bandwidth_area) if clutter is None else float(clutter)) * rad.pt_ref)
     slope, graze = np.radians(float(sicd.SCPCOA.SlopeAng)), np.radians(float(sicd.SCPCOA.GrazeAng))
     pn = rad.noise_per_sample
     noise_db = float(10 * np.log10(noise * pn)) if pn is not None and pn > 0 else None
     return dict(source=rad.level_source, noise_db=noise_db, rcs=rcs * inv_gain, sigma0=sigma * inv_gain,
                 beta0=sigma / np.cos(slope) * inv_gain, gamma0=sigma / np.sin(graze) * inv_gain, order=int(order),
-                residual_db=res,
-                tasked_residual_db=None if inside is None or not inside.any() else float(err[inside].max()),
+                residual_db=res, constant=bool(constant),
+                tasked_residual_db=None if constant or inside is None or not inside.any() else float(err[inside].max()),
                 gain_span_db=float(10 * np.log10(ff.max() / ff.min())),
                 nesz_db=None if noise_db is None else float(noise_db + 10 * np.log10(sigma * inv_gain[0, 0])),
                 scp=np.asarray(sicd.GeoData.SCP.ECF.get_array(), np.float64),

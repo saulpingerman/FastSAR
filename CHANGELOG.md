@@ -17,8 +17,14 @@ was published on PyPI.
   state their order and residual. `out['radiometric']` holds what was written;
   `rgiqe.calibration`, `rgiqe.reference_levels` and `rgiqe.support_area` are the pieces
   ([docs/product-options.md](docs/product-options.md#radiometric-calibration), with the simulator's accuracy
-  and the comparison with a vendor's SICD). The step adds a `radiometry` entry to `timing`; where the noise has to
-  be measured it reads 512 pulses of the file again.
+  and the comparison with a vendor's SICD). The radiometric model's time is the `radiometry` entry of `timing`
+  (for the quality areas it was part of `form`).
+- A check of the antenna block against the data (`Radiometry.footprint`, `measure_footprint()`): the beam's
+  footprint measured from the range-Doppler power of a few hundred pulses, against the modeled gain. Where the
+  fitted beam center lies more than half a half-power radius from the modeled one, a note says that the modeled
+  gain is not to be relied on away from the scene reference point, and the scale factors of the `Radiometric`
+  block are written as constants. Five of seven Umbra collections fail it: their per-vector antenna frames put
+  the boresight 1.4 to 1.6 km from the scene reference point, and the data put the beam near that point.
 - `sim.write_cphd(..., pt_ref=, pn_ref=, beam=)` writes the reference levels and an antenna block, and
   `sim.beam_gain` gives the matching gain of simulated scatterers.
 
@@ -32,9 +38,14 @@ was published on PyPI.
   rows along ground range away from the radar, the view from above); most producers deliver slant-plane SICDs,
   and [docs/product-options.md](docs/product-options.md#the-ground-plane-sicd-the-default) lists what a consumer
   that assumes one should check. No weighting leaves the choice of an apodization to the user of the complex
-  image. Since apodization runs on the slant plane, `process_cphd(cphd, weighting='sva')` for a SICD now raises a
-  `ValueError` unless `plane='slant'` is given. The defaults of a SIDD, of a moving-beam collection (Taylor
-  weighting in range for either product) and of `form_cphd` are unchanged.
+  image. Since apodization runs on the slant plane, a SICD with `weighting='sva'` and no `plane` is a slant-plane
+  SICD as before, with a note in the product that says so; `plane='ground'` with `'sva'` raises a `ValueError`.
+  The defaults of a SIDD, of a moving-beam collection (Taylor weighting in range for either product) and of
+  `form_cphd` are unchanged.
+- The noise measurement of `rgiqe.Radiometry` is bounded and no longer reads the file a second time from
+  `process_cphd`: about 8 million samples at most (64 pulses of an Umbra collection with 120,736 samples per
+  pulse, 0.03 dB from the level of 512), taken from the phase history in memory (`Radiometry(..., history=)`). On
+  that collection under a load of 100 it took 0.4 to 0.9 s where it took 52 to 181 s.
 - `area='black'` ends where a scene of sigma zero -10 dB has a signal-to-noise ratio of 1, ambiguities counted as
   noise: where the noise-equivalent sigma zero plus the ambiguity level reaches -10 dB. In 0.2.0 the reference was
   the RGIQE's scene (0 dB for a co-polarized channel), which put the edge about 10 dB further down the beam, past
