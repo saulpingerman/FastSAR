@@ -493,14 +493,15 @@ def _keep(img, out, info, guard, sb=None, z=2.0):
     return out
 
 
-def _apply(img, phi):
+def _apply(img, phi, q=None):
     """img with the phase phi [nx] (rad, FFT order) removed from its azimuth spectrum, complex64, on the device of
-    img: ifft(fft(img, axis=0) * exp(-1j * phi)[:, None], axis=0), exact zeros of img kept. Column blocks: on the
+    img: ifft(fft(img, axis=0) * exp(-1j * phi)[:, None], axis=0), exact zeros of img kept (q [nx]: any factor per
+    bin in place of exp(-1j * phi), as moving.band_limit gives). Column blocks: on the
     host one thread per block of about 4 MB, on a GPU blocks of 1 GB, in JAX equal blocks of at most 2 GB (less on
     a device with little memory: _xp.jax_block) through one jitted kernel (the last block overlaps its neighbor
     so that every block has the same shape)."""
     nx, ny = img.shape
-    q = np.exp(-1j * np.asarray(phi, np.float64)).astype(np.complex64)
+    q = np.exp(-1j * np.asarray(phi, np.float64)).astype(np.complex64) if q is None else np.asarray(q, np.complex64)
     k = _xp.kind(img)
     if k == 'numpy' and _VIA:                                       # through JAX's device, to a new host image
         f, w, out, block = _jit('fixed'), _jax_width(nx, ny), np.empty((nx, ny), np.complex64), _columns(img)

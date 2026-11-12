@@ -606,13 +606,15 @@ def choose_buckets(counts, compile_cost, step=256):
 
 def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 1.0, 0.0), patch=(128, 128), crop=0,
                 beam=None, umax=1.0, awin=None, pulses=None, margin=None, guard=None, backend='cpu', T='auto',
-                levels='auto', target_db=-40.0, sub='auto', wtol_db=None, exact=False, info=None, precision='float32'):
+                levels='auto', target_db=-40.0, sub='auto', wtol_db=None, exact=False, info=None, precision='float32',
+                amask=False):
     """Complex image [nx, ny] (complex64) on the grid origin + i spx e1 + j spy e2 from the FX phase history fx
     (see echoes_to_fx and the module docstring) and the antenna positions ant [P, 3] of any track, formed patch by
     patch with ImageFormer on backend ('cpu', 'jax', 'cuda', 'tpu').
     beam(idx, points) -> u [len(idx), m]: normalized azimuth coordinate of pulses idx (stripmap_beam); a pulse
     serves a patch when |u| <= umax somewhere on it. With an azimuth window awin (stripmap.window) pulse p is
-    weighted at pixel x by W_a(u_p(x)/umax), the window clipped at its edges. The weight is applied in FFBP's final
+    weighted at pixel x by W_a(u_p(x)/umax), the window clipped at its edges, or with amask zero where |u| > umax
+    (a window that does not end at zero, or 'none': a rectangle over the band). The weight is applied in FFBP's final
     stage (ImageFormer's aperture_weight: each final subaperture's mean weight at each final tile, with its
     first-order variation across the tile). With exact=True or FASTSAR_WEIGHT_TERMS=1, the weight on pulses x 9 x 9
     points of the patch is split into separable terms
@@ -648,6 +650,7 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
     mx, my = (int(v) for v in patch)
     px, py = mx + 2 * crop, my + 2 * crop
     wa = sm.window(awin)
+    wu = (lambda u: wa(u / umax)) if amask else (lambda u: wa(np.clip(u / umax, -1, 1)))
     si, sj = np.linspace(0, px - 1, 9), np.linspace(0, py - 1, 9)          # sample points, in patch pixels
     gi, gj = np.meshgrid(si - px / 2, sj - py / 2, indexing='ij')
     # the azimuth window in the final stage of a single FFBP; FASTSAR_WEIGHT_TERMS=1 and exact=True use the separable
@@ -736,7 +739,7 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
         lo, hi = span
         wt = None
         if beam is not None and awin is not None and not in_kernel:
-            wt = weight_terms(wa(np.clip(beam(slice(lo, hi), pts) / umax, -1, 1)), wtol_db)
+            wt = weight_terms(wu(beam(slice(lo, hi), pts)), wtol_db)
         tm('beam span')
         for attempt in range(40):
             try:
@@ -787,7 +790,7 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
                     # the window at points q (relative to the patch center) for pulses pul of af (the nearest
                     # recorded pulse for one inserted at a gap)
                     k = np.clip(np.searchsorted(idx, pul), 0, len(idx) - 1)
-                    return wa(np.clip(beam(lo + k, np.asarray(q) + c) / umax, -1, 1))
+                    return wu(beam(lo + k, np.asarray(q) + c))
             former = ImageFormer(af, f0, df, S.shape[1], px * s1, py * s2, spx / s1, spy / s2, e1, e2, backend=backend, precision=precision,
                                  window=False, T=Tp, levels=nlev, aperture_weight=aw)
 

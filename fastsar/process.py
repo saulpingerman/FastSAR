@@ -20,8 +20,16 @@ Remap (SIDD). A name of fastsar.remap.REMAPS (the NGA MATLAB SAR Toolbox's: 'nrl
 'highcontrast', 'pedf', 'log') or a function.
 
 Defaults: the tasked area; a SICD on the slant plane with Taylor weighting and quadratic autofocus; for a SIDD the
-ground plane, spatially variant apodization and the NRL remap. A moving-beam collection (stripmap, sliding
-spotlight) is formed on the ground plane on axes along the track, without autofocus or apodization.
+ground plane, spatially variant apodization and the NRL remap.
+
+A moving-beam collection (stripmap, sliding spotlight) is formed on the ground plane on axes along the track and
+brought to baseband there (fastsar.moving). Weighting: 'taylor' is the Taylor window along frequency and over each
+pixel's processed azimuth band, 'uniform' a rectangle over that band and no frequency window, 'sva' the uniform
+image at twice Nyquist of both bands, cut to the same rectangle at every pixel and apodized on the ground grid
+(refused where the squint or the swath leaves no rectangle). Autofocus: 'quadratic' or 'spatially_variant', by map
+drift on blocks along the track, tied together by a smooth fit (the phase gradient modes are for one aperture).
+Area: the tasked extent along the track, and in ground range as far as the criterion holds. Defaults: Taylor,
+quadratic autofocus, the tasked area. The slant plane is for spotlight collections.
 """
 import contextlib
 import time
@@ -50,13 +58,14 @@ def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None
     cphd: path. output: the file to write (NITF), or None to return the product without writing it.
     product: 'sicd' or 'sidd'. area: 'tasked', 'tasked_quality', an RNIIRS (number) or 'black'.
     plane: 'slant' or 'ground'; None: slant for a SICD, ground for a SIDD (and for any moving-beam collection).
-    autofocus: 'quadratic', 'pga', 'spatially_variant', 'spatially_variant_pga' or False; None: 'quadratic' for a
-        spotlight, none for a moving beam.
+    autofocus: 'quadratic', 'pga', 'spatially_variant', 'spatially_variant_pga' or False; None: 'quadratic'. A
+        moving beam takes 'quadratic' and 'spatially_variant' (fastsar.moving.autofocus).
     weighting: 'taylor', 'uniform' or 'sva'; None: 'taylor' for a SICD, 'sva' for a SIDD ('taylor' for a moving beam).
     remap, remap_args: the SIDD's remap and its parameters (fastsar.sidd.to_display). shadows_down: lay a SIDD out
         with range increasing down the rows (False: the grid's own layout).
     spacing: the product's pixel spacing in meters: (azimuth, range) on the slant plane, (across, along the line of
-        sight) for a ground-plane SICD, one number (square pixels) for a ground-plane SIDD. None: 0.96 of the
+        sight) for a ground-plane SICD, one number (square pixels) for a ground-plane SIDD, (along, across) the
+        track for a moving beam. None: 0.96 of the
         reciprocal of the bandwidth for a complex product (half of it with 'sva'), 0.7 of the finer ground
         resolution for a SIDD. Without a spacing or a vendor sicd, a spotlight uses the central part of the
         aperture that makes the azimuth resolution the ground range resolution (form_cphd's aperture='auto').
@@ -121,13 +130,13 @@ def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None
         wt = weighting or ('sva' if product == 'sidd' and spot else 'taylor')
         af = ('quadratic' if spot else False) if autofocus is None else autofocus
         if not spot:
-            for name, v, ok in (('plane', pl, pl == 'ground'), ('weighting', wt, wt != 'sva'), ('autofocus', af, not af),
-                                ('area', area, area == 'tasked')):
-                if not ok:
-                    raise ValueError(f'{name}={v!r} is for spotlight collections; this one has a moving beam')
-            st.update(spot=False, plane=pl, weighting=wt, autofocus=af)
-            sp = None if spacing is None else tuple(float(v) for v in np.broadcast_to(np.asarray(spacing, np.float64), (2,)))
-            return dict(window=wt == 'taylor', spacing=sp)
+            if pl != 'ground':
+                raise ValueError(f'plane={pl!r} is for spotlight collections; this one has a moving beam')
+            from . import moving
+            return moving.plan(g, st, dict(
+                product=product, weighting=wt, autofocus='quadratic' if autofocus is None else autofocus, area=area,
+                spacing=spacing, extent=extent, cphd=cphd, channel=channel, nesz_db=nesz_db,
+                scene_sigma0_db=scene_sigma0_db))
         if product == 'sicd' and pl == 'ground' and wt == 'sva':
             raise ValueError("weighting='sva' is applied on the slant plane: for a SICD give plane='slant'")
         if product == 'sidd' and pl == 'slant':
@@ -195,13 +204,9 @@ def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None
     try:
         if st['spot']:
             out, tight = _spotlight(out, st, product, area, spacing, lap, cuda, jaxdev)
-        elif cuda and product == 'sidd':                             # a moving beam: the remap alone is the device's
-            place, tight = _cuda_place(out, dict(ground=out['image'].nbytes, display=out['image'].size))
-            if place['ground'] == 'device':
-                out['image'] = _xp.device(out['image'], backend)
-        elif jaxdev and product == 'sidd':
-            if _jax_place(out, dict(ground=out['image'].nbytes, display=out['image'].size))['ground'] == 'device':
-                out['image'] = _xp.device(out['image'], backend)
+        else:
+            from . import moving
+            out, tight = moving.stages(out, st, product, lap, backend)
         out['timing'] = timing
         if product == 'sidd':
             out.update(remap=remap, remap_args=dict(remap_args or {}), shadows_down=bool(shadows_down))

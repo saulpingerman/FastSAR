@@ -8,15 +8,19 @@ Mode. A spotlight collection keeps one scene reference point (SRP) for every pul
 dynamic stripmap collections move it with the beam. mode='auto' tells them apart by how far the SRP moves (more than
 one range resolution: a moving beam). A spotlight is formed as one image by factorized backprojection over the full
 aperture (ImageFormer, with the phase reference moved to the grid center); a moving beam is formed as a mosaic of
-range-gated patches (patches.form_mosaic), each pixel weighted by a Hann window over the azimuth band the beam
-illuminates around it (the beam center of each pulse is its own SRP).
+range-gated patches (patches.form_mosaic), each pixel weighted by a window over the azimuth band the beam
+illuminates around it (the beam center of each pulse is its own SRP): the pulses p for which the sine of the look
+angle of the pixel, d_p . (x - a_p) / |x - a_p| with d_p the direction of flight, lies within half the processed
+spread of the SRP's. The window is a Hann window over that spread by default; azimuth_window selects a Taylor
+window (nbar 4, 35 dB) or a rectangle, both zero outside the spread.
 
 Grid. A ground-plane grid (axes along track and across track, horizontal at the scene) covering the vendor image's
 footprint when a SICD is given, else the CPHD's image area (SceneCoordinates.ImageArea; for CPHD 0.3, the corners of Global.ImageArea). Pixel spacing: the SICD's,
 widened to 0.8 of its impulse response width, or 0.8 of the resolution the data support (range: c / 2B over the
 cosine of the grazing angle; azimuth: lambda / 2 over the angular span of the aperture, or of the processed band).
 
-Window. Taylor (nbar 4, 35 dB) along frequency, and along pulses for a spotlight (window=False: none).
+Window. Taylor (nbar 4, 35 dB) along frequency, and along pulses for a spotlight (window=False: none; a moving
+beam then weights every pulse of a patch by one, whatever the pixel, unless azimuth_window is given).
 
 Azimuth band of a moving beam: the SICD's processed bandwidth (Grid.Col.ImpRespBW) when a SICD is given, else
 `azimuth_fraction` (default 0.8) of the Doppler band the PRF samples, 2 v sin(theta) / lambda in [-PRF/2, PRF/2].
@@ -89,7 +93,8 @@ def _image_area(cphd, meta):
 
 def form_cphd(cphd, sicd=None, *, mode='auto', backend='auto', window=True, spacing=None, channel=0, patch=1024,
               azimuth_fraction=0.8, extent=None, height=None, precision='float32', target_db=-40.0, info=None,
-              autofocus=False, troposphere=None, reader_options=None, axes='track', aperture='auto', _plan=None):
+              autofocus=False, troposphere=None, reader_options=None, axes='track', aperture='auto',
+              azimuth_window=None, _plan=None):
     """Form the image of a CPHD collection (see the module docstring).
 
     cphd: path. sicd: the vendor's SICD (path, .xml metadata, or SICD metadata) for the footprint, spacing and
@@ -113,11 +118,14 @@ def form_cphd(cphd, sicd=None, *, mode='auto', backend='auto', window=True, spac
         spotlight, 'track' for a moving beam.
     aperture: 'auto' (a spotlight without a sicd or a spacing: the central part of the aperture that makes the
         azimuth resolution the ground range resolution), 'square' (that part whatever else is given) or 'full'.
+    azimuth_window: of a moving beam, each pixel's weighting of the pulses across its processed azimuth band: 'hann',
+        'taylor' (nbar 4, 35 dB) or 'uniform'; None: 'hann' with window, else no per-pixel weighting.
     -> dict(image [nx, ny] complex64, origin [3] (local, pixel (0, 0)), e1, e2 (unit axes, local), spx, spy, mode,
     band (first and last frequency, Hz), bandwidth (spatial frequency support along e1 and e2, cycles/m), window,
     phase_error (autofocus: per pulse, rad, else None), meta (read_cphd's), notes, and the geometry of the grid:
     plane ('ground'), axes, center [3] (local), height (the plane's, local z), graze (rad, at the center), pulses
-    (first, last + 1 of the pulses read that were used)). Pixel (i, j) lies at
+    (first, last + 1 of the pulses read that were used), dsin (a moving beam's processed spread of the sine of the
+    look angle about each pulse's SRP, else None)). Pixel (i, j) lies at
     origin + i spx e1 + j spy e2 in the local frame (io.local_to_ecf for ECF; products.geolocate for latitude and
     longitude)."""
     from .api import ImageFormer, _backend
@@ -128,6 +136,8 @@ def form_cphd(cphd, sicd=None, *, mode='auto', backend='auto', window=True, spac
         raise ValueError("axes must be 'track', 'los' or 'auto'")
     if aperture not in ('auto', 'square', 'full'):
         raise ValueError("aperture must be 'auto', 'square' or 'full'")
+    if azimuth_window not in (None, 'hann', 'taylor', 'uniform'):
+        raise ValueError("azimuth_window must be 'hann', 'taylor', 'uniform' or None")
     backend = _backend(backend)                       # before the file is read
     for n, v in (('spacing', spacing), ('extent', extent)):
         if v is not None and (np.size(v) not in (1, 2) or not np.all(np.isfinite(v)) or np.min(v) <= 0):
@@ -210,12 +220,24 @@ def form_cphd(cphd, sicd=None, *, mode='auto', backend='auto', window=True, spac
             notes.append(f'aperture: the central {hi_ - lo_} of {P} pulses ({np.degrees(want):.2f} of {np.degrees(np.ptp(ang)):.2f} '
                          'degrees) for square resolution; give spacing= or a sicd for the whole aperture')
             P = hi_ - lo_
+    # azimuth band of a moving beam (spread of sin(look angle) about each pulse's SRP)
+    dsin = None
+    if not spot:
+        if sm is not None:
+            dsin = float(sm.Grid.Col.ImpRespBW) * lam / 2
+        else:
+            prf = (P - 1) / float(meta['tx_time'][-1] - meta['tx_time'][0])
+            vel = np.linalg.norm(np.gradient(ant, axis=0), axis=1).mean() * prf
+            dsin = azimuth_fraction * lam * prf / (2 * vel)
+            notes.append(f'azimuth band {azimuth_fraction:.2f} of the PRF ({prf:.0f} Hz): spread of sin(look) {dsin:.4f}')
     # a caller's own grid (process_cphd): spacing and bounds (m from the center along e1 and e2) from the geometry
     plan = {} if _plan is None else (_plan(dict(S=S, ant=ant, fmin=f0, df=df, center=center, e1=e1, e2=e2, graze=graze,
                                                 corners=corners, mode=mode, meta=meta, sicd=sm, notes=notes,
-                                                pulses=used)) or {})
+                                                pulses=used, srp=srp, dsin=dsin)) or {})
     if plan.get('window') is not None:
         window = bool(plan['window'])
+    if plan.get('azimuth_window') is not None:
+        azimuth_window = plan['azimuth_window']
     if plan.get('axes') is not None:                  # any plane through the center (a slant-plane grid)
         e1, e2 = (np.asarray(v, np.float64) for v in plan['axes'])
     if window:
@@ -228,15 +250,6 @@ def form_cphd(cphd, sicd=None, *, mode='auto', backend='auto', window=True, spac
             np.multiply(wp[sl, None], wk[None, :], out=w)
             S[sl] *= w
         _rows_with(_win, P, lambda: np.empty((min(256, P), K), np.result_type(wp, wk)), chunk=256)
-    # azimuth band of a moving beam (spread of sin(look angle) about each pulse's SRP)
-    if not spot:
-        if sm is not None:
-            dsin = float(sm.Grid.Col.ImpRespBW) * lam / 2
-        else:
-            prf = (P - 1) / float(meta['tx_time'][-1] - meta['tx_time'][0])
-            vel = np.linalg.norm(np.gradient(ant, axis=0), axis=1).mean() * prf
-            dsin = azimuth_fraction * lam * prf / (2 * vel)
-            notes.append(f'azimuth band {azimuth_fraction:.2f} of the PRF ({prf:.0f} Hz): spread of sin(look) {dsin:.4f}')
     # resolution the data support (before windowing)
     if spot:
         u = (center[None] - ant) / np.linalg.norm(center[None] - ant, axis=1, keepdims=True)
@@ -309,11 +322,19 @@ def form_cphd(cphd, sicd=None, *, mode='auto', backend='auto', window=True, spac
             w = np.asarray(pts)[None] - ant[idx][:, None]
             return ((w * d[idx][:, None]).sum(-1) / np.linalg.norm(w, axis=-1) - sp[idx][:, None]) / (dsin / 2)
 
-        img = patches.form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1, e2, patch=(patch, patch), beam=beam, precision=precision,
-                                  awin='hann' if window else None, backend=backend, target_db=target_db, info=info)
+        # a window that does not end at zero is cut at the band's edge; azimuth_pad (process_cphd's) widens the
+        # rectangle beyond the band, for a cut made on the image's spectrum afterwards
+        awin = azimuth_window or ('hann' if window else None)
+        # a grid smaller than a patch is formed as one patch of its own size, in whole tiles of 32
+        pp = tuple(int(min(patch, 32 * -(-n // 32))) for n in (nx, ny))
+        img = patches.form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1, e2, patch=pp, beam=beam, precision=precision,
+                                  awin='none' if awin == 'uniform' else awin, amask=awin in ('taylor', 'uniform'),
+                                  umax=1.0 + float(plan.get('azimuth_pad') or 0.0), backend=backend,
+                                  target_db=target_db, info=info)
     return dict(image=img, origin=origin, e1=e1, e2=e2, spx=float(spx), spy=float(spy), mode=mode,
                 band=(f0, f0 + (K - 1) * df), bandwidth=(1.0 / ares, 2 * K * df * np.cos(graze) / C),
-                window=('taylor' if spot else 'hann', 'taylor') if window else None,
+                window=(('taylor', 'taylor') if window else None) if spot else (
+                    (awin, 'taylor' if window else 'uniform') if awin else None),
                 phase_error=phi if autofocus else None, meta=meta, notes=notes, plane='ground', axes=axes,
                 center=origin + (nx / 2.0) * spx * e1 + (ny / 2.0) * spy * e2, height=float(hz), graze=float(graze),
-                pulses=used)
+                pulses=used, dsin=dsin)
