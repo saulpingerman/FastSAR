@@ -273,10 +273,13 @@ scene when the file saves one; otherwise it takes the lowest cell of a range-Dop
 bounded: about 8 million samples are transformed at most (fewer blocks of pulses when a pulse is long, each pulse
 with its whole band; 64 pulses of an Umbra collection with 120,736 samples per pulse, which give the level of 512
 to 0.03 dB), on all cores, and `process_cphd` hands it the phase history it has already read, so the file is not
-read a second time (`Radiometry(..., history=)`). On that Umbra collection the measurement took 0.4 to 0.9 s
-(0.5 to 0.8 s of CPU) and the whole radiometric model, with the check of the antenna block, 1.3 to 2.2 s (1.2 to
-2.0 s of CPU), on a machine that other jobs kept at a load of 100 on 48 cores; 0.2.0 took 52 to 181 s (43 to
-174 s of CPU) for the measurement under the same load. A quiet machine was not available for either.
+read a second time (`Radiometry(..., history=)`). On that Umbra collection, in a fresh process held to 16 cores
+on a 48-core machine that other jobs kept at a load of about 67, the measurement took 0.2 to 0.65 s of wall time
+(0.3 to 0.75 s of CPU), the check of the antenna block 0.26 s, and the whole radiometric model 0.55 to 1.2 s (0.6
+to 1.3 s of CPU, the first call the slowest). The model of 0.2.0, which read 512 pulses from the file and had no
+such check, took 0.8 to 3.6 s (1.5 to 4.2 s of CPU) under the same conditions. A machine with no other load was
+not available. When the machine was oversubscribed several times over (a load of 100 and more) the measurement of
+0.2.0 took 52 to 181 s and the new one 0.4 to 0.9 s.
 
 1. `nesz_db` given by the caller (`'argument'`).
 2. The Radiometric block of a SICD of the same collection (`'sicd'`).
@@ -355,7 +358,7 @@ area='black')` plans:
 | Collection | `black_sigma0_db=0.0` | `black_sigma0_db=-10.0` (default) |
 |---|---|---|
 | Umbra, 2024-09-10 | 8.30 x 11.35 km, 94.2 km^2, 364 Mpx | 7.90 x 9.45 km, 74.7 km^2, 285 Mpx |
-| Capella, 2025-03-13 | 11.85 x 7.95 km, 94.2 km^2, 1,643 Mpx | 6.05 x 7.75 km, 46.9 km^2, 809 Mpx |
+| Capella, 2025-03-13 | 11.85 x 7.95 km, 94.2 km^2, 1,643 Mpx | 6.15 x 7.85 km, 48.3 km^2, 833 Mpx |
 
 The Umbra area shrinks along the line of sight and hardly across it. Across the beam its edge is where the azimuth
 ambiguities reach the signal, and their level follows the scene's own sigma zero, so that edge does not move with
@@ -460,8 +463,9 @@ through the check of the antenna block against the data:
 - What the data show. The fitted beam center lies 0.8 to 2.0 km from the modeled one, toward the reference point
   in all seven: 1.26 km on average (standard error 0.15 km), where a beam centered on the reference point would
   give 1.5 km and a beam mirrored through it 3.0 km. Five of the seven fail the check (0.65 to 1.00 half-power
-  radii) and two pass (0.44 and 0.49). The beam of these collections is therefore not where the frames put it, and not mirrored
-  either: it lies near the reference point, as it would if the frames were those of 0.2 s earlier.
+  radii) and two pass (0.44 and 0.49). The beam of these collections is therefore not where the frames put it,
+  and not mirrored either: it lies near the reference point, as it would if the frames were those of 0.2 s
+  earlier.
 - A direction cosine of the opposite sign about the boresight cannot be seen with patterns this symmetric and
   an electrical boresight of zero. The one file whose pattern peaks off its origin (UMBRA-05, 1e-3 along X) fits
   as read (correlation 0.89) and not mirrored along X (0.78).
