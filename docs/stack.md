@@ -76,12 +76,12 @@ more than a pixel. `stack.register(products, reference=0)` removes it:
 - `registration['residual_median']` and `['residual_rms']` (m, with `residual_worst` and the tiles' own shifts)
   are what 4 by 4 tiles of the image still disagree by after the translation. They tell whether one translation
   was enough. Measured: a median of 0.15 m (0.26 m rms) for the pair with equal look directions; medians of 0.6
-  to 1.1 m and rms of 0.7 to 2.3 m between look directions 12 to 30 degrees apart, where single tiles of trees
-  and buildings are off by 5 to 6 m.
+  to 1.1 m and rms of 0.7 to 2.3 m between look directions 12 to 30 degrees apart, where single tiles are off by
+  5 to 6 m and set the rms.
 
 What remains between different look directions is height, not a warp of the ground: a scatterer above the grid
 plane lays over toward each radar, by 0.5 to 0.9 m per meter of height between these directions, and no smooth
-map of the plane removes that. A first-order warp fitted to the tiles lowered the residual by a tenth.
+map of the plane removes that. A first-order warp fitted to the tiles' shifts lowered their rms by 5 to 26%.
 
 The translation is applied in one of two ways, which agree to -49 dB away from the edges
 (`tests/test_stack.py`):

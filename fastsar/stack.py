@@ -746,7 +746,7 @@ def register(products, reference=0, *, apply='fourier', max_shift=64, tiles=4, b
     disagree by after the translation, over the tiles whose own peak is significant and lies within 8 pixels of
     the image's (tiles_used of tiles): a tenth of a pixel or two when one translation registers the pair; a pixel
     or more when it does not, which between different look directions is the layover of whatever stands above the
-    grid plane and no warp of the ground removes (a tile of tall trees or buildings stands out in the rms).
+    grid plane and no warp of the ground removes (single tiles can set the rms: read it beside the median).
 
     -> the list of products, registered (apply) or as given, each with registration (that dict; the reference:
     shift (0, 0)) and, when applied, shift. The stack then has the reference's geolocation."""
