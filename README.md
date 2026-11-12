@@ -5,8 +5,9 @@
 
 FastSAR forms synthetic aperture radar (SAR) images on x86 and ARM CPUs, Nvidia GPUs and Google Cloud TPUs from
 Python. It reads frequency-domain CPHD files (versions 1.0, 1.1 and 0.3) and NISAR, Sentinel-1 and ALOS PALSAR raw data, forms spotlight,
-stripmap and sliding spotlight images by factorized backprojection, and provides autofocus, interferometry,
-geolocation, map GeoTIFFs and SICD output.
+stripmap and sliding spotlight images by factorized backprojection, and provides autofocus, terrain-informed
+focusing, radiometric calibration, products of several collections of one scene, interferometry, geolocation,
+map GeoTIFFs and SICD and SIDD output.
 
 ![FastSAR image of the Panama Canal's Pacific entrance from an Umbra spotlight collection](https://raw.githubusercontent.com/saulpingerman/FastSAR/main/docs/images/hero_panama.jpg)
 
@@ -93,6 +94,27 @@ resampling fewer. Most producers deliver slant-plane SICDs, and a tool that assu
 `Grid.ImagePlane` needs `plane='slant'`
 ([what to check](https://github.com/saulpingerman/FastSAR/blob/main/docs/product-options.md#the-ground-plane-sicd-the-default)).
 Every stage after formation runs where the image lives, on the CPU, an Nvidia GPU or a TPU.
+
+The same call takes stripmap and sliding-spotlight collections, with the weightings, autofocus along the track
+and the quality areas in ground range. Three more things it does, each where the data allow it:
+
+```python
+fastsar.process_cphd('scene_CPHD.cphd', 'focused.nitf', dem='dem.tif', geoid=22.4)   # terrain off the image
+                                                                                     # plane, focused from a DEM
+fastsar.process_stack(['a_CPHD.cphd', 'b_CPHD.cphd', 'c_CPHD.cphd'], 'mean_SIDD.nitf')   # several collections
+                                                                                         # of one scene, averaged
+fastsar.process_stack(['a_CPHD.cphd', 'b_CPHD.cphd'], 'coherence.tif', product='coherence')   # or a coherent pair
+```
+
+- Terrain-informed focusing (`dem=`, spotlight collections) removes the defocus of terrain above or below the
+  image plane, computed from the collection geometry and the DEM
+  ([product-options.md](https://github.com/saulpingerman/FastSAR/blob/main/docs/product-options.md#terrain-informed-focusing)).
+- Calibration: where a CPHD file states its reference level (`PTRef`; Umbra's do, Capella's do not), a spotlight
+  SICD carries the `Radiometric` block, with the antenna pattern pointed as the data confirm it
+  ([product-options.md](https://github.com/saulpingerman/FastSAR/blob/main/docs/product-options.md#radiometric-calibration)).
+- Several collections of one scene: `process_stack` forms them on one ground grid, registers them, and writes
+  their incoherent average, or the coherence, interferogram, coherent sum or change of a pair
+  ([stack.md](https://github.com/saulpingerman/FastSAR/blob/main/docs/stack.md)).
 
 [`examples/chain.py`](https://github.com/saulpingerman/FastSAR/blob/main/examples/chain.py) runs this chain from the command line (`--simulate` needs no data);
 [`form_umbra.py`](https://github.com/saulpingerman/FastSAR/blob/main/examples/form_umbra.py) and [`form_capella_stripmap.py`](https://github.com/saulpingerman/FastSAR/blob/main/examples/form_capella_stripmap.py) form
