@@ -3,6 +3,38 @@
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The date of a version is the day it
 was published on PyPI.
 
+## [Unreleased]
+
+### Added
+
+- Several collections of one scene ([docs/stack.md](docs/stack.md)). `process_stack(cphds, output, product=)`
+  forms each collection on one Earth-fixed ground grid, registers them and writes the incoherent average as a
+  SIDD (`'mean'`), or the coherence or the change of a pair as a GeoTIFF. The collections are read and formed one
+  at a time, and the stack stages run where the images are (all cores, CuPy, JAX).
+- `form_cphd(..., grid=, shift=)` and `process_cphd(..., grid=)`: a collection formed on an Earth-fixed ground
+  grid (`stack.ground_grid`, or an earlier product for its pixels) in place of its own, and on that grid
+  displaced by a translation. Products record the grid.
+- `fastsar.stack`: `ground_grid` and `as_grid`; `register` (one translation per image from the detected images'
+  cross-correlation, with its significance and the residual shifts of tiles) and `shift_image` (the translation
+  applied by a phase ramp on the baseband spectrum); `mean` (with the equivalent number of looks measured on
+  homogeneous tiles and optional brightness equalization); `coherence` (on the common band of the two spectra,
+  with a linear fringe removed and the estimator's floor measured on the pair) and `change`; `baseline` (whether
+  a pair is inside the critical baseline, from the per-pulse parameters alone).
+- `write_sidd(..., collections=, product_class=, product_type=, extensions=)`: a SIDD made from several
+  collections holds one `ExploitationFeatures` `Collection` per input.
+- `ImageFormer(..., range_gate=)`, also on `form_image` and `form_cphd`: the phase history gated in range to the
+  image's swath before formation. `form_cphd(aperture=(first, last + 1))`: the pulses to use.
+
+### Fixed
+
+- The cuda backend refused an image narrow in range from a wide-band collection ("the cuda backend's first-level
+  window ... exceeds the GPU's shared memory", for example a 2 km image of a collection with 76,032 samples per
+  pulse). Such a history is now gated in range to the image's swath first, on the device, with a note in the
+  product; the image equals that of the whole history to -63 dB (measured against the cpu backend).
+- `docs/products.md` said that two passes formed onto one grid are coregistered by construction; that holds for
+  the geometry as known, and real repeat collections lay 9 to 22 m apart. `products.coherence` gave its bias for
+  independent pixels; the note now states the measured floor of oversampled images.
+
 ## [0.2.0] - 2026-11-10
 
 ### Added

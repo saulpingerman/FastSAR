@@ -44,7 +44,7 @@ def _choice(name, value, allowed):
 def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None, autofocus=None, weighting=None,
                  remap='nrl', remap_args=None, spacing=None, extent=None, sicd=None, mode='auto', backend='auto',
                  precision='float32', shadows_down=True, nesz_db=None, scene_sigma0_db=-10.0, height=None, channel=0,
-                 troposphere=None, reader_options=None, target_db=-40.0):
+                 troposphere=None, reader_options=None, target_db=-40.0, grid=None):
     """Form the image of a CPHD collection and write it as a SICD or a SIDD (see the module docstring).
 
     cphd: path. output: the file to write (NITF), or None to return the product without writing it.
@@ -66,6 +66,12 @@ def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None
     sicd: the vendor's SICD (path, .xml or SICD metadata), whose footprint is then the tasked area.
     nesz_db, scene_sigma0_db: the noise level of the quality areas when the files give none (fastsar.rgiqe).
     mode, backend, precision, height, channel, troposphere, reader_options, target_db: form_cphd's.
+    grid: an Earth-fixed ground grid (fastsar.stack.ground_grid, or an earlier product: the same pixels) in place
+        of the collection's own area, axes and spacing; the product is the image on that grid (a SICD on the
+        ground plane; a SIDD detected on it as formed). The quality areas, the slant plane, apodization, spacing,
+        extent and height do not apply and are refused; Taylor or uniform weighting does, and the autofocus where
+        the grid's first axis lies within 5 degrees of the collection's azimuth (the default then; refused
+        otherwise).
 
     -> the product dict (form_cphd's entries on the product's grid: image, origin, e1, e2, spx, spy, plane, meta,
     notes, ...), with product, area, weighting, autofocus (the mode run), autofocus_info, timing (seconds of each
@@ -96,6 +102,16 @@ def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None
             raise ValueError(f"remap {remap!r}: one of {sorted(k for k in _remap.REMAPS if k != 'linear')}, or a function")
     if weighting == 'sva' and product == 'sicd' and spacing is not None:
         raise ValueError("weighting='sva' sets the slant spacing itself (twice Nyquist): leave spacing=None")
+    if grid is not None:                                             # the grid is the area, the plane and the sampling
+        for name, v, ok, why in (
+                ('area', area, isinstance(area, str) and area == 'tasked', 'the grid is the processed area'),
+                ('plane', plane, plane in (None, 'ground'), "the product is on the grid's ground plane"),
+                ('weighting', weighting, weighting != 'sva', 'apodization is applied on the slant plane'),
+                ('spacing', spacing, spacing is None, 'the grid gives it'),
+                ('extent', extent, extent is None, 'the grid gives it'),
+                ('height', height, height is None, 'the grid gives its plane')):
+            if not ok:
+                raise ValueError(f'{name}={v!r} does not apply with grid=: {why}')
     timing, st = {}, {}
     t0 = time.perf_counter()
     st['start'] = t0
@@ -120,6 +136,8 @@ def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None
         pl = plane or ('slant' if product == 'sicd' and spot else 'ground')
         wt = weighting or ('sva' if product == 'sidd' and spot else 'taylor')
         af = ('quadratic' if spot else False) if autofocus is None else autofocus
+        if grid is not None:
+            pl, wt = 'ground', weighting or 'taylor'
         if not spot:
             for name, v, ok in (('plane', pl, pl == 'ground'), ('weighting', wt, wt != 'sva'), ('autofocus', af, not af),
                                 ('area', area, area == 'tasked')):
@@ -128,6 +146,28 @@ def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None
             st.update(spot=False, plane=pl, weighting=wt, autofocus=af)
             sp = None if spacing is None else tuple(float(v) for v in np.broadcast_to(np.asarray(spacing, np.float64), (2,)))
             return dict(window=wt == 'taylor', spacing=sp)
+        if grid is not None:
+            # the image as formed on the grid is the product; the autofocus works along the first axis, which must
+            # then be this collection's azimuth
+            c, e1, e2 = g['center'], g['e1'], g['e2']
+            los = c - g['ant'][len(g['ant']) // 2]
+            off = float(np.degrees(np.arctan2(abs(los @ e1), los @ e2)))
+            if autofocus is None and off > 5.0:
+                af = False
+                g['notes'].append(f"no autofocus: the grid's second axis is {off:.0f} degrees from the line of sight")
+            elif af and off > 5.0:
+                raise ValueError(f"autofocus={af!r} works along the grid's first axis, which is {off:.0f} degrees from "
+                                 "this collection's azimuth: give autofocus=False, or a grid along its line of sight")
+            K = g['S'].shape[1]
+            s = planes.sampling(planes.slant_frame(g['meta'], c, g['pulses']), g['ant'],
+                                (g['fmin'], g['fmin'] + (K - 1) * g['df']), c[None], e1, e2)
+            gs = g['grid']
+            if gs['spx'] > 1.0001 / s['bx'] or gs['spy'] > 1.0001 / s['by_full']:
+                g['notes'].append(f"the grid's spacing {gs['spx']:.3f} x {gs['spy']:.3f} m is coarser than the band of the "
+                                  f"data allows on its axes ({1 / s['bx']:.3f} x {1 / s['by_full']:.3f} m): the image is aliased")
+            st.update(spot=True, plane=pl, weighting=wt, autofocus=af, sampling=s, bounds=None, kept=None, valid=None,
+                      via_slant=False, margin=0)
+            return dict(window=wt == 'taylor')
         if product == 'sicd' and pl == 'ground' and wt == 'sva':
             raise ValueError("weighting='sva' is applied on the slant plane: for a SICD give plane='slant'")
         if product == 'sidd' and pl == 'slant':
@@ -183,7 +223,7 @@ def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None
 
     out = form_cphd(cphd, sicd, mode=mode, backend=backend, channel=channel, height=height, precision=precision,
                     target_db=target_db, troposphere=troposphere, reader_options=reader_options, axes='auto',
-                    extent=extent,
+                    extent=extent, grid=grid,
                     aperture='auto' if spacing is None else 'full', _plan=plan)
     lap('form')
     timing['read'] = st['read'] - st['start']                        # the file, to the phase history in memory
@@ -202,6 +242,9 @@ def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None
         elif jaxdev and product == 'sidd':
             if _jax_place(out, dict(ground=out['image'].nbytes, display=out['image'].size))['ground'] == 'device':
                 out['image'] = _xp.device(out['image'], backend)
+        if grid is not None and product == 'sidd' and st['spot']:    # detected on the grid as formed
+            out['image'] = _xp.module(out['image']).abs(out['image'])
+            lap('detect', out['image'])
         out['timing'] = timing
         if product == 'sidd':
             out.update(remap=remap, remap_args=dict(remap_args or {}), shadows_down=bool(shadows_down))

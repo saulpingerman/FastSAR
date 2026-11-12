@@ -750,7 +750,7 @@ def range_gate(S, g, win=None):
     (win: (wp [P], wk [K]) or None), checked for non-finite samples (ValueError), padded to the guard, inverse
     transformed along frequency, the bins about the reference range transformed back, cut to the band and its
     guards and tapered -> [P, K'] complex64 on the device. A host history crosses in blocks through two pinned
-    staging buffers."""
+    staging buffers, each rewritten only once its last transfer is complete."""
     P, K = S.shape
     npl, Kp, N, k0, k1 = g['npl'], g['Kp'], g['N'], g['k0'], g['k1']
     h = N // 2
@@ -765,13 +765,17 @@ def range_gate(S, g, win=None):
         bufs = [memory._pinned(nb * K * 8) for _ in range(2)]
         stg = [np.frombuffer(b, np.complex64, nb * K).reshape(nb, K) for b in bufs]
         nth = max(1, min(8, _ncpu() - 1))
-    sums = []
+    sums, done = [], [None, None]
     for n, i in enumerate(range(0, P, nb)):
         r = min(nb, P - i)
         z = cp.zeros((r, Kp), cp.complex64)
         if host:
+            if done[n % 2] is not None:
+                done[n % 2].synchronize()                                         # the buffer's last transfer is complete
             _copy_rows(stg[n % 2][:r], S[i:i + r], nth)
-            z[:, npl:npl + K] = cp.asarray(stg[n % 2][:r])
+            z[:, npl:npl + K] = cp.asarray(stg[n % 2][:r])                        # asynchronous from pinned memory
+            done[n % 2] = cp.cuda.Event()
+            done[n % 2].record()
         else:
             z[:, npl:npl + K] = S[i:i + r]
         if win is not None:
@@ -783,6 +787,7 @@ def range_gate(S, g, win=None):
         del q
         cp.multiply(u[:, k0:k1], T, out=out[i:i + r])
         del u
+    cp.cuda.get_current_stream().synchronize()                                    # before the staging buffers go back
     if not np.isfinite(complex(cp.stack(sums).sum())):
         bad = next(i for n, i in enumerate(range(0, P, nb)) if not np.isfinite(complex(sums[n])))
         raise ValueError(f'phase history has non-finite samples (NaN or inf), in pulses {bad} to {min(P, bad + nb) - 1}; '
