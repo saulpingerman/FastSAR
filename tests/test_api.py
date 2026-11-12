@@ -128,3 +128,84 @@ def test_pfa_support(scene):
     assert e < -15
     with pytest.raises(ValueError, match='support'):
         fastsar.form_image(scene.S, c.ant, c.fmin, c.df, **GRID, algorithm='pfa', pfa_guard=10.0, pfa_support='circumscribed')
+
+
+@pytest.fixture(scope='module')
+def wide_band():
+    """An image narrow in range from a wide-band collection (24,000 samples for an image of 40 m): points in the
+    image, and clutter over 3 km of range around it."""
+    rng = np.random.default_rng(3)
+    res, r0, K, P = 0.5, 30e3, 24000, 384
+    df = sim.C / (2 * res) / K
+    y = (np.arange(P) - (P - 1) / 2) * (r0 * sim.C / 9.6e9 / (2 * res) / P)
+    psi = np.radians(40.0)
+    ant = np.stack([np.full(P, -r0 * np.cos(psi)), y, np.full(P, r0 * np.sin(psi))], 1)
+    col = sim.Collect(fmin=9.6e9 - (K // 2) * df, df=df, K=K, ant=ant, res=res)
+    pts = np.array([[0.0, 0.0, 0], [11.3, -7.1, 0], [-14.2, 12.4, 0], [15.1, 16.2, 0], [-9.3, -15.7, 0]])
+    cl = np.stack([(rng.random(4000) - 0.5) * 3000, (rng.random(4000) - 0.5) * 60, np.zeros(4000)], 1)
+    amp = np.concatenate([np.full(5, 30.0), (rng.standard_normal(4000) + 1j * rng.standard_normal(4000)) / np.sqrt(2)])
+    S = sim.simulate(col, np.concatenate([pts, cl]), amp).astype(np.complex64)
+    return SimpleNamespace(col=col, S=S, grid=dict(nx=96, ny=96, spx=0.4, spy=0.4, e1=(0.0, 1.0, 0.0), e2=(1.0, 0.0, 0.0)))
+
+
+@pytest.mark.needs('finufft')
+@pytest.mark.parametrize('window', [True, False])
+def test_range_gate(wide_band, window):
+    """The phase history gated in range to the image's swath: fewer samples, a first level that decimates less,
+    and the image of the whole history to the former's accuracy."""
+    c = wide_band.col
+    args = (c.ant, c.fmin, c.df, c.K)
+    full = fastsar.ImageFormer(*args, **wide_band.grid, backend='cpu', window=window, range_gate=False)
+    gated = fastsar.ImageFormer(*args, **wide_band.grid, backend='cpu', window=window, range_gate=True)
+    assert full.range_gate is None and fastsar.ImageFormer(*args, **wide_band.grid, backend='cpu').range_gate is None
+    g = gated.range_gate
+    assert g['K'] == c.K and g['kept'] < c.K // 20 and 'range gate' in g['note']
+    assert gated._plan['levels'][0]['Dk'] < 4 < full._plan['levels'][0]['Dk']
+    a, b = full(wide_band.S), gated(wide_band.S)
+    db = rel_db(b, a)
+    print(f'window {window}: gated to {g["kept"]} of {c.K} samples; against the whole history {db:.1f} dB')
+    assert db < -55                                                  # measured -68 dB
+    assert np.array_equal(fastsar.form_image(wide_band.S, *args[:3], **wide_band.grid, backend='cpu', window=window, range_gate=True), b)
+    with pytest.raises(ValueError, match='range_gate'):
+        fastsar.ImageFormer(*args, **wide_band.grid, backend='cpu', range_gate='yes')
+    bad = wide_band.S.copy()
+    bad[7, 100] = np.nan
+    with pytest.raises(ValueError, match='non-finite'):
+        gated(bad)
+    with pytest.raises(ValueError, match='phase history must be'):
+        gated(wide_band.S[:, :-1])
+    # an image that fills the swath is not gated
+    small = sim.make_collect(res=0.5, scene=60.0, r0=5e3)
+    assert fastsar.ImageFormer(small.ant, small.fmin, small.df, small.K, **GRID, backend='cpu', range_gate=True).range_gate is None
+
+
+@pytest.mark.cuda
+@pytest.mark.needs('finufft')
+def test_cuda_first_level_window(wide_band, monkeypatch):
+    """A range decimation whose filter window no variant of the cuda first-level kernel can hold in shared memory
+    (an image narrow in range from a wide-band collection: refused through 0.2.0): the history is gated in range
+    first, and the image is the cpu backend's of the whole history."""
+    from fastsar import ffbp_cuda
+    c = wide_band.col
+    args = (c.ant, c.fmin, c.df, c.K)
+    monkeypatch.setenv('FASTSAR_CUDA_SMEM_KB', '99')                 # the shared memory of an Ada-generation card
+    with pytest.raises(ValueError, match='first-level window'):
+        fastsar.ImageFormer(*args, **wide_band.grid, backend='cuda', range_gate=False)(wide_band.S)
+    former = fastsar.ImageFormer(*args, **wide_band.grid, backend='cuda')
+    assert not ffbp_cuda.first_level_fits(fastsar.ImageFormer(*args, **wide_band.grid, backend='cpu')._plan)
+    assert former.range_gate is not None and 'shared memory' in former.range_gate['note']
+    img = former(wide_band.S)
+    ref = fastsar.ImageFormer(*args, **wide_band.grid, backend='cpu', range_gate=False)(wide_band.S)
+    db = rel_db(img, ref)
+    print(f'cuda, gated to {former.range_gate["kept"]} of {c.K} samples, against the cpu image of the whole history: {db:.1f} dB')
+    assert db < -55                                                  # measured -68 dB
+    import cupy as cp
+    assert np.allclose(former(cp.asarray(wide_band.S)), img, rtol=1e-4, atol=1e-4 * np.abs(img).max())       # a device history
+    bad = wide_band.S.copy()
+    bad[7, 100] = np.inf
+    with pytest.raises(ValueError, match='non-finite'):
+        former(bad)
+    # where the window fits, nothing is gated
+    monkeypatch.delenv('FASTSAR_CUDA_SMEM_KB')
+    small = sim.make_collect(res=0.5, scene=60.0, r0=5e3)
+    assert fastsar.ImageFormer(small.ant, small.fmin, small.df, small.K, **GRID, backend='cuda').range_gate is None

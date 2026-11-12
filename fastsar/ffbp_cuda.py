@@ -439,6 +439,56 @@ def _dev_taps(kern_h):
     return t[1]
 
 
+def _smem_block():
+    """Shared memory a block of the level kernels may take (bytes): the device's opt-in limit, or
+    FASTSAR_CUDA_SMEM_KB (testing: a smaller card's)."""
+    kb = memory._env_number('FASTSAR_CUDA_SMEM_KB', 1)
+    return kb * 1024 if kb else int(cp.cuda.Device().attributes.get('MaxSharedMemoryPerBlockOptin', 48 * 1024))
+
+
+def _window(Dk, L, jt):
+    """The first-level kernel's configuration for a range decimation Dk with an L-tap filter and jt threads per
+    pulse -> (W: input samples per block, rawreg, pb: pulses per block, smem: the block's shared memory in bytes,
+    smem_max: what the device allows). smem > smem_max: the window fits no variant of the kernel."""
+    cols = 2 * jt
+    W = cols * Dk + L
+    smem_max = _smem_block()
+    pb_env = memory._env_number('FASTSAR_CUDA_PB', 1) or 0          # testing: force the pulses per block
+    # the raw window in registers (this thread's samples) and its rotated copy in shared memory, or, for a wider
+    # window, both in shared memory; a child's samples are rotated from the raw window by the child's own ramp
+    # either way, so that the image does not depend on how many children a launch holds (the group size, which
+    # the free device memory sets): 0.1.4 rotated one copy on from child to child
+    if int(cp.cuda.Device().attributes.get('MaxSharedMemoryPerMultiprocessor', 0)) >= _SMEM_BIG:
+        rawreg = 0
+    else:
+        rawreg = next((r for r in _RAWREG if -(-W // jt) <= r), 0)
+    if os.environ.get('FASTSAR_CUDA_RAWREG'):
+        rawreg = int(os.environ['FASTSAR_CUDA_RAWREG'])             # testing: a tier, 0 for shared memory, -1 for reloads
+    # pulses per block: the largest whose window fits the device. A window too wide for two copies in shared
+    # memory at any block size (a large range decimation: an image narrow in range from a wide-band
+    # collection) keeps one copy there and reloads the raw samples for every child
+    for rawreg in ((rawreg,) if rawreg != 0 or os.environ.get('FASTSAR_CUDA_RAWREG') else (0, -1)):
+        for pb in ((pb_env,) if pb_env else _PB_CHOICES):
+            smem = ((4 if rawreg == 0 else 2) * pb * (W | 1) + L + 2 * pb * cols) * 4
+            if smem <= smem_max:
+                break
+        if smem <= smem_max:
+            break
+    return W, rawreg, pb, smem, smem_max
+
+
+def first_level_fits(plan):
+    """Whether the first level's range filter window of a plan fits the device's shared memory (in some variant of
+    the kernel); False for a large range decimation, an image narrow in range from a wide-band collection, which
+    ImageFormer then gates in range first."""
+    lv = plan['levels'][0]
+    if lv['Dk'] <= 1:
+        return True
+    jt = memory._env_number('FASTSAR_CUDA_JT', 1) or 8
+    _, _, _, smem, smem_max = _window(lv['Dk'], lv['fir_k']['L'], jt)
+    return smem <= smem_max
+
+
 def _children(kern, pre, pim, c0, sl, lv):
     """pre, pim [Np, P, K] float32 (device); c0, sl [Np, C, P] float32 (device) -> [Np C, Po, Ko] planes."""
     Np, P, K = pre.shape
@@ -453,35 +503,13 @@ def _children(kern, pre, pim, c0, sl, lv):
         yim = cp.empty((Np * Cn, P, Ko), kern['dtype'])
         jt = kern['jt']
         cols = 2 * jt                                     # output columns per block
-        W = cols * Dk + L
-        smem_max = int(cp.cuda.Device().attributes.get('MaxSharedMemoryPerBlockOptin', 48 * 1024))
-        pb_env = memory._env_number('FASTSAR_CUDA_PB', 1) or 0          # testing: force the pulses per block
-        # the raw window in registers (this thread's samples) and its rotated copy in shared memory, or, for a wider
-        # window, both in shared memory; a child's samples are rotated from the raw window by the child's own ramp
-        # either way, so that the image does not depend on how many children a launch holds (the group size, which
-        # the free device memory sets): 0.1.4 rotated one copy on from child to child
-        if int(cp.cuda.Device().attributes.get('MaxSharedMemoryPerMultiprocessor', 0)) >= _SMEM_BIG:
-            rawreg = 0
-        else:
-            rawreg = next((r for r in _RAWREG if -(-W // jt) <= r), 0)
-        if os.environ.get('FASTSAR_CUDA_RAWREG'):
-            rawreg = int(os.environ['FASTSAR_CUDA_RAWREG'])             # testing: a tier, 0 for shared memory, -1 for reloads
-        # pulses per block: the largest whose window fits the device. A window too wide for two copies in shared
-        # memory at any block size (a large range decimation: an image narrow in range from a wide-band
-        # collection) keeps one copy there and reloads the raw samples for every child
-        for rawreg in ((rawreg,) if rawreg != 0 or os.environ.get('FASTSAR_CUDA_RAWREG') else (0, -1)):
-            for pb in ((pb_env,) if pb_env else _PB_CHOICES):
-                smem = ((4 if rawreg == 0 else 2) * pb * (W | 1) + L + 2 * pb * cols) * 4
-                if smem <= smem_max:
-                    break
-            if smem <= smem_max:
-                break
+        W, rawreg, pb, smem, smem_max = _window(Dk, L, jt)
         if os.environ.get('FASTSAR_CUDA_DEBUG'):                            # testing: the kernel's configuration
             print(f'rot_fir_k W {W} jt {jt} per-thread {-(-W // jt)} rawreg {rawreg} pb {pb} smem {smem}', flush=True)
         if smem > smem_max:
             raise ValueError(f"the cuda backend's first-level window ({smem // 1024} KB: range decimation {Dk} with a "
                              f"{L}-tap filter, a small image from a wide-band collection) exceeds the GPU's shared memory "
-                             f"({smem_max // 1024} KB): use backend='cpu' or 'jax', or a larger image")
+                             f"({smem_max // 1024} KB): use backend='cpu' or 'jax', a larger image, or range_gate=True")
         kl = kern['rot_fir_k'] if pb == 32 and rawreg == _RAWREG[0] else _kernels(kern['store'], pb, rawreg)['rot_fir_k']
         kl(((Ko + cols - 1) // cols, (P + pb - 1) // pb, Np), (pb * jt,),
                           (pre, pim, c0, sl, taps, yre, yim, np.int32(Cn), np.int32(P), np.int32(K), np.int32(Ko), np.int32(Dk),
@@ -715,6 +743,51 @@ def _upload_planes(S, pre, pim, win, check, scaled, scale=None):
                 raise ValueError(f'phase history has non-finite samples (NaN or inf), the first in pulse {bad}; '
                                  'zero them (S[~np.isfinite(S)] = 0) or drop the pulses')
     return scale
+
+
+def range_gate(S, g, win=None):
+    """S [P, K] complex (host or device) gated in range on the device in pulse blocks (g: api._gate_plan): windowed
+    (win: (wp [P], wk [K]) or None), checked for non-finite samples (ValueError), padded to the guard, inverse
+    transformed along frequency, the bins about the reference range transformed back, cut to the band and its
+    guards and tapered -> [P, K'] complex64 on the device. A host history crosses in blocks through two pinned
+    staging buffers."""
+    P, K = S.shape
+    npl, Kp, N, k0, k1 = g['npl'], g['Kp'], g['N'], g['k0'], g['k1']
+    h = N // 2
+    T = cp.asarray(g['taper'])[None, :]
+    out = cp.empty((P, k1 - k0), cp.complex64)
+    nb = max(1, min(P, (BLOCK_BYTES // 2) // (int(Kp) * 8)))
+    host = isinstance(S, np.ndarray)
+    if win is not None:
+        wpd, wkd = cp.asarray(win[0], cp.float32)[:, None], cp.asarray(win[1], cp.float32)[None, :]
+    if host:
+        from .patches import _ncpu
+        bufs = [memory._pinned(nb * K * 8) for _ in range(2)]
+        stg = [np.frombuffer(b, np.complex64, nb * K).reshape(nb, K) for b in bufs]
+        nth = max(1, min(8, _ncpu() - 1))
+    sums = []
+    for n, i in enumerate(range(0, P, nb)):
+        r = min(nb, P - i)
+        z = cp.zeros((r, Kp), cp.complex64)
+        if host:
+            _copy_rows(stg[n % 2][:r], S[i:i + r], nth)
+            z[:, npl:npl + K] = cp.asarray(stg[n % 2][:r])
+        else:
+            z[:, npl:npl + K] = S[i:i + r]
+        if win is not None:
+            z[:, npl:npl + K] *= wpd[i:i + r] * wkd
+        sums.append(z.sum())
+        q = cp.fft.ifft(z, axis=1)
+        del z
+        u = cp.fft.fft(cp.concatenate([q[:, :N - h], q[:, Kp - h:]], axis=1), axis=1)
+        del q
+        cp.multiply(u[:, k0:k1], T, out=out[i:i + r])
+        del u
+    if not np.isfinite(complex(cp.stack(sums).sum())):
+        bad = next(i for n, i in enumerate(range(0, P, nb)) if not np.isfinite(complex(sums[n])))
+        raise ValueError(f'phase history has non-finite samples (NaN or inf), in pulses {bad} to {min(P, bad + nb) - 1}; '
+                         'zero them (S[~np.isfinite(S)] = 0) or drop the pulses')
+    return out
 
 
 _GEOM_KERN = None

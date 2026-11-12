@@ -245,6 +245,37 @@ def _to_host(dev):
     return host
 
 
+def _gate_plan(ant, ref, fmin, df, K, nx, ny, spx, spy, e1, e2):
+    """The range gate of an nx x ny image centered on the origin, as the mosaic's patches are gated
+    (patches.patch_history): the spectrum is padded by a guard of an eighth of the band on either side, each
+    pulse's inverse transform (range bins of c / (2 Kp df), about the pulse's reference range) is cut to the N bins
+    the image's points span over the aperture with a margin, and the transform back is kept over the band and the
+    guards, tapered to 0 across them. -> dict(npl: samples padded below, Kp: padded length, N: bins kept, k0, k1:
+    the samples of the gated spectrum kept, taper [k1 - k0] float32 (with the scale Kp / N), fmin, df: of the
+    gated history)."""
+    from scipy.fft import next_fast_len
+    from .patches import _taper
+    C = 299792458.0
+    band = (fmin, fmin + (K - 1) * df)
+    guard = 0.125 * (band[1] - band[0])
+    npl = int(np.ceil(guard / df))
+    Kp = next_fast_len(K + 2 * npl)
+    idx = np.unique(np.linspace(0, len(ant) - 1, min(len(ant), 257)).astype(np.int64))
+    a = ant[idx]
+    r0 = np.linalg.norm(a, axis=1) if ref is None else np.asarray(ref, np.float64)[idx]
+    t = np.linspace(-0.5, 0.5, 5)
+    pts = ((t * nx * spx)[:, None, None] * e1 + (t * ny * spy)[None, :, None] * e2).reshape(-1, 3)
+    half = np.abs(np.linalg.norm(pts[None] - a[:, None], axis=2) - r0[:, None]).max() + 6 * C / (2 * guard)
+    N = next_fast_len(2 * int(np.ceil(half * 2 * Kp * df / C)))
+    N += N % 2
+    df2, f0 = Kp * df / N, fmin - npl * df
+    T = _taper(f0 + df2 * np.arange(N), band, guard)
+    keep = np.nonzero(T > 0)[0]
+    k0, k1 = int(keep[0]), int(keep[-1]) + 1
+    return dict(npl=npl, Kp=int(Kp), N=int(N), k0=k0, k1=k1, taper=(T[k0:k1] * (Kp / N)).astype(np.float32),
+                fmin=float(f0 + k0 * df2), df=float(df2))
+
+
 class _Staged:
     """A phase history staged for a JAX or TPU former (ImageFormer.stage): the host array, its device planes and
     scale, and the program they were padded for."""
@@ -265,11 +296,17 @@ class ImageFormer:
     in the final stage as the mean weight of each final subaperture's pulses at each final tile's center, with its
     first-order variation across the tile (final_weights), and
     ref [P]: the range (one way) each pulse is referenced to, when it is not |ant| (the distance to the origin):
-    a bistatic collection's half path |tx| / 2 + |rcv| / 2, or a reference point other than the origin."""
+    a bistatic collection's half path |tx| / 2 + |rcv| / 2, or a reference point other than the origin.
+    range_gate: the phase history gated in range to the image's swath before formation (each pulse's inverse
+    transform, the range bins about the reference range that the image and a margin span, transformed back: fewer
+    samples over the same band, and a first level that decimates less). 'auto': where the cuda backend's first
+    level could not otherwise hold its filter window in the GPU's shared memory (an image narrow in range from a
+    wide-band collection); True: wherever the gate keeps less than half of the samples; False: never. The image
+    equals the ungated one to the former's accuracy. former.range_gate: None, or dict(K, kept, note)."""
 
     def __init__(self, ant, fmin, df, K, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 1.0, 0.0), *, backend='auto',
                  precision='float32', window=True, T='auto', levels=None, pmax=0.4, target_db=-40.0, aperture_weight=None,
-                 ref=None):
+                 ref=None, range_gate='auto'):
         from . import ffbp2
         import warnings
         self.ant = _check_positions(ant)
@@ -304,20 +341,41 @@ class ImageFormer:
         self.T = T
         # levels=None: three, or more where three cannot split a long side into final tiles (factors up to 8)
         nlev = 3 if levels is None else levels
-        while True:
-            try:
-                plan = ffbp2.make_plan(col, nx, ny, spx, spy, T=T, nlev=nlev, pmax=pmax, e1=e1, e2=e2)
-                break
-            except ValueError as e:
-                if levels is not None or 'cannot split' not in str(e) or nlev >= 8:
-                    raise
-                nlev += 1
-        self.levels = nlev
-        self._plan = plan
         if ref is not None and np.shape(ref) != (self.P,):
             raise ValueError(f'ref must hold one range per pulse ({self.P}), got shape {np.shape(ref)}')
         if ref is not None and not np.all(np.isfinite(ref)):
             raise ValueError('ref has non-finite values')
+        if range_gate not in ('auto', True, False):
+            raise ValueError(f"range_gate must be 'auto', True or False, got {range_gate!r}")
+
+        def planned(col, nlev):
+            while True:
+                try:
+                    return ffbp2.make_plan(col, nx, ny, spx, spy, T=T, nlev=nlev, pmax=pmax, e1=e1, e2=e2), nlev
+                except ValueError as e:
+                    if levels is not None or 'cannot split' not in str(e) or nlev >= 8:
+                        raise
+                    nlev += 1
+        plan, nlev = planned(col, nlev)
+        self.range_gate = None
+        why = None
+        if range_gate == 'auto' and self.backend == 'cuda' and aperture_weight is None:
+            from . import ffbp_cuda
+            if not ffbp_cuda.first_level_fits(plan):
+                why = ("the cuda backend's first level could not hold the range filter of a decimation by "
+                       f"{plan['levels'][0]['Dk']} in the GPU's shared memory")
+        if why or range_gate is True:
+            g = _gate_plan(self.ant, ref, float(fmin), float(df), self.K, nx, ny, spx, spy, e1, e2)
+            kept = g['k1'] - g['k0']
+            if g['N'] < g['Kp'] and kept < (self.K if why else self.K // 2):
+                col = Collect(fmin=g['fmin'], df=g['df'], K=kept, ant=self.ant, res=0.5)
+                plan, nlev = planned(col, 3 if levels is None else levels)
+                self.range_gate = dict(g, K=self.K, kept=kept, note=(
+                    f'range gate: each pulse cut to the {g["N"]} range bins about the image before formation, '
+                    f'{kept} samples for {self.K}' + (f' ({why})' if why else '')))
+        self._Kf = plan['levels'][0]['K']                     # samples per pulse as the former takes them
+        self.levels = nlev
+        self._plan = plan
         coll = ffbp2.collection_arrays(plan, self.ant, ref)
         wf = None if aperture_weight is None else final_weights(plan, aperture_weight, self.P, grad=os.environ.get('FASTSAR_WEIGHT_GRAD', '1') == '1')
         if window:
@@ -347,10 +405,10 @@ class ImageFormer:
             # one compiled program per plan signature: patches of a mosaic with equal shapes and filters share it
             # (with the device arrays that depend on the plan alone: filters, tile geometry)
             self._filt = filt
-            ng = _jax_group(plan, self.K) if filt == 'pallas2' else 1
+            ng = _jax_group(plan, self._Kf) if filt == 'pallas2' else 1
             if filt == 'pallas2' and ng < min(_mem.TPU_GROUP, plan['levels'][0]['C']) and not os.environ.get('FASTSAR_TPU_GROUP'):
                 _mem._warn(f'tpu: first-level groups of {_mem._nchildren(ng)} instead of {_mem.TPU_GROUP} for lack of device '
-                           f'memory, which is slower; full speed needs about {_mem._gb(_mem.full_speed(plan, self.K, "tpu")[0])} '
+                           f'memory, which is slower; full speed needs about {_mem._gb(_mem.full_speed(plan, self._Kf, "tpu")[0])} '
                            f'of TPU memory, the device has {_mem._gb(_mem.tpu_capacity())}')
             self._fn, static = self._program(ng)
             self._arrs = ffbp2.device_arrays(pol, plan, coll, static)
@@ -367,7 +425,7 @@ class ImageFormer:
         if self.backend not in ('jax', 'tpu'):
             return S
         from . import ffbp2
-        S = self._host(S)
+        S = self._host(S) if self.range_gate is None else self._gate(S)
         hre, him, scale = self._upload(S)
         return _Staged(S, hre, him, scale, self._fn)
 
@@ -383,7 +441,7 @@ class ImageFormer:
             # computation; a buffer allocation that fails on a TPU has surfaced as a ValueError)
             if 'RESOURCE_EXHAUSTED' not in str(e):
                 raise
-            raise MemoryError(f'{self.backend}: the phase history ({_mem._gb(8.0 * self.P * self.K)} as float32 planes, '
+            raise MemoryError(f'{self.backend}: the phase history ({_mem._gb(8.0 * self.P * self._Kf)} as float32 planes, '
                               f'more once padded for the first-level kernel) does not fit in device memory '
                               f'({_mem._gb(_mem.tpu_capacity())}). Use the cuda or cpu backend (both stream or read the '
                               'history in place), a device with more memory, or fewer pulses.') from e
@@ -414,10 +472,45 @@ class ImageFormer:
             S = S.copy()
         return S
 
+    def _gate(self, S):
+        """S [P, K] windowed, checked for non-finite samples and gated in range (_gate_plan) -> [P, K'] complex64
+        on the gated frequencies: on the device in pulse blocks for the cuda backend (a CuPy array), in row blocks
+        on all cores otherwise (NumPy)."""
+        K, g = self.K, self.range_gate
+        if not type(S).__module__.startswith('cupy'):
+            S = np.asarray(S)
+        if S.shape != (self.P, K):
+            raise ValueError(f'phase history must be {(self.P, K)}, got {S.shape}')
+        win = (self.wp, self.wk) if self.window else None
+        if self.backend == 'cuda':
+            from . import ffbp_cuda
+            _check_history(S, finite=False)
+            return ffbp_cuda.range_gate(S, g, win)
+        import scipy.fft as sf
+        from .patches import _rows
+        _check_history(S)
+        out = np.empty((self.P, g['kept']), np.complex64)
+        npl, Kp, N, k0, k1, T = g['npl'], g['Kp'], g['N'], g['k0'], g['k1'], g['taper']
+        h = N // 2
+
+        def blk(sl):
+            z = np.zeros((sl.stop - sl.start, Kp), np.complex64)
+            z[:, npl:npl + K] = S[sl] if win is None else S[sl] * (win[0][sl, None] * win[1][None, :])
+            q = sf.ifft(z, axis=1, workers=1)
+            u = sf.fft(np.concatenate([q[:, :N - h], q[:, Kp - h:]], axis=1), axis=1, workers=1)
+            np.multiply(u[:, k0:k1], T, out=out[sl])
+        _rows(blk, self.P, chunk=int(max(1, min(64, (1 << 22) // Kp))))
+        return out
+
     def __call__(self, S):
         """S [P, K] complex phase history (numpy, or cupy on the cuda backend), or former.stage(S) -> complex64
         image [nx, ny]."""
         staged = S if isinstance(S, _Staged) else None
+        if staged is None and self.range_gate is not None:
+            S = self._gate(S)                                      # windowed and checked there; on the device for cuda
+            if self.backend == 'cuda':
+                return _to_host(self._form(S))
+            staged = _Staged(S, None, None, None, None)            # the host history as the former takes it
         if self.backend == 'cuda' and staged is None and not type(S).__module__.startswith('cupy'):
             # a host history is windowed and checked on the device as its row blocks are uploaded (two passes over
             # 1.75 GB on the host cost a 4-vCPU instance more than the whole formation); one that streams is prepared
@@ -463,8 +556,8 @@ class ImageFormer:
                     continue
                 ng = self._fn.stages['ng']          # the group the program runs (a divisor of the children)
                 if ng <= 1:
-                    need = _mem.tpu_history_bytes(self._plan, self.K) + _mem.child_bytes(self._plan, 'tpu')
-                    raise MemoryError(f'{self.backend}: the phase history ({_mem._gb(8.0 * self.P * self.K)} as float32 '
+                    need = _mem.tpu_history_bytes(self._plan, self._Kf) + _mem.child_bytes(self._plan, 'tpu')
+                    raise MemoryError(f'{self.backend}: the phase history ({_mem._gb(8.0 * self.P * self._Kf)} as float32 '
                                       f'planes) and one first-level child do not fit in device memory; this needs about '
                                       f'{_mem._gb(need)}. Use the cuda or cpu backend (both stream or read the history in '
                                       'place), a device with more memory, or fewer pulses.') from e
@@ -472,14 +565,14 @@ class ImageFormer:
                 self._fn = self._program(ng // 2)[0]
                 _mem._warn(f'{self.backend}: out of device memory; retrying with first-level groups of '
                            f'{_mem._nchildren(self._fn.stages["ng"])} (slower); full speed needs about '
-                           f'{_mem._gb(_mem.full_speed(self._plan, self.K, "tpu")[0])}')
+                           f'{_mem._gb(_mem.full_speed(self._plan, self._Kf, "tpu")[0])}')
         return ((np.asarray(re) + 1j * np.asarray(im)) * scale).astype(np.complex64)
 
     def memory(self):
         """What full speed needs on this former's device and what is free: dict(backend, needed, available,
         full_speed, parts) in bytes (fastsar.memory)."""
         isz = 4 if self.backend == 'cuda' and self.precision == 'float16' else 8
-        need, parts = _mem.full_speed(self._plan, self.K, self.backend, isz)
+        need, parts = _mem.full_speed(self._plan, self._Kf, self.backend, isz)
         avail = _mem.device_available(self.backend)
         return dict(backend=self.backend, needed=need, available=avail, full_speed=need <= avail, parts=parts)
 
@@ -514,9 +607,9 @@ class ImageFormer:
 
 def form_image(S, ant, fmin, df, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 1.0, 0.0), *, algorithm='ffbp',
                backend='auto', precision='float32', window=True, T='auto', levels=None, pmax=0.4, pfa_guard=300.0, pfa_support='union', target_db=-40.0,
-               ref=None, interp=None, upsample=None, center=None):
+               ref=None, interp=None, upsample=None, center=None, range_gate='auto'):
     """Form the complex image [nx, ny] (complex64). See the module docstring for the arguments. precision, T, levels,
-    pmax and target_db apply to factorized backprojection, pfa_guard and pfa_support to polar format, and interp ('cubic' or
+    pmax, target_db and range_gate (ImageFormer's) apply to factorized backprojection, pfa_guard and pfa_support to polar format, and interp ('cubic' or
     'linear'), upsample and center to exact backprojection (algorithm='bp'; see ExactFormer). For more than one
     image of the same geometry, build an ImageFormer (or ExactFormer) once and call it; this function sets one up
     on every call."""
@@ -543,7 +636,8 @@ def form_image(S, ant, fmin, df, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
             S = rereference(S, float(fmin), float(df), np.asarray(ref, np.float64) - np.linalg.norm(col.ant, axis=1))
         return _pfa(S, col, nx, ny, spx, spy, np.asarray(e1, np.float64), np.asarray(e2, np.float64), pfa_guard, window, pfa_support)
     return ImageFormer(ant, fmin, df, S.shape[1], nx, ny, spx, spy, e1, e2, backend=backend, precision=precision,
-                       window=window, T=T, levels=levels, pmax=pmax, target_db=target_db, ref=ref)(S)
+                       window=window, T=T, levels=levels, pmax=pmax, target_db=target_db, ref=ref,
+                       range_gate=range_gate)(S)
 
 
 _PFA_PROGRAMS = {}
