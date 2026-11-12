@@ -813,7 +813,8 @@ def plan(g, st, opt):
     st.update(spot=False, plane='ground', weighting=wt, autofocus=af, beam=bm, margin=margin, valid=valid,
               band1=b1, band2=b2, pad=pad, wide=wide,
               footprint=float(np.median((sp['pulses'] * sp['speed'])[use])))
-    out.update(window=wt == 'taylor', azimuth_window='taylor' if wt == 'taylor' else 'uniform', azimuth_pad=pad)
+    out.update(window=wt == 'taylor', azimuth_window='taylor' if wt == 'taylor' else 'uniform', azimuth_pad=pad,
+               fit_patch=True)
     return out
 
 

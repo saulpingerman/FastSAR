@@ -325,8 +325,9 @@ def form_cphd(cphd, sicd=None, *, mode='auto', backend='auto', window=True, spac
         # a window that does not end at zero is cut at the band's edge; azimuth_pad (process_cphd's) widens the
         # rectangle beyond the band, for a cut made on the image's spectrum afterwards
         awin = azimuth_window or ('hann' if window else None)
-        # a grid smaller than a patch is formed as one patch of its own size, in whole tiles of 32
-        pp = tuple(int(min(patch, 32 * -(-n // 32))) for n in (nx, ny))
+        pp = (patch, patch)
+        if plan.get('fit_patch'):                     # a grid smaller than a patch as one patch, in whole tiles of 32
+            pp = tuple(int(min(patch, 32 * -(-n // 32))) for n in (nx, ny))
         img = patches.form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1, e2, patch=pp, beam=beam, precision=precision,
                                   awin='none' if awin == 'uniform' else awin, amask=awin in ('taylor', 'uniform'),
                                   umax=1.0 + float(plan.get('azimuth_pad') or 0.0), backend=backend,
