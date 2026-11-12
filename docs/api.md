@@ -147,10 +147,13 @@ rasterio.
 
 - `rgiqe.Radiometry(cphd_path, meta, *, channel=0, pulses=None, nesz_db=None, sicd=None, sigma0_db=None,
   scene_sigma0_db=-10.0, eval_pulses=64, history=None)` with `gain_db`, `nesz_db`, `snr`, `rniirs`; `history`
-  is the phase history already read, from which the noise is measured in place of the file; `footprint` (and
-  `measure_footprint()`) is the check of the antenna block against the beam's footprint in the data: a dict
-  with `status` (`'consistent'`, `'inconsistent'`, `'unchecked'`), `correlation`, `fitted_correlation`, `offset`,
-  `offset_m`, `radius_m`, `ratio`;
+  is the phase history already read, from which the noise is measured in place of the file; `pointing` is how
+  the data had the antenna pattern pointed (`'file'`, `'reference point'`, or `None` when neither agrees with
+  them and the model has no trusted pattern), and `footprint` the check behind it, of the antenna block against
+  the beam's footprint in the phase history: a dict with `status` (`'consistent'`, `'inconsistent'`,
+  `'unchecked'` with `reason`), `correlation`, `fitted_correlation`, `offset`, `offset_m`, `radius_m`, `ratio`,
+  and the same under `file` and `reference_point` for each pointing
+  ([product-options.md](product-options.md#the-antenna-patterns-pointing));
   `rgiqe.area_mask(rad, points, kind, bandwidth_area, samples, tasked=None, tasked_rniirs=None, *,
   ambiguities=True, black_sigma0_db=-10.0)` and `rgiqe.area_bounds(rad, kind, center, e1, e2, bandwidth_area,
   samples, ..., black_sigma0_db=-10.0)`: `'black'` ends where a scene of `black_sigma0_db` has an SNR of 1, and the
@@ -160,7 +163,7 @@ rasterio.
   tolerance_db=0.1, max_order=8, constant=None)`: the content of the SICD `Radiometric` block of an image, as a
   dict: `noise_db` (the constant of `NoisePoly`), `rcs`, `sigma0`, `beta0`, `gamma0` (polynomial coefficients in
   SICD's image coordinates), `order`, `residual_db`, `nesz_db`, `source`, `constant` (the factors written without
-  the gain's variation: by default when `rad.footprint` is `'inconsistent'`). `rgiqe.reference_levels(cphd_path, meta, channel=0)`:
+  the gain's variation: by default when `rad.pointing` is `None`). `rgiqe.reference_levels(cphd_path, meta, channel=0)`:
   (PTRef, PNRef / BNRef) of a CPHD file, `None` for one it does not state. `rgiqe.support_area(ant, band, point)`:
   the ground-plane area of an image's spatial-frequency support
   ([product-options.md](product-options.md#processed-area-by-image-quality)).
@@ -211,5 +214,6 @@ rasterio.
 - `sim.make_collect(...)`, `sim.simulate(col, pos, amp)` (needs finufft), `sim.simulate_brute(col, pos, amp)`.
 - `sim.write_cphd(path, col, S, lat, lon, height=0.0, heading=0.0, ..., pt_ref=None, pn_ref=None, beam=None)`: a
   simulated collection as a CPHD 1.0.1 file placed on the Earth, with the reference levels PTRef and PNRef and an
-  antenna block when they are given. `sim.beam_gain(col, pos, beam)`: the two-way amplitude gain of scatterers
-  under that antenna. `sim.to_ecf(points, lat, lon, height=0.0, heading=0.0)`.
+  antenna block when they are given (`boresight=` turns the frames written off the scene center, for a file
+  whose stated pointing is not the beam's). `sim.beam_gain(col, pos, beam)`: the two-way amplitude gain of
+  scatterers under that antenna. `sim.to_ecf(points, lat, lon, height=0.0, heading=0.0)`.

@@ -19,12 +19,21 @@ was published on PyPI.
   ([docs/product-options.md](docs/product-options.md#radiometric-calibration), with the simulator's accuracy
   and the comparison with a vendor's SICD). The radiometric model's time is the `radiometry` entry of `timing`
   (for the quality areas it was part of `form`).
-- A check of the antenna block against the data (`Radiometry.footprint`, `measure_footprint()`): the beam's
-  footprint measured from the range-Doppler power of a few hundred pulses, against the modeled gain. Where the
-  fitted beam center lies more than half a half-power radius from the modeled one, a note says that the modeled
-  gain is not to be relied on away from the scene reference point, and the scale factors of the `Radiometric`
-  block are written as constants. Five of seven Umbra collections fail it: their per-vector antenna frames put
-  the boresight 1.4 to 1.6 km from the scene reference point, and the data put the beam near that point.
+- The antenna pattern's pointing is decided by the data (`Radiometry.pointing`, `Radiometry.footprint`). The
+  beam's footprint is measured from the range-Doppler power of a few hundred pulses and compared with the modeled
+  gain. The file's antenna frames are used where they pass (the fitted beam center within half a half-power radius
+  of the modeled one). Where they fail, the same pattern is tried with each pulse's boresight on that pulse's
+  scene reference point, where a tracking beam is steered, and used if it passes. Where neither passes the model
+  has no trusted pattern: the quality areas other than `'tasked'` raise a `ValueError` and the scale factors of
+  the `Radiometric` block are constants. A scene that shows no footprint keeps the file's pointing, with a note
+  that it is unverified. Of seven Umbra collections five fail as their files point them (0.65 to 1.00 radii; the
+  frames put the boresight 1.4 to 1.6 km ahead of the scene reference point) and pass on the reference point
+  (0.19 to 0.31), and two pass as stated; on one of the five the black area moves from 7.90 x 9.45 km to 7.75 x
+  9.05 km, centered on the reference point, and the tasked-quality area from 7.65 x 6.75 km to 5.95 x 6.70 km
+  ([docs/product-options.md](docs/product-options.md#the-antenna-patterns-pointing)).
+- The clutter factor of the `Radiometric` block uses the samples' own density in spatial frequency
+  (`rgiqe.clutter_gain`): pulses spaced unevenly in angle moved a simulated sigma zero by up to 0.1 dB under a
+  Taylor window.
 - `sim.write_cphd(..., pt_ref=, pn_ref=, beam=)` writes the reference levels and an antenna block, and
   `sim.beam_gain` gives the matching gain of simulated scatterers.
 

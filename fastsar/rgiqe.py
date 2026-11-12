@@ -247,19 +247,28 @@ class Radiometry:
     history: the phase history of the pulses used [pulses, samples], as read_cphd returned it (before any window);
     a noise measurement then takes its pulses from it and does not read the file a second time.
 
-    footprint (when the noise was measured, else None until measure_footprint is called) compares the beam the
-    antenna block describes with the beam in the data: the range-Doppler power map of the measured pulses against
-    the modeled gain over the ground, binned into the same cells. It is a dict: status ('consistent',
-    'inconsistent' or 'unchecked'), correlation (of the logarithms of the measured map and of the model as the
-    file states it, with a fitted scale and floor), fitted_correlation (with the beam moved to where it fits
-    best), offset (that move: the direction cosines along the antenna's X and Y axes to add to every direction),
-    offset_m (its size on the ground at the reference range), radius, radius_m (the half-power radius of the two-way
-    beam) and ratio (offset over radius). The status is 'inconsistent' when the fitted beam center lies more than
-    half a half-power radius from the modeled one, which is a gain error of about 3 dB at the half-power radius;
-    scene content alone moves the fitted center by some 0.2 radii (seven Umbra collections). Then the modeled
-    gain should not be relied on away from the reference point: a note says so, and calibration writes constant
-    scale factors. 'unchecked': no antenna pattern, or a scene of a few point scatterers, or no fit.
-    """
+    pointing and footprint. The antenna block is checked against the data, and the data decide how the pattern is
+    pointed. The beam's footprint is measured as the range-Doppler power map of a few hundred pulses (those of the
+    noise measurement; from `history`, else from the file) and compared with the modeled gain over the ground,
+    binned into the same cells. footprint is a dict: status ('consistent', 'inconsistent' or 'unchecked', with
+    reason), correlation (of the logarithms of the measured map and of the model, with a fitted scale and floor),
+    fitted_correlation (with the beam moved to where it fits best), offset (that move: the direction cosines along
+    the antenna's X and Y axes to add to every direction), offset_m (its size on the ground at the reference
+    range), radius, radius_m (the half-power radius of the two-way beam), ratio (offset over radius), and under
+    file and reference_point the same numbers for each of the two pointings (the top level holds those of the
+    pointing in use; the file's when none is trusted). A pointing fails when the fitted
+    beam center lies more than half a half-power radius from the modeled one (about 3 dB of gain at the half-power
+    radius; scene content alone moves the fitted center by some 0.2 radii). pointing says which is in use:
+      'file'             the antenna frames as the file states them: they pass, or could not be checked (a scene
+                         of a few point scatterers, clutter under the noise, no samples to measure: a note says
+                         the pattern is unverified);
+      'reference point'  the file's frames fail, and the same pattern with each pulse's boresight turned onto that
+                         pulse's scene reference point, where a tracking beam is steered, passes: gain_db, snr
+                         and the areas use it;
+      None               neither passes (or there is no pattern): the model has no trusted antenna pattern,
+                         area_mask and area_bounds refuse every kind but 'tasked', and calibration writes
+                         constant scale factors.
+        """
 
     def __init__(self, cphd_path, meta, *, channel=0, pulses=None, nesz_db=None, sicd=None, sigma0_db=None,
                  scene_sigma0_db=-10.0, eval_pulses=64, history=None):
@@ -333,11 +342,8 @@ class Radiometry:
         if self._ant is None:
             self.notes.append('The file has no antenna description that could be used, so the antenna gain is taken '
                               'as 0 dB everywhere and only the spreading loss shapes the signal.')
-        e['gref'] = np.zeros(len(idx))
-        if self._ant is not None:
-            for i in range(len(idx)):
-                e['gref'][i] = sum(float(self._oneway(k, i, e['srp'][i][None], np.array([e['rt' if k == 'tx' else 'rr'][i]]))[0][0])
-                                   for k in ('tx', 'rcv'))
+        self.pointing = 'file' if self._ant is not None else None
+        self._reference_gain()
         # the noise level
         self.noise_per_sample = self.clutter_per_sample = self.area_eff = self.measurement = self.footprint = None
         self._blocks = dict(reader=r, ch=ch, pv=pv, fsel=fsel, history=history, tx=tx, rcv=rcv, srp=srp)
@@ -388,21 +394,45 @@ class Radiometry:
                                   f'{self.scene_sigma0_db:.1f} dB divided by the clutter-to-noise ratio measured '
                                   'from the data, and is only as good as that assumption.')
 
-        if history is not None:                                     # used here only: the caller goes on to change it
-            self.measure_footprint()
-            self._blocks['history'] = None
+        self.measure_footprint()                                    # the pointing, where no noise measurement set it
+        self._blocks['history'] = None                              # used here only: the caller goes on to change it
+
+    def _reference_gain(self):
+        """The gain of each evaluation pulse toward its scene reference point, to which every gain is referred."""
+        e = self._e
+        e['gref'] = np.zeros(len(e['rt']))
+        if self._ant is not None:
+            for i in range(len(e['rt'])):
+                e['gref'][i] = sum(float(self._oneway(k, i, e['srp'][i][None], np.array([e['rt' if k == 'tx' else 'rr'][i]]))[0][0])
+                                   for k in ('tx', 'rcv'))
+
+    def _repoint(self):
+        """Turn the antenna frame of every evaluation pulse, by the least rotation, so that its boresight (X x Y) is
+        on that pulse's scene reference point. The pattern, its orientation about the boresight and the electrical
+        boresight terms stay as the file states them."""
+        e = self._e
+        for k in ('tx', 'rcv'):
+            a = self._ant[k]
+            z = e['srp'] - e[k]
+            z /= np.linalg.norm(z, axis=1, keepdims=True)
+            x = a['ax'] - np.einsum('ij,ij->i', a['ax'], z)[:, None] * z
+            x /= np.linalg.norm(x, axis=1, keepdims=True)
+            a['ax'], a['ay'] = x, np.cross(z, x)
+        self._reference_gain()
 
     def measure_footprint(self):
-        """Measure the beam's footprint from the phase history and compare it with the antenna model, when a noise
-        measurement has not done so already (a file with PNRef, or a level that was given) -> self.footprint."""
+        """Measure the beam's footprint from the phase history and decide the pointing with it (see the class), when
+        a noise measurement has not done so already (a file with PNRef, or a level that was given) ->
+        self.footprint."""
         if self.footprint is None:
-            b = self._blocks
-            try:
-                K = int(np.shape(b['history'])[1]) if b['history'] is not None else \
-                    int(b['reader'].cphd_meta.Data.Channels[b['ch']].NumSamples)
-                fp = _measure_noise(b['reader'], b['ch'], b['pv'], b['fsel'], K, b['history'])['footprint']
-            except (AttributeError, KeyError, TypeError, ValueError, IndexError):   # no samples to measure from
-                fp = None
+            b, fp = self._blocks, None
+            if self._ant is not None:
+                try:
+                    K = int(np.shape(b['history'])[1]) if b['history'] is not None else \
+                        int(b['reader'].cphd_meta.Data.Channels[b['ch']].NumSamples)
+                    fp = _measure_noise(b['reader'], b['ch'], b['pv'], b['fsel'], K, b['history'])['footprint']
+                except (AttributeError, KeyError, TypeError, ValueError, IndexError):   # no samples to measure from
+                    fp = None
             self._check_footprint(fp)
         return self.footprint
 
@@ -416,12 +446,22 @@ class Radiometry:
         return g
 
     def _check_footprint(self, fp):
-        """Set self.footprint from the measured range-Doppler map fp (_measure_noise's) and add its note."""
-        out = dict(status='unchecked', correlation=None, fitted_correlation=None, offset=None, offset_m=None,
-                   radius=None, radius_m=None, ratio=None)
+        """Set self.footprint and self.pointing from the measured range-Doppler map fp (_measure_noise's), turn the
+        antenna frames when the data ask for it, and add the note."""
+        out = dict(status='unchecked', reason=None, correlation=None, fitted_correlation=None, offset=None,
+                   offset_m=None, radius=None, radius_m=None, ratio=None, file=None, reference_point=None)
         self.footprint = out
-        if fp is None or self._ant is None:
+        if self._ant is None:
+            out['reason'] = 'the file describes no antenna pattern'
             return out
+
+        def unchecked(reason):
+            out['reason'] = reason
+            self.notes.append(f"The antenna block could not be checked against the beam's footprint in the phase "
+                              f"history ({reason}): the pattern is used as the file points it, unverified.")
+            return out
+        if fp is None:
+            return unchecked('no pulses could be measured for it')
         b, e = self._blocks, self._e
         i = len(e['rt']) // 2
         D = np.asarray(fp['power'], np.float64)
@@ -432,11 +472,11 @@ class Radiometry:
         U, V = np.meshgrid(gp, gp, indexing='ij')
         two = self._pattern_db('tx', U, V, i) + self._pattern_db('rcv', U, V, i)
         if not np.isfinite(two).all() or np.ptp(two) < 6.0:
-            return out
+            return unchecked('the pattern has no beam within 0.02 of its origin in direction cosine')
         inside = two >= two.max() - 3.0
         radius = float(np.sqrt(inside.sum() * (gp[1] - gp[0]) ** 2 / np.pi))
         if not 1e-4 < radius < 0.015:
-            return out
+            return unchecked('the pattern has no beam within 0.02 of its origin in direction cosine')
         # a ground lattice out to three radii, with its direction cosines and its delay and Doppler cells
         r0 = float(e['rt'][i])
         half = 3.0 * radius * r0 / max(np.sin(self.graze), 0.2)
@@ -474,7 +514,6 @@ class Radiometry:
             with np.errstate(divide='ignore', invalid='ignore'):
                 tap = np.where(tmid < a1, (tmid - e1) / (a1 - e1), np.where(tmid > a2, (e2 - tmid) / (e2 - a2), 1.0))
             weight = weight * np.clip(np.nan_to_num(tap, nan=1.0), 0.0, 1.0)
-
         same = bool(self._ant['same'])
 
         def predict(ox=0.0, oy=0.0):
@@ -493,15 +532,15 @@ class Radiometry:
             if not m.any():
                 return -1.0
             sc, fl = np.linalg.lstsq(np.stack([m, np.ones(m.size)], 1), A, rcond=None)[0]
-            q = np.log(max(sc, 1e-300) * M + max(fl, floor, 1e-300)) - 0.0
+            q = np.log(max(sc, 1e-300) * M + max(fl, floor, 1e-300))
             q, d = q - q.mean(), logd - logd.mean()
             den = np.sqrt((q * q).sum() * (d * d).sum())
             return float((q * d).sum() / den) if den > 0 else -1.0
 
         M0 = predict()
         foot = M0 >= 0.25 * M0.max()
-        if foot.sum() < 8 or np.median(D[foot]) < 0.02 * np.percentile(D[foot], 95):   # a few point scatterers
-            return out
+        if foot.sum() < 8 or np.median(D[foot]) < 0.02 * np.percentile(D[foot], 95):
+            return unchecked('the scene is a few point scatterers, which show no footprint')
         c0 = corr(M0)
         best = (c0, 0.0, 0.0)
         for span, step in ((1.5 * radius, radius / 4), (radius / 4, radius / 16)):
@@ -511,24 +550,50 @@ class Radiometry:
                     v = corr(predict(ox, oy))
                     if v > best[0]:
                         best = (v, float(ox), float(oy))
-        off = float(np.hypot(best[1], best[2]))
-        out.update(correlation=c0, fitted_correlation=best[0], offset=(best[1], best[2]), offset_m=off * r0,
-                   radius=radius, radius_m=radius * r0, ratio=off / radius)
-        if best[0] < 0.5:
+        out.update(fitted_correlation=best[0], radius=radius, radius_m=radius * r0)
+
+        def judged(c, ox, oy):
+            """One pointing against the fit: the model's own correlation, and the move that would fit it best."""
+            off = float(np.hypot(ox, oy))
+            bad = off > _FOOTPRINT_RATIO * radius and best[0] - c > 0.02
+            return dict(status='inconsistent' if bad else 'consistent', correlation=c, offset=(ox, oy),
+                        offset_m=off * r0, ratio=off / radius)
+        file = out['file'] = judged(c0, best[1], best[2])
+        out.update(file)
+        # the same pattern with each boresight on its scene reference point: the reference point's direction cosines
+        # in the file's frame are taken from every direction, and the fitted move is counted from there
+        a, pos = self._ant['tx'], e['tx'][i]
+        o = np.array([(e['srp'][i] - pos) @ a['ax'][i], (e['srp'][i] - pos) @ a['ay'][i]]) / r0
+        turned = bool(np.hypot(*o) > 0.02 * radius)                 # else the file's frames are on it already
+        ref = out['reference_point'] = judged(corr(predict(-o[0], -o[1])), best[1] + o[0], best[2] + o[1]) if turned \
+            else dict(file)
+        if best[0] < 0.5:                                           # no beam to be seen in the map
+            contrast = 10 * np.log10(np.percentile(D, 95) / max(np.percentile(D, 5), 1e-300))
+            out['status'] = file['status'] = ref['status'] = 'unchecked'
+            return unchecked(f'the clutter stands only {contrast:.1f} dB above the noise in the range-Doppler map, '
+                             f'and the fit explains too little of it (correlation {best[0]:.2f})' if contrast < 3.0 else
+                             f'the map does not resemble a beam (correlation {best[0]:.2f} at the best fit)')
+        km = lambda v: f"{v['offset_m'] / 1e3:.2f} km ({v['ratio']:.2f} of the half-power radius of the two-way beam)"
+        if file['status'] == 'consistent':
+            self.notes.append(f"The beam's footprint in the phase history agrees with the antenna block as the file "
+                              f'points it: its fitted center lies {km(file)} from the modeled one.')
             return out
-        out['status'] = 'inconsistent' if off > _FOOTPRINT_RATIO * radius and best[0] - c0 > 0.02 else 'consistent'
-        if out['status'] == 'inconsistent':
+        if ref['status'] == 'consistent' and turned:                # the file's pointing fails, this one passes
+            self._repoint()
+            self.pointing = 'reference point'
+            out.update(ref)
             self.notes.append(
-                f"The beam's footprint in the phase history does not agree with the antenna block of the file: fitted "
-                f"to the range-Doppler power of the measured pulses, its center lies {off * r0 / 1e3:.2f} km from the "
-                f"modeled one, {off / radius:.2f} of the half-power radius of the two-way beam ({radius * r0 / 1e3:.2f} "
-                f"km), and the correlation rises from {c0:.2f} to {best[0]:.2f}. The modeled gain is not to be relied "
-                'on away from the scene reference point.')
+                f"The beam's footprint in the phase history does not agree with the antenna block as the file points "
+                f'it: fitted to the range-Doppler power of the measured pulses, its center lies {km(file)} from the '
+                f'modeled one. With each boresight on its scene reference point, where a tracking beam is steered, '
+                f'it lies {km(ref)} away: the pattern is used with that pointing.')
         else:
+            self.pointing = None
             self.notes.append(
-                f"The beam's footprint in the phase history agrees with the antenna block: its fitted center lies "
-                f"{off * r0 / 1e3:.2f} km from the modeled one, {off / radius:.2f} of the half-power radius of the "
-                'two-way beam.')
+                f"The beam's footprint in the phase history does not agree with the antenna block: fitted to the "
+                f'range-Doppler power of the measured pulses, its center lies {km(file)} from the modeled one as the '
+                f'file points it, and {km(ref)} with each boresight on its scene reference point. The model has no '
+                'trusted antenna pattern: only the tasked area can be processed, and scale factors do not follow it.')
         return out
 
     def _antenna(self, r, m, par, pv, fi, t_tx, t_rcv):
@@ -941,8 +1006,9 @@ def area_mask(rad, points, kind, bandwidth_area, samples, tasked=None, tasked_rn
 
     Apart from 'tasked', the mask is the union of the tasked polygon with the connected region that meets the
     criterion and contains the scene reference point or touches the polygon, so it never falls short of the tasked
-    area. Points where the antenna pattern is not known do not meet any criterion. A lower RNIIRS threshold gives a
-    larger area, and so does a lower black_sigma0_db. 'black' contains the area of every RNIIRS threshold that needs
+    area. Points where the antenna pattern is not known do not meet any criterion, and a model whose antenna
+    pattern the data contradict (rad.pointing None) gives no area but 'tasked': a ValueError says so. A lower RNIIRS
+    threshold gives a larger area, and so does a lower black_sigma0_db. 'black' contains the area of every RNIIRS threshold that needs
     a reference SNR of at least rad.sigma0_db - black_sigma0_db (10 dB for a co-polarized channel at the default);
     a threshold that needs less, a low RNIIRS at a large bandwidth area or a tasked quality met at a low SNR, gives
     an area that reaches beyond 'black' across the beam. Grids of more than about 300,000 points are evaluated on
@@ -997,6 +1063,11 @@ def area_mask(rad, points, kind, bandwidth_area, samples, tasked=None, tasked_rn
         mask = polygon()
         info['border'], info['level'] = border(mask), np.where(mask, 1.0, -1.0).astype(np.float32)
         return mask, info
+    if getattr(rad, 'pointing', 'file') is None and getattr(rad, 'has_antenna', True):
+        raise ValueError(f'area {kind!r}: the antenna block of the file does not describe the beam the data show, as '
+                         'the file points it or with each boresight on its scene reference point '
+                         "(Radiometry.footprint), so the signal has no modeled edge to follow; only 'tasked' can be "
+                         'processed')
     extended, scene = False, None
     if isinstance(kind, str) and kind == 'black':
         if not np.isfinite(float(black_sigma0_db)):
@@ -1205,8 +1276,9 @@ def calibration(rad, sicd, samples, bandwidth_area, coherent=None, noise=None, *
     and to judge: the pixels that hold data (default: all of them; a slant-plane image is zero beyond the ground
     that was formed, and the polynomials mean nothing there). Points where the antenna pattern is not known are
     left out. constant: write the factors as constants, their values at the scene reference point (G = 1), without
-    the modeled gain's variation over the image; None: when the beam's footprint in the data does not agree with
-    the antenna model (rad.footprint['status'] == 'inconsistent'), in which case the variation would be wrong.
+    the modeled gain's variation over the image; None: when the model has no trusted antenna pattern
+    (rad.pointing None: the data contradict the antenna block as the file points it and pointed at the scene
+    reference point, or the file has none), in which case the variation would be wrong.
 
     -> dict(source (rad.level_source), noise_db (thermal noise power of a pixel, dB: NoisePoly, a constant; None
     without a noise power), rcs, sigma0, beta0, gamma0 (coefficients [n + 1, n + 1], exponent of the row coordinate
@@ -1239,7 +1311,7 @@ def calibration(rad, sicd, samples, bandwidth_area, coherent=None, noise=None, *
             None if inside is None else inside[ok]
 
     if constant is None:
-        constant = (getattr(rad, 'footprint', None) or {}).get('status') == 'inconsistent'
+        constant = getattr(rad, 'pointing', 'file') is None
     u, v, f, _ = lattice(33)
     uu, vv, ff, inside = lattice(64)                               # the fit is judged between its own nodes
     if len(f) < 4 or len(ff) < 4:

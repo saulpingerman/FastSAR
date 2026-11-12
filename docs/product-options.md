@@ -341,23 +341,100 @@ lo1, hi1, lo2, hi2 = rgiqe.area_bounds(rad, 'black', c, e1, e2, bw_area, samples
 - Ambiguities assume a uniform scene and are placed with the mid-aperture geometry; range ambiguities are ignored.
 - An RNIIRS threshold that needs an SNR of the reference scene below 10 dB gives an area that exceeds `'black'`
   at its default of -10 dB.
+- The pattern's pointing is checked against the data to about 0.2 half-power radii of the two-way beam at best,
+  and passes within 0.5. Two of seven Umbra collections lie halfway between the file's pointing and the scene
+  reference point.
 
 `process_cphd(..., area=, black_sigma0_db=-10.0)` takes the same four kinds. The image is formed over the bounding
 rectangle of the area on the ground axes, with one impulse response everywhere and a noise-equivalent sigma zero
 that rises toward the edges, and the pixels outside the area are set to 0. For a file that describes no antenna
 pattern the model cannot predict where the signal fades, and an `area` other than `'tasked'` raises a
-`ValueError`. The model's beam is the one the file's antenna block states; where a producer's stated boresight
-differs from the true beam, the area is displaced with it.
+`ValueError`. The model's beam has the pattern the file's antenna block states and the pointing the data decide
+([below](#the-antenna-patterns-pointing)); where no pointing agrees with the data, an `area` other than
+`'tasked'` raises a `ValueError` that says so.
+
+### The antenna pattern's pointing
+
+The areas and the calibration both rest on the two-way gain over the ground, so `Radiometry` checks the antenna
+block against the data before it uses it, and the data decide how the pattern is pointed (`rad.pointing`, with
+the numbers in `rad.footprint` and a sentence in `rad.notes`).
+
+The measurement is the beam's footprint in the phase history: the range-Doppler power map of the pulses the noise
+measurement uses (64 to 512 of them, from the history `process_cphd` has read). Each cell of delay and Doppler is
+a patch of ground, and the model's map is the two-way gain over a ground lattice binned into the same cells, with
+the azimuth ambiguities folded in and a fitted noise floor. The fit moves the modeled beam to where the two maps
+(their logarithms) correlate best. A pointing passes when the fitted beam center lies within half a half-power
+radius of the two-way beam from the modeled one, which is about 3 dB of gain at the half-power radius; scene
+content alone moves the fitted center by about 0.2 radii.
+
+1. `'file'`: the antenna frames as the file states them, when they pass.
+2. `'reference point'`: when they fail, the same pattern (its shape, its orientation about the boresight and any
+   electrical boresight terms) with each pulse's boresight turned onto that pulse's scene reference point, which is
+   where a spotlight or a moving beam is steered. If that passes it is used, and the note gives both offsets.
+3. `None`: neither passes, and the model has no trusted pattern. The areas other than `'tasked'` are refused and
+   the SICD's scale factors are written as constants.
+
+Where the check cannot be made the file's pointing is kept, and the note says that it is unverified and why: a
+scene of a few point scatterers shows no footprint, and neither does one whose clutter is under the noise in the
+range-Doppler map.
+
+Seven Umbra spotlight collections (2024-05 to 2025-01, satellites 05 to 08) and two Capella ones, by this rule:
+
+| Collection | As the file points it | On the reference point | Pointing used |
+|---|---|---|---|
+| Umbra-07, 2024-09-10 | 2.01 km, 1.00 radii | 0.54 km, 0.27 | reference point |
+| UMBRA-06, 2024-05-28 | 1.50 km, 0.77 | 0.36 km, 0.19 | reference point |
+| UMBRA-06, 2024-07-14 | 1.24 km, 0.65 | 0.40 km, 0.21 | reference point |
+| UMBRA-06, 2024-07-28 | 1.22 km, 0.65 | 0.38 km, 0.20 | reference point |
+| UMBRA-06, 2024-10-26 | 1.08 km, 0.71 | 0.47 km, 0.31 | reference point |
+| UMBRA-08, 2024-11-12 | 0.97 km, 0.49 | 1.09 km, 0.55 | file |
+| UMBRA-05, 2025-01-19 | 0.82 km, 0.44 | 0.87 km, 0.47 | file |
+| Capella, 2025-03-13 | 1.22 km, 0.46 | 0.61 km, 0.23 | file |
+| Capella, 2025-01-19 | no fit | | file, unverified |
+
+The offsets are those of the fitted beam center from the modeled one, in kilometers on the ground and in
+half-power radii. In all seven Umbra files the per-vector frames (`TxACX`, `TxACY` and the same for receive, with
+ACY along the velocity; `TxEB` and `RcvEB` zero; pattern arrays that peak within 2e-4 of their origin, 1e-3 along
+X for UMBRA-05) put the boresight 0.15 to 0.18 degrees ahead of the scene reference point along the track, 1.4 to
+1.6 km on the ground, and the data put the beam 0.8 to 2.0 km from there, toward the reference point in every one
+(1.26 km on average, standard error 0.15 km). Five fail as the file points them and pass on the reference point;
+two lie halfway and pass either way, so they keep the file's pointing. The second Capella collection gives no
+fit: at a range of 931 km its clutter stands 1.9 dB above the noise in the map.
+
+One observation on the Umbra frames, which is not used as a rule: the stated offset is the rotation of the line
+of sight over 0.19 to 0.21 s in each of the seven files. With the frames taken 0.20 s later than stamped the
+boresight falls on the reference point in all seven (to 2e-4 along ACY), and the fitted offsets are 0.16 to 0.48
+radii, against 0.44 to 1.00 as stamped and 0.19 to 0.55 on the reference point. The delay that fits each file
+best scatters from 0.10 to 0.27 s (mean 0.16 s, standard deviation 0.05 s, which is the fit's noise), so the
+footprints agree with one common delay near 0.2 s and cannot tell it from a boresight on the reference point.
+
+On the first of those collections the modeled gain was held against the image itself. Over 200 m cells within
+2.4 km of the scene center the image's brightness changes by -0.23 dB per dB of the gain as the file points it
+(correlation -0.30) and by +0.50 dB per dB of the gain on the reference point (correlation +0.31), where a
+correct model over homogeneous ground gives +1: the re-pointed pattern has the right sense and about twice the
+roll-off the image shows over this farmland. Its quality areas change with the pointing as follows (across by
+along the line of sight, and the pixels of the SIDD):
+
+| Area | As the file points it | On the reference point |
+|---|---|---|
+| `'tasked_quality'` | 7.65 x 6.75 km, 51.6 km^2, 192 Mpx (RNIIRS 3.72) | 5.95 x 6.70 km, 39.9 km^2, 148 Mpx (RNIIRS 4.28) |
+| `'black'` | 7.90 x 9.45 km, 74.7 km^2, 285 Mpx | 7.75 x 9.05 km, 70.1 km^2, 267 Mpx |
+
+The RNIIRS is the least over the tasked area, which is the threshold of `'tasked_quality'`: with the file's
+pointing the modeled gain fell 19.6 dB within the tasked area, on the reference point 9.9 dB. The black area is
+now centered on the reference point (-3.8 to +3.95 km across, -4.4 to +4.65 km along) where it reached from -4.7
+to +3.2 km and from -3.3 to +6.15 km.
 
 ### The black area at -10 dB
 
-Two spotlight collections with tasked areas of 5 by 5 km, at the reference of 0.2.0 and at the default. Sizes are
-across by along the line of sight, and the pixels are those of the SIDD that `process_cphd(product='sidd',
-area='black')` plans:
+Two spotlight collections with tasked areas of 5 by 5 km, at a reference of 0 dB, which was that of 0.2.0, and at
+the default, with the pattern pointed as the data decide (the Umbra collection on the reference point; with the
+file's pointing, as in 0.2.0, its area at 0 dB was 8.30 x 11.35 km). Sizes are across by along the line of sight,
+and the pixels are those of the SIDD that `process_cphd(product='sidd', area='black')` plans:
 
 | Collection | `black_sigma0_db=0.0` | `black_sigma0_db=-10.0` (default) |
 |---|---|---|
-| Umbra, 2024-09-10 | 8.30 x 11.35 km, 94.2 km^2, 364 Mpx | 7.90 x 9.45 km, 74.7 km^2, 285 Mpx |
+| Umbra, 2024-09-10 | 8.15 x 11.10 km, 90.5 km^2, 348 Mpx | 7.75 x 9.05 km, 70.1 km^2, 267 Mpx |
 | Capella, 2025-03-13 | 11.85 x 7.95 km, 94.2 km^2, 1,643 Mpx | 6.15 x 7.85 km, 48.3 km^2, 833 Mpx |
 
 The Umbra area shrinks along the line of sight and hardly across it. Across the beam its edge is where the azimuth
@@ -420,22 +497,15 @@ The image is not corrected for the antenna pattern (`ImageBeamComp` NO), so the 
 error, of the lowest order (the same in both coordinates, at most 8) that stays within 0.1 dB of the model on a
 lattice finer than the one fitted. The note states the order and the residual. Order 8 follows a gain that falls
 by about 30 dB over the image; where an area asked for reaches further down the beam, the residual stated is
-larger than 0.1 dB. A file with `PTRef` and no antenna pattern gets factors that follow the spreading loss alone.
+larger than 0.1 dB. A file with `PTRef` and no antenna pattern gets constant factors.
 
-**The antenna block is checked against the data.** The variation of the factors over the image is only as good
-as the antenna block of the file, so `Radiometry` measures the beam's footprint from the phase history and
-compares it with the modeled gain. The measurement is the range-Doppler power map of the pulses the noise
-measurement uses (64 to 512 of them): each cell of delay and Doppler is a patch of ground, and the model's map is
-the two-way gain over a ground lattice binned into the same cells, with the azimuth ambiguities folded in and a
-fitted noise floor. `rad.footprint` holds the correlation of the two maps (of their logarithms) with the beam as
-the file states it, the correlation with the beam moved to where it fits best, that move in direction cosines
-and in meters, and a status. The status is `'inconsistent'` when the fitted beam center lies more than half a
-half-power radius of the two-way beam from the modeled one, which is a gain error of about 3 dB at the half-power
-radius; scene content alone moves the fitted center by about 0.2 radii. Then a note says that the modeled gain is
-not to be relied on away from the scene reference point, and the scale factors are written as constants, their
-values at the reference point, as the vendors' own SICDs carry them (`out['radiometric']['constant']`). A scene
-of a few point scatterers, or one with no clutter above the noise, gives no footprint: the status is
-`'unchecked'` and the model is used as it is.
+**The pattern's pointing is the one the data decide.** The variation of the factors over the image is only as
+good as the modeled gain, so the factors follow the pattern as `Radiometry` has pointed it
+([the rule](#the-antenna-patterns-pointing)): as the file states it where that agrees with the beam's footprint in
+the phase history, with each boresight on its scene reference point where the file's pointing fails and that one
+passes, and not at all where neither does. In the last case the scale factors are written as constants, their
+values at the scene reference point, as the vendors' own SICDs carry them (`out['radiometric']['constant']`).
+The note in the product says which pointing was used and gives the offsets.
 
 **For a consumer.** All four factors are written, so none needs deriving. SICD's relations between sigma zero,
 beta zero and gamma zero hold exactly, with the angles of the scene center point. The relation between RCS and
@@ -453,41 +523,26 @@ weights to within 0.07 dB and the sum of their squares to 0.03 dB on both planes
 formers' own accuracy, with no normalization to correct for. sarkit's consistency check passes with the block
 present (`tests/test_sicd_consistency.py`).
 
-Seven Umbra spotlight collections (2024-05 to 2025-01, satellites 05 to 08) and two Capella ones were put
-through the check of the antenna block against the data:
+Against the vendor's SICD of one Umbra spotlight collection (2024-09-10; PTRef, no PNRef), over the same ground
+through each file's own projection and its own block. The vendor's factors are constant over its image (to
+0.06 dB). FastSAR's follow the file's pattern with the boresights on the scene reference point, which the data
+chose over the file's pointing (0.27 against 1.00 half-power radii); the gain falls 9.9 dB over the tasked
+rectangle and the fit is of order 6, to 0.03 dB.
 
-- What the Umbra files state. The per-vector frames (`TxACX`, `TxACY` and the same for receive, with ACY along the
-  velocity; `TxEB` and `RcvEB` zero; pattern arrays that peak within 2e-4 of their origin) put the boresight 0.15
-  to 0.18 degrees ahead of the scene reference point along the track, 1.4 to 1.6 km on the ground. In every one of
-  the seven that angle is the rotation of the line of sight over 0.19 to 0.21 s.
-- What the data show. The fitted beam center lies 0.8 to 2.0 km from the modeled one, toward the reference point
-  in all seven: 1.26 km on average (standard error 0.15 km), where a beam centered on the reference point would
-  give 1.5 km and a beam mirrored through it 3.0 km. Five of the seven fail the check (0.65 to 1.00 half-power
-  radii) and two pass (0.44 and 0.49). The beam of these collections is therefore not where the frames put it,
-  and not mirrored either: it lies near the reference point, as it would if the frames were those of 0.2 s
-  earlier.
-- A direction cosine of the opposite sign about the boresight cannot be seen with patterns this symmetric and
-  an electrical boresight of zero. The one file whose pattern peaks off its origin (UMBRA-05, 1e-3 along X) fits
-  as read (correlation 0.89) and not mirrored along X (0.78).
-- Of the two Capella collections one passes at 0.46 radii and the other gives no fit (correlation 0.18).
-
-No producer rule is applied on this evidence. A collection that fails the check gets constant factors, and its
-notes say so; the quality areas still use the modeled gain, with the same note.
-
-Against the vendor's SICD of one of those Umbra collections (2024-09-10; PTRef, no PNRef; it fails the check at
-1.00 radii, the model's gain falling 20.5 dB over the tasked rectangle), over the same ground through each file's
-own projection and its own block:
-
-- Sigma zero over 64 boxes of 500 m within 2 km of the scene center: FastSAR less vendor +0.06 dB on average, with
-  a standard deviation of 0.26 dB and a range of -0.85 to +1.00 dB (slant-plane product: +0.04, 0.20, -0.42 to
-  +0.58). The vendor's factors are constant over its image too (to 0.06 dB).
-- With the factors following the antenna block instead (`constant=False`), the same boxes differ by -1.5 to
-  +9.9 dB, and the image does not darken with the modeled gain (over 200 m cells the vendor's sigma zero falls by
-  0.2 dB per dB of modeled gain, where a rise of 1 dB per dB would show the roll-off).
+- At the scene center the two agree: over the central 500 m FastSAR's sigma zero is 0.4 dB above the vendor's
+  (-8.4 against -8.8 dB).
+- Over 64 boxes of 500 m within 2 km of the center FastSAR less vendor is +1.95 dB on average, with a standard
+  deviation of 1.18 dB and a range of +0.05 to +4.82 dB (slant-plane product: +1.94, 1.22, +0.03 to +4.72). The
+  difference is the modeled gain, which the vendor's constant factors leave in the image. The image darkens by
+  half as much as the model says ([above](#the-antenna-patterns-pointing): +0.50 dB per dB). Taking the image's
+  own roll-off for the truth, FastSAR's factors are too large toward the edges by up to about 2.4 dB and the
+  vendor's too small by as much.
+- With constant factors (`rgiqe.calibration(..., constant=True)`) the same boxes differ by +0.06 dB on average
+  (standard deviation 0.26 dB, range -0.85 to +1.00). With the file's pointing they differed by -1.5 to +9.9 dB.
 - Noise. The vendor's `NoisePoly` times its sigma zero factor is -71.5 dB, and its `theoretical_nesz_db`
   parameter states -30.8 dB. FastSAR's noise level, measured from the phase history, gives a noise-equivalent
-  sigma zero of -24.8 dB at the scene reference point. The darkest 100 m cells of the image lie at -18 dB by
-  either block, an upper bound.
+  sigma zero of -24.8 dB at the scene center point. The darkest 100 m cells of the image lie at -18 dB by the
+  vendor's block, an upper bound.
 
 A Capella spotlight collection (2025-03-13) states neither PTRef nor PNRef, so its FastSAR SICD has no
 `Radiometric` block, the note says why, and the step costs nothing. The vendor's SICD of that collection states a

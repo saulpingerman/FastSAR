@@ -345,14 +345,17 @@ def _radiometric(out, st, cphd, channel, area, black_sigma0_db):
         notes.append(f'No Radiometric block: {e}.')
         return None
     if cal['constant']:
-        follow = ("The beam's footprint in the phase history does not agree with the antenna block of the file, so "
-                  'the scale factors are written as constants, their values at the scene reference point, without '
-                  f"the modeled gain's variation over the image ({cal['gain_span_db']:.1f} dB by the antenna block).")
+        follow = ('The model has no trusted antenna pattern (the data contradict the antenna block as the file '
+                  'points it and with each boresight on its scene reference point, or the file has none), so the '
+                  'scale factors are written as constants, their values at the scene reference point, without a '
+                  f"gain's variation over the image ({cal['gain_span_db']:.1f} dB by the antenna block as read).")
     else:
         over = '' if cal['tasked_residual_db'] is None or model is None else \
             f" ({cal['tasked_residual_db']:.2f} dB over the tasked area)"
-        follow = (f"Polynomials of order {cal['order']} follow the antenna gain of the file's antenna block over the "
-                  f"pixels that hold data, where it spans {cal['gain_span_db']:.1f} dB, to within "
+        how = ('with each boresight on its scene reference point' if rad.pointing == 'reference point' else
+               'as the file points it')
+        follow = (f"Polynomials of order {cal['order']} follow the gain of the file's antenna pattern, {how}, over "
+                  f"the pixels that hold data, where it spans {cal['gain_span_db']:.1f} dB, to within "
                   f"{cal['residual_db']:.2f} dB{over}.")
     noise_from = ('the noise level on its PNRef' if cal['source'] == 'cphd' else
                   'the file states no PNRef, so the noise level is the noise power measured from the phase history '

@@ -146,15 +146,21 @@ def _reference_geometry(arp, varp, srp):
                 SlopeAngle=np.degrees(np.arccos(U @ spn)), LayoverAngle=deg(-spn @ E, -spn @ N))
 
 
-def _beam_axes(ant):
+def _beam_axes(ant, boresight=(0.0, 0.0)):
     """The antenna's X and Y axes [Np, 3] at each pulse of a track ant [Np, 3] (simulator frame): X along the track,
     made normal to the line of sight, and Y = boresight x X, so that X x Y is the boresight, which follows the scene
-    center (CPHD's antenna coordinate frame)."""
+    center (CPHD's antenna coordinate frame). boresight: direction cosines along X and Y by which the boresight is
+    turned off the scene center instead."""
     ant = np.asarray(ant, np.float64)
     z = -ant / np.linalg.norm(ant, axis=1, keepdims=True)
     v = np.gradient(ant, axis=0)
     x = v - np.einsum('ij,ij->i', v, z)[:, None] * z
     x /= np.linalg.norm(x, axis=1, keepdims=True)
+    if np.any(boresight):
+        bx, by = (float(b) for b in boresight)
+        z = np.sqrt(1.0 - bx * bx - by * by) * z + bx * x + by * np.cross(z, x)
+        x = x - np.einsum('ij,ij->i', x, z)[:, None] * z
+        x /= np.linalg.norm(x, axis=1, keepdims=True)
     return x, np.cross(z, x)
 
 
@@ -176,7 +182,8 @@ def beam_gain(col, pos, beam):
 
 
 def write_cphd(path, col, S, lat, lon, height=0.0, heading=0.0, speed=200.0, srp=None, scene=None, pol='VV',
-               start='2026-01-01T00:00:00.000000Z', tropo=0.0, pt_ref=None, pn_ref=None, beam=None):
+               start='2026-01-01T00:00:00.000000Z', tropo=0.0, pt_ref=None, pn_ref=None, beam=None,
+               boresight=(0.0, 0.0)):
     """Write a simulated phase history S [Np, K] (this module's convention: compensated to the scene center, phase
     exp(-j 4 pi f dR / c)) as a monostatic frequency-domain CPHD 1.0.1 file, placed by to_ecf, with the pulses
     `speed` m/s apart in time along the track. srp: per-pulse scene reference points [Np, 3] in the simulator's
@@ -187,6 +194,8 @@ def write_cphd(path, col, S, lat, lon, height=0.0, heading=0.0, speed=200.0, srp
     scene center: a scatterer of RCS s then has the amplitude sqrt(s pt_ref)) and NoiseLevel.PNRef (the noise power
     per sample, with BNRef 1); None writes neither. beam: (a, dcx, dcy) writes an antenna block with the pattern of
     beam_gain (a spotlight: the boresight follows the scene center); S should hold that gain. None: no antenna.
+    boresight: direction cosines along the antenna's X and Y by which the frames written are turned off the scene
+    center, for a file whose stated pointing is not the beam's (S holds the gain of the beam on the scene center).
     The file is written by fastsar._cphdxml.write_cphd."""
     from . import _cphdxml
     from .io import ecf_to_geodetic
@@ -230,7 +239,7 @@ def write_cphd(path, col, S, lat, lon, height=0.0, heading=0.0, speed=200.0, srp
         shift = np.polynomial.Polynomial([-tm, 1.0])
         axis = lambda tag, v: f'<{tag}>' + ''.join(poly1(k, np.polynomial.Polynomial(np.polynomial.polynomial.polyfit(
             t - tm, (v @ M)[:, i], min(5, P - 1)))(shift).coef) for i, k in enumerate('XYZ')) + f'</{tag}>'
-        xa, ya = _beam_axes(ant)
+        xa, ya = _beam_axes(ant, boresight)
         gain = np.array([[0.0, 2 * a_db * dcy, -a_db], [2 * a_db * dcx, 0.0, 0.0], [-a_db, 0.0, 0.0]])
         poly2 = lambda tag, c: f'<{tag} order1="{c.shape[0] - 1}" order2="{c.shape[1] - 1}">' + ''.join(
             f'<Coef exponent1="{i}" exponent2="{j}">{g(c[i, j])}</Coef>' for i in range(c.shape[0])
