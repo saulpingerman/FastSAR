@@ -337,6 +337,22 @@ pattern the model cannot predict where the signal fades, and an `area` other tha
 `ValueError`. The model's beam is the one the file's antenna block states; where a producer's stated boresight
 differs from the true beam, the area is displaced with it.
 
+### The black area at -10 dB
+
+Two spotlight collections with tasked areas of 5 by 5 km, at the reference of 0.2.0 and at the default. Sizes are
+across by along the line of sight, and the pixels are those of the SIDD that `process_cphd(product='sidd',
+area='black')` plans:
+
+| Collection | `black_sigma0_db=0.0` | `black_sigma0_db=-10.0` (default) |
+|---|---|---|
+| Umbra, 2024-09-10 | 8.30 x 11.35 km, 94.2 km^2, 364 Mpx | 7.90 x 9.45 km, 74.7 km^2, 285 Mpx |
+| Capella, 2025-03-13 | 11.85 x 7.95 km, 94.2 km^2, 1,643 Mpx | 6.05 x 7.75 km, 46.9 km^2, 809 Mpx |
+
+The Umbra area shrinks along the line of sight and hardly across it. Across the beam its edge is where the azimuth
+ambiguities reach the signal, and their level follows the scene's own sigma zero, so that edge does not move with
+the reference. The Capella collection has a noise-equivalent sigma zero of -13.6 dB at the scene center (an
+uncalibrated level, from the measured clutter-to-noise ratio), and its area halves.
+
 ## Radiometric calibration
 
 A spotlight SICD from `process_cphd` carries the SICD `Radiometric` block when the CPHD file supports it, and only
@@ -401,7 +417,7 @@ peaks off the scene center and with PTRef and PNRef in its file, is processed on
 and the polynomials of each written file are read and evaluated by sarpy. Point targets of 0.5 to 8 m^2 come back
 within 0.07 dB of their RCS, clutter of -13 dB within 0.08 dB of its sigma zero (beta zero and gamma zero
 likewise), and the noise power within 0.03 dB of `NoisePoly`. The fits are of order 5 or 6 and follow 10 to 11 dB
-of gain to 0.04 to 0.08 dB. A unit point target and unit-variance noise through the formers give the sum of the
+of gain to 0.03 to 0.08 dB. A unit point target and unit-variance noise through the formers give the sum of the
 weights to within 0.07 dB and the sum of their squares to 0.03 dB on both planes, with autofocus on and off: the
 formers' own accuracy, with no normalization to correct for. sarkit's consistency check passes with the block
 present (`tests/test_sicd_consistency.py`).
@@ -415,20 +431,21 @@ ground through each file's own projection and its own block:
   center. The vendor's factors are constant over its image (to 0.06 dB). FastSAR's follow the gain of the file's
   antenna block, a 0.54 degree beam whose boresight the file puts 1.5 km from the scene reference point, which
   falls by 21 dB over the tasked rectangle (fitted at order 8 to 0.06 dB).
-- The image does not darken with that modeled gain. Over 200 m cells the vendor's sigma zero falls by 0.2 dB per
-  dB of modeled gain (correlation -0.30), where a rise of 1 dB per dB would show the roll-off. Against the modeled
-  gain mirrored through the scene center point it rises by 0.5 dB per dB (correlation +0.61). The beam of this
-  collection therefore does not lie where its antenna block, read by the conventions of the CPHD standard, puts
-  it, and until that is understood FastSAR's factors should be trusted at the scene center only. The quality
-  areas rest on the same antenna block.
+- The image shows no such roll-off. Over 200 m cells the vendor's sigma zero falls by 0.2 dB per dB of modeled
+  gain (correlation -0.30), where a rise of 1 dB per dB would show it; against the modeled gain mirrored through
+  the scene center point it rises by 0.5 dB per dB (correlation +0.61). On this collection, then, the illumination
+  is not what the antenna block states when it is read by the conventions of the CPHD standard, and until that is
+  understood FastSAR's factors should be trusted at the scene center only. The quality areas rest on the same
+  antenna block.
 - Noise. The vendor's `NoisePoly` times its sigma zero factor is -71.5 dB, and its `theoretical_nesz_db`
   parameter states -30.8 dB. FastSAR's noise level, measured from the phase history, gives a noise-equivalent
   sigma zero of -24.8 dB at the scene center. The darkest 100 m cells of the image lie at -18 dB by either block,
   an upper bound.
 
-A Capella spotlight collection (2025-03-13) states no PTRef, so its FastSAR SICD has no `Radiometric`
-block and the note says why. The vendor's SICD of that collection states a noise-equivalent sigma zero of -18.4 dB
-at its scene center point.
+A Capella spotlight collection (2025-03-13) states neither PTRef nor PNRef, so its FastSAR SICD has no
+`Radiometric` block, the note says why, and the step costs nothing. The vendor's SICD of that collection states a
+sigma zero factor of -67.8 dB and a noise level of 49.4 dB at its scene center point, a noise-equivalent sigma
+zero of -18.4 dB, from calibration data that the CPHD file does not carry.
 
 ## Autofocus on the image
 
