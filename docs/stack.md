@@ -200,10 +200,12 @@ combination, the translations applied, whose geolocation the product has, and th
 phenomenology on the product's plane. `Measurement` carries the reference collection's aperture and time, so the
 SIDD's own projection is the reference's. sarkit's consistency check passes it (`tests/test_stack.py`).
 
-Time for the six collections (3.0 to 4.7 GB each) on an Nvidia RTX PRO 6000 shared with other jobs, to the SIDD
-of the average: 36 s, of which 7.5 s reading, 17.8 s windowing, range gate and formation, 9.9 s registration,
-0.25 s the average and its looks, and 0.2 s writing; 1.5 megapixels of input image per second end to end. The
-coherence of a pair to its GeoTIFF took 22 to 31 s.
+Time for the six collections (3.0 to 4.7 GB each) to the SIDD of the average, on an Nvidia RTX PRO 6000 and a
+48-core host that other jobs kept fully loaded: 36 s, or 1.5 megapixels of formed image per second end to end.
+Reading took 7.5 s; windowing, the range gate and formation 17.8 s (3.1 megapixels per second); registration
+9.9 s (the detected images, 17 correlations and the translation of each image: 4.7 megapixels per second); the
+average with its looks 0.25 s (over 200 megapixels per second); writing 0.2 s. The coherence of a pair to its
+GeoTIFF took 20 to 29 s, of which 1.5 to 3.4 s for the common band, the coherence and its floor.
 
 ## The range gate
 
@@ -227,7 +229,10 @@ as a whole by meters:
 - `register` recovers the errors to 0.02 pixel for a pass on the reference's track and to 0.07 pixel from
   another direction (other speckle, on images of 241 pixels), and the phase ramp agrees with formation on the
   displaced grid to -49 dB;
-- four images with independent speckle average to 3.8 looks against 3.8 for four times one image's (0.95);
+- a moving-beam collection formed as a mosaic on a grid turned 45 degrees from its track has its targets within
+  0.1 pixel of where the grid says;
+- four images with independent speckle average to 3.80 looks, against 3.78 for four times one image's;
 - the same track with noise added gives a coherence of 0.948 against the 0.943 its signal-to-noise ratio implies,
   and a pass from another direction over other clutter gives the floor (0.26 against 0.25);
-- `process_stack` gives the same products with the images on the host, on a CUDA device and on JAX's.
+- `process_stack` gives the same products with the images on the host, on a CUDA device and on JAX's (the
+  average's intensity to -87 and -93 dB), and sarkit's consistency check passes the SIDD of an average.

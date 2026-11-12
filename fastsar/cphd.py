@@ -358,15 +358,14 @@ def form_cphd(cphd, sicd=None, *, mode='auto', backend='auto', window=True, spac
 
         img = patches.form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1, e2, patch=(patch, patch), beam=beam, precision=precision,
                                   awin='hann' if window else None, backend=backend, target_db=target_db, info=info)
-    out = dict(image=img, origin=origin, e1=e1, e2=e2, spx=float(spx), spy=float(spy), mode=mode,
-               band=(f0, f0 + (K - 1) * df), bandwidth=(1.0 / ares, 2 * K * df * np.cos(graze) / C),
-               window=('taylor' if spot else 'hann', 'taylor') if window else None,
-               phase_error=phi if autofocus else None, meta=meta, notes=notes, plane='ground', axes=axes,
-               center=origin + (nx / 2.0) * spx * e1 + (ny / 2.0) * spy * e2, height=float(hz), graze=float(graze),
-               pulses=used)
-    if gl is not None:                            # with what forms it again on the displaced grid (stack.register)
-        out.update(grid=gl['grid'], shift=gl['shift'], source=cphd, form_options=dict(
-            sicd=sicd, mode=mode, backend=backend, window=window, channel=channel, patch=patch,
-            azimuth_fraction=azimuth_fraction, precision=precision, target_db=target_db, autofocus=autofocus,
-            troposphere=troposphere, reader_options=reader_options, aperture=aperture, range_gate=range_gate))
-    return out
+    # on a grid: the grid, and what forms the collection again on it displaced (stack.register)
+    on_grid = {} if gl is None else dict(grid=gl['grid'], shift=gl['shift'], source=cphd, form_options=dict(
+        sicd=sicd, mode=mode, backend=backend, window=window, channel=channel, patch=patch,
+        azimuth_fraction=azimuth_fraction, precision=precision, target_db=target_db, autofocus=autofocus,
+        troposphere=troposphere, reader_options=reader_options, aperture=aperture, range_gate=range_gate))
+    return dict(image=img, origin=origin, e1=e1, e2=e2, spx=float(spx), spy=float(spy), mode=mode,
+                band=(f0, f0 + (K - 1) * df), bandwidth=(1.0 / ares, 2 * K * df * np.cos(graze) / C),
+                window=('taylor' if spot else 'hann', 'taylor') if window else None,
+                phase_error=phi if autofocus else None, meta=meta, notes=notes, plane='ground', axes=axes,
+                center=origin + (nx / 2.0) * spx * e1 + (ny / 2.0) * spy * e2, height=float(hz), graze=float(graze),
+                pulses=used, **on_grid)
