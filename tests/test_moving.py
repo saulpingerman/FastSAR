@@ -14,9 +14,14 @@ CPHD reader.
 (c) Areas. With an antenna block in the file, the area in ground range against the two-way gain computed here
     from the beam's formula, the receive window and its extension, a window that holds nothing beyond the tasked
     swath, and a file without an antenna pattern.
-(d) The backends give the same products.
+(d) The backends give the same products. On JAX's device, where everything is float32: the baseband phase of an
+    orbit at 600 km over tens of kilometers of ground against the phase in double, and the stages with a device
+    budget of a fifth of a megabyte (blocks of a few rows or columns, an image kept on the host) against the
+    unblocked ones, with no device array larger than the budget.
 
 Limits are about twice the departures measured when they were set."""
+import gc
+
 import numpy as np
 import pytest
 
@@ -414,3 +419,160 @@ def test_stages_on_a_device_array(kind, focused):
     keep = (np.abs(np.fft.fftfreq(nx)) < 0.25).astype(np.float32)
     la, lb = moving.band_limit(o['image'][:nx], keep), moving.band_limit(d['image'][:nx], keep)
     assert _xp.kind(lb) == kind and np.abs(_xp.host(lb) - la).max() < 1e-4 * top
+
+
+def orbit(T, prf, squint=0.0, slide=1.0, drift=0.0, R0=600e3, alt=520e3, v=7600.0):
+    """A circular orbit past a flat scene at slant range R0 at closest approach: antenna and SRP positions [P, 3]
+    in the scene's tangent frame (x along the track) and times [P]. The beam center moves along the ground at the
+    footprint's speed over `slide`, at a squint that drifts by `drift` rad over the collection."""
+    Re = 6371e3
+    r = Re + alt
+    t = (np.arange(int(T * prf)) - int(T * prf) / 2) / prf
+    th = v * t / r
+    gam = np.arccos((r * r + Re * Re - R0 * R0) / (2 * r * Re))      # the earth angle from the nadir track to the scene
+    ant = np.stack([r * np.sin(th), -r * np.cos(th) * np.sin(gam), r * np.cos(th) * np.cos(gam) - Re], 1)
+    sq = squint + drift * t / T
+    srp = np.stack([v * Re / r * np.cos(gam) / slide * t + R0 * np.tan(sq), np.zeros(len(t)), np.zeros(len(t))], 1)
+    return ant, srp, t
+
+
+@pytest.mark.parametrize('name, kw, grid', [
+    ('stripmap', dict(T=8.0), (39000, 5000, 0.77, 1.2)),
+    ('long strip, drifting squint', dict(T=14.0, drift=np.radians(0.2)), (104000, 5000, 0.77, 1.2)),
+    ('squinted', dict(T=8.0, squint=np.radians(3.0)), (39000, 5000, 0.77, 1.2)),
+    ('sliding spotlight', dict(T=11.0, slide=5.8), (34000, 5000, 0.146, 1.0))], ids=lambda v: v if isinstance(v, str) else '')
+def test_baseband_phase_in_float32(name, kw, grid):
+    """The baseband phase as JAX's device computes it, in float32 and int32, against the phase in double at every
+    pixel of three blocks of rows (the first, the middle and the last) of a grid of 30 by 6 km (80 km for the long
+    strip, 5 by 5 km for the sliding spotlight) at 600 km: under 1e-3 rad (measured: 2e-5)."""
+    jnp = pytest.importorskip('jax.numpy')
+    ant, srp, t = orbit(prf=2000.0, **kw)
+    lam = 0.031
+    speed = np.linalg.norm(np.diff(ant, axis=0), axis=1).mean() * 2000.0
+    bm = moving.beam_model(ant, srp, t, 0.8 * lam * 2000.0 / (2 * speed))
+    nx, ny, spx, spy = grid
+    e1 = bm['flight'] * [1.0, 1.0, 0.0]
+    e1 /= np.linalg.norm(e1)
+    e2 = np.cross([0.0, 0.0, 1.0], e1)
+    e2 = e2 if e2 @ (srp[len(srp) // 2] - ant[len(ant) // 2]) > 0 else -e2
+    a, b = spx * e1, spy * e2
+    o = srp[len(srp) // 2] - nx / 2 * a - ny / 2 * b
+    k = -4 * np.pi / lam
+    F0 = float(moving._exact(bm, (o + (nx // 2) * a + (ny // 2) * b)[None])[0])
+    rows, cols = moving._separable(bm, o, a, b, nx, ny, k, F0)
+    assert all(v.dtype in (np.float32, np.int32) for v in rows + cols) and rows[3].shape[1] <= 4
+    rows, cols = tuple(jnp.asarray(v) for v in rows), tuple(jnp.asarray(v) for v in cols)
+    nb, worst = 24, 0.0
+    for r0 in (0, nx // 2 - nb // 2, nx - nb):
+        got = np.asarray(moving._baseband_step(jnp.ones((nb, ny), jnp.complex64), np.int32(r0), rows, cols))
+        i, j = np.arange(r0, r0 + nb, dtype=np.float64), np.arange(ny, dtype=np.float64)
+        want = k * (moving._exact(bm, o + i[:, None, None] * a + j[None, :, None] * b) - F0)
+        worst = max(worst, np.abs(np.angle(got * np.exp(-1j * want))).max())
+    print(f'  {name}: {nx} x {ny} pixels, {rows[3].shape[1]} terms, largest error {worst:.1e} rad')
+    assert worst < 1e-3, worst
+
+
+def device_arrays(monkeypatch, sizes):
+    """Record in `sizes` the bytes of the largest JAX array alive whenever a block comes to the host or an estimate
+    starts."""
+    import jax
+    from fastsar import _xp, autofocus as af
+
+    def seen(fn):
+        def wrapped(*a, **k):
+            sizes.append(max((x.nbytes for x in jax.live_arrays()), default=0))
+            return fn(*a, **k)
+        return wrapped
+    monkeypatch.setattr(_xp, 'to_host', seen(_xp.to_host))
+    monkeypatch.setattr(af, '_map_drift', seen(af._map_drift))
+
+
+def test_jax_stages_in_blocks(focused, monkeypatch):
+    """The stages on JAX's device with a fifth of a megabyte to count on: baseband in blocks of 8 rows, the autofocus
+    correction column by column and the guard's sums cell by cell give the image of the unblocked stages to
+    float32 rounding, with its zeros; an image on the host crosses the device in the same blocks, written in
+    place, and nothing larger than the budget is ever on the device."""
+    jnp = pytest.importorskip('jax.numpy')
+    from fastsar import _xp, autofocus as af
+    c = focused[0]
+    s = (np.arange(PL) - PL / 2) / (c.aperture / 2)
+    tg, amp = scene()
+    ms.collection('blk.cphd', tg, amp, P=PL, phase=5.0 * s ** 2)
+    o = fastsar.form_cphd('blk.cphd', backend='cpu', extent=LONG, azimuth_window='taylor',
+                          _plan=lambda g: dict(fit_patch=True))
+    o['image'][:90, :30] = 0
+    nx, ny = o['image'].shape
+    kw = dict(band=moving.band(dict(o, bandwidth=(2 * c.dsin / c.lam, 1.0))), block=192)
+    monkeypatch.delenv('FASTSAR_JAX_BLOCK_MB', raising=False)
+    ref = moving.baseband(dict(o, image=jnp.asarray(o['image'])))
+    top = np.abs(np.asarray(ref['image'])).max()
+    ra, ria = moving.autofocus(ref['image'], 'quadratic', **kw)
+    assert ria['applied'] and ria['applied_blocks'].all()
+    ref, ra = np.array(ref['image']), np.array(ra)                   # copies: a view would keep the device arrays
+    host = moving.baseband(dict(o, image=o['image'].copy()))['image']                      # in double
+    assert np.abs(ref - host).max() < 2e-5 * top
+    monkeypatch.setenv('FASTSAR_JAX_BLOCK_MB', '0.2')
+    assert _xp.jax_budget() < o['image'].nbytes / 2
+    sizes = []
+    device_arrays(monkeypatch, sizes)
+
+    def same(got, want, kind):
+        assert _xp.kind(got) == kind
+        got = _xp.host(got)
+        assert got.dtype == np.complex64 and np.array_equal(got == 0, want == 0) and not got[:90, :30].any()
+        assert np.abs(got - want).max() < 1e-5 * top
+    dev = moving.baseband(dict(o, image=jnp.asarray(o['image'])))
+    same(dev['image'], ref, 'jax')
+    b, ib = moving.autofocus(dev['image'], 'quadratic', **kw)
+    same(b, ra, 'jax')
+    assert np.abs(ib['fit'] - ria['fit']).max() < 1e-3 and abs(ib['part_gain'] - ria['part_gain']) < 1e-5
+    del dev, b
+    gc.collect()
+    sizes.clear()                                                    # from here on the image is on the host
+    img = o['image'].copy()
+    via = moving.baseband(dict(o, image=img), _jax=True)
+    assert via['image'] is img
+    same(img, ref, 'numpy')
+    with af._via_jax():
+        b, ib = moving.autofocus(img, 'quadratic', **kw)
+    same(b, ra, 'numpy')
+    assert np.abs(ib['fit'] - ria['fit']).max() < 1e-3 and ib['applied_blocks'].all()
+    assert len(sizes) > 100 and max(sizes) <= _xp.jax_budget(), (len(sizes), max(sizes))
+
+
+def test_small_jax_device_gives_the_same_product(monkeypatch):
+    """A JAX device without room for the image and what the stages make beside it (FASTSAR_JAX_BLOCK_MB: a fifth
+    of a megabyte to count on): the image stays on the host and crosses the device in blocks, a note says so, no array
+    on the device is as large as the image, and the product is the one of a device with room to float32
+    rounding, with the zeros of its area."""
+    pytest.importorskip('jax')
+    from fastsar import _xp
+    tg, amp = scene()
+    ms.collection('sj.cphd', tg, amp, P=PL, phase=5.0 * ((np.arange(PL) - PL / 2) / 500.0) ** 2)
+    antenna_strip('sj_ant.cphd', 95.0, 120.0)
+    for name, kw in (('sj.cphd', dict(extent=LONG)), ('sj.cphd', dict(extent=LONG, weighting='sva')),
+                     ('sj_ant.cphd', dict(extent=EXT, area='black', nesz_db=-10.0))):
+        monkeypatch.undo()
+        monkeypatch.delenv('FASTSAR_JAX_BLOCK_MB', raising=False)
+        ref = fastsar.process_cphd(name, backend='jax', **kw)
+        ref = dict(ref, image=np.array(ref['image']))                # a copy: a view would keep the device array
+        assert not any('JAX device' in n for n in ref['notes'])
+        gc.collect()
+        monkeypatch.setenv('FASTSAR_JAX_BLOCK_MB', '0.2')
+        sizes = []
+        device_arrays(monkeypatch, sizes)
+        o = fastsar.process_cphd(name, backend='jax', **kw)
+        assert sum('kept on the host and passed through the device in blocks' in n for n in o['notes']) == 1
+        assert [n for n in o['notes'] if 'JAX device' not in n] == ref['notes']
+        assert o['autofocus'] == ref['autofocus'] and (name != 'sj.cphd' or o['autofocus'] == 'quadratic')
+        assert o['image'].shape == ref['image'].shape and np.array_equal(o['image'] == 0, ref['image'] == 0)
+        e = np.abs(o['image'] - ref['image']).max() / np.abs(ref['image']).max()
+        print(f'  {kw}: {e:.1e}, largest device array {max(sizes)} bytes of {ref["image"].nbytes}')
+        assert e < 1e-5, (kw, e)
+        assert ('area' in kw) == bool((o['image'] == 0).any())
+        # nothing larger than the budget but the columns of one block's estimate, which stay together (half of the
+        # long image; the short one is a single block)
+        block = 8 * o['autofocus_info']['block'] * o['image'].shape[1]
+        assert max(sizes) <= max(_xp.jax_budget(), block), (kw, max(sizes), block)
+        assert 'area' in kw or block < 0.6 * o['image'].nbytes
+
