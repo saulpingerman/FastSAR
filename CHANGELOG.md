@@ -18,12 +18,16 @@ was published on PyPI.
   - `autofocus='quadratic'` and `'spatially_variant'`: map drift on blocks along the track no longer than half
     the footprint of the synthetic aperture, each under the guard of the spotlight modes, tied together by a
     robust local fit along the track and across the swath, and removed with a cross-faded correction
-    (`moving.autofocus`). The phase gradient modes are refused on a moving beam.
+    (`moving.autofocus`). The guard's contrast test measures its scatter over cells along and across the track,
+    as many as the corrected rows hold. The phase gradient modes are refused on a moving beam.
   - `area='tasked_quality'`, an RNIIRS and `'black'`: the tasked extent along the track, and in ground range as
     far as the criterion holds for the moving beam's own gain and receive windows.
 - `fastsar.moving`: the baseband step of a moving-beam image, exact at every pixel on both axes for any squint or
   slide of the beam (`baseband`), the spectrum of the image from the collection (`spectrum`), `band_limit` and
-  `autofocus`, on NumPy, CuPy and JAX arrays.
+  `autofocus`, on NumPy, CuPy and JAX arrays. On JAX's device everything is float32, complex64 or int32, as a TPU
+  needs: the baseband phase is the sum of two vectors the host solves in double and a remainder of a few radians
+  the device computes, to 2e-5 rad at 600 km, and every stage runs in blocks sized to the device's memory
+  (`FASTSAR_JAX_BLOCK_MB`), with an image the device cannot hold kept on the host and passed through it.
 - `form_cphd(..., azimuth_window=)`: the per-pixel azimuth window of a moving beam, `'hann'` (the default, as
   before), `'taylor'` or `'uniform'`; `patches.form_mosaic(..., amask=)` cuts a window at the edge of the band.
 
@@ -37,8 +41,8 @@ was published on PyPI.
   the image, which is wider than the beam's Doppler band over the platform's speed wherever the footprint moves
   slower than the platform (1.10 times on a Capella stripmap, 5.8 times on a sliding spotlight; 0.2.0 sampled
   both for the narrower band), and the `bandwidth` entry of the product states that band. An autofocus that was
-  applied is recorded in the SICD as `AzAutofocus` SV.
-- `form_cphd` forms a moving-beam grid smaller than one patch as a single patch of the grid's size.
+  applied is recorded in the SICD as `AzAutofocus` SV. A grid smaller than one patch is formed as a single patch
+  of its own size. `form_cphd` itself gives the image of 0.2.0 for the same arguments.
 
 ## [0.2.0] - 2026-11-10
 

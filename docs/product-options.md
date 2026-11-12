@@ -396,9 +396,21 @@ spotlight. With F(x, t) = |x - a(t)| + G(t), G the integral of s |da/dt| over ti
 time t_c(x) at which the beam center crosses x, and psi(x) = (4 pi fc / c) F(x, t_c(x)) has the gradient
 (4 pi fc / c) u(x) at that time: the center of the pixel's spectrum on both axes. For a broadside stripmap psi is
 4 pi fc / c times the range of closest approach. The track and s |da/dt| are polynomials fitted to the pulses,
-t_c is solved at knots every 32 pixels, and F is evaluated per pixel in double: on the host's cores, in a CUDA
-kernel, or for a JAX array on the host in blocks of rows whose phasor the device multiplies. Every
-`process_cphd` product of a moving beam is at baseband, and its SICD states a band centered at zero.
+t_c is solved at knots every 32 pixels, and F is evaluated per pixel in double on the host's cores or in a CUDA
+kernel. Every `process_cphd` product of a moving beam is at baseband, and its SICD states a band centered at
+zero.
+
+JAX's device works in float32 (a TPU has no fast float64), which cannot hold 4 pi fc / c times a range of 600 km
+to a thousandth of a radian. The host therefore solves psi in double along the center row and the center column
+of the grid, at every pixel of both, and the device adds the two vectors, reduced modulo 2 pi. What is left
+vanishes on that row and that column and is small and smooth: zero for a straight track and a constant squint,
+15 rad over 30 by 6 km of a stripmap from an orbit at 600 km, 115 rad over the 5 by 5 km of a sliding spotlight.
+Its part in the product of row and column is taken in integer turns, as `planes.deramp` takes its own, and the
+rest is solved at the knots, split into its singular vectors (one or two terms) and carried to the pixels by a
+cubic spline of each; the device sums the terms. Against the phase in double at every pixel of the first, the
+middle and the last rows of such grids the float32 phase is off by at most 2e-5 rad
+(`tests/test_moving.py::test_baseband_phase_in_float32`), and the host's part takes about two seconds for a grid
+of 500 megapixels.
 
 The support is a rectangle on the grid's axes only approximately. The band along the track grows in proportion to
 the frequency (a trapezoid, 3% wider at the top of a band of 3% of the carrier), a squint moves its center with
@@ -474,9 +486,14 @@ it with a correction that follows the strip.
   three times its standard error (`'spatially_variant'`: a parabola, always), held at its end values beyond the
   columns the sets cover; where there is a trend, the block's estimate of all columns is made again with the
   trend removed column by column, because the columns in best focus would otherwise carry it.
-- **Guard, second test.** After the correction the contrast of the corrected rows must rise by more than its
-  scatter over 16 sets of columns, or the image is returned as it came; a single block whose own contrast does
-  not rise is given back as it came. A fit below 0.02 rad everywhere changes nothing.
+- **Guard, second test.** `quadratic`'s rule on the corrected rows: their contrast must rise, the median gain of
+  the parts must not be below minus twice its standard error, and one of the two gains must be twice its
+  standard error, or the image is returned as it came. For a spotlight the parts are 16 sets of columns, because
+  one estimate serves the image. Here the blocks along the track are separate measurements, so the parts are
+  cells of 128 rows by 32 columns (16 sets of columns at least), as many as the corrected rows hold, and the
+  standard errors are measured over all of them: a narrow image is then not declined for the few sets of
+  columns it holds. A single block whose own contrast does not rise, or whose cells lose, is given back as it
+  came. A fit below 0.02 rad everywhere changes nothing.
 - **Correction.** `autofocus.spatially_variant`'s: strips of one block, extended by the length of the blur,
   corrected column by column and cross-faded along the track with weights that sum to one. Exact zeros stay
   exact zeros.
@@ -520,8 +537,7 @@ of ground range (gain -9.6 and -9.7 dB for a noise-equivalent sigma zero of -10 
 
 ### Real collections
 
-Two public Capella collections were processed on an Nvidia RTX PRO 6000 and 48 CPU cores that other jobs were
-using at the time, so the times below are upper bounds.
+Two public Capella collections were processed on an Nvidia RTX PRO 6000 that other jobs shared.
 
 **Stripmap** (2024-11-27, VV, 200 MHz, 135,477 pulses in 13.4 s, grazing angle 53 degrees, tasked area 82.5 by
 5.0 km; a 10 by 5.1 km cut at the center of the strip, formed from the 36,000 pulses that illuminate it). A pixel
@@ -575,55 +591,71 @@ least 1 from -3,550 to +3,300 m about the swath center, 6.9 km of ground range f
 for 55.5).
 
 **Sliding spotlight** (2024-08-29, HH, 300 MHz, 111,132 pulses in 10.7 s, grazing angle 61 degrees, tasked area 5
-by 5 km; a 1 by 3 km cut at the center, formed from the central 150 MHz of the band, which is what the shared
-host's memory allowed). The footprint moves at 1.3 km/s under a platform at 7.2 km/s: a pixel takes 86,878 pulses
-(8.4 s), its azimuth band is 6.50 cycles/m, 5.8 times 2 dsin / lambda, and the default product is sampled at
-0.146 m along the track (0.2.0 sampled it at 0.84 m). The beam center's squint runs from -2.7 to +2.8 degrees
-over the collection, and the baseband phase follows it.
+by 5 km; a 1 by 3 km cut at the center, formed from the whole band). The footprint moves at 1.3 km/s under a
+platform at 7.2 km/s: a pixel takes 86,878 pulses (8.4 s), its azimuth band is 6.50 cycles/m, 5.8 times
+2 dsin / lambda, and the default product is sampled at 0.144 m along the track (0.2.0 sampled it at 0.84 m). The
+beam center's squint runs from -2.7 to +2.8 degrees over the collection, and the baseband phase follows it. The
+product is 6,929 by 3,013 pixels (20.9 Mpx) and takes 27.5 GB of host memory at its peak, against 27.0 GB for
+0.2.0's `form_cphd` of the same cut: the phase history is 16.8 GB as complex64 and the mosaic's range profiles
+are the rest.
 
-- Weighting. `'taylor'`: 6,873 by 1,507 pixels, contrast 10.12, median azimuth width of 30 points 0.255 m (1.66
-  reciprocal bands) and range width 2.50 m (1.20). `'uniform'`: contrast 8.85, azimuth width 0.201 m (1.31).
-  `'sva'` is refused on this cut: the squint at its ends, 0.6 degrees on the ground, shears the range band by 13%
-  of its width (half of that with the whole 300 MHz). On a 0.7 by 3 km cut the shear is within the limit: the
-  product is 9,052 by 2,893 pixels of 0.077 by 1.04 m, and over 40 points the contrast is 7.3, 7.1 and 8.6 for
-  Taylor, uniform and apodized, the range widths 1.21, 0.90 and 0.87 reciprocal bands with peak sidelobes of
-  -17.1, -12.5 and -16.7 dB, and the azimuth widths 1.62, 1.32 and 1.27.
-- Autofocus on the collection as it came: three blocks give -1.31, -1.78 and -1.64 rad (standard errors 1.0, 0.5
-  and 0.35), the sets of one block agree, and the fit is -1.64 rad; the contrast gain of the correction, 0.5%, is
-  within its scatter over the parts of the image (0.8%), and the guard declines. The error is real: with 2 rad
-  injected the image is sharper than as it came (contrast 10.15, azimuth width 0.243 m), the fit is 0.36 rad and
-  is applied (contrast 10.17). With 15 rad injected (contrast 9.21, azimuth width 0.591 m) the fit is 13.32 rad,
-  every block is corrected, and the image returns to contrast 10.17 and 0.249 m. With 5 rad (contrast 9.83,
-  0.306 m) the fit is 3.20 to 3.35 rad, the right value, but the contrast gain it brings, 3.3%, is within twice
-  its scatter over the 16 sets of columns of this 1,507 column image (2.5%), and the guard returns the image as it
-  came; with `guard=False` the same fit takes the contrast to 10.17. The guard's second test is the limit here,
-  not the estimate.
-- Areas, with the same noise source as the stripmap. `'tasked_quality'` (a model minimum of RNIIRS 5.15): -1,650
+- Weighting. `'taylor'`: contrast 14.33, median azimuth width of 30 points 0.253 m (1.65 reciprocal bands) and
+  range width 1.23 m (1.18). `'uniform'`: contrast 11.42, azimuth width 0.206 m (1.34). `'sva'`: 12,928 by 5,783
+  pixels of 0.077 by 0.519 m, formed with a rectangle 7.8% wider than the processed band; contrast 15.15,
+  azimuth width 0.209 m (1.35), range width 0.924 m (0.89) with a peak range sidelobe of -19.7 dB. The squint at
+  the ends of the cut shears the range band by about 7% of its width, within the limit; a cut much longer along the
+  track, or half the bandwidth, passes it and is refused.
+- Autofocus on the collection as it came: three blocks give -1.64, -1.65 and -1.54 rad, each consistent over its
+  sets, and the fit runs from -1.65 to -1.58 rad. The contrast gain of the whole image, 0.4%, is within its
+  jackknife scatter (0.8%, a few bright points carry it), but the median gain of the 5,000 cells is 0.08% with a
+  standard error of 0.01%: the correction is applied (one block of three is given back, its own contrast not
+  rising), the contrast goes from 14.33 to 14.42 and the azimuth width from 0.253 to 0.250 m. With a quadratic
+  error injected:
+
+  | Injected | Contrast, blurred | Azimuth width, blurred | Fit over the three blocks | Contrast after | Azimuth width after |
+  |---|---|---|---|---|---|
+  | none | 14.33 | 0.253 m | -1.65 to -1.58 rad | 14.42 | 0.250 m |
+  | 2 rad | 14.37 | 0.249 m | 0.34 to 0.45 rad | declined | |
+  | 5 rad | 14.01 | 0.311 m | 3.31 to 3.38 rad | 14.39 | 0.245 m |
+  | 15 rad | 13.20 | 0.618 m | 13.23 to 13.30 rad | 14.37 | 0.245 m |
+
+  The fits are the injected error less the 1.6 rad the collection has of its own. With 2 rad injected the image
+  is sharper than as it came, 0.4 rad are left, and neither gain of that correction stands out of its scatter:
+  the guard returns the image as it came. With the guard's parts as 16 sets of columns, as for a spotlight, the
+  5 rad case was declined on half the band (a 1,507 column image: a gain of 3.3% against a scatter of 2.5%, and
+  a median over 16 sets within its error); over the cells its median gain is ten standard errors.
+- Areas, with the same noise source as the stripmap. `'tasked_quality'` (a model minimum of RNIIRS 5.58): -1,650
   to +1,500 m of ground range about the swath center for the tasked +-1,500 m. An RNIIRS of 4.5: -1,650 to
   +2,150 m. `'black'`: -3,150 to +4,100 m, 7.3 km of ground range, in the extended window.
 
-**Speed.** Seconds per stage for the stripmap cut, second call, with megapixels per second in parentheses. The
-GPU and the host were shared with other jobs throughout (the GPU at full utilization, a load average of 250 to
-400 on the host's 48 cores), so these are lower bounds on the rates.
+**Speed.** Seconds per stage for the stripmap cut, second call, with megapixels per second in parentheses, on an
+Nvidia RTX PRO 6000 that other jobs were using and on 16 of the host's 48 cores:
 
 | Product | Arrays | Form | Baseband | Autofocus | Apodization | Mask |
 |---|---|---|---|---|---|---|
-| Taylor SICD, 55.5 Mpx | CuPy, Nvidia RTX PRO 6000 | 21 to 26 | 0.065 (855) | 1.62 (34) | | |
-| | JAX on the same GPU | | 4.8 (12) | 1.40 (40) | | |
-| | NumPy, host | | 3.9 (14) | 6.1 (9) | | |
-| Apodized SICD, 201.8 Mpx | CuPy | 116 | 1.47 (137) | 4.8 (42) | 0.044 (4,500) | |
-| | NumPy, host | | 21.2 (10) | 35.6 (6) | 10.0 (20) | |
-| Taylor SICD of the `'black'` area, 75.6 Mpx | CuPy | 56 | 0.14 (550) | 2.5 (30) | | 0.38 (197) |
-| | NumPy, host | | 6.5 (12) | 18.2 (4) | | 1.5 (50) |
+| Taylor SICD, 55.5 Mpx | CuPy | 8.0 | 0.058 (954) | 0.66 (84) | | |
+| | JAX on the same GPU | | 0.63 (88) | 0.49 (112) | | |
+| | NumPy | | 2.7 (20) | 3.2 (17) | | |
+| Apodized SICD, 201.8 Mpx | CuPy | 17.5 | 0.38 (527) | 1.21 (166) | 0.097 (2,077) | |
+| | JAX | | 2.25 (90) | 0.90 (224) | 0.163 (1,235) | |
+| | NumPy | | 8.2 (25) | 19.7 (10) | 9.8 (20) | |
+| Taylor SICD of the `'black'` area, 75.6 Mpx | CuPy | 5.6 | 0.066 (1,147) | 0.24 (322) | | 0.109 (694) |
+| | JAX | | 0.98 (77) | 0.37 (203) | | 0.132 (574) |
+| | NumPy | | 1.6 (47) | 1.9 (40) | | 0.24 (319) |
 
-Formation is the mosaic's on the GPU (the 36,000 pulses of the cut, 8,194 samples each); on the CPU backend,
-under that load, the mosaic of a 2 km cut (11.1 Mpx from 24,000 pulses) took 619 s. The stages after
-formation are the new ones. The baseband step on the GPU includes the upload of the mosaic, which the former
-assembles on the host; for a JAX array its phase is computed on the host's cores, so it runs at the host's rate.
-Autofocus is the estimate on the blocks, the cross-faded correction and the guard's contrast sums before and
-after; it was applied in every row of the table (5 rad injected). The three kinds of array give the same product
-to 3e-7 of its peak, zeros included. The image goes to the device when its memory plan (`memory.cuda_plan`) holds
-it with a second image of its size; otherwise the stages run on the host and a note says so.
+Formation is the mosaic's on the GPU (the 36,000 pulses of the cut, 8,194 samples each); the stages after it are
+the new ones. The baseband step includes the upload of the mosaic, which the former assembles on the host, and on
+JAX the host's part of the phase (the two vectors and the knots). Autofocus is the estimate on the blocks, the
+cross-faded correction and the guard's sums before and after; it was applied in every row of the table (5 rad
+injected). The three kinds of array give the same product to 3e-7 of its peak, zeros included. The times moved
+by a factor of two between runs with the load of the machine.
+
+The image goes to the device when its memory plan (`memory.cuda_plan`) holds it with the arrays the stages make
+beside it. A CUDA device without that room leaves the stages to the host; a JAX device (a TPU) keeps the image on
+the host and takes it through in blocks, stage by stage, and a note says so. With `FASTSAR_JAX_BLOCK_MB=4096`
+the 201.8 Mpx product, which would take 7.7 GB of the device, crosses it in blocks of at most 1 GB and holds 1.6 GB
+of it at its peak: baseband 3.9 s (51 Mpx/s), autofocus 4.9 s (41), apodization 3.6 s (56). With the image on the
+device the same stages hold 8.6 GB at their peak.
 
 ## Display orientation and SIDD output
 
