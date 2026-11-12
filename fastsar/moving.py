@@ -564,7 +564,9 @@ def _range_area(g, bm, b, opt, step=50.0, limit=30e3):
     the middle position's pulses, by Radiometry's order of sources. b: the tasked rectangle (lo1, hi1, lo2, hi2), m
     from g['center'] along e1 and e2.
     -> (the area's bounding rectangle, valid: dict(along, across (m from the center), level [lines, across]: the
-    margin of rgiqe.area_mask, >= 0 inside the area))."""
+    margin of rgiqe.area_mask, >= 0 inside the area); the tasked rectangle and None when the area reaches less
+    than one step of the model's lattice beyond the tasked swath, with a note that says which of the receive
+    window and the criterion ends it there)."""
     from . import rgiqe
     area, c, e1, e2 = opt['area'], g['center'], g['e1'], g['e2']
     K, f0, df = g['S'].shape[1], float(g['fmin']), float(g['df'])
@@ -629,6 +631,8 @@ def _range_area(g, bm, b, opt, step=50.0, limit=30e3):
                          f'area is the tasked area ({what} was asked).')
         else:
             notes.append(f'No ground range beyond the tasked swath has {what}: the area is the tasked area.')
+        g['notes'].extend(notes)
+        return np.asarray(b, np.float64), None
     else:
         notes.append(f'The area is the tasked extent along the track and the ground range with {what}: '
                      f'{lo - mid:+.0f} to {hi - mid:+.0f} m from the swath center (tasked {b[2] - mid:+.0f} to '

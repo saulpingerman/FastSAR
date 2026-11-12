@@ -223,7 +223,7 @@ def test_autofocus_follows_an_error_along_the_track(focused):
 @pytest.mark.parametrize('heights', ['level', 'tilted'])
 def test_autofocus_recovers_a_height_offset(heights):
     """Targets above the focus plane, seen from a track that curves across the line of sight: a quadratic error in
-    proportion to the height. 'level': all 40 m up. 'tilted': the height grows across the swath, from -10 to 50 m."""
+    proportion to the height. 'level': all 40 m up. 'tilted': the height grows across the swath, from -6 to 46 m."""
     tg, amp = scene()
     kw = dict(P=PL, curve=1.7e-4)
     c = ms.collection('curved.cphd', tg, amp, **kw)
@@ -319,7 +319,10 @@ def test_areas_follow_the_gain_in_range():
         assert o['area'] == area and o['image'].shape[0] == t['image'].shape[0] and np.ptp(sw, 0).max() < 2 * o['spy']
         assert sw[:, 0].max() <= -25 + o['spy'] and sw[:, 1].min() >= 25 - o['spy']          # never short of the tasked swath
         assert np.abs(g - level).max() < 1.0, (area, sw, g, level)
-        assert (o['image'] == 0).any() and any('ground range' in n for n in o['notes'])
+        if area == 'tasked_quality':                                 # the tasked swath is where its own quality ends
+            assert o['image'].shape == t['image'].shape and any('No ground range beyond' in n for n in o['notes'])
+            continue
+        assert (o['image'] == 0).any() and any('ground range with' in n for n in o['notes'])
         j = ms.to_pixels(o, o['meta'], c.tg)
         inside = (c.tg[:, 0] > sw[1, 0] + 2) & (c.tg[:, 0] < sw[1, 1] - 2)
         assert all(abs(o['image'][round(a), round(b)]) > 0 for (a, b), ok in zip(j, inside) if ok)
@@ -337,13 +340,8 @@ def test_areas_end_at_the_receive_window():
     for area in ('black', 4.0, 'tasked_quality'):
         o = fastsar.process_cphd('tight.cphd', backend='cpu', extent=EXT, area=area, nesz_db=-10.0, autofocus=False)
         assert sum('holds no ground range beyond the tasked swath' in n for n in o['notes']) == 1, o['notes']
-        sw = swath(o)
-        assert np.abs(np.abs(sw) - 25).max() < 4, sw
-        # the tasked swath's pixels are those of the tasked product: the wider grid lies on its lattice
-        j0 = ms.to_pixels(o, o['meta'], [[0.0, 0.0, 0.0]])[0, 1] - ms.to_pixels(t, t['meta'], [[0.0, 0.0, 0.0]])[0, 1]
-        assert abs(j0 - round(j0)) < 1e-6
-        a, b = o['image'][:, round(j0) + 8:round(j0) + t['image'].shape[1] - 8], t['image'][:, 8:-8]
-        assert np.abs(np.abs(a) - np.abs(b)).max() < 2e-2 * np.abs(b).max()       # another tiling: the former's accuracy
+        assert o['image'].shape == t['image'].shape and np.allclose(o['origin'], t['origin'])
+        assert np.abs(np.abs(o['image']) - np.abs(t['image'])).max() < 2e-3 * np.abs(t['image']).max()
 
 
 # ---------------------------------------------------------------------------------------------- (d) backends
