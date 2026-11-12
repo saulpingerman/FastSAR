@@ -652,7 +652,7 @@ def test_small_gpu_gives_the_same_product(monkeypatch):
         assert np.abs(o['image'] - ref['image']).max() < 2e-6 * np.abs(ref['image']).max()
 
 
-@pytest.mark.parametrize('kind', ['cupy', 'jax'])
+@pytest.mark.parametrize('kind', [pytest.param('cupy', marks=pytest.mark.cuda), 'jax'])
 def test_stages_on_a_device_array(kind, focused):
     """The stages themselves on a device array against the host's: baseband to rounding of the phase, the band
     limit and the autofocus correction to float32 rounding, the result where the image is."""
@@ -824,11 +824,15 @@ def test_small_jax_device_gives_the_same_product(monkeypatch):
         assert sum('kept on the host and passed through the device in blocks' in n for n in o['notes']) == 1
         assert [n for n in o['notes'] if 'JAX device' not in n] == ref['notes']
         assert o['autofocus'] == ref['autofocus'] and (name != 'sj.cphd' or o['autofocus'] == 'quadratic')
-        assert o['image'].shape == ref['image'].shape and np.array_equal(o['image'] == 0, ref['image'] == 0)
+        assert o['image'].shape == ref['image'].shape
+        # the zeros of the area are zeros in both; a null of the apodization at 1e-11 of the peak lands on zero or
+        # beside it with the compiled program's rounding, which differs between block shapes and machines
+        flips = np.count_nonzero((o['image'] == 0) != (ref['image'] == 0))
+        assert flips <= 1e-4 * o['image'].size, (kw, flips)
         e = np.abs(o['image'] - ref['image']).max() / np.abs(ref['image']).max()
         print(f'  {kw}: {e:.1e}, largest device array {max(sizes)} bytes of {ref["image"].nbytes}')
         assert e < 1e-5, (kw, e)
-        assert ('area' in kw) == bool((o['image'] == 0).any())
+        assert ('area' in kw) == bool((o['image'] == 0).mean() > 1e-3)
         # nothing larger than the budget but the columns of one block's estimate, which stay together (half of the
         # long image; the short one is a single block)
         block = 8 * o['autofocus_info']['block'] * o['image'].shape[1]
