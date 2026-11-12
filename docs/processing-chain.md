@@ -2,7 +2,7 @@
 
 The calls from a CPHD file to products, as [`examples/chain.py`](../examples/chain.py) runs them; signatures are in
 the [API reference](api.md). Not covered: TOA-domain CPHD, Capella's 2022 dynamic stripmap
-convention, autofocus of moving-beam mosaics, speckle filters, coregistration across grids, phase unwrapping,
+convention, speckle filters, coregistration across grids, phase unwrapping,
 radiometric calibration.
 
 ## 1. Read
@@ -23,7 +23,8 @@ print(out['mode'], out['spx'], out['spy'], out['notes'])
 
 A collection whose scene reference point moves by more than one range resolution is a moving beam (stripmap,
 sliding spotlight, dynamic stripmap), formed as a mosaic of patches with a Hann azimuth window
-([stripmap-burst.md](stripmap-burst.md#long-apertures-and-arbitrary-tracks)); otherwise it is a spotlight. The
+([stripmap-burst.md](stripmap-burst.md#long-apertures-and-arbitrary-tracks); `azimuth_window='taylor'` or
+`'uniform'` gives each pixel a Taylor window or a rectangle over its processed band); otherwise it is a spotlight. The
 image lies on a ground-plane grid along and across track, over `extent=` meters if given, else the SICD footprint,
 else the CPHD image area. Its height is `height=`, else that of the SICD's scene center point, else that of the
 CPHD's image-area reference point. The optional SICD also sets the
@@ -44,7 +45,9 @@ img = fastsar.backproject(col['S'], col['ant'], col['fmin'], col['df'], pts, ref
 ## 3. Autofocus
 
 `form_cphd(..., autofocus=True)` runs two rounds of phase gradient autofocus on a spotlight (three image
-formations) and returns the per-pulse estimate as `out['phase_error']`. Directly:
+formations) and returns the per-pulse estimate as `out['phase_error']`. `process_cphd` instead corrects the finished
+image, of a spotlight or of a moving beam ([product-options.md](product-options.md#autofocus-on-the-image)).
+Directly:
 
 ```python
 img, phi = fastsar.autofocus.autofocus(col['S'], col['ant'], col['fmin'], col['df'], col['nx'], col['ny'],

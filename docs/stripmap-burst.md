@@ -63,7 +63,10 @@ error from -59.9 to -65.7 dB. It also cut the time per patch on the c4d-highmem-
 range profiles made patch histories 7 times faster ([switches](performance.md#environment-variables)).
 
 `echoes_to_fx` assumes one fast-time grid. `stripmap_beam` models an antenna
-held along a fixed direction; `beam` can be any function of pulse and point.
+held along a fixed direction; `beam` can be any function of pulse and point. A window that does not end at zero
+(Taylor, or none: a rectangle) is cut at the edge of the band with `amask=True`; `form_cphd(azimuth_window=)` does
+so for a CPHD collection, and [product-options.md](product-options.md#moving-beam-collections) has the measured
+impulse responses and what `process_cphd` builds on them.
 
 ## Burst modes (ScanSAR and TOPS)
 

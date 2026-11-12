@@ -3,6 +3,43 @@
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The date of a version is the day it
 was published on PyPI.
 
+## [Unreleased]
+
+### Added
+
+- `process_cphd` on moving-beam collections (stripmap, sliding spotlight) takes the weightings, autofocus and the
+  quality areas that 0.2.0 refused there ([docs/product-options.md](docs/product-options.md#moving-beam-collections)):
+  - `weighting='taylor'` (the Taylor window along frequency and over each pixel's processed azimuth band),
+    `'uniform'` (a rectangle over that band, no frequency window) and `'sva'` (the uniform image at twice Nyquist
+    of both bands, cut to the same rectangle at every pixel and apodized on the ground grid). Apodization is
+    refused, with the reason, where the squint shears the range band by more than 10% of its width, the ground
+    range band changes by more than 5% across the swath, or the azimuth band differs by more than 10% over the
+    scene.
+  - `autofocus='quadratic'` and `'spatially_variant'`: map drift on blocks along the track no longer than half
+    the footprint of the synthetic aperture, each under the guard of the spotlight modes, tied together by a
+    robust local fit along the track and across the swath, and removed with a cross-faded correction
+    (`moving.autofocus`). The phase gradient modes are refused on a moving beam.
+  - `area='tasked_quality'`, an RNIIRS and `'black'`: the tasked extent along the track, and in ground range as
+    far as the criterion holds for the moving beam's own gain and receive windows.
+- `fastsar.moving`: the baseband step of a moving-beam image, exact at every pixel on both axes for any squint or
+  slide of the beam (`baseband`), the spectrum of the image from the collection (`spectrum`), `band_limit` and
+  `autofocus`, on NumPy, CuPy and JAX arrays.
+- `form_cphd(..., azimuth_window=)`: the per-pixel azimuth window of a moving beam, `'hann'` (the default, as
+  before), `'taylor'` or `'uniform'`; `patches.form_mosaic(..., amask=)` cuts a window at the edge of the band.
+
+### Changed
+
+- `process_cphd` on a moving beam. The product is at baseband (0.2.0 gave the image as formed), and its SICD
+  states a band centered at zero. `weighting='taylor'`, the default, weights the azimuth band with the Taylor
+  window in place of `form_cphd`'s Hann window (a main lobe 18% narrower, a peak sidelobe 3.5 dB lower), and
+  `'uniform'` with a rectangle over each pixel's band in place of every pulse of a patch. Autofocus is
+  `'quadratic'` by default, as for a spotlight. The default spacing along the track follows the azimuth band of
+  the image, which is wider than the beam's Doppler band over the platform's speed wherever the footprint moves
+  slower than the platform (1.10 times on a Capella stripmap, 5.8 times on a sliding spotlight; 0.2.0 sampled
+  both for the narrower band), and the `bandwidth` entry of the product states that band. An autofocus that was
+  applied is recorded in the SICD as `AzAutofocus` SV.
+- `form_cphd` forms a moving-beam grid smaller than one patch as a single patch of the grid's size.
+
 ## [0.2.0] - 2026-11-10
 
 ### Added

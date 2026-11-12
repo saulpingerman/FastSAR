@@ -12,17 +12,23 @@
   reader_options=None, target_db=-40.0)`: from a CPHD file to a SICD or SIDD
   ([product-options.md](product-options.md)). Returns the product dict (`form_cphd`'s entries on the product's
   grid) with `product`, `area`, `weighting`, `autofocus`, `autofocus_info`, `timing` (seconds per stage) and, when
-  written, `path` and `metadata`.
+  written, `path` and `metadata`. A moving-beam collection takes the ground plane, the three weightings,
+  `autofocus='quadratic'` or `'spatially_variant'` and the areas in ground range
+  ([product-options.md](product-options.md#moving-beam-collections)).
 - `form_cphd(cphd, sicd=None, *, mode='auto', backend='auto', window=True, spacing=None, channel=0, patch=1024,
   azimuth_fraction=0.8, extent=None, height=None, precision='float32', target_db=-40.0, info=None,
-  autofocus=False, troposphere=None, reader_options=None, axes='track', aperture='auto')`: the image of a CPHD file ([processing-chain.md](processing-chain.md#2-form)).
+  autofocus=False, troposphere=None, reader_options=None, axes='track', aperture='auto', azimuth_window=None)`: the
+  image of a CPHD file ([processing-chain.md](processing-chain.md#2-form)).
   `mode`: `'auto'`, `'spotlight'`, `'moving'`. `troposphere`: passed to `read_cphd` (default: the delay the file
   gives is removed; `'model'` removes a standard-atmosphere delay for files that give none). `sicd`: path, `.xml` or SICD metadata. `spacing`, `extent`: (along, across
   track) in m. `height`: grid height above the ellipsoid. Returns a dict: `image` [nx, ny] complex64, `origin`
   (pixel (0, 0)), `e1`, `e2`, `spx`, `spy`, `mode`, `band` (first and last frequency), `bandwidth` (spatial
   frequency support along e1, e2), `window`, `phase_error` (or None), `meta` (from `read_cphd`), `notes`, and the
-  grid's geometry: `plane`, `axes`, `center`, `height`, `graze`, `pulses`. `axes`: `'track'`, `'los'` (a spotlight:
+  grid's geometry: `plane`, `axes`, `center`, `height`, `graze`, `pulses`, and `dsin` (a moving beam's processed
+  spread of the sine of the look angle). `axes`: `'track'`, `'los'` (a spotlight:
   e2 along the line of sight on the ground) or `'auto'`. `aperture`: `'auto'`, `'square'` or `'full'`.
+  `azimuth_window`: a moving beam's weighting of each pixel's processed azimuth band, `'hann'` (the default with
+  `window`), `'taylor'` or `'uniform'`.
 - `form_image(S, ant, fmin, df, nx, ny, spx, spy, e1, e2, *, algorithm='ffbp', backend='auto', precision='float32',
   window=True, T='auto', ..., target_db=-40.0, ref=None, interp=None, upsample=None, center=None)`: a spotlight
   image on a grid centered on the frame origin ([algorithms.md](algorithms.md)). `algorithm`: `'ffbp'`, `'pfa'` or
@@ -161,11 +167,26 @@ rasterio.
   `(image, phi)`, phi per pulse. `pga(img, ...)` works on an image in the polar-format convention; `deramp_phase`
   and `pulse_bins` support it.
 
+## `fastsar.moving`
+
+The stages after formation for a moving-beam image
+([product-options.md](product-options.md#moving-beam-collections)); each takes a NumPy, CuPy or JAX array.
+
+- `baseband(out, sign=-1)`: a `form_cphd` product of a moving beam brought to baseband in place, exactly at every
+  pixel on both axes. `beam_model(ant, srp, t, dsin)`, `center_time(bm, X)` and `spectrum(bm, ant, band, K, points,
+  e1, e2, umax=1.0)`: the smooth model of the beam, the time its center crosses a ground point, and the spectrum
+  of the image there (center, widths, shear).
+- `autofocus(img, mode='quadratic', *, band=None, footprint=None, block=None, overlap=0.5, guard=True, ...)`:
+  `(img2, info)` for a baseband image whose axis 0 is along the track; mode `'quadratic'` or
+  `'spatially_variant'`. `band(out)`: the `band` argument from a product.
+- `band_limit(img, keep)`: the azimuth frequencies of `keep` [nx] kept, exact zeros preserved.
+
 ## `fastsar.patches`
 
 - `form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1, e2, patch=(128, 128), beam=None, umax=1.0, awin=None, ...,
-  backend='cpu', exact=False, ...)`: image on the grid `origin + i spx e1 + j spy e2`. `fx`: `dict(S, fmin, df,
-  ref, band)`. `beam(idx, points) -> u`: normalized azimuth coordinate; pulses with |u| <= `umax` serve a patch.
+  backend='cpu', exact=False, ..., amask=False)`: image on the grid `origin + i spx e1 + j spy e2`. `fx`:
+  `dict(S, fmin, df, ref, band)`. `beam(idx, points) -> u`: normalized azimuth coordinate; pulses with |u| <=
+  `umax` serve a patch. `amask`: the azimuth window is zero beyond `umax` instead of held at its edge value.
 - `form_stripmap(data, p, ...)`: mosaic of straight-track echoes; returns `(image, r, x)`.
 - `echoes_to_fx`, `stripmap_beam`, `straight_track`, `simulate`, `backproject`; the mosaic steps `range_profiles`,
   `patch_history`, `tile_plan`, `beam_span`, `weight_terms`, `fill_gaps`; `report_timing()` (with
