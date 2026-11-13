@@ -802,19 +802,39 @@ cannot see an offset of 20 m under 200 m of relief.
 each pixel shows: the point of the DEM on the pixel's circle of constant range and Doppler, by a scan over
 height. Where the circle meets the surface more than once (layover: a slope steeper than the line of sight),
 the heights of the crossings are averaged with the ground area each contributes as the weight; outside the
-DEM nothing is corrected. `terrain.coefficients` gives the phase as a polynomial in azimuth frequency from the
-antenna positions themselves, with no small-angle expansion; its constant and linear terms place the
-scatterer at its layover point with the phase of its range at the center of aperture, which is where and how
-the SICD's projection expects it. The degree is the lowest that fits within a hundredth of a radian: 2 or 3
-from orbit, up to 8 for a short range and a track with a jerk. The phase is removed by the strips of the
-spatially variant autofocus: per column, so that it follows range pixel by pixel, and cross-faded along azimuth
-over blocks of about 64 m, on the device that holds the image, with exact zeros kept. It runs on the baseband
-ground image before the data-driven autofocus, which then sees the residual: what the DEM got wrong, and the
-errors that have nothing to do with terrain.
+DEM nothing is corrected. A list of DEM tiles on one grid (adjacent Copernicus tiles are) is joined into one
+raster first, so that heights are interpolated across the seams between tiles.
+
+`terrain.coefficients` gives the phase as a polynomial in azimuth frequency from the antenna positions
+themselves, with no small-angle expansion; its constant and linear terms place the scatterer at its layover
+point with the phase of its range at the center of aperture, which is where and how the SICD's projection
+expects it. The degree is the lowest that fits within a hundredth of a radian: 2 or 3 from orbit, up to 8 for a
+short range and a track with a jerk. That is the phase at the center frequency. Across the range band the phase
+scales with frequency, and each pulse's azimuth frequency moves with it, so that over the image's 2-D spectrum
+the phase also depends on the range frequency: the range walk, about `B / (2 fc)` of the phase at the corners of
+the band (from orbit it is close to `-w c2 v^2`, with `w` the range frequency as a fraction of the center
+frequency). Left in place it limits the correction to about -34 dB at 3 rad of phase and -28 dB at 6 rad. The
+correction fits the phase over both frequencies, to the exact phase at every pulse and five frequencies.
+
+The phase is removed in strips of about 64 m along azimuth, each read with as many rows again on either side as
+the phase displaces, on the device that holds the image, with exact zeros kept. Within a strip, column by
+column, each pixel is corrected for the height it shows: the strip is corrected for a few heights spanning the
+column's heights over the strip (Chebyshev nodes, as many as keep the interpolation in height within 0.025 rad
+at the band edge: from one on level ground to four on Etna's steepest slopes), and each pixel takes the
+interpolation between those corrections at its own height. Exact backprojection onto the surface does the same,
+pixel by pixel. The range walk is proportional to the height; it is removed by a short series (one or two terms
+from orbit), each term applied along azimuth with the strip's correction and along range through each row's
+spectrum, and scaled by the pixel's height. A strip takes the geometry of its middle row, which from orbit
+changes by under a thousandth along 64 m; at a short range the strips are shortened until it holds. The stage
+runs on the baseband ground image before the data-driven autofocus, which then sees the residual: what the DEM
+got wrong, and the errors that have nothing to do with terrain.
 
 **What the product says.** `out['terrain']` holds what was applied (`applied`, `powers`, `edge_rad`,
 `quadratic_rad`: the least and greatest quadratic coefficient in radians at the band edge; `height`; the DEM's
-`offset` from the plane and its `relief`; the `layover` and `outside` fractions), `out['notes']` a line, and
+`offset` from the plane and its `relief`; the `layover` and `outside` fractions; `levels`, the most heights a
+strip column was corrected for, and `height_rad`, the largest half range of phase across one column's heights
+in a strip; `walk_rad`, the largest range walk at the band's corners, `walk_terms` its series, and
+`walk_left_rad`, any walk left uncorrected), `out['notes']` a line, and
 `out['timing']['terrain']` the stage's seconds. The grid, the geolocation and the SICD's projection are
 unchanged: the SICD is still `Grid.Type` PLANE on the same plane, and it records the step as an
 `ImageFormation.Processing` element (`TERRAIN PHASE CORRECTION`). The image is not orthorectified; heights
@@ -852,11 +872,22 @@ either side, with point targets 30, 100 and 300 m above and below the plane: pha
 the band edge, the cubic term the largest. On a straight track the phase is zero at any height. Uncorrected,
 the targets are 1.8 to 2.1, 2.7 to 2.9 and 4.1 to 4.2 times as wide in azimuth as a target on the plane, with
 0.50, 0.34 and 0.24 of its peak, and the phase of their azimuth spectra is the model's within 0.01 rad at 30 m
-and 0.06 rad at 100 m. Corrected, the targets at 30 m have the on-plane width within 0.7%, its peak sidelobe
-within 0.13 dB, 0.98 of its peak, and lie within 0.04 pixel of their layover point; as complex chips they differ
-from exact backprojection at their true height by -19 to -26 dB of the peak, from -1 to -4 dB uncorrected. At
-100 m the widths are within 4 to 8% and the peak 0.89 to 0.94, at 300 m within 37 to 50% and 0.65 to 0.71. What
-remains there is the range walk of the limitations below, which is most of a range cell at 300 m.
+and 0.06 rad at 100 m. Corrected, the targets at 30 m have the on-plane width within 0.4%, its peak sidelobe
+within 0.16 dB, 0.99 of its peak or more, and lie within 0.003 pixel of their layover point; as complex chips
+they differ from exact backprojection at their true height by -39 to -51 dB of the peak (-19 to -26 dB with
+0.3.0's correction, the phase at the center frequency alone), from -1 to -4 dB uncorrected. At 100 m, where the
+range walk reaches 5 rad at the band's corners, three targets have the on-plane widths within 0.7% and 0.99 of
+the peak, -34 to -40 dB from exact backprojection (-11 to -14 dB before); the fourth lies in a strip whose walk
+is beyond the series (widths within 4.4%, 0.93 of the peak, -14 dB). At 300 m the walk is 13 to 19 rad, two
+range cells, and is left: widths within 38 to 50% and 0.65 to 0.71 of the peak, as before.
+
+A cliff 300 m high across azimuth (the surface rises 3 m per meter, from 150 m below the plane to 150 m above
+it), covered with scatterers of random phase, on the same track bent a twentieth as much (0.008 rad of quadratic
+phase per meter of height at the band edge, as from orbit): over a chip of 128 by 128 pixels that holds the
+whole cliff the corrected image differs from exact backprojection onto the surface by -35 dB, the plane's image
+by -2.5 dB, and 0.3.0's correction by -9 dB. The fast former is within -42.6 dB of exact backprojection on the
+plane there, and the exact phase applied pixel by pixel through the local spectrum reaches -35 dB as well: at
+10 km the curvature of the wavefronts over the correction's kernel is what is left.
 
 The same collection written with `PTRef`, `PNRef` and an antenna beam, as the default ground-plane SICD and as
 the slant-plane one: the SICD carries the terrain step and the `Radiometric` block together, the block is that of
@@ -893,20 +924,73 @@ uncorrected image, against the model's predictions for the same blocks.
   over eight parts of the scene). After the GLO-30 correction they still do, in the collapsed area. After the
   lidar correction the parts agree on a residual of -0.35 +- 0.08 rad, which the contrast test then declines:
   it is too small to raise the contrast of an image whose pit is corrected for the wrong depth.
-- Against exact backprojection onto the DEM's surface, on three 256-pixel chips of the first image (590,000
-  points; the rms of the complex difference over the rms of the chip): the plane's image differs from it by -11.5
-  dB on high ground (+74 m) and the corrected image by -48 dB; in the collapsed area with the lidar surface (-190
-  to -230 m) by -4.5 dB and -38 dB; near the plane (-30 to +5 m) by -26 dB and -50 dB. The fast former itself
-  is within -52 dB of exact backprojection on the plane. The exact route took 215 s for those points on the
-  shared GPU, 0.003 megapixels per second, where formation and the correction make 3.3: the surface costs about
-  a thousand times the plane with its correction.
-- The stage takes 1.9 to 5.8 s for the 206 and 299 megapixel images on a GPU shared with other work (50 to 140
-  megapixels per second) and 3 to 15 s on the host's 48 shared cores (19 to 72 megapixels per second), of which
-  0.4 to 1.0 s is the height map; formation took 40 and 84 s on the same GPU.
+- Against exact backprojection onto the DEM's surface on the four 256-pixel chips the validation harness picks
+  from the first image with GLO-30: 75 m above the plane (1.2 rad), -54.9 dB (0.3.0's correction: -37.1 dB);
+  68 m below it (1.1 rad), -53.7 dB (-39.3); near the plane, -53.7 dB (-49.9); 122 m below it (2.0 rad), -52.8 dB
+  (-35.0). The plane's image is within -53.2 to -55.2 dB of exact backprojection on the plane there.
+- Over the whole first image with GLO-30, on 42 chips of 128 pixels drawn by phase (up to 2 rad) and slope as
+  on Etna below: -51.3 dB in the median and -42.9 dB at worst (0.3.0: -35.5 and -22.4 dB). The worst chips
+  are gentle in phase (0.2 to 0.8 rad) with slopes of 1 to 3.4 m per meter, 10 dB above the plane's agreement
+  there; on the one examined the residual sits in a few pixels where the surface is smooth, and the exact phase
+  applied pixel by pixel through the local spectrum leaves the same. Its source is not identified.
+- On three further 256-pixel chips of the first image's unweighted product, against exact backprojection onto
+  each DEM's surface: on high ground (+74 m) -54.6 dB (0.3.0's correction: -37.1 dB; uncorrected -4.8 dB); in
+  the collapsed area with the lidar surface (189 to 233 m below the plane within the chip, where the lidar
+  surface reaches 10 rad of phase) -46.5 dB (-28.7; uncorrected +1.4 dB); near the plane -54.1 dB with GLO-30
+  (-30 to +5 m; before -44.8 dB) and -45.7 dB with the lidar surface (-95 to +3 m; before -30.2 dB). The fast
+  former is within -53 to -54 dB of exact backprojection on the plane on these chips. The exact route took 8 s
+  for their 590,000 points on an otherwise idle GPU (215 s on one shared with other work), 0.07 megapixels per
+  second, where formation and the correction make 30: the surface costs about 400 times the plane with its
+  correction.
+- The stage, its height map included, on the first image (299 megapixels) and on Etna's (121 megapixels), the
+  least of three runs alternated with 0.3.0's: on the GPU 0.74 and 1.29 s (0.3.0: 0.55 and 1.26 s), of which
+  the height map on the host takes 0.29 and 1.0 s; on the host's CPU (16 cores) 4.1 and 3.4 s (1.8 and 2.1 s);
+  with JAX on the same cores 6.1 and 3.5 s (5.5 and 3.3 s). The correction itself, the height map aside, costs
+  1.7 to 1.8 times what 0.3.0's did on the GPU, 2.3 to 2.6 times on the host and 1.1 times with JAX: more heights
+  per strip on steep ground and the range walk's transforms along rows. Formation took
+  9 and 6 s on the same GPU.
 - A flat control, an Umbra spotlight of Fargo, North Dakota: with the EGM2008 undulation (-26.2 m) the DEM's
   median is 1.6 m below the image plane with 1.8 m of relief, the predicted phase stays under 0.012 rad, nothing
   is applied and the product is the one without a DEM, sample for sample; the stage takes 0.6 s for its height
   map. With the undulation left at 0 the DEM lies 25 m above the plane and the warning says so.
+
+**Measured on Etna.** A Capella spotlight of Mount Etna (2024-07-12, 500 MHz at 9.65 GHz, an 11,109 by
+10,871 pixel ground image of 0.45 m), whose surface lies between 1,120 m below and 570 m above the image plane
+in Copernicus GLO-30 (two tiles, the EGM2008 undulation of 43.6 m): 0.0057 rad of quadratic phase per meter of
+height at the band edge. Against exact backprojection onto the DEM's surface, on the four 256-pixel chips of the
+validation harness (the rms of the complex difference over the rms of the exact chip):
+
+- 500 m above the plane (496 to 537 m, 2.8 to 3.0 rad): -51.6 dB; 0.3.0's correction -33.1 dB, uncorrected +0.7.
+- Below it, 588 to 296 m within one chip (1.7 to 3.3 rad): -49.0 dB; before -29.3.
+- Near the plane (-28 to +33 m): -51.6 dB; before -47.6.
+- 1,050 m below it (5.9 to 6.1 rad): -49.6 dB; before -25.2.
+- The plane's image against exact backprojection on the plane: -50.9 to -52.4 dB, which bounds the comparison.
+
+Over the whole image, on 72 chips of 128 pixels drawn three to a cell from every combination of phase (the
+chip's median, 0 to 8 rad at the band edge) and steepest slope inside the chip (under 0.2 to over 2.5 m per
+meter, up to 225 m of relief within one chip), the corrected image differs from exact backprojection onto the
+surface by -50.2 dB in the median and -44.7 dB at worst (0.3.0: -35.0 and -25.2 dB):
+
+| phase at the band edge | 0.3.0, median of the cells | now, median of the cells | now, worst chip |
+| --- | --- | --- | --- |
+| under 0.5 rad | -45 to -49 dB | -51 to -53 dB | -47 dB |
+| 0.5 to 1.5 rad | -36 to -45 dB | -48 to -52 dB | -47 dB |
+| 1.5 to 3 rad | -34 to -35 dB | -49 to -51 dB | -45 dB |
+| 3 to 5 rad | -28 to -31 dB | -48 to -50 dB | -46 dB |
+| 5 to 8 rad | -25 to -27 dB | -48 to -50 dB | -46 dB |
+
+Slope costs little once each pixel has its own height: the steepest cells (over 2.5 m per meter, 70 to 225 m of
+relief inside a 58 m chip) are at -48 to -53 dB, within about 3 dB of the gentlest at the same phase, where
+0.3.0's correction lost up to 9 dB to them. The six worst chips lie 2 to 7 dB above the plane's own agreement
+with exact backprojection on them (-49 to -53 dB).
+
+What limited 0.3.0's correction there, measured on the same chips with the correction's parts varied: the range
+walk. With each pixel's exact height but the phase along azimuth alone the chips reach only -34.6, -36.0, -50.7
+and -27.6 dB; with the phase over both frequencies and a constant height per 64-pixel tile -43.4 dB on the
+first and -45.6 dB on the deepest; with both, -52.2, -52.2, -50.9 and -50.1 dB. On the chip below the plane
+the height averaged over strips of 64 m also cost 4 dB (-30.8 against -34.6 dB). Shorter strips did not help
+the old correction (-24 dB at 14 m). Layover played no part: 0.04% of the lattice. The two DEM tiles' seam,
+where 0.3.0's mosaic left a band without heights (1.1% of the image uncorrected), is now interpolated across.
 
 **Limitations.**
 
@@ -914,17 +998,20 @@ uncorrected image, against the model's predictions for the same blocks.
   and 0.6 rad with its whole aperture. A DEM older than the terrain (the caldera above), a surface model where
   the radar sees the ground or the reverse, and the geoid offset all enter directly. The data-driven autofocus
   runs after the correction and sees what is left.
-- *One height per pixel.* In layover the heights that share a pixel are averaged, so each is corrected for the
-  wrong height by up to the relief folded into the pixel. Along azimuth the height is averaged over half a
-  block (32 m by default), so a cliff keeps a residual within a block of its edge; `terrain.focus(block=)` sets
-  the rows of a block.
-- *Range walk.* The phase is applied at the center frequency. Over the band it varies by `B / (2 fc)` of
-  itself, because the range error behind it, `phi lambda / (4 pi)`, also moves the response across range bins
-  during the aperture. A correction along azimuth leaves that part: it is under a quarter of a radian while
-  `|phi| B / (2 fc)` is, 8 rad of phase at a 3% band, which the square-resolution products above stay within
-  outside the pit; with its whole aperture the first collection passes it 140 m from the plane. Beyond it (the
-  simulated targets at 100 and 300 m) the correction still removes most of the smear, and exact backprojection
-  onto the surface removes all of it.
+- *One height per pixel.* Each pixel is corrected for the height it shows, as exact backprojection onto the
+  surface is formed. In layover the heights that share a pixel are averaged (as `surface_points` takes them), so
+  each scatterer is corrected for the wrong height by up to the relief folded into the pixel. The interpolation
+  in height stops at eight heights per strip column, which covers 4.3 rad of phase across one column's heights
+  within a strip at the band edge; Etna's steepest strips need 0.9 rad and four heights, Kilauea's pit with the
+  lidar surface 1.6 rad and five. `terrain.focus(block=)` sets the rows of a strip.
+- *Range walk.* The walk is removed by a series of at most eight terms. Beyond about 4.5 rad of walk at the
+  band's corners the series would not converge, and the walk of that strip is left as 0.3.0 left it everywhere
+  (`walk_left_rad` says how much): from orbit the walk is about `B / (2 fc)` of the phase, 0.25 rad on Etna's
+  deepest ground, while the simulated 10 km collection reaches 13 to 19 rad at 300 m.
+- *Short range.* The correction treats the image's spectrum near a pixel as plane waves. At 10 km the
+  wavefronts' curvature over the correction's kernel limits the simulated 300 m cliff to -35 dB against exact
+  backprojection onto the surface (the exact phase applied pixel by pixel through the local spectrum reaches the
+  same), where the former itself is within -42 dB on the plane; from orbit the effect is negligible.
 - *Spotlight only.* A moving-beam collection is refused. The model holds for it pixel by pixel, with the pulses
   that illuminate the pixel and their own center of aperture; the correction would run per patch of the mosaic.
 - The image is not moved: layover stays, and geolocation needs the height as before.

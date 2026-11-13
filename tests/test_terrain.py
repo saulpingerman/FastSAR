@@ -25,13 +25,14 @@ SPOT = np.array([[10.0, -60.0], [-45.0, 20.0], [45.0, -20.0], [0.0, 0.0], [-45.0
 
 
 def _collect(squint, left, curved=True):
+    """curved: True, or a factor on the track's bend (0.05: a twentieth of it, 0.02 rad per meter of height)."""
     col = sim.make_collect(res=0.35, scene=170.0, r0=10e3, graze_deg=35.0)
     y = col.ant[:, 1] / np.ptp(col.ant[:, 1])
     ant = col.ant.copy()
     ant[:, 1] -= 10e3 * np.cos(np.radians(35)) * np.tan(np.radians(squint))
     if curved:
-        ant[:, 0] += 160.0 * y ** 2 + 120.0 * y ** 3
-        ant[:, 2] += -100.0 * y ** 2 + 6.0 * y
+        ant[:, 0] += float(curved) * (160.0 * y ** 2 + 120.0 * y ** 3)
+        ant[:, 2] += float(curved) * -100.0 * y ** 2 + 6.0 * y
     return dataclasses.replace(col, ant=ant[::-1].copy() if left else ant)
 
 
@@ -106,17 +107,27 @@ def test_scaling_law():
 
 
 def test_model_over_the_image():
-    """focus's model of the coefficients over pixels and heights reproduces the exact fit at points and heights
-    it was not built from."""
+    """focus's model of the phase over the image's 2-D spectrum, as a function of pixel and height, reproduces the
+    exact phase at points and heights it was not built from, at every pulse and frequency, within 0.02 rad of
+    its fits at the nodes (which are within 0.1 rad of phases that reach 150): the azimuth part c and the range walk (the phase scales with frequency, and each
+    pulse's azimuth frequency moves with it), here more than 2 rad at the band's corners."""
     out = _product(_collect(20.0, False))
     grid, fr, ant, fc = terrain._scene(out)
     band = terrain._band(grid, fr, ant, fc)
-    model = terrain._Model(grid, fr, ant, fc, band, 6, -300.0, 300.0)
+    bw = out['band'][1] - out['band'][0]
+    eta_c = 2 / C * fc * grid[6] * float(fr['e2'] @ grid[4])
+    model = terrain._Model(grid, fr, ant, fc, band, 6, -300.0, 300.0, bw, eta_c)
     rng = np.random.default_rng(3)
     i, j, h = rng.uniform(0, 479, 40), rng.uniform(0, 439, 40), rng.uniform(-300, 300, 40)
-    exact = terrain.coefficients(out, i, j, h, order=6, band=band)[0]
-    v = np.linspace(-1, 1, 101)[:, None] ** np.arange(7)
-    assert np.abs(v @ (model(i, j, h) - exact.T)).max() < 0.02       # rad, of phases that reach 150
+    y = grid[2] + i[:, None] * grid[5] * grid[3] + j[:, None] * grid[6] * grid[4]
+    v, w, psi = terrain._spectrum(grid, fr, terrain._some(ant, 257), fc, bw, eta_c, band, y, h)
+    cde = model(i, j, h)
+    c, d, e = (np.moveaxis(q, 0, -1)[:, None, None, :] for q in (cde[:7], cde[7:14], cde[14:]))
+    p = v[..., None] ** np.arange(7)
+    walk = w * (p * d).sum(-1) + w * w * (p * e).sum(-1)
+    got = (p * c).sum(-1) + walk
+    assert np.abs(psi).max() > 100 and np.abs(w).max() < 0.03 and np.abs(walk).max() > 2
+    assert np.abs(got - psi).max() < model.res2 + 0.02 and model.res2 < 0.1 and model.err < 0.01, np.abs(got - psi).max()
 
 
 # ------------------------------------------------------------------------------------------------ simulated targets
@@ -206,10 +217,11 @@ def test_defocus_is_the_models(scene):
 def test_correction_restores_the_targets(scene):
     """With the correction for its height each target has the on-plane response where its range and Doppler at
     the COA put it: within 1% in width and 0.3 dB in peak sidelobe at 30 m, where the phase reaches 12 rad at the
-    band edge. The correction is the phase at the center frequency: over the band the phase varies by B / (2 fc)
-    of itself (a range walk of the response across the aperture), which leaves 0.3 rad there, 0.9 rad at 100 m
-    (40 rad: widths within 10%) and 2.7 rad at 300 m (120 rad, a walk of a range cell: widths within 1.6, from
-    4.1 times the on-plane width uncorrected)."""
+    band edge, and at 100 m (40 rad) within 1% but where the range walk's series stops short (one target: 4%).
+    Over the band the phase varies by B / (2 fc) of itself (a range walk of the response across the aperture),
+    1.5 rad at the band's corners at 30 m, 5 rad at 100 m, which the correction removes through each row's
+    spectrum; at 300 m (120 rad, 13 to 19 rad of walk, two range cells) that is beyond its series, and the
+    walk is left as it is: widths within 1.6, from 4.1 times the on-plane width uncorrected."""
     out, pix, hp = scene['out'], scene['pix'], scene['hp']
     img = out['image']
     ref = _measure(img, out, pix[3])
@@ -225,6 +237,10 @@ def test_correction_restores_the_targets(scene):
         assert info['applied'] and info['fit_rad'] < 0.011 and info['height'][1] == pytest.approx(HTS[k], abs=0.01)
         assert 6 <= info['order'] <= 8 and np.abs(info['edge_rad']).max() > 10
         assert any('terrain: focused' in n for n in o['notes'])
+        if abs(HTS[k]) == 300:                                       # two range cells of walk: left, and said so
+            assert info['walk_left_rad'] > 10 and any('series' in n for n in o['notes'])
+        else:
+            assert info['walk_terms'] >= 3
         m = _measure(o['image'], out, pix[k])
         assert abs(m['i'] - pix[k, 0]) < pos and abs(m['j'] - pix[k, 1]) < pos, (k, m['i'], m['j'])
         assert 0.99 < m['res_az'] / ref['res_az'] < wid, (k, m['res_az'])
@@ -237,11 +253,13 @@ def test_correction_restores_the_targets(scene):
 def test_against_exact_backprojection_at_the_true_height(scene):
     """The corrected chip of a target against exact backprojection onto the surface at its height, at the points
     the chip's pixels show (surface_points), as complex images: before the correction they differ by about the
-    peak itself, after it by -19 to -26 dB of the peak at 30 m and -11 to -14 dB at 100 m (the range walk)."""
+    peak itself, after it by -39 to -51 dB of the peak at 30 m (-19 to -26 dB with the phase at the center
+    frequency alone, the correction of 0.3.0) and -34 to -40 dB at 100 m but -14 dB where the walk's series
+    stops short."""
     out, pix, hp, bp = scene['out'], scene['pix'], scene['hp'], scene['bp']
     img = out['image']
     fr, kc = planes._frame(out), 4 * np.pi * 0.5 * (out['band'][0] + out['band'][1]) / C
-    for k, lim in ((2, -17.0), (4, -17.0), (1, -10.0), (5, -10.0)):
+    for k, lim in ((2, -35.0), (4, -35.0), (1, -10.0), (5, -10.0)):
         dem = terrain.as_dem(hp + HTS[k])
         i0, j0 = int(round(pix[k, 0])), int(round(pix[k, 1]))
         I, J = np.meshgrid(np.arange(i0 - 12, i0 + 13), np.arange(j0 - 12, j0 + 13), indexing='ij')
@@ -305,6 +323,85 @@ def test_flat_dem_changes_nothing(scene):
         info = terrain.focus(o, terrain.as_dem(dem))
         assert not info['applied'] and o['image'] is img and o['terrain'] is info and not o['notes']
         assert abs(info['offset']) < 1e-2 and info['layover'] == 0 and info['outside'] == 0
+
+
+# ------------------------------------------------------------------------------------------------ steep relief
+BEND = 0.05                            # a twentieth of the track's bend: 0.008 rad per meter of height, as from orbit
+
+
+@pytest.fixture(scope='module')
+def cliff(tmp_path_factory):
+    """A cliff 300 m high across azimuth (the surface rises 3 m per meter along e1, from 150 m below the plane to
+    150 m above it), covered with scatterers of random phase two pixels apart, on a curved track bent a twentieth
+    of the other scenes' (0.008 rad of quadratic phase per meter of height at the band edge, as from orbit). The
+    plane's image and exact backprojection onto the surface at the points a central chip of 128 x 128 pixels shows
+    (heights -150 to +150 m inside it)."""
+    col = _collect(20.0, False, curved=BEND)
+    geo = _product(col)
+    dem = _ramp(geo, 3.0, 150.0, axis='e1')[0]
+    I, J = np.meshgrid(np.arange(140, 341, 2), np.arange(130, 311, 2), indexing='ij')
+    tg = terrain.surface_points(geo, dem, I, J).reshape(-1, 3)        # the simulator's frame is geo's local frame
+    rng = np.random.default_rng(7)
+    path = str(tmp_path_factory.mktemp('cliff') / 'c.cphd')
+    sim.write_cphd(path, col, sim.simulate(col, tg, np.exp(2j * np.pi * rng.uniform(size=len(tg)))), LAT, LON, H0,
+                   heading=HEADING, scene=160.0)
+    got = {}
+
+    def plan(g):
+        got.update(g)
+        f = planes.slant_frame(g['meta'], g['center'])
+        t = np.linspace(-85, 85, 5)
+        pts = g['center'] + (t[:, None, None] * g['e1'] + t[None, :, None] * g['e2']).reshape(-1, 3)
+        b = planes.sampling(f, g['ant'], (g['fmin'], g['fmin'] + (g['S'].shape[1] - 1) * g['df']), pts, g['e1'], g['e2'])
+        return dict(spacing=(0.96 / b['bx'], 0.96 / b['by']), bounds=(-85, 85, -85, 85))
+    out = fastsar.form_cphd(path, axes='los', window=False, backend='cpu', aperture='full', _plan=plan)
+    planes.deramp(out)
+    nx, ny = out['image'].shape
+    i0, j0, n = nx // 2 - 64, ny // 2 - 64, 128
+    I, J = np.meshgrid(np.arange(i0, i0 + n), np.arange(j0, j0 + n), indexing='ij')
+    fr = planes._frame(out)
+    y = out['origin'] + I[..., None] * out['spx'] * out['e1'] + J[..., None] * out['spy'] * out['e2']
+    base = np.exp(-1j * 4 * np.pi * 0.5 * (out['band'][0] + out['band'][1]) / C * (np.linalg.norm(y - fr['arp'], axis=-1)
+                                                                                   - fr['r0']))
+    bp = lambda pts: fastsar.backproject(got['S'], got['ant'] - out['center'], got['fmin'], got['df'],
+                                         pts - out['center'], backend='cpu', window=False) * base
+    pts = terrain.surface_points(out, dem, I, J)
+    return dict(out=out, dem=dem, chip=(slice(i0, i0 + n), slice(j0, j0 + n)), exact=bp(pts), plane=bp(y),
+                h=pts[..., 2] - out['origin'][2])
+
+
+def _rel_db(a, ref):
+    return float(10 * np.log10((np.abs(a - ref) ** 2).mean() / (np.abs(ref) ** 2).mean()))
+
+
+def test_steep_relief_against_exact_backprojection(cliff):
+    """The cliff's chip against exact backprojection onto the surface (the rms of the complex difference over the
+    rms of the exact chip): the plane's image differs by -2.5 dB; corrected, each pixel for its own height and
+    with the range walk, by -35 dB, where the former itself is within -42 dB of exact backprojection on the plane
+    and the exact phase applied pixel by pixel through the local spectrum reaches -35 dB (the wavefronts' curvature
+    over the correction's kernel at 10 km). The correction of 0.3.0, one height per column averaged over strips of
+    64 m and the phase at the center frequency alone, reaches -9 dB on it."""
+    out, ch, exact = cliff['out'], cliff['chip'], cliff['exact']
+    assert cliff['h'].min() < -140 and cliff['h'].max() > 140
+    assert _rel_db(out['image'][ch], cliff['plane']) < -40 and _rel_db(out['image'][ch], exact) > -5
+    o = dict(out, image=out['image'].copy(), notes=[])
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', terrain.TerrainWarning)
+        info = terrain.focus(o, cliff['dem'])
+    got = _rel_db(o['image'][ch], exact)
+    print(f'cliff: {got:.1f} dB against exact backprojection on the surface; levels {info.get("levels")}, '
+          f'walk terms {info.get("walk_terms")}, block {info["block"]}')
+    assert got < -32, got
+    assert info['levels'] >= 3 and info['walk_terms'] >= 1 and 1.0 < info['height_rad'] < 4.3
+    assert 0.5 < np.abs(info['quadratic_rad']).max() < 2
+
+
+def test_steep_relief_flat_control(cliff):
+    """The same image with a DEM at the plane's height: nothing is applied, and the image is the one given."""
+    out = cliff['out']
+    o = dict(out, notes=[])
+    info = terrain.focus(o, terrain.as_dem(_plane_height(out)))
+    assert not info['applied'] and o['image'] is out['image'] and not o['notes']
 
 
 # ------------------------------------------------------------------------------------------------ the layover map
@@ -398,6 +495,12 @@ def test_dem_conventions(tmp_path, need):
     assert np.isnan(west(LAT, LON + 0.02))
     both = terrain.as_dem([tmp_path / 'w.tif', tmp_path / 'e.tif'], geoid=-30.0)
     assert np.abs(both(lat, lon) - surf(lat, lon)).max() < 1e-6
+    # the seam: between the last post of one tile and the first of the next, half a post either side of their
+    # common edge, each tile alone has no height; the joined tiles interpolate across it
+    seam = LON + 0.005 + np.linspace(-0.0005, 0.0005, 11)
+    assert np.isnan(west(LAT, seam[6:])).all() and np.isnan(terrain.as_dem(str(tmp_path / 'e.tif'), 0.0)(LAT, seam[:5])).all()
+    assert np.abs(both(np.full(11, LAT), seam) - surf(LAT, seam)).max() < 1e-6
+    np.testing.assert_array_equal(both(lat, lon), products.read_dem([tmp_path / 'w.tif', tmp_path / 'e.tif'], -30.0)(lat, lon))
     assert terrain.as_dem(120.0)(lat, lon).shape == (5, 5)
     assert np.all(terrain.as_dem(120, geoid=5.0)(lat, lon) == 125.0) and terrain.as_dem(surf) is surf
     assert np.all(terrain.as_dem(surf, geoid=-30.0)(lat, lon) == surf(lat, lon) - 30.0)
@@ -445,7 +548,8 @@ DEVICES = [pytest.param('cupy', marks=pytest.mark.cuda), 'jax']
 
 @pytest.mark.parametrize('lib', DEVICES)
 def test_on_device(lib, need, request):
-    """focus on a CuPy and on a JAX image gives the host's image, with its zeros, in the same place."""
+    """focus on a CuPy and on a JAX image gives the host's image, with its zeros, in the same place: on a cliff that
+    takes several heights per strip column and the range walk, with a last strip that overlaps the one before."""
     from fastsar import _xp
     if lib == 'jax':
         request.getfixturevalue('jax_cpu')
@@ -454,21 +558,26 @@ def test_on_device(lib, need, request):
     img = (rng.normal(size=(480, 440)) + 1j * rng.normal(size=(480, 440))).astype(np.complex64)
     img[:60, :200] = 0
     img[300:, 400:] = 0
-    base = _product(_collect(20.0, False), image=img)
-    dem, h, c = _ramp(base, 0.3)
+    base = _product(_collect(20.0, False, curved=BEND), image=img)
+    dem = _ramp(base, 3.0, 150.0, axis='e1')[0]                      # the cliff: several nodes, the walk, a last strip
     ref, dev = dict(base, notes=[]), dict(base, image=xp.asarray(img.copy()), notes=[])
     with warnings.catch_warnings():
         warnings.simplefilter('ignore', terrain.TerrainWarning)
         a, b = terrain.focus(ref, dem, block=64), terrain._stage(dev, dem)
         blk = dict(base, image=xp.asarray(img.copy()), notes=[])
-        terrain.focus(blk, dem, block=64)
+        c = terrain.focus(blk, dem, block=64)
     assert a['applied'] and b['applied'] and a['powers'] == b['powers'] and _xp.kind(dev['image']) == lib
-    assert np.abs(ref['image'] - img).max() > 0.5                    # a correction of tens of radians
-    for got in (blk['image'], ):
+    assert a['levels'] >= 3 and a['walk_terms'] >= 1 and 480 % a['block'] != 0 and c['levels'] == a['levels']
+    assert np.abs(ref['image'] - img).max() > 0.5                    # a correction of radians
+    for got in (blk['image'], dev['image']):
         got = _xp.host(got)
         assert got.dtype == np.complex64 and np.array_equal(got == 0, img == 0)
-        assert np.abs(got - ref['image']).max() < 2e-4 * np.abs(ref['image']).max()
-    assert np.array_equal(_xp.host(dev['image']) == 0, img == 0)
+    assert np.abs(_xp.host(blk['image']) - ref['image']).max() < 2e-4 * np.abs(ref['image']).max()
+    host = dict(base, image=img.copy(), notes=[])
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', terrain.TerrainWarning)
+        terrain.focus(host, dem)
+    assert np.abs(_xp.host(dev['image']) - host['image']).max() < 2e-4 * np.abs(host['image']).max()
 
 
 @pytest.mark.cuda
@@ -521,7 +630,7 @@ def test_process_cphd_with_a_dem(scene, tmp_path):
         o = fastsar.process_cphd(path, str(tmp_path / 't.nitf'), dem=lambda lat, lon: np.full(np.shape(lat), hp),
                                  geoid=30.0, **kw)
     t = o['terrain']
-    assert t['applied'] and t['height'][1] == pytest.approx(30.0, abs=0.01) and 2 in t['powers'] and t['block'] >= 32
+    assert t['applied'] and t['height'][1] == pytest.approx(30.0, abs=0.01) and 2 in t['powers'] and t['block'] >= 16
     assert o['timing']['terrain'] > 0 and any(n.startswith('terrain: focused with the DEM') for n in o['notes'])
     sm = o['metadata']
     assert sm.Grid.Type == 'PLANE' and sm.Grid.ImagePlane == 'GROUND' and sm.ImageFormation.ImageFormAlgo == 'OTHER'

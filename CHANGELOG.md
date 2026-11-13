@@ -11,13 +11,25 @@ was published on PyPI.
   image plane is displaced (layover) and, on a curved track, defocused by a phase across the aperture that is
   proportional to its height and to the track's curvature out of the slant plane. `terrain.focus` computes that
   phase from the antenna positions and a DEM, with nothing estimated from the image, and removes it from the
-  baseband ground image before the data-driven autofocus: per column and cross-faded along azimuth, on the device
-  that holds the image (NumPy, CuPy, JAX). The image stays on its plane, with its geolocation and its SICD
-  projection; the product records the step in `out['terrain']`, a note, `timing['terrain']` and an
-  `ImageFormation.Processing` element of the SICD. `dem` is a GeoTIFF (or a list of tiles), a function of
-  latitude and longitude, or a number; a file needs `geoid`, the geoid's height above the ellipsoid at the scene
-  (`terrain.as_dem`), and a DEM whose median over the image is off the scene height by more than its relief
-  explains raises `terrain.TerrainWarning`. `terrain.heights` gives the surface each pixel shows through layover,
+  baseband ground image before the data-driven autofocus, on the device that holds the image (NumPy, CuPy, JAX):
+  in strips along azimuth, each pixel corrected for the height it shows (interpolated between the corrections
+  for a few heights that span each column's heights within the strip), and with the range walk, the part of the
+  phase that scales with frequency over the band, removed through each row's spectrum. Against exact
+  backprojection onto the DEM's surface (the rms of the complex difference over that of the exact chip) a Capella
+  spotlight of Mount Etna, with 1,690 m of relief, gives -49 to -52 dB on chips 500 m above the plane, 300 to
+  600 m below it within one chip, and 1,050 m below it (2.8 to 6 rad of phase), where the plane's image is within
+  -51 to -52 dB of exact backprojection on the plane; a correction per column with the height averaged over
+  strips and the phase at the center frequency alone gave -25 to -33 dB there. Over 72 chips drawn by phase and
+  slope the median is -50 dB and the worst -45 dB (that correction: -35 and -25 dB). On a Capella spotlight of
+  Kilauea the chips reach -53 to -55 dB at 1.1 to 2 rad (before -35 to -50 dB), and -46 dB in the collapsed
+  caldera with a 2019 lidar surface (before -29 dB). The image stays on its plane,
+  with its geolocation and its SICD projection; the product records the step in `out['terrain']`, a note,
+  `timing['terrain']` and an `ImageFormation.Processing` element of the SICD. `dem` is a GeoTIFF (or a list of
+  tiles), a function of latitude and longitude, or a number; a file needs `geoid`, the geoid's height above the
+  ellipsoid at the scene (`terrain.as_dem`; tiles on one grid, as adjacent Copernicus tiles are, are joined into
+  one raster so that heights interpolate across their seams, here and in `products.read_dem`, which takes a list
+  of tiles too), and a DEM whose median over the image is off the scene height by more than its relief explains
+  raises `terrain.TerrainWarning`. `terrain.heights` gives the surface each pixel shows through layover,
   `terrain.phase_error` and `terrain.coefficients` the exact model, and `terrain.surface_points` the points at
   which `fastsar.backproject` forms the image on the surface itself
   ([docs/product-options.md](docs/product-options.md#terrain-informed-focusing)). Spotlight collections only;

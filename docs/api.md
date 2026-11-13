@@ -154,7 +154,8 @@ the CPU), `'auto'`. Precision: `'float32'`, `'float16'` (CUDA, JAX),
 - `locate(out, lat, lon, height=0.0)`: fractional pixel coordinates [..., 2] of ground points.
 - `geocode_image(out, data=None, spacing=None, crs=None, height=None, order=1)`: data on a north-up map grid (default
   the scene's UTM zone) as `dict(data, transform, crs)`, the arguments of `write_geotiff`.
-- `read_dem(path, offset=0.0)`: a DEM GeoTIFF as `dem(lat, lon)`; `offset` adds the geoid height.
+- `read_dem(path, offset=0.0)`: a DEM GeoTIFF, or a list of tiles, as `dem(lat, lon)`; `offset` adds the geoid
+  height. Tiles on one grid (adjacent Copernicus tiles) are joined into one raster, interpolated across their seams.
 - `project(points, ant, nx, ny, spx, spy, e1, e2)`, `sample(img, ij, order=1)`, `geocode(img, grid, ant, points,
   order=1)`: the same model on a `form_image` grid.
 - `write_sicd(path, out)`, `write_sicd(path, img, template, transpose=None)`: SICD of a `form_cphd` output, or of

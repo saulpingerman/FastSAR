@@ -464,22 +464,62 @@ def geocode_image(out, data=None, spacing=None, crs=None, height=None, order=1):
 
 
 def read_dem(path, offset=0.0):
-    """A DEM GeoTIFF (any crs) as the function dem(lat, lon) -> height that geolocate and geocode_image take:
-    bilinear between posts, NaN outside, plus offset. DEMs often give heights above the geoid (Copernicus DEM:
-    EGM2008); offset, the geoid's height above the ellipsoid at the scene, makes them ellipsoid heights. The whole
-    raster is read into memory. Needs rasterio."""
+    """A DEM GeoTIFF (any crs), or a list of tiles, as the function dem(lat, lon) -> height that geolocate and
+    geocode_image take: bilinear between posts, NaN outside, plus offset. DEMs often give heights above the geoid
+    (Copernicus DEM: EGM2008); offset, the geoid's height above the ellipsoid at the scene, makes them ellipsoid
+    heights. The whole raster is read into memory. Tiles on one grid (the same crs and post spacing, their posts
+    aligned: the adjacent tiles of Copernicus GLO-30 at a latitude) are joined into one raster, so that the
+    interpolation runs across their seams; others are tried in turn, the first that covers a point giving its
+    height. Needs rasterio."""
     _deps.require('rasterio')
     import rasterio
     from rasterio.warp import transform as warp
-    with rasterio.open(path) as src:
-        z = src.read(1, masked=True).astype(np.float64).filled(np.nan)
-        tr, crs = src.transform, src.crs
+    rasters = []
+    for p in (path if isinstance(path, (list, tuple)) else [path]):
+        with rasterio.open(p) as src:
+            rasters.append((src.read(1, masked=True).astype(np.float64).filled(np.nan), src.transform, src.crs))
+    rasters = _join(rasters)
+
+    def one(z, tr, crs):
+        def dem(lat, lon):
+            lat, lon = np.broadcast_arrays(np.asarray(lat, np.float64), np.asarray(lon, np.float64))
+            x, y = lon, lat
+            if not crs.is_geographic:
+                x, y = (np.reshape(v, lat.shape) for v in warp('EPSG:4326', crs, lon.ravel(), lat.ravel()))
+            col, row = ~tr * (x, y)
+            return sample(z, np.stack([row - 0.5, col - 0.5], -1)) + offset
+        return dem
+    tiles = [one(*r) for r in rasters]
+    if len(tiles) == 1:
+        return tiles[0]
 
     def dem(lat, lon):
-        lat, lon = np.broadcast_arrays(np.asarray(lat, np.float64), np.asarray(lon, np.float64))
-        x, y = lon, lat
-        if not crs.is_geographic:
-            x, y = (np.reshape(v, lat.shape) for v in warp('EPSG:4326', crs, lon.ravel(), lat.ravel()))
-        col, row = ~tr * (x, y)
-        return sample(z, np.stack([row - 0.5, col - 0.5], -1)) + offset
+        h = tiles[0](lat, lon)
+        for t in tiles[1:]:
+            h = np.where(np.isfinite(h), h, t(lat, lon))
+        return h
     return dem
+
+
+def _join(rasters):
+    """Rasters (z, transform, crs) that share a grid, joined into one on the union of their extents (NaN where none
+    has data; where they overlap the first one's data); the others as they are, after it, in their order."""
+    if len(rasters) < 2:
+        return rasters
+    z0, t0, c0 = rasters[0]
+    a, e = t0.a, t0.e
+    same, rest = [], []
+    for z, t, c in rasters:
+        i, j = (t.f - t0.f) / e, (t.c - t0.c) / a                          # the tile's first post in rows, columns
+        ok = (c == c0 and t.b == 0 and t.d == 0 and t0.b == 0 and t0.d == 0 and abs(t.a - a) <= 1e-9 * abs(a)
+              and abs(t.e - e) <= 1e-9 * abs(e) and abs(i - round(i)) < 1e-6 and abs(j - round(j)) < 1e-6)
+        (same if ok else rest).append((z, int(round(i)), int(round(j))))
+    if len(same) < 2:
+        return rasters
+    i0, j0 = min(q[1] for q in same), min(q[2] for q in same)
+    n = max(q[1] + q[0].shape[0] for q in same) - i0, max(q[2] + q[0].shape[1] for q in same) - j0
+    big = np.full(n, np.nan)
+    for z, i, j in same[::-1]:                                              # the first one's data last: it wins
+        view = big[i - i0:i - i0 + z.shape[0], j - j0:j - j0 + z.shape[1]]
+        np.copyto(view, z, where=np.isfinite(z))
+    return [(big, t0 * t0.translation(j0, i0), c0)] + [r for r in rasters if not any(r[0] is q[0] for q in same)]
