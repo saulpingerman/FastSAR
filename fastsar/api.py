@@ -180,7 +180,7 @@ def _jax_group(plan, K):
     return ng
 
 
-def final_weights(plan, weight, P, grad=False, points=None, nodes=3):
+def final_weights(plan, weight, P, grad=False, points=None, nodes=3, first=0):
     """Weight of each final subaperture at each final tile [ntiles, Pf] (float32), for ImageFormer's aperture_weight:
     weight(points [m, 3], pulses [n] int) -> [n, m], the per-pulse weights at the tile centers, averaged over the
     pulses that each final subaperture spans (its center on the input pulse axis composed through the levels'
@@ -188,16 +188,19 @@ def final_weights(plan, weight, P, grad=False, points=None, nodes=3):
     center pulse alone). grad=True also returns the gradient along e1 and e2 (per metre) at the tile centers:
     [3, ntiles, Pf], by central differences of the center-pulse weights at four points half a tile away, the four
     point sets in one call of weight. The quadrature sum is written out rather than a BLAS product: a mosaic calls
-    this on several prefetch threads at once, and each BLAS call there started a thread pool the size of the host."""
+    this on several prefetch threads at once, and each BLAS call there started a thread pool the size of the host.
+    first: the collection is the P pulses from pulse `first` of the plan's (zero pulses around them: ImageFormer's
+    padded=)."""
     if nodes not in (1, 3):
         raise ValueError(f'final_weights: nodes must be 1 or 3, got {nodes!r}')
     cen = np.asarray(plan['final']['cen'], np.float64)
     if grad:
         h1, h2 = 0.5 * plan['T'] * plan['spx'], 0.5 * plan['T'] * plan['spy']
         e1, e2 = np.asarray(plan['e1'], np.float64), np.asarray(plan['e2'], np.float64)
-        w0 = final_weights(plan, weight, P, points=cen)
+        w0 = final_weights(plan, weight, P, points=cen, first=first)
         m = len(cen)
-        wq = final_weights(plan, weight, P, points=np.concatenate([cen + h1 * e1, cen - h1 * e1, cen + h2 * e2, cen - h2 * e2]), nodes=1)
+        wq = final_weights(plan, weight, P, points=np.concatenate([cen + h1 * e1, cen - h1 * e1, cen + h2 * e2, cen - h2 * e2]), nodes=1,
+                           first=first)
         return np.stack([w0, (wq[:m] - wq[m:2 * m]) / (2 * h1), (wq[2 * m:3 * m] - wq[3 * m:]) / (2 * h2)]).astype(np.float32)
     q = cen if points is None else points
     idx, D = np.arange(plan['final']['P'], dtype=np.float64), 1.0
@@ -205,12 +208,12 @@ def final_weights(plan, weight, P, grad=False, points=None, nodes=3):
         idx = lv['Dp'] * idx + float(lv['pidx'][0])
         D *= lv['Dp']
     # pulse p covers [p - 1/2, p + 1/2); a subaperture spans [idx - D/2, idx + D/2] within the collection
-    a = np.clip(idx - D / 2, -0.5, P - 0.5); b = np.clip(idx + D / 2, -0.5, P - 0.5)
+    a = np.clip(idx - D / 2, first - 0.5, first + P - 0.5); b = np.clip(idx + D / 2, first - 0.5, first + P - 0.5)
     if nodes == 1:
         t, gw = np.array([0.0]), np.array([1.0])
     else:
         t, gw = np.array([-np.sqrt(0.6), 0.0, np.sqrt(0.6)]), np.array([5.0, 8.0, 5.0]) / 18.0
-    nodes_ = np.clip(np.rint(0.5 * (a + b)[:, None] + 0.5 * (b - a)[:, None] * t[None, :]), 0, P - 1).astype(np.int64)
+    nodes_ = np.clip(np.rint(0.5 * (a + b)[:, None] + 0.5 * (b - a)[:, None] * t[None, :]), first, first + P - 1).astype(np.int64)
     U, inv = np.unique(nodes_.ravel(), return_inverse=True)
     W = np.asarray(weight(q, U), np.float64)[inv].reshape(len(idx), len(t), -1)    # [Pf, nodes, npoints]
     # a subaperture centered beyond the collection holds the filter tails of the edge pulses (the decimators run m
@@ -304,11 +307,19 @@ class ImageFormer:
     wide-band collection); True: wherever the gate keeps less than half of the samples; False: never. The image
     equals the ungated one to the former's accuracy. On the cuda backend the gate runs on the device in blocks
     sized to the memory that is free, and on the host on all cores when other work has filled the device (the
-    note then says so). former.range_gate: None, or dict(K, kept, note)."""
+    note then says so). former.range_gate: None, or dict(K, kept, note).
+    padded: (first, count, pulse) when ant is an aperture of `count` pulses from pulse `first` with zero pulses
+    added around it (a mosaic pads a JAX or TPU patch to a pulse count that patches share a compiled program at) and
+    aperture_weight is to cut that aperture where the former of the aperture alone cuts it: a weight with a step (a
+    rectangle over a pixel's band) is applied per final subaperture, so two formers agree on it only if their
+    subapertures are the same pulses. pulse: the pulse decimations and passbands of the aperture's own plan
+    (ffbp2.pulse_plan; make_plan's pulse=), with `first` a multiple of the product of the decimations; the weight is
+    then averaged over the aperture's pulses alone, and the jax and tpu backends apply it in the form of the cpu and
+    cuda final stages, (w0 + gx dx)(1 + gy / w0 dy), in one final stage (without padded: w0 + gx dx + gy dy, three)."""
 
     def __init__(self, ant, fmin, df, K, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 1.0, 0.0), *, backend='auto',
                  precision='float32', window=True, T='auto', levels=None, pmax=0.4, target_db=-40.0, aperture_weight=None,
-                 ref=None, range_gate='auto'):
+                 ref=None, range_gate='auto', padded=None):
         from . import ffbp2
         import warnings
         self.ant = _check_positions(ant)
@@ -350,10 +361,16 @@ class ImageFormer:
         if range_gate not in ('auto', True, False):
             raise ValueError(f"range_gate must be 'auto', True or False, got {range_gate!r}")
 
+        if padded is not None and (aperture_weight is None or levels is None or len(padded[2]) != levels
+                                   or not 0 <= padded[0] <= self.P - padded[1]):
+            raise ValueError('padded=(first, count, pulse) goes with an aperture_weight, the levels of the plan that '
+                             f'pulse is from and an aperture within the {self.P} pulses, got {padded!r}')
+
         def planned(col, nlev):
             while True:
                 try:
-                    return ffbp2.make_plan(col, nx, ny, spx, spy, T=T, nlev=nlev, pmax=pmax, e1=e1, e2=e2), nlev
+                    return ffbp2.make_plan(col, nx, ny, spx, spy, T=T, nlev=nlev, pmax=pmax, e1=e1, e2=e2,
+                                           pulse=padded and padded[2]), nlev
                 except ValueError as e:
                     if levels is not None or 'cannot split' not in str(e) or nlev >= 8:
                         raise
@@ -379,7 +396,8 @@ class ImageFormer:
         self.levels = nlev
         self._plan = plan
         coll = ffbp2.collection_arrays(plan, self.ant, ref)
-        wf = None if aperture_weight is None else final_weights(plan, aperture_weight, self.P, grad=os.environ.get('FASTSAR_WEIGHT_GRAD', '1') == '1')
+        wspan = dict(P=self.P) if padded is None else dict(P=int(padded[1]), first=int(padded[0]))
+        wf = None if aperture_weight is None else final_weights(plan, aperture_weight, grad=os.environ.get('FASTSAR_WEIGHT_GRAD', '1') == '1', **wspan)
         if window:
             self.wp, self.wk = _window(self.P, self.K)
         if self.backend == 'cuda':
@@ -414,7 +432,16 @@ class ImageFormer:
                            f'of TPU memory, the device has {_mem._gb(_mem.tpu_capacity())}')
             self._fn, static = self._program(ng)
             self._arrs = ffbp2.device_arrays(pol, plan, coll, static)
-            if wf is not None:
+            if wf is not None and padded is not None and wf.ndim == 3:
+                # the cpu final stage's factors (ffbp_cpu.make_ffbp_cpu): the gradient along e2 over the weight,
+                # left out where the weight is under 1e-6 of the largest of its first-level tile
+                import jax.numpy as jnp
+                G = plan['levels'][0]['C']
+                w0 = wf[0].reshape(G, -1)
+                big = np.abs(w0) > 1e-6 * np.maximum(np.abs(w0).max(1, keepdims=True), 1e-30)
+                gyr = np.where(big, wf[2].reshape(G, -1) / np.where(w0 == 0, 1, w0), 0.0).astype(np.float32)
+                self._arrs['final']['wp'] = jnp.asarray(np.stack([wf[0], wf[1], gyr.reshape(wf[0].shape)]))
+            elif wf is not None:
                 import jax.numpy as jnp
                 self._arrs['final']['w'] = jnp.asarray(wf if wf.ndim == 3 else np.stack([wf, 0 * wf, 0 * wf]))
         else:

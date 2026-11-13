@@ -358,6 +358,17 @@ def gate_bins(fx, ant, center, pts, lo, hi, margin=None, guard=None):
     return _gate_bins(a, np.linalg.norm(a - center, axis=1), center, pts, margin, K2, float(fx['df'])), K2
 
 
+def _gate_samples(f0, df, K2, N, band, guard):
+    """The frequency samples of a history gated to N of its K2 range bins (all of them: no gate): -> (gate, df2,
+    f2 [N or K2], taper over them, k0, k1: the samples kept, those the taper does not zero)."""
+    gate = N < K2
+    df2 = K2 * df / N if gate else df
+    f2 = f0 + df2 * np.arange(N if gate else K2)
+    T = _taper(f2, band, guard)
+    keep = np.nonzero(T > 0)[0]
+    return gate, df2, f2, T, int(keep[0]), int(keep[-1]) + 1
+
+
 def patch_history(fx, ant, center, pts, lo, hi, margin=None, guard=None, prof=None, gate_len=None):
     """Phase history of one patch: pulses lo:hi of fx re-referenced to center [3] and gated in range to the extent
     of the points pts [m, 3] (the patch outline) plus margin (m), with the guard taper. prof: range_profiles(fx, guard)
@@ -375,12 +386,7 @@ def patch_history(fx, ant, center, pts, lo, hi, margin=None, guard=None, prof=No
     N = _gate_bins(a, rc, center, pts, margin, K2, df)
     if gate_len is not None and N < K2:
         N = min(gate_len(N), K2)
-    gate = N < K2
-    df2 = K2 * df / N if gate else df
-    f2 = f0 + df2 * np.arange(N if gate else K2)
-    T = _taper(f2, band, guard)
-    keep = np.nonzero(T > 0)[0]
-    k0, k1 = int(keep[0]), int(keep[-1]) + 1
+    gate, df2, f2, T, k0, k1 = _gate_samples(f0, df, K2, N, band, guard)
     out = np.empty((hi - lo, k1 - k0), np.complex128)
     j = (np.arange(N) + N // 2) % N - N // 2
 
@@ -620,6 +626,12 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
     points of the patch is split into separable terms
     (weight_terms, down to wtol_db, default target_db - 10), each formed by one FFBP of the weighted phase history
     and multiplied by its pixel factor, interpolated by bicubic splines.
+    With amask the weight has a step at the band's edge, which the final stage places per final subaperture and
+    tile: where the pulses are cut into subapertures decides where each pixel's band ends. The jax and tpu backends
+    pad a patch's pulses and range gate to sizes that patches share a compiled program at, so under amask they take
+    the tile size, the sub-grid, the levels and the pulse decimations from the patch as the cpu and cuda backends
+    form it (its own pulses, its own gate), put a multiple of one final subaperture's pulses in front, and apply
+    the weight in the cpu final stage's form (ImageFormer's padded=): the backends then cut the same band.
     pulses: (lo, hi) or a function of the patch center returning (lo, hi), used when beam is None (default: all).
     beam, pulses and the window are evaluated on the prefetch worker threads, several at once when
     FASTSAR_MOSAIC_PREFETCH is above 1 (the default on a GPU or TPU), so callables must be thread-safe (a pure NumPy
@@ -631,7 +643,8 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
     info: a list to which a dict per patch is appended (center, pulse range, K, T, sub, levels, predicted error,
     number of weight terms)."""
     from scipy.interpolate import RectBivariateSpline
-    from .api import ImageFormer, _backend, _check_history, _check_positions, _check_grid
+    from .api import ImageFormer, Collect, _backend, _check_history, _check_positions, _check_grid
+    from .ffbp2 import make_plan, pulse_plan
     backend = _backend(backend)
     missing = [k for k in ('S', 'fmin', 'df', 'ref') if k not in fx]
     if missing:
@@ -656,6 +669,7 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
     # the azimuth window in the final stage of a single FFBP; FASTSAR_WEIGHT_TERMS=1 and exact=True use the separable
     # terms, one FFBP (or exact backprojection) each
     in_kernel = not exact and os.environ.get('FASTSAR_WEIGHT_TERMS', '0') != '1'
+    stepped = amask and in_kernel and beam is not None and awin is not None      # a step in the final stage's weight
     out = np.zeros((nx, ny), np.complex64)
     npatch = -(-nx // mx) * -(-ny // my)
     prof = range_profiles(fx, guard) if npatch > 1 and os.environ.get('FASTSAR_SHARED_PROFILES', '1') != '0' else None
@@ -722,6 +736,13 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
             taken.append(v)
             return v
 
+    def gate_axis(c, pts, lo, hi):
+        """The frequency samples of a patch's history as patch_history gates it with no widening: (fmin, df, K)."""
+        N, K2 = gate_bins(fx, ant, c, pts, lo, hi, margin, guard)
+        g, band, npl, _, f0 = _padding(fx, guard)
+        _, df2, f2, _, k0, k1 = _gate_samples(f0, float(fx['df']), K2, N, band, g)
+        return float(f2[k0]), float(df2), k1 - k0
+
     def span_of(i0, j0):
         """Center, points and pulse span (lo, hi) of patch (i0, j0); span None when no pulse serves it."""
         c = o + (i0 - crop + px / 2) * spx * e1 + (j0 - crop + py / 2) * spy * e2
@@ -772,18 +793,34 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
             Tp, s12, nlev, err = None, None, None, None
         else:
             af, idx = fill_gaps(a)
+            own = None
+            if backend in ('jax', 'tpu') and stepped:
+                # the patch as the cpu and cuda backends form it, before the padding below: its tiles, levels and
+                # pulse decimations, from its own pulses and the samples of its own gate
+                n0 = len(af)
+                f0r, dfr, Kr = gate_axis(c, pts, lo, hi)
+                Tp, s12, err = tile_plan(af, f0r + Kr * dfr, px, py, spx, spy, e1, e2, target_db,
+                                         (32, 16) if T == 'auto' else (T,), subs)
+                nlev = _levels(min(px * s12[0], py * s12[1]), Tp) if levels == 'auto' else levels
+                pulse, D = pulse_plan(make_plan(Collect(fmin=f0r, df=dfr, K=Kr, ant=af, res=0.5), px * s12[0], py * s12[1],
+                                                spx / s12[0], spy / s12[1], T=Tp, nlev=nlev, e1=e1, e2=e2))
             if backend in ('jax', 'tpu'):         # pulses padded (padded_pulses) so that patches share compiled
                 # programs: zero pulses continuing the track, half before and half after (the final stage centers
-                # its plane-wave model on the mean over the aperture)
+                # its plane-wave model on the mean over the aperture); under a weight with a step, the multiple of
+                # a final subaperture's pulses nearest to half before, which keeps the subapertures where they are
                 extra = padded_pulses(len(af)) - len(af)
+                e0 = extra // 2 if not stepped else D * int(round(extra / 2 / D))
+                if stepped:
+                    own = (e0, n0, pulse)
                 if extra:
-                    e0, e1_ = extra // 2, extra - extra // 2
+                    e1_ = extra - e0
                     af = np.concatenate([af[0] - (af[1] - af[0]) * np.arange(e0, 0, -1)[:, None], af,
                                          af[-1] + (af[-1] - af[-2]) * np.arange(1, e1_ + 1)[:, None]])
                     idx = idx + e0
-            Tp, s12, err = tile_plan(af, f0 + S.shape[1] * df, px, py, spx, spy, e1, e2, target_db, tiles, subs)
+            if own is None:
+                Tp, s12, err = tile_plan(af, f0 + S.shape[1] * df, px, py, spx, spy, e1, e2, target_db, tiles, subs)
+                nlev = _levels(min(px * s12[0], py * s12[1]), Tp) if levels == 'auto' else levels
             s1, s2 = s12
-            nlev = _levels(min(px * s1, py * s2), Tp) if levels == 'auto' else levels
             aw = None
             if beam is not None and awin is not None and in_kernel:
                 def aw(q, pul, c=c, lo=lo, idx=idx):
@@ -792,7 +829,7 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
                     k = np.clip(np.searchsorted(idx, pul), 0, len(idx) - 1)
                     return wu(beam(lo + k, np.asarray(q) + c))
             former = ImageFormer(af, f0, df, S.shape[1], px * s1, py * s2, spx / s1, spy / s2, e1, e2, backend=backend, precision=precision,
-                                 window=False, T=Tp, levels=nlev, aperture_weight=aw)
+                                 window=False, T=Tp, levels=nlev, aperture_weight=aw, padded=own)
 
             def form(S_, former=former, idx=idx, n=len(af), s1=s1, s2=s2):
                 xp = _xp(S_)

@@ -1022,8 +1022,13 @@ azimuth band, zero outside it: what Taylor weighting means for a spotlight, appl
 is 22% wider and whose first sidelobe is 3.5 dB higher; `azimuth_window='taylor'` or `'uniform'` selects the
 others. The weights enter the
 final stage of the factorized backprojection of each patch, per subaperture and tile with their slope across the
-tile. Measured on a simulated broadside stripmap, a 3 degree squinted one and a sliding spotlight
-(`tests/test_moving.py`; widths in units of the reciprocal band, azimuth then range):
+tile. The rectangle and the Taylor window's pedestal end in a step at the edge of the band, which the final stage
+places by subaperture: a pixel's band ends within one final subaperture of the pulses its beam gives it (24 of
+1,000 pulses on the simulated stripmap). Every backend places it at the same pulses, the jax and tpu backends by
+laying each patch out as the cpu and cuda backends form it, whatever pulse count and range gate their compiled
+program is shared at ([docs/stripmap-burst.md](stripmap-burst.md)). Measured on a simulated broadside stripmap, a
+3 degree squinted one and a sliding spotlight (`tests/test_moving.py`; widths in units of the reciprocal band,
+azimuth then range):
 
 | Azimuth window | 3 dB width | Peak sidelobe | Theory |
 |---|---|---|---|

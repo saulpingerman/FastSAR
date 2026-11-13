@@ -49,6 +49,13 @@ tile (the JAX program instead evaluates its final stage three times). C++ and CU
 patch that misses the target at T=16 is formed on a finer grid (2 or 4 times, range first) and decimated; JAX also
 accepts T=8. `exact=True` uses exact backprojection, with the window split into separable SVD terms.
 
+A window cut at the edge of the band (`amask`: a rectangle, a Taylor window's pedestal) has a step there, and the
+final stage places the step by subaperture, so a pixel's band ends where the pulses are cut into final
+subapertures. The JAX and TPU programs pad a patch's pulses and range gate to shared sizes, which would cut them
+elsewhere. Under `amask` they therefore take the tile size, sub-grid, levels and pulse decimations of the patch as
+C++ and CUDA form it, put a whole number of final subapertures of zero pulses in front, and apply the weight in the
+C++ final stage's form in one final stage (`ImageFormer(padded=)`): every backend cuts each band at the same pulses.
+
 Test results (`tests/test_patches.py`, 12 patches of 128 by 128 pixels, about 1 s on four CPU threads), error
 against float64 backprojection near the targets:
 

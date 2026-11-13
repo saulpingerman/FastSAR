@@ -18,10 +18,11 @@ CPHD reader.
     and its extension, a window that holds nothing beyond the tasked swath, a file without an antenna pattern, and
     the check of the antenna block against the beam's footprint in the phase history: the pointing it chooses for
     a beam whose reference point moves, and the refusal of the areas when no pattern is trusted.
-(d) The backends give the same products. On JAX's device, where everything is float32: the baseband phase of an
-    orbit at 600 km over tens of kilometers of ground against the phase in double, and the stages with a device
-    budget of a fifth of a megabyte (blocks of a few rows or columns, an image kept on the host) against the
-    unblocked ones, with no device array larger than the budget.
+(d) The backends give the same products, and under a window with a step at the band's edge (the rectangle, a
+    Taylor window's pedestal) JAX's former cuts each pixel's band at the pulses the cpu former cuts it at. On JAX's
+    device, where everything is float32: the baseband phase of an orbit at 600 km over tens of kilometers of ground
+    against the phase in double, and the stages with a device budget of a fifth of a megabyte (blocks of a few rows
+    or columns, an image kept on the host) against the unblocked ones, with no device array larger than the budget.
 
 Limits are about twice the departures measured when they were set."""
 import gc
@@ -632,6 +633,67 @@ def test_backends_agree(backend):
         assert e < 2e-2, (kw, e)
         if 'area' in kw:
             assert np.array_equal(o['image'] == 0, ref['image'] == 0) and (o['image'] == 0).any()
+
+
+def test_jax_cuts_each_band_where_the_cpu_does(strip):
+    """A weighting with a step at the edge of each pixel's azimuth band (the rectangle of the default product, the
+    pedestal of a Taylor window) enters the former per final subaperture, so the band ends where the pulses are cut
+    into subapertures. The JAX former pads a patch's pulses and its range gate to the sizes its compiled programs
+    are shared at, and must still cut the pulses where the cpu former does: a mosaic of patches with their own
+    pulse counts under form_cphd's rectangle and Taylor window, then the default product and the Taylor-weighted
+    one (one patch fitted to the grid). With subapertures of its own the JAX image was 2e-3 to 3e-2 of the peak and
+    -23 to -41 dB of the image away from the cpu's; here they agree to 5e-4 and -69 dB or better."""
+    pytest.importorskip('jax')
+    name, c = strip
+
+    def departure(a, b):
+        d = np.abs(b - a).astype(np.float64)
+        return d.max() / np.abs(a).max(), 10 * np.log10((d ** 2).sum() / (np.abs(a).astype(np.float64) ** 2).sum())
+    runs = [(f'form_cphd {aw}', lambda be, aw=aw: fastsar.form_cphd(name + '.cphd', backend=be, extent=EXT, patch=64,
+                                                                    azimuth_window=aw, window=aw == 'taylor'))
+            for aw in ('uniform', 'taylor')]
+    runs += [(f'process_cphd {kw}', lambda be, kw=kw: fastsar.process_cphd(name + '.cphd', backend=be, extent=EXT, **kw))
+             for kw in ({}, dict(weighting='taylor', autofocus=False))]
+    worst = []
+    for what, run in runs:
+        ref, o = run('cpu'), run('jax')
+        assert o['image'].shape == ref['image'].shape and o['window'] == ref['window']
+        pk, db = departure(ref['image'], np.asarray(o['image']))
+        print(f'  {name} {what}: {pk:.1e} of the peak, {db:.1f} dB')
+        worst.append((what, float(pk), round(float(db), 1)))
+    assert max(w[1] for w in worst) < 2e-3 and max(w[2] for w in worst) < -60, worst
+
+
+def test_tpu_programs_cut_each_band_where_the_cpu_does(strip, monkeypatch):
+    """The same through the tpu backend's programs, whose final stage is a Pallas kernel that takes the two factors
+    of the weight (pallas_ffbp.fused_final2's weights=). On a TPU the kernels are the device's; elsewhere they run
+    in interpret mode on the CPU (as in tests/test_pallas_e2e.py), which checks what the programs compute and not
+    that a TPU compiles them."""
+    pytest.importorskip('jax')
+    from fastsar import api, pallas_ffbp
+    name, c = strip
+    weighted = []
+    real = 'tpu' in fastsar.available_backends()
+    monkeypatch.setattr(api, '_JAX_PROGRAMS', {})                   # the programs made here are not kept
+    monkeypatch.setenv('FFBP_FORCE_TPU_KERNELS', '1')
+    for k in ('fused_rotate_dec_k2', 'fused_rotate_dec_k3', 'fused_final', 'fused_final2', 'fused_final3'):
+        def kernel(*a, _f=getattr(pallas_ffbp, k), _k=k, **kw):
+            weighted.append((_k, kw.get('weights') is not None))
+            return _f(*a, **(kw if real else {**kw, 'interpret': True}))
+        monkeypatch.setattr(pallas_ffbp, k, kernel)
+    worst = []
+    for what, run in (
+            [(f'form_cphd {aw}', lambda be, aw=aw: fastsar.form_cphd(name + '.cphd', backend=be, extent=EXT, patch=64,
+                                                                     azimuth_window=aw, window=aw == 'taylor'))
+             for aw in ('uniform', 'taylor')]
+            + [('process_cphd', lambda be: fastsar.process_cphd(name + '.cphd', backend=be, extent=EXT))]):
+        ref, o = run('cpu'), run('tpu')
+        d = np.abs(np.asarray(o['image']) - ref['image']).astype(np.float64)
+        pk, db = d.max() / np.abs(ref['image']).max(), 10 * np.log10((d ** 2).sum() / (np.abs(ref['image']).astype(np.float64) ** 2).sum())
+        print(f'  {name} {what} (tpu programs{"" if real else ", interpreted"}): {pk:.1e} of the peak, {db:.1f} dB')
+        worst.append((what, float(pk), round(float(db), 1)))
+    assert ('fused_final2', True) in weighted and ('fused_final2', False) not in weighted, set(weighted)
+    assert max(w[1] for w in worst) < 2e-3 and max(w[2] for w in worst) < -60, worst
 
 
 @pytest.mark.cuda
