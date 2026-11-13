@@ -198,6 +198,10 @@ was published on PyPI.
 - `fastsar._xp.device(a, 'cuda')` returned before a page-locked host array (the image a cuda former returns) had
   been read, so that writing the host array afterwards changed the device copy. No path of 0.2.0 wrote it. The
   copy is now complete when the call returns.
+- The cuda backend at `precision='float16'` could run out of device memory at the very end of a formation that
+  fit: the image was scaled back from the half range into a new array while the padded image and an uploaded
+  phase history were still on the device (a Capella spotlight of 94,513 pulses by 38,400 samples on a 24 GB L4).
+  The image is now scaled in place; the pixels are unchanged.
 - Under a memory limit (a container, a systemd scope, a batch job) the memory FastSAR took as available was the
   limit less the group's usage with its page cache counted, so that a collection just read from disk counted
   twice and `form_cphd` could refuse, with "... GiB is available", an image that fit. The group's file cache,

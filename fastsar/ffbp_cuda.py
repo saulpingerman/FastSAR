@@ -1196,7 +1196,9 @@ def make_ffbp_cuda(plan, coll, final_mode='fp32', store='fp32', wf=None):
                 ng = max(1, ng // 2)
                 memory._warn(f'cuda: out of GPU memory in the later levels; FastSAR continues in first-level groups of '
                              f'{memory._nchildren(ng)}, which is slower ({memory._gb(memory.cuda_free())} free)')
-        img = full[ox:ox + nx, oy:oy + ny] if scale == 1.0 else full[ox:ox + nx, oy:oy + ny] * np.float32(scale)
+        img = full[ox:ox + nx, oy:oy + ny]
+        if scale != 1.0:            # in place: a scaled copy beside `full` and an uploaded history may not fit
+            img *= np.float32(scale)
         if scaled and not bool(cp.isfinite(img).all()):
             if _scale is None:
                 del img, full
