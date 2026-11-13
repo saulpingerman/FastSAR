@@ -662,24 +662,30 @@ def _apply(img, plan, bins, Wq, B, pad, nr):
     out = np.empty((nx, ny), np.complex64)
     w = int(max(64, af._BLOCK['numpy'] // (2 * (B + 2 * pad))))
     for p, r0 in zip(plan, done):
-        terms = p['terms']
-        hs = np.empty((B, ny), np.float32) if terms else None
-        Ts = np.empty((len(terms), B, ny), np.complex64) if terms else None
-        z0 = np.empty((B, ny), np.complex64)
+        terms, z0, off = p['terms'], out[r0:p['s0'] + B], r0 - p['s0']
+        if terms:
+            hs, zs, Ts = (np.empty((B, ny), np.float32), np.empty((B, ny), np.complex64),
+                          np.empty((len(terms), B, ny), np.complex64))
+            nz = np.empty((B, ny), bool)
 
         def work(j):                                                # column blocks on all cores
             cs = slice(j, j + w)
             blk = rows(p['s0'], cs)
             z, h, T = _strip(np, sfft, blk, bins, *args(p, cs), p['um'], terms, B, pad, {})
             if terms:
-                hs[:, cs], Ts[:, :, cs] = h, T
-                z0[:, cs] = z
+                hs[:, cs], zs[:, cs], nz[:, cs] = h, z, blk[pad:pad + B] != 0
+                for t, Tt in zip(Ts, T):
+                    t[:, cs] = Tt
             else:
-                z0[:, cs] = keep0(z, blk)
+                z0[:, cs] = keep0(z, blk)[off:]
         af._threads(work, range(0, ny, w))
-        if terms:                                                   # the walk's transforms span whole rows
-            z0 = keep0(_walk(np, sfft, z0, hs, Ts, terms, Wq, nr, dict(workers=-1)), rows(p['s0']))
-        out[r0:p['s0'] + B] = z0[r0 - p['s0']:]
+        if terms:                                                   # the walk's transforms along whole rows
+
+            def walk(i):
+                rs = slice(max(i, off), min(i + 8, B))
+                z = _walk(np, sfft, zs[rs], hs[rs], Ts[:, rs], terms, Wq, nr, dict(workers=1))
+                z0[rs.start - off:rs.stop - off] = np.where(nz[rs], z, 0)
+            af._threads(walk, [i for i in range(0, B, 8) if i + 8 > off])
     return out
 
 
