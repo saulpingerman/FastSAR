@@ -597,6 +597,18 @@ def test_coherent_sum(pairs, clutter, tmp_path, need):
     assert abs(g['snr'] - g['expected']) < 0.2 and abs(g['incoherent'] - 3.01) < 0.05 and g['coherence'] > 0.97
     assert abs(g['second'] - g['snr']) < 0.15                          # equal noise: the same against either image
     assert abs(s['amplitude_factor'] - 1) < 0.03 and s['window'] == outs[0]['window']
+    assert g['noise_reference'] == 'incoherent'
+    # dark ground the two images share (a smooth playa, calm water): darker than the noise and coherent. It is not
+    # noise, and the noise is still read where the pair is incoherent (on the darkest ground it read 6 dB)
+    rng = np.random.default_rng(5)
+    a2, b2 = (dict(o, image=o['image'].copy()) for o in outs)
+    n0 = a2['image'].shape[0] // 4
+    level = 0.05 * float(np.median(np.abs(outs[0]['image'][outs[0]['image'] != 0])))
+    shared = (level * (rng.standard_normal((n0, a2['image'].shape[1])) + 1j * rng.standard_normal((n0, a2['image'].shape[1])))).astype(np.complex64)
+    a2['image'][:n0], b2['image'][:n0] = shared, shared
+    d = stack.coherent_sum(a2, b2, dark=0.2)['gain']
+    print(f"with shared dark ground: noise {d['noise']:+.2f} dB ({d['noise_reference']}), signal to noise {d['snr']:+.2f} dB")
+    assert d['noise_reference'] == 'incoherent' and abs(d['noise'] - 3.01) < 0.3 and abs(d['snr'] - g['snr']) < 0.3
     twice = stack.coherent_sum(outs[0], outs[0])
     assert np.allclose(twice['image'], 2 * outs[0]['image'], rtol=1e-4, atol=1e-4 * np.abs(outs[0]['image']).max())
     inc = stack.coherent_sum(clutter[0], clutter[2])['gain']
