@@ -34,27 +34,47 @@ scatterer at y with the phase of its range at the COA, which is where and how SI
 quadratic term carries the phase from orbit, where the cubic is a hundredth of it or less; a short range and a
 track with a jerk need more terms (the simulated collection of the tests: order 6 to 8, the cubic the largest).
 
+Range walk. phi is the phase at the center frequency. At frequency f the phase is f / fc phi_p, and pulse p lies at
+another azimuth frequency (each pulse's spectral line is a ray from the origin of the wavenumber plane), so that
+over the image's 2-D spectrum the phase is a function psi(v, w) of the azimuth frequency and of w = eta / eta_c,
+the range frequency (eta, cycles per pixel of axis 1) as a fraction of the center frequency's (eta_c). From orbit
+the part that varies with w, the range walk, is about -w c_2 v^2, B / (2 fc) of the phase at the band's corners:
+a correction along axis 0 alone leaves 0.009 of the phase in rms, -34 dB at 3 rad. _Model fits
+psi = sum_n c_n v^n + w sum_n d_n v^n + w^2 sum_n e_n v^n to the exact phase at every pulse and five frequencies.
+
 Correction (focus). The height of the surface each pixel shows is found on a lattice by solving the layover
-relation (heights); the polynomial's coefficients, exact functions of position and height, follow from it; and the
-phase is removed by the strips of autofocus.spatially_variant: per column, so that it follows range from pixel to
-pixel, and cross-faded along azimuth over `block` rows, on the device that holds the image, with its exact zeros
-kept. The image stays on its plane: pixels, geolocation and the SICD's projection are unchanged, and heights still
-enter geolocation as they did (products.geolocate, geocode_image). It is not an orthorectification.
+relation (heights); the coefficients, exact functions of position and height, follow from it. The image is
+corrected in strips of `block` rows along azimuth, each read with as many rows again on either side as the phase
+displaces, on the device that holds the image, with its exact zeros kept. Within a strip, per column, each pixel
+is corrected for its own height: the strip is corrected for a few heights that span the column's heights over the
+strip's rows (Chebyshev nodes, as many as keep the interpolation in height within tol / 2 at the band edge) and
+each pixel takes the interpolation between them at its height, which is what exact backprojection onto the
+surface does pixel by pixel. The range walk, proportional to the height, is removed by a series in w (the terms
+of exp(-1j w h D) - 1, h the pixel's height, D the walk per meter), each term's azimuth part applied with the
+strip's and its w part through each row's spectrum. A strip takes its middle row's geometry; from orbit the phase
+at a fixed height changes by under a thousandth along 64 m, at a short range strips shorten until the change over
+half a strip is under tol / 8. The image stays on its plane: pixels, geolocation and the SICD's projection are
+unchanged, and heights still enter geolocation as they did (products.geolocate, geocode_image). It is not an
+orthorectification.
 
 Limits. One correction serves the heights that share a pixel: in layover (several surface points at one range and
-Doppler) their mean is used, weighted by the ground area each contributes, and within a strip the height is
-averaged along azimuth over half a block, so that cliffs keep a residual. The phase is taken at the center
-frequency: over the band it varies by B / (2 fc) of itself (the range error behind it, phi lambda / (4 pi), walks
-the response across range), which a correction along axis 0 leaves: negligible while |phi| B / (2 fc) stays under
-a quarter of a radian, 8 rad of phase at a 3% band. The DEM's own errors remain, for the data-driven autofocus
-that runs after it. Moving-beam collections are not handled: the model holds for them pixel by pixel with the
-pulses that illuminate the pixel and their own center of aperture, and the correction would run per patch of the
-mosaic on its track axes.
+Doppler) their mean is used, weighted by the ground area each contributes, as surface_points does. The walk's
+series stops at eight terms: beyond about 4.5 rad of walk at the band's corners the walk is left as it is (the
+simulated 10 km collection of the tests at 300 m: 13 to 19 rad, two range cells; Etna's deepest ground: 0.25 rad). The interpolation in height stops at eight heights, enough for 4.3 rad of
+phase across one column's heights within a strip (Etna: 1.6 rad at most). The correction treats the image's
+spectrum near a pixel as plane waves; at a short range the wavefronts' curvature over the correction's kernel
+limits it (a 300 m cliff at 10 km: -35 dB against exact backprojection onto the surface), from orbit it does not
+(Etna: -49 to -52 dB, the plane former's own agreement with exact backprojection). The DEM's own errors remain,
+for the data-driven autofocus that runs after it. Moving-beam collections are not handled: the model holds for them
+pixel by pixel with the pulses that illuminate the pixel and their own center of aperture, and the correction
+would run per patch of the mosaic on its track axes.
 
 Formation onto the surface itself is the exact kernel's work: fastsar.backproject at surface_points.
 """
 import math
+import os
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import scipy.fft as sfft
@@ -357,7 +377,8 @@ def focus(out, dem, *, order=None, block=None, post=None, tol=0.05, check=True):
     order: the degree of the polynomial in azimuth frequency, 2 to 8; None: the lowest that fits the model within
         tol / 5 at the heights of the scene (2 from orbit; more for a short range or a track with a jerk). Terms
         that stay under tol / 10 are dropped.
-    block: rows of a strip of the correction (default: about 64 m, at least 32 rows and eight times the blur).
+    block: rows of a strip of the correction (default: about 64 m, at least 32 rows and eight times the blur, and
+        fewer, down to 16, where the geometry changes along azimuth by more than tol / 8 over half a strip).
     post: heights' lattice spacing (m). tol: nothing is applied when the phase stays below it everywhere (rad).
     check: warn (TerrainWarning, and a note) when the median of the DEM over the image is further from the image
     plane, the collection's stated scene height, than 10 m plus three times the DEM's standard deviation there:
@@ -368,7 +389,11 @@ def focus(out, dem, *, order=None, block=None, post=None, tol=0.05, check=True):
     each term's coefficient [len(powers), 2] (rad at the band edge); quadratic_rad: the same of the quadratic term;
     height: (least, median, greatest) of the surface above the image plane (m); offset, relief: the median and
     the standard deviation of the DEM above the plane at the pixels' own positions (m); layover, outside: heights';
-    block, post; order; fit_rad: the largest misfit of the polynomial and of its model over the image (rad))."""
+    block, post; order; fit_rad: the largest misfit of the polynomial and of its model over the image (rad); and,
+    when applied, levels: the most heights a strip column was corrected for; height_rad: the largest phase across
+    one column's heights within a strip, half of it (rad at the band edge); walk_rad: the largest range walk (rad
+    at the band's corners); walk_terms: the most terms of its series; walk_left_rad: the walk left where it
+    is beyond the series, 0 elsewhere)."""
     if order is not None and not 2 <= int(order) <= 8:
         raise ValueError(f'order must be 2 to 8, got {order!r}')
     grid, fr, ant, fc = _scene(out)
@@ -658,32 +683,38 @@ def _apply(img, plan, bins, Wq, B, pad, nr):
         return jnp.concatenate(parts, axis=0) if k == 'jax' else out
     out = np.empty((nx, ny), np.complex64)
     w = int(max(64, af._BLOCK['numpy'] // (2 * (B + 2 * pad))))
-    for p, r0 in zip(plan, done):
-        terms, z0, off = p['terms'], out[r0:p['s0'] + B], r0 - p['s0']
-        if terms:
-            hs, zs, Ts = (np.empty((B, ny), np.float32), np.empty((B, ny), np.complex64),
-                          np.empty((len(terms), B, ny), np.complex64))
-            nz = np.empty((B, ny), bool)
-
-        def work(j):                                                # column blocks on all cores
-            cs = slice(j, j + w)
-            blk = rows(p['s0'], cs)
-            z, h, T = _strip(np, sfft, blk, bins, *args(p, cs), p['um'], terms, B, pad, {})
-            if terms:
-                hs[:, cs], zs[:, cs], nz[:, cs] = h, z, blk[pad:pad + B] != 0
-                for t, Tt in zip(Ts, T):
-                    t[:, cs] = Tt
-            else:
-                z0[:, cs] = keep0(z, blk)[off:]
-        af._threads(work, range(0, ny, w))
-        if terms:                                                   # the walk's transforms along whole rows
-
-            def walk(i):
-                rs = slice(max(i, off), min(i + 8, B))
-                z = _walk(np, sfft, zs[rs], hs[rs], Ts[:, rs], terms, Wq, nr, dict(workers=1))
-                z0[rs.start - off:rs.stop - off] = np.where(nz[rs], z, 0)
-            af._threads(walk, [i for i in range(0, B, 8) if i + 8 > off])
+    with ThreadPoolExecutor(os.cpu_count() or 1) as ex:
+        for p, r0 in zip(plan, done):
+            _host_strip(ex, p, r0, rows, args, keep0, bins, Wq, B, pad, nr, ny, w, out)
     return out
+
+
+def _host_strip(ex, p, r0, rows, args, keep0, bins, Wq, B, pad, nr, ny, w, out):
+    """One strip on the host: its column blocks, then the walk's row transforms, on the threads of ex."""
+    terms, z0, off = p['terms'], out[r0:p['s0'] + B], r0 - p['s0']
+    if terms:
+        hs, zs, Ts = (np.empty((B, ny), np.float32), np.empty((B, ny), np.complex64),
+                      np.empty((len(terms), B, ny), np.complex64))
+        nz = np.empty((B, ny), bool)
+
+    def work(j):                                                # column blocks on all cores
+        cs = slice(j, j + w)
+        blk = rows(p['s0'], cs)
+        z, h, T = _strip(np, sfft, blk, bins, *args(p, cs), p['um'], terms, B, pad, {})
+        if terms:
+            hs[:, cs], zs[:, cs], nz[:, cs] = h, z, blk[pad:pad + B] != 0
+            for t, Tt in zip(Ts, T):
+                t[:, cs] = Tt
+        else:
+            z0[:, cs] = keep0(z, blk)[off:]
+    list(ex.map(work, range(0, ny, w)))
+    if terms:                                                   # the walk's transforms along whole rows
+
+        def walk(i):
+            rs = slice(max(i, off), min(i + 8, B))
+            z = _walk(np, sfft, zs[rs], hs[rs], Ts[:, rs], terms, Wq, nr, dict(workers=1))
+            z0[rs.start - off:rs.stop - off] = np.where(nz[rs], z, 0)
+        list(ex.map(walk, [i for i in range(0, B, 8) if i + 8 > off]))
 
 
 def _stage(out, dem):

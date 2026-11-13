@@ -802,19 +802,39 @@ cannot see an offset of 20 m under 200 m of relief.
 each pixel shows: the point of the DEM on the pixel's circle of constant range and Doppler, by a scan over
 height. Where the circle meets the surface more than once (layover: a slope steeper than the line of sight),
 the heights of the crossings are averaged with the ground area each contributes as the weight; outside the
-DEM nothing is corrected. `terrain.coefficients` gives the phase as a polynomial in azimuth frequency from the
-antenna positions themselves, with no small-angle expansion; its constant and linear terms place the
-scatterer at its layover point with the phase of its range at the center of aperture, which is where and how
-the SICD's projection expects it. The degree is the lowest that fits within a hundredth of a radian: 2 or 3
-from orbit, up to 8 for a short range and a track with a jerk. The phase is removed by the strips of the
-spatially variant autofocus: per column, so that it follows range pixel by pixel, and cross-faded along azimuth
-over blocks of about 64 m, on the device that holds the image, with exact zeros kept. It runs on the baseband
-ground image before the data-driven autofocus, which then sees the residual: what the DEM got wrong, and the
-errors that have nothing to do with terrain.
+DEM nothing is corrected. A list of DEM tiles on one grid (adjacent Copernicus tiles are) is joined into one
+raster first, so that heights are interpolated across the seams between tiles.
+
+`terrain.coefficients` gives the phase as a polynomial in azimuth frequency from the antenna positions
+themselves, with no small-angle expansion; its constant and linear terms place the scatterer at its layover
+point with the phase of its range at the center of aperture, which is where and how the SICD's projection
+expects it. The degree is the lowest that fits within a hundredth of a radian: 2 or 3 from orbit, up to 8 for a
+short range and a track with a jerk. That is the phase at the center frequency. Across the range band the phase
+scales with frequency, and each pulse's azimuth frequency moves with it, so that over the image's 2-D spectrum
+the phase also depends on the range frequency: the range walk, about `B / (2 fc)` of the phase at the corners of
+the band (from orbit it is close to `-w c2 v^2`, with `w` the range frequency as a fraction of the center
+frequency). Left in place it limits the correction to about -34 dB at 3 rad of phase and -28 dB at 6 rad. The
+correction fits the phase over both frequencies, to the exact phase at every pulse and five frequencies.
+
+The phase is removed in strips of about 64 m along azimuth, each read with as many rows again on either side as
+the phase displaces, on the device that holds the image, with exact zeros kept. Within a strip, column by
+column, each pixel is corrected for the height it shows: the strip is corrected for a few heights spanning the
+column's heights over the strip (Chebyshev nodes, as many as keep the interpolation in height within 0.025 rad
+at the band edge: from one on level ground to five on Etna's steepest slopes), and each pixel takes the
+interpolation between those corrections at its own height. Exact backprojection onto the surface does the same,
+pixel by pixel. The range walk is proportional to the height; it is removed by a short series (one or two terms
+from orbit), each term applied along azimuth with the strip's correction and along range through each row's
+spectrum, and scaled by the pixel's height. A strip takes the geometry of its middle row, which from orbit
+changes by under a thousandth along 64 m; at a short range the strips are shortened until it holds. The stage
+runs on the baseband ground image before the data-driven autofocus, which then sees the residual: what the DEM
+got wrong, and the errors that have nothing to do with terrain.
 
 **What the product says.** `out['terrain']` holds what was applied (`applied`, `powers`, `edge_rad`,
 `quadratic_rad`: the least and greatest quadratic coefficient in radians at the band edge; `height`; the DEM's
-`offset` from the plane and its `relief`; the `layover` and `outside` fractions), `out['notes']` a line, and
+`offset` from the plane and its `relief`; the `layover` and `outside` fractions; `levels`, the most heights a
+strip column was corrected for, and `height_rad`, the largest half range of phase across one column's heights
+in a strip; `walk_rad`, the largest range walk at the band's corners, `walk_terms` its series, and
+`walk_left_rad`, any walk left uncorrected), `out['notes']` a line, and
 `out['timing']['terrain']` the stage's seconds. The grid, the geolocation and the SICD's projection are
 unchanged: the SICD is still `Grid.Type` PLANE on the same plane, and it records the step as an
 `ImageFormation.Processing` element (`TERRAIN PHASE CORRECTION`). The image is not orthorectified; heights
