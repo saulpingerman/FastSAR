@@ -106,17 +106,27 @@ def test_scaling_law():
 
 
 def test_model_over_the_image():
-    """focus's model of the coefficients over pixels and heights reproduces the exact fit at points and heights
-    it was not built from."""
+    """focus's model of the phase over the image's 2-D spectrum, as a function of pixel and height, reproduces the
+    exact phase at points and heights it was not built from, at every pulse and frequency, within 0.02 rad of
+    phases that reach 150: the azimuth part c and the range walk (the phase scales with frequency, and each
+    pulse's azimuth frequency moves with it), here more than 2 rad at the band's corners."""
     out = _product(_collect(20.0, False))
     grid, fr, ant, fc = terrain._scene(out)
     band = terrain._band(grid, fr, ant, fc)
-    model = terrain._Model(grid, fr, ant, fc, band, 6, -300.0, 300.0)
+    bw = out['band'][1] - out['band'][0]
+    eta_c = 2 / C * fc * grid[6] * float(fr['e2'] @ grid[4])
+    model = terrain._Model(grid, fr, ant, fc, band, 6, -300.0, 300.0, bw, eta_c)
     rng = np.random.default_rng(3)
     i, j, h = rng.uniform(0, 479, 40), rng.uniform(0, 439, 40), rng.uniform(-300, 300, 40)
-    exact = terrain.coefficients(out, i, j, h, order=6, band=band)[0]
-    v = np.linspace(-1, 1, 101)[:, None] ** np.arange(7)
-    assert np.abs(v @ (model(i, j, h) - exact.T)).max() < 0.02       # rad, of phases that reach 150
+    y = grid[2] + i[:, None] * grid[5] * grid[3] + j[:, None] * grid[6] * grid[4]
+    v, w, psi = terrain._spectrum(grid, fr, terrain._some(ant, 257), fc, bw, eta_c, band, y, h)
+    cde = model(i, j, h)
+    c, d, e = (np.moveaxis(q, 0, -1)[:, None, None, :] for q in (cde[:7], cde[7:14], cde[14:]))
+    p = v[..., None] ** np.arange(7)
+    walk = w * (p * d).sum(-1) + w * w * (p * e).sum(-1)
+    got = (p * c).sum(-1) + walk
+    assert np.abs(psi).max() > 100 and np.abs(w).max() < 0.03 and np.abs(walk).max() > 2
+    assert np.abs(got - psi).max() < 0.02 and model.err < 0.01, np.abs(got - psi).max()
 
 
 # ------------------------------------------------------------------------------------------------ simulated targets
@@ -521,7 +531,7 @@ def test_process_cphd_with_a_dem(scene, tmp_path):
         o = fastsar.process_cphd(path, str(tmp_path / 't.nitf'), dem=lambda lat, lon: np.full(np.shape(lat), hp),
                                  geoid=30.0, **kw)
     t = o['terrain']
-    assert t['applied'] and t['height'][1] == pytest.approx(30.0, abs=0.01) and 2 in t['powers'] and t['block'] >= 32
+    assert t['applied'] and t['height'][1] == pytest.approx(30.0, abs=0.01) and 2 in t['powers'] and t['block'] >= 16
     assert o['timing']['terrain'] > 0 and any(n.startswith('terrain: focused with the DEM') for n in o['notes'])
     sm = o['metadata']
     assert sm.Grid.Type == 'PLANE' and sm.Grid.ImagePlane == 'GROUND' and sm.ImageFormation.ImageFormAlgo == 'OTHER'
