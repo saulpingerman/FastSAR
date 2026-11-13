@@ -198,6 +198,11 @@ was published on PyPI.
 - `fastsar._xp.device(a, 'cuda')` returned before a page-locked host array (the image a cuda former returns) had
   been read, so that writing the host array afterwards changed the device copy. No path of 0.2.0 wrote it. The
   copy is now complete when the call returns.
+- The cuda backend could run out of device memory after its range gate (new in this version) on a long
+  wide-band collection: the gated history stayed on the device and the former copied it into its planes beside
+  it (a Capella sliding spotlight of 150,162 pulses and a 1,024-pixel image on a 24 GB L4). The gate's transform
+  plans are released, and a gated history whose planes the former would stream from the host is given to it from
+  the host; the image is the same to the bit.
 - The cuda backend at `precision='float16'` could run out of device memory at the very end of a formation that
   fit: the image was scaled back from the half range into a new array while the padded image and an uploaded
   phase history were still on the device (a Capella spotlight of 94,513 pulses by 38,400 samples on a 24 GB L4).

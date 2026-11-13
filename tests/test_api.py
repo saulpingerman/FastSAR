@@ -319,6 +319,17 @@ def test_cuda_range_gate_within_the_device_budget(monkeypatch):
     bad[5, 17] = np.nan
     with pytest.raises(ValueError, match='non-finite'):               # the host gate checks the samples as well
         former._gate(bad)
+    # a gated history on the device whose planes the former would stream from the host (a 24 GB device and a
+    # 150,000-pulse wide-band collection): the former takes it from the host instead of copying it into planes beside
+    # it, the image is the device's to the bit, and the note says so
+    monkeypatch.undo()
+    from fastsar import memory as fmem
+    streams = fmem.cuda_streams
+    monkeypatch.setattr(fmem, 'cuda_streams', lambda planes, free: True)
+    former = make()
+    moved = former(S)
+    assert former.range_gate['note'].count('left the GPU for the former') == 1 and np.array_equal(moved, img)
+    monkeypatch.setattr(fmem, 'cuda_streams', streams)
 
 
 @pytest.mark.cuda
