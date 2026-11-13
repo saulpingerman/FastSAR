@@ -409,14 +409,18 @@ def focus(out, dem, *, order=None, block=None, post=None, tol=0.05, check=True):
         return info
     keep = np.flatnonzero(top >= tol / 10)
     hf = min(band[1], 0.5)
-    blur = (np.abs(c[keep]) * keep[:, None, None]).sum(0).max() / (2 * np.pi * hf)
+    # the defocus in pixels: the steepest phase over the band and across the gap between its edges, where the
+    # phase returns from one edge's value to the other's
+    vs = _bins(4096, 0.0, hf, keep)
+    slope = np.abs(np.diff(vs, axis=1)) * (4096 * hf)                          # d v^p / dv, per power
+    blur = float((np.abs(c[keep]).reshape(len(keep), -1).max(1)[:, None] * slope).sum(0).max()) / (2 * np.pi * hf)
     if block is not None:
         B = int(block)
     else:                                       # about 64 m, and short enough that the geometry holds over a strip
         B = max(32, 2 * int(round(32.0 / spx)), 16 * int(np.ceil(blur / 2)))
-        B = min(B, max(16, _rows(model, keep, float(h.min()), float(h.max()), nx, ny, 0.25 * tol)))
+        B = min(B, max(16, _rows(model, keep, float(h.min()), float(h.max()), nx, ny, 0.125 * tol)))
     B = max(1, min(B, nx))
-    pad = int(np.ceil(blur)) + 16
+    pad = int(np.ceil(blur)) + _PAD
     nb = sfft.next_fast_len(B + 2 * pad, real=False)
     nb += (nb - B) % 2
     pad = (nb - B) // 2
@@ -469,6 +473,7 @@ def _bins(n, f0, hf, powers):
     return np.array(rows, np.float32).reshape(len(rows), n)
 
 
+_PAD = 16                                       # rows beyond the defocus that a strip reads on either side
 _MOST = 8                                       # Chebyshev nodes in height, and terms of the walk, at most per strip
 
 
