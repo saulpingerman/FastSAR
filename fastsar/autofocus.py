@@ -297,7 +297,7 @@ def _peaks(X, n, up=8, workers=1):
     return (np.where(i >= L // 2, i - L, i) + frac) / up, y1, sig
 
 
-def _map_drift(A, band, iterations, tol, workers=-1, c0=0.0, pool=False, G=None, contrast=True):
+def _map_drift(A, band, iterations, tol, workers=-1, c0=0.0, pool=False, G=None, contrast=True, taper=None):
     """Iterated map drift on A [n, nb, m] complex64 (on its device): nb independent sets of m columns, one quadratic
     coefficient each. Each iteration removes the estimate so far, forms the detected images of the lower and upper
     half bands, measures the shift d (samples) of the upper against the lower at the peak of their cross-correlation
@@ -305,7 +305,8 @@ def _map_drift(A, band, iterations, tol, workers=-1, c0=0.0, pool=False, G=None,
     apart by c sep / (pi hf) samples). Stops when every set's update is below tol. workers: host FFT threads; c0:
     the coefficient every set starts from (rad); pool: one coefficient for all sets together (the correlations
     summed over the sets too; the results then have one entry); G: fft(A, axis=0) if at hand; contrast: False to
-    skip before and after.
+    skip before and after; taper [n]: a weight per azimuth bin (FFT order) on both looks, with band's sep measured
+    under it (moving.autofocus's: the looks of the estimate, not of the image).
     -> dict(c [nb] rad at the band edge, corr [nb] the correlation coefficient at the peak, sig [nb] the peak's
     significance (_peaks), step [nb] the last update, iterations, G, before, after [nb]: the contrast of each set
     as given and with its estimate removed)."""
@@ -313,7 +314,10 @@ def _map_drift(A, band, iterations, tol, workers=-1, c0=0.0, pool=False, G=None,
     f0, hf, sep = band
     n, nb = A.shape[:2]
     v = _offsets(n, f0, hf)
-    dn, up = (xp.asarray(k.astype(np.float32))[:, None, None] for k in ((v < 0) & (v >= -1), (v >= 0) & (v <= 1)))
+    dn, up = (v < 0) & (v >= -1), (v >= 0) & (v <= 1)
+    if taper is not None:
+        dn, up = dn * np.asarray(taper, np.float64), up * np.asarray(taper, np.float64)
+    dn, up = (xp.asarray(k.astype(np.float32))[:, None, None] for k in (dn, up))
     jitted = _xp.kind(A) == 'jax'                                   # an iteration as one compiled program
     if G is None:
         G = _jit('fft0')(A) if jitted else _ft(A, 'fft', workers)

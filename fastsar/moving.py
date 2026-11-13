@@ -461,6 +461,8 @@ def _modes(mode):
 
 _JIT = {}
 _CELL = (128, 32)             # least rows and columns of a part of the image the guard measures the contrast of
+_TAYLOR = (4, 35.0)           # the Taylor window (nbar, sidelobe level in dB) of the copy the estimate is made on
+_SETTLED = 10.0               # a block's iteration has settled when its last update is under this many tol
 
 
 def _cellsums(img, h, cuts):
@@ -560,7 +562,7 @@ def _strips_jax(img, st, B, pad, win, V, coef):
 
 def autofocus(img, mode='quadratic', *, band=None, footprint=None, block=None, overlap=0.5, guard=True,
               iterations=6, tol=0.02, lines=0.3, max_lines=1024, subsets=8, span=4, band_db=30.0,
-              min_significance=None):
+              min_significance=None, taper=True, range_band=None):
     """Estimate and remove the azimuth phase error of a moving-beam image, which changes along the track: each
     along-track position is formed from its own stretch of pulses, so an error over slow time defocuses each part
     of the strip by its own amount, and a height above the focus plane adds a term that changes with the terrain.
@@ -577,12 +579,33 @@ def autofocus(img, mode='quadratic', *, band=None, footprint=None, block=None, o
     the image, and overlap by `overlap`: the pixels of a block then share at least half of their pulses.
     Estimate. Each block gives quadratic's estimate by map drift on the fraction `lines` of up to max_lines
     columns, and the columns are cut into `subsets` contiguous sets across the swath that each give their own.
-    Guard, the first test, quadratic's on every block. The correlation peak of all its columns and of at least
+    With `taper` the estimate reads a Taylor-weighted copy of those columns, so that it does not depend on the
+    weighting the image was formed with, and the correction goes to the image as it came. Across range the copy
+    is each column with its neighbors one resolution cell to either side, at 0.203, 0.594 and 0.203: the Taylor
+    window (nbar 4, 35 dB) to its first cosine term. range_band, the half width of the range band in cycles per
+    pixel, gives the cell as 0.5 / range_band columns (None: one column, an image sampled at its band). Along the
+    track it is the same window over the processed band on the two looks. A column of an unweighted image is one
+    range cell and the sidelobes of its neighbors, and a bright scatterer that crosses or straddles cells over
+    its aperture leaves unequal parts of its band in two columns: the looks of either column are then different
+    parts of it, their correlation has two peaks and the iteration alternates between them. taper=False reads the
+    columns as they are: for an image that is Taylor weighted on both axes already (process_cphd's
+    weighting='taylor', whose own columns are that copy).
+    Capture range. An error of c rad at the band edge moves the two looks apart by c sep / (pi hf) rows, sep being
+    the distance between the looks' centers in half bands (0.72 under the Taylor window, less under an antenna
+    pattern that falls toward the band's edges, never more than 1), and the peak of their correlation is sought
+    within a quarter of a block: an estimate needs |c| <= pi hf block / (4 sep), which every error up to
+    info['capture'] = pi hf block / 4 rad meets (96 rad for 256 rows of an image sampled at 0.96 of its band,
+    1,500 rad for 4096 rows). Beyond that range another peak is found, and the second test of the guard returns
+    the image as it came. Inside it the scene decides: each look of a scatterer is spread over about half of
+    that lag and has to stand out of what surrounds it.
+    Guard, the first test, quadratic's on every block. The iteration of its estimate must have settled, its last
+    update under ten times tol (info['settled']: an estimate that still alternates between two peaks is that of
+    neither). The correlation peak of all its columns and of at least
     half of its sets (and four) must stand min_significance robust deviations above the other lags; the estimate
     of all columns must lie within three standard errors (from the sets' scatter about their median) of that
     median; and no more than a quarter of the sets may lie far from it (4.5 times the scatter and twice tol, the
     iteration's own precision). A block with a small estimate counts: it says that its part of the strip is
-    focused. Without the guard every block with significant peaks counts.
+    focused. Without the guard every block that has settled with significant peaks counts.
     Fit. Across the swath, the departures of the sets that agree from their block's median are fitted against
     their offset from the block's middle, locally along the track (tricube weights over `span` block steps,
     Tukey's biweight against outliers): a linear trend where it is three times its standard error
@@ -612,7 +635,8 @@ def autofocus(img, mode='quadratic', *, band=None, footprint=None, block=None, o
 
     -> (img2 complex64 [nx, ny] where img is; info: dict(mode, band (f0, hf), block, starts [n] (first row of
     each block), estimates [n] (rad at the band edge, all columns; nan without one), estimates_std [n], subsets
-    [n, sets], subset_significance, subset_position [n, sets] (-1 to 1 across the swath), counted [n] (the first
+    [n, sets], subset_significance, subset_position [n, sets] (-1 to 1 across the swath), settled [n], capture
+    (rad: the capture range), counted [n] (the first
     test), fit [n], slope [n], curve [n], offset [n], reach (the correction at a block's center is fit + slope d +
     curve d^2, d = y - offset with y from -1 to 1 across the swath, held within reach = (least, greatest y of the
     sets)), applied_blocks [n], block_gain [n] (log of the contrast ratio), edge_rad (least,
@@ -651,9 +675,22 @@ def autofocus(img, mode='quadratic', *, band=None, footprint=None, block=None, o
     v = af._offsets(B0, f0, hf)
     up, dn = (v >= 0) & (v <= 1), (v < 0) & (v >= -1)
     tap = xp.asarray((np.sin(np.pi * (np.arange(B0) + 0.5) / B0) ** 2).astype(np.float32))[:, None]
+    tw = None
+    if taper:                              # the Taylor window of the estimate's copy: on the looks, and across range
+        from scipy.signal.windows import taylor
+        tay = taylor(1025, nbar=_TAYLOR[0], sll=_TAYLOR[1], norm=False)
+        tw = np.where(np.abs(v) <= 1, np.interp(v, np.linspace(-1.0, 1.0, 1025), tay), 0.0)
+        f1 = float(np.mean(tay * np.cos(2 * np.pi * (np.arange(1025) - 512) / 1025)))  # its first cosine term
+        side = np.float32(f1 / (1 + 2 * f1))
+        js = 0.5 / max(0.5 if range_band is None else float(range_band), 1e-6)      # columns in a range cell
+        js = int(np.clip(round(js), 1, max(1, ny // 2)))
+        lo, hi = np.clip(idx - js, 0, ny - 1), np.clip(idx + js, 0, ny - 1)
+        three = np.stack([lo, idx, hi], 1).ravel()                   # a column between its two neighbors: one read
+        w3 = np.array([side, 1 - 2 * side, side], np.float32)
     info = dict(mode=mode, band=(f0, hf), block=B0, starts=st0, estimates=np.full(nb, np.nan),
                 estimates_std=np.full(nb, np.nan), subsets=np.full((nb, ks), np.nan),
                 subset_significance=np.zeros((nb, ks)), subset_position=np.full((nb, ks), np.nan),
+                settled=np.zeros(nb, bool), capture=float(np.pi * hf * B0 / 4),
                 counted=np.zeros(nb, bool), fit=np.zeros(nb), slope=np.zeros(nb), curve=np.zeros(nb),
                 offset=np.zeros(nb), reach=(-1.0, 1.0),
                 applied_blocks=np.zeros(nb, bool), block_gain=np.zeros(nb), edge_rad=(0.0, 0.0), contrast_before=0.0,
@@ -661,9 +698,28 @@ def autofocus(img, mode='quadratic', *, band=None, footprint=None, block=None, o
                 reason=None)
     cand, kept, ends = np.zeros(nb, bool), {}, np.zeros((2, nb, ks))        # ends: the sets' first and last columns
     if jx:                                 # the columns of the estimates, cut by rows through one compiled program
-        cut = rj._source([np.ascontiguousarray(img[:, idx], np.complex64) if kind == 'numpy'
-                          else xp.take(img, xp.asarray(idx), axis=1)])
+        if kind == 'numpy' and taper:
+            cols = np.empty((nx, len(idx)), np.complex64)
+            for r0 in range(0, nx, 4096):
+                cols[r0:r0 + 4096] = np.take(img[r0:r0 + 4096], three, axis=1).reshape(-1, len(idx), 3) @ w3
+        elif kind == 'numpy':
+            cols = np.ascontiguousarray(img[:, idx], np.complex64)
+        else:
+            cols = xp.take(img, xp.asarray(idx), axis=1)
+            if taper:
+                cols = cols * (1 - 2 * side)
+                for j in (lo, hi):
+                    cols = cols + xp.take(img, xp.asarray(j), axis=1) * side
+        cut = rj._source([cols])
+        del cols
         grab = lambda i: cut(int(st0[i]), B0)
+    elif taper and host:
+        grab = lambda i: (np.take(img[st0[i]:st0[i] + B0], three, axis=1).reshape(B0, len(idx), 3) @ w3
+                          ).astype(np.complex64, copy=False)
+    elif taper:
+        def grab(i):
+            blk = img[st0[i]:st0[i] + B0][:, three]
+            return ((1 - 2 * side) * blk[:, 1::3] + side * (blk[:, 0::3] + blk[:, 2::3])).astype(xp.complex64)
     else:
         grab = lambda i: img[st0[i]:st0[i] + B0][:, idx].astype(xp.complex64)
 
@@ -681,18 +737,23 @@ def autofocus(img, mode='quadratic', *, band=None, footprint=None, block=None, o
         cols = sub[:, sel[:k * m]]
         w = 1 if host else -1
         a = np.sqrt(_xp.host((xp.abs(af._ft(cols * tap, workers=w)) ** 2).sum(1)).astype(np.float64))
+        if taper:
+            a = a * tw
         if not (a[up].sum() > 0 and a[dn].sum() > 0):
             return
         sep = float((a[up] * v[up]).sum() / a[up].sum() - (a[dn] * v[dn]).sum() / a[dn].sum())
         A = cols.reshape(B0, k, m)
-        est = af._map_drift(A, (f0, hf, sep), iterations, tol, w, pool=True, contrast=False)
-        sets = af._map_drift(A, (f0, hf, sep), iterations, tol, w, c0=float(est['c'][0]), G=est['G'], contrast=False)
+        est = af._map_drift(A, (f0, hf, sep), iterations, tol, w, pool=True, contrast=False, taper=tw)
+        sets = af._map_drift(A, (f0, hf, sep), iterations, tol, w, c0=float(est['c'][0]), G=est['G'], contrast=False,
+                             taper=tw)
         ycol = (idx[sel[:k * m]].reshape(k, m) - (ny - 1) / 2) / (ny / 2)
         info['estimates'][i], info['subsets'][i, :k] = float(est['c'][0]), sets['c']
         info['subset_significance'][i, :k] = np.where(np.isfinite(sets['c']), sets['sig'], 0.0)
         info['subset_position'][i, :k], ends[0, i, :k], ends[1, i, :k] = ycol.mean(1), ycol.min(1), ycol.max(1)
+        info['settled'][i] = abs(float(est['step'][0])) < _SETTLED * tol
         kept[i] = (sel[:k * m], k, m, (f0, hf, sep), ycol)
-        cand[i] = est['sig'][0] >= sig0 and (info['subset_significance'][i] >= sig0).sum() >= max(4, (k + 1) // 2)
+        cand[i] = (info['settled'][i] and est['sig'][0] >= sig0
+                   and (info['subset_significance'][i] >= sig0).sum() >= max(4, (k + 1) // 2))
     if host:
         af._threads(estimate, range(nb))
     else:
@@ -747,7 +808,7 @@ def autofocus(img, mode='quadratic', *, band=None, footprint=None, block=None, o
             q = np.exp(-1j * (trend[i, 0] * d + trend[i, 1] * d * d)[None] * vq[:, None, None]).astype(np.complex64)
             G = G * xp.asarray(q)
             level[i] = float(af._map_drift(G, bandi, iterations, tol, -1, c0=float(level[i]), pool=True, G=G,
-                                           contrast=False)['c'][0])
+                                           contrast=False, taper=tw)['c'][0])
     kept.clear()
     mid = np.zeros(nb)
     for i in range(nb):
@@ -1172,8 +1233,10 @@ def stages(out, st, product, lap, backend):
     if af:
         try:
             fp = st['footprint'] / out['spx']
+            hr = min(0.5, 0.5 * st['band2'] * out['spy'])            # the range band, for the estimate's taper
             with crossing():
-                out['image'], info = run(lambda a: autofocus(a, af, band=(0.0, hf), footprint=fp))
+                out['image'], info = run(lambda a: autofocus(a, af, band=(0.0, hf), footprint=fp, range_band=hr,
+                                                             taper=wt != 'taylor'))
         except ValueError as e:                                      # an image too small for the estimate
             info = dict(mode=af, applied=False, reason=str(e))
             out['notes'].append(f'autofocus skipped: {e}')
