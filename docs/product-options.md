@@ -820,7 +820,7 @@ The phase is removed in strips of about 64 m along azimuth, each read with as ma
 the phase displaces, on the device that holds the image, with exact zeros kept. Within a strip, column by
 column, each pixel is corrected for the height it shows: the strip is corrected for a few heights spanning the
 column's heights over the strip (Chebyshev nodes, as many as keep the interpolation in height within 0.025 rad
-at the band edge: from one on level ground to five on Etna's steepest slopes), and each pixel takes the
+at the band edge: from one on level ground to four on Etna's steepest slopes), and each pixel takes the
 interpolation between those corrections at its own height. Exact backprojection onto the surface does the same,
 pixel by pixel. The range walk is proportional to the height; it is removed by a short series (one or two terms
 from orbit), each term applied along azimuth with the strip's correction and along range through each row's
@@ -928,13 +928,15 @@ uncorrected image, against the model's predictions for the same blocks.
   from the first image with GLO-30: 75 m above the plane (1.2 rad), -54.9 dB (0.3.0's correction: -37.1 dB);
   68 m below it (1.1 rad), -53.7 dB (-39.3); near the plane, -53.7 dB (-49.9); 122 m below it (2.0 rad), -52.8 dB
   (-35.0). The plane's image is within -53.2 to -55.2 dB of exact backprojection on the plane there.
-- Against exact backprojection onto the DEM's surface, on three 256-pixel chips of the first image (590,000
-  points; the rms of the complex difference over the rms of the chip): the plane's image differs from it by -11.5
-  dB on high ground (+74 m) and the corrected image by -48 dB; in the collapsed area with the lidar surface (-190
-  to -230 m) by -4.5 dB and -38 dB; near the plane (-30 to +5 m) by -26 dB and -50 dB. The fast former itself
-  is within -52 dB of exact backprojection on the plane. The exact route took 215 s for those points on the
-  shared GPU, 0.003 megapixels per second, where formation and the correction make 3.3: the surface costs about
-  a thousand times the plane with its correction.
+- On three further 256-pixel chips of the first image's unweighted product, against exact backprojection onto
+  each DEM's surface: on high ground (+74 m) -54.6 dB (0.3.0's correction: -37.1 dB; uncorrected -4.8 dB); in
+  the collapsed area with the lidar surface (189 to 233 m below the plane within the chip, where the lidar
+  surface reaches 10 rad of phase) -46.5 dB (-28.7; uncorrected +1.4 dB); near the plane -54.1 dB with GLO-30
+  (-30 to +5 m; before -44.8 dB) and -45.7 dB with the lidar surface (-95 to +3 m; before -30.2 dB). The fast
+  former is within -53 to -54 dB of exact backprojection on the plane on these chips. The exact route took 8 s
+  for their 590,000 points on an otherwise idle GPU (215 s on one shared with other work), 0.07 megapixels per
+  second, where formation and the correction make 30: the surface costs about 400 times the plane with its
+  correction.
 - The stage takes 1.9 to 5.8 s for the 206 and 299 megapixel images on a GPU shared with other work (50 to 140
   megapixels per second) and 3 to 15 s on the host's 48 shared cores (19 to 72 megapixels per second), of which
   0.4 to 1.0 s is the height map; formation took 40 and 84 s on the same GPU.

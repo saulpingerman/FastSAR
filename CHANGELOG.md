@@ -19,7 +19,10 @@ was published on PyPI.
   spotlight of Mount Etna, with 1,690 m of relief, gives -49 to -52 dB on chips 500 m above the plane, 300 to
   600 m below it within one chip, and 1,050 m below it (2.8 to 6 rad of phase), where the plane's image is within
   -51 to -52 dB of exact backprojection on the plane; a correction per column with the height averaged over
-  strips and the phase at the center frequency alone gave -25 to -33 dB there. The image stays on its plane,
+  strips and the phase at the center frequency alone gave -25 to -33 dB there. Over 72 chips drawn by phase and
+  slope the median is -50 dB and the worst -45 dB (that correction: -35 and -25 dB). On a Capella spotlight of
+  Kilauea the chips reach -53 to -55 dB at 1.1 to 2 rad (before -35 to -50 dB), and -46 dB in the collapsed
+  caldera with a 2019 lidar surface (before -29 dB). The image stays on its plane,
   with its geolocation and its SICD projection; the product records the step in `out['terrain']`, a note,
   `timing['terrain']` and an `ImageFormation.Processing` element of the SICD. `dem` is a GeoTIFF (or a list of
   tiles), a function of latitude and longitude, or a number; a file needs `geoid`, the geoid's height above the
