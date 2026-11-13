@@ -702,12 +702,35 @@ def _apply(img, plan, bins, Wq, B, pad, nr, stats):
                 out[r0:p['s0'] + B] = one(rows(p['s0']), dev[:3], dev[3], *a)[r0 - p['s0']:]
         return jnp.concatenate(parts, axis=0) if k == 'jax' else out
     out = np.empty((nx, ny), np.complex64)
-    ncpu = os.cpu_count() or 1                                      # column blocks: cache-sized, and enough for all cores
-    w = int(max(64, min(af._BLOCK['numpy'] // (2 * (B + 2 * pad)), -(-ny // ncpu))))
-    with ThreadPoolExecutor(ncpu) as ex:
+    w = int(max(64, af._BLOCK['numpy'] // (2 * (B + 2 * pad))))         # column blocks of a cache's size
+    with ThreadPoolExecutor(_workers()) as ex:
         for p, r0 in strips():
             _host_strip(ex, p, r0, rows, args, keep0, bins, Wq, B, pad, nr, ny, w, out)
     return out
+
+
+def _workers():
+    """Threads for the host: the CPUs this process may run on, and no more than a control group's CPU quota grants
+    (cgroup v2 cpu.max of the group and its ancestors; threads beyond it are stalled by the quota at every strip)."""
+    from .patches import _ncpu
+    n = _ncpu()
+    try:
+        with open('/proc/self/cgroup') as fh:
+            path = next((line.split(':', 2)[2].strip() for line in fh if line.startswith('0::')), None)
+        while path is not None:
+            try:
+                with open(f'/sys/fs/cgroup{path.rstrip("/")}/cpu.max') as fh:
+                    quota, period = fh.read().split()[:2]
+                if quota != 'max':
+                    n = min(n, max(1, math.ceil(int(quota) / int(period))))
+            except (OSError, ValueError):
+                pass
+            if path in ('', '/'):
+                break
+            path = path.rsplit('/', 1)[0] or '/'
+    except (OSError, StopIteration):
+        pass
+    return max(1, n)
 
 
 def _host_strip(ex, p, r0, rows, args, keep0, bins, Wq, B, pad, nr, ny, w, out):
