@@ -237,6 +237,10 @@ def test_correction_restores_the_targets(scene):
         assert info['applied'] and info['fit_rad'] < 0.011 and info['height'][1] == pytest.approx(HTS[k], abs=0.01)
         assert 6 <= info['order'] <= 8 and np.abs(info['edge_rad']).max() > 10
         assert any('terrain: focused' in n for n in o['notes'])
+        if abs(HTS[k]) == 300:                                       # two range cells of walk: left, and said so
+            assert info['walk_left_rad'] > 10 and any('series' in n for n in o['notes'])
+        else:
+            assert info['walk_terms'] >= 3
         m = _measure(o['image'], out, pix[k])
         assert abs(m['i'] - pix[k, 0]) < pos and abs(m['j'] - pix[k, 1]) < pos, (k, m['i'], m['j'])
         assert 0.99 < m['res_az'] / ref['res_az'] < wid, (k, m['res_az'])

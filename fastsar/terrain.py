@@ -457,8 +457,8 @@ def focus(out, dem, *, order=None, block=None, post=None, tol=0.05, check=True):
     big = lambda q, s: np.flatnonzero(np.abs(q).reshape(len(q), -1).max(1) * s >= tol / 10)
     sets = (keep, big(d, wmax), big(e, wmax ** 2))
     bins = [_bins(nb, band[0], hf, k) for k in sets]                           # [terms, nb] for c, d and e
-    plan = _plan(model, hm, sets, bins, B, nx, ny, wmax, 0.5 * tol)
-    out['image'] = _apply(img, plan, bins, Wq, B, pad, nr)
+    plan = []                                   # what each strip took, filled as the strips are made
+    out['image'] = _apply(img, _plan(model, hm, sets, bins, B, nx, ny, wmax, 0.5 * tol), bins, Wq, B, pad, nr, plan)
     info.update(applied=True, powers=tuple(int(p) for p in keep), block=B,
                 edge_rad=np.stack([c[keep].reshape(len(keep), -1).min(1), c[keep].reshape(len(keep), -1).max(1)], 1),
                 levels=max(len(p['um']) for p in plan), walk_terms=max(len(p['terms']) for p in plan),
@@ -467,6 +467,10 @@ def focus(out, dem, *, order=None, block=None, post=None, tol=0.05, check=True):
     q, hh = info['quadratic_rad'], info['height']
     notes.append(f'terrain: focused with the DEM, quadratic phase {q[0]:+.2f} to {q[1]:+.2f} rad at the band edge for '
                  f'surface heights {hh[0]:+.0f} to {hh[2]:+.0f} m about the image plane')
+    left = [p for p in plan if p['left'] > 0]
+    if left:
+        notes.append(f"terrain: the range walk of {len(left)} of {len(plan)} strips, up to {info['walk_left_rad']:.1f} rad "
+                     'at the band\'s corners, is beyond the correction\'s series and is left as it is')
     return info
 
 
@@ -533,7 +537,8 @@ def _plan(model, hm, sets, bins, B, nx, ny, wmax, tol):
     heights. The range walk: the derivatives in height of d and e at hb, D1 and E1 [terms, ny], so that the walk of
     a pixel showing h is w h D1 + w^2 h E1 (d and e are proportional to the height to a part in a thousand); the
     terms (a, b) of the series of exp(-1j (w h D1 + w^2 h E1)) - 1 that leave tol (xw, xe: the largest of each part
-    at the band's corners); and the exponent's coefficients C0 at hb when no node lies there."""
+    at the band's corners); and the exponent's coefficients C0 at hb when no node lies there. A generator: the host
+    prepares a strip while the device works on the one before."""
     keep, dkeep, ekeep = sets
     li, lj, h = hm['i'], hm['j'], np.nan_to_num(hm['h'])
     jc = np.arange(ny, dtype=np.float64)
@@ -544,7 +549,6 @@ def _plan(model, hm, sets, bins, B, nx, ny, wmax, tol):
     r = int(np.ceil(B / step)) + 2
     vmax = [np.abs(v).max(1) if len(v) else np.zeros(0) for v in bins]
     n1 = model.order + 1
-    plan = []
     for s0 in st:
         f = np.clip((np.arange(s0, s0 + B) - li[0]) / step, 0, max(len(li) - 1 - 1e-9, 0))
         k0 = f.astype(np.intp)
@@ -574,10 +578,8 @@ def _plan(model, hm, sets, bins, B, nx, ny, wmax, tol):
             left = 0.0
         terms = [(i, j) for i in range(qa + 1) for j in range(qb + 1) if i or j]
         C0 = model.at(P, hb)[keep].astype(np.float32) if terms and M % 2 == 0 else None
-        plan.append(dict(s0=s0, Hr=Hr.astype(np.float32), Wr=Wr.astype(np.float32), hb=hb.astype(np.float32),
-                         dl=dl.astype(np.float32), um=um, C=Cm, C0=C0, D1=D1, E1=E1, terms=terms, x=x, xw=xw, xe=xe,
-                         left=left))
-    return plan
+        yield dict(s0=s0, Hr=Hr.astype(np.float32), Wr=Wr.astype(np.float32), hb=hb.astype(np.float32),
+                   dl=dl.astype(np.float32), um=um, C=Cm, C0=C0, D1=D1, E1=E1, terms=terms, x=x, xw=xw, xe=xe, left=left)
 
 
 def _strip(xp, ft, blk, bins, C, C0, D1, E1, Hr, Wr, hb, dl, um, terms, B, pad, kw):
@@ -638,10 +640,11 @@ def _walk(xp, ft, z, h, T, terms, Wq, nr, kw):
 _JIT = {}
 
 
-def _apply(img, plan, bins, Wq, B, pad, nr):
-    """The strips of plan on the device of img (NumPy: all cores; CuPy; JAX, one compilation per number of nodes
-    and walk terms) -> the corrected image, complex64, on the same device, its exact zeros kept. The strips do not
-    overlap; the last one, which ends at the last row, gives only the rows the others leave."""
+def _apply(img, plan, bins, Wq, B, pad, nr, stats):
+    """The strips of plan (_plan's generator) on the device of img (NumPy: all cores; CuPy; JAX, one compilation per
+    number of nodes and walk terms) -> the corrected image, complex64, on the same device, its exact zeros kept; what
+    each strip took is appended to stats. The strips do not overlap; the last one, which ends at the last row, gives
+    only the rows the others leave."""
     nx, ny = img.shape
     k, xp = _xp.kind(img), _xp.module(img)
 
@@ -651,7 +654,13 @@ def _apply(img, plan, bins, Wq, B, pad, nr):
         if r1 - r0 == B + 2 * pad:
             return blk
         return xp.pad(blk, ((r0 - (s0 - pad), s0 + B + pad - r1), (0, 0)))
-    done = [max(p['s0'], plan[i - 1]['s0'] + B) if i else 0 for i, p in enumerate(plan)]   # first row each one gives
+
+    def strips():                                                   # each strip and the first row it gives
+        end = 0
+        for p in plan:
+            stats.append({k: p[k] for k in ('s0', 'um', 'terms', 'x', 'xw', 'xe', 'left')})
+            yield p, max(p['s0'], end)
+            end = p['s0'] + B
     args = lambda p, cs=slice(None): (p['C'][:, :, cs], None if p['C0'] is None else p['C0'][:, cs], p['D1'][:, cs],
                                       p['E1'][:, cs], p['Hr'][:, cs], p['Wr'], p['hb'][cs], p['dl'][cs])
     keep0 = lambda z, blk: xp.where(blk[pad:pad + B] != 0, z, 0).astype(xp.complex64)
@@ -665,7 +674,7 @@ def _apply(img, plan, bins, Wq, B, pad, nr):
             put = xp.asarray
         dev = [put(v) for v in bins] + [put(Wq)]
         parts, out = [], (xp.empty((nx, ny), xp.complex64) if k == 'cupy' else None)
-        for p, r0 in zip(plan, done):
+        for p, r0 in strips():
             a = [None if v is None else put(v) for v in args(p)]
             um, terms = p['um'], p['terms']
 
@@ -684,7 +693,7 @@ def _apply(img, plan, bins, Wq, B, pad, nr):
     out = np.empty((nx, ny), np.complex64)
     w = int(max(64, af._BLOCK['numpy'] // (2 * (B + 2 * pad))))
     with ThreadPoolExecutor(os.cpu_count() or 1) as ex:
-        for p, r0 in zip(plan, done):
+        for p, r0 in strips():
             _host_strip(ex, p, r0, rows, args, keep0, bins, Wq, B, pad, nr, ny, w, out)
     return out
 
