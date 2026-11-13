@@ -987,6 +987,16 @@ that `azimuth_fraction` of the PRF (or the vendor SICD's processed bandwidth) co
 - Across the track it is the range band times the horizontal part of the line of sight, (2 B / c) cos(graze), on
   the carrier (2 fc / c) cos(graze); both change across the swath.
 
+The beam center is each pulse's SRP, unless the file's antenna block says the beam is elsewhere by enough to
+matter. `process_cphd` takes the antenna's two-way electrical boresight (its axes and steering, per pulse or as
+polynomials) as the beam center where the processed spread about the SRPs takes a point of the tasked area
+through pulses on which it lies farther than lambda PRF / (4 v) from the boresight in sin(look), outside the
+Doppler band the PRF samples about the beam: those pulses hold no echo of it that is not ambiguous with
+others, and a window over them adds noise and states a band the image does not have. A note that begins with
+`beam center:` says so. The boresight is used only where its own window reaches every point of the area, its
+track is smooth, and the processed spread fits in the PRF's band (a vendor SICD's band can exceed it).
+`form_cphd` keeps the SRPs, as before.
+
 `moving.baseband` removes both carriers with one phase, exact at every pixel as `planes.deramp` is for a
 spotlight. With F(x, t) = |x - a(t)| + G(t), G the integral of s |da/dt| over time, F is stationary in t at the
 time t_c(x) at which the beam center crosses x, and psi(x) = (4 pi fc / c) F(x, t_c(x)) has the gradient
@@ -1179,7 +1189,7 @@ the boresights on the reference points.
 
 ### Real collections
 
-Two public Capella collections were processed on an Nvidia RTX PRO 6000 that other jobs shared.
+Three public Capella collections were processed on an Nvidia RTX PRO 6000 that other jobs shared.
 
 **Stripmap** (2024-11-27, VV, 200 MHz, 135,477 pulses in 13.4 s, grazing angle 53 degrees, tasked area 82.5 by
 5.0 km; a 10 by 5.1 km cut at the center of the strip, formed from the 36,000 pulses that illuminate it). A pixel
@@ -1284,6 +1294,34 @@ are the rest.
   +2,150 m. `'black'`: -3,150 to +4,100 m, 7.3 km of ground range, where the extended window ends, at the default
   of -10 dB as at 0 dB. The beam is steered along the track, so the pointing of its antenna block is not
   checked against the footprint, and the note in the product says that the pattern is used unverified.
+
+**Sliding spotlight whose reference points lag the beam** (Capella C10, 2024-04-05, HH, 300 MHz, 158,767 pulses
+in 15.4 s at a PRF of 10.3 kHz, grazing angle 62 degrees, a scene near Yerevan at 1,262 m; a 1 by 3 km cut at
+the center). The SRPs move 612 m/s along the track at the scene center, while the antenna block points the beam
+so that its footprint moves 1,061 m/s (its axis polynomials; no electrical steering). About the SRPs, the
+processed spread (0.8 of the PRF) takes a pixel through pulses up to 0.0149 in sin(look) from the boresight,
+beyond the 0.0111 the PRF samples. The image confirms the antenna: with the SRPs as the beam center the
+product stated 11.29 cycles/m and was sampled at 0.083 m (12,024 by 3,511 pixels), but the
+-3, -6 and -10 dB widths of the mean azimuth spectrum were 3.35, 5.2 and 7.0 cycles/m, against 3.8, 5.3 and 6.9
+predicted from the boresight's motion and the file's two-way pattern and 6.0, 8.5 and 11.0 from the SRPs'; the
+spectrum fell smoothly to -20 dB at 12 cycles/m, and 4.4% of its energy lay beyond the band the beam gives.
+
+With the boresight as the beam center the product states 7.76 cycles/m and is sampled at 0.120 m (8,324 rows).
+The spectrum fills that band and ends at its edge: -3, -10 and -20 dB widths of 2.9, 6.8 and 7.8 cycles/m (tiles
+of 62 by 55 m: 3.7 and 7.5 at the median), 98% of the energy within 6.9 and 0.06% beyond 7.76. Formation of the
+cut on the GPU takes 14.5 s for 21.7 s. The vendor's SICD of the collection processes 2.5 cycles/m (0.354 m);
+FastSAR forms the whole of the 0.8 PRF about the beam, three times that band, tapered by the antenna's two-way
+pattern, which the file puts 12.8 dB down at the band's edges.
+
+The brightest returns of this scene are not point targets. Each of the twelve brightest occupies 0.3 to 1.2
+cycles/m of the band (-3 dB) about a centroid 0.9 to 2.3 cycles/m off the beam center that moves with the
+position along the track as the look direction does: specular returns, lit over 0.3 to 1.1 degrees of the
+6.9 degrees of look angle the band spans. They are 0.5 to 5.4 m long along the track with either beam center, a
+quadratic phase across their band does not shorten them, and none stands 25 dB above the mean power of the 49 by
+49 pixels about it less the central 9 by 9 (the best: 21.7 dB with the SRPs as the beam center, 23.4 dB with the
+boresight). The two C09 collections above and a C14 sliding spotlight (2024-08-29) keep their SRPs as the beam
+center: the processed spread about their SRPs stays within the band the PRF samples about the boresight, and
+their products are the same to the bit.
 
 **Speed.** Seconds per stage for the stripmap cut, second call, with megapixels per second in parentheses, on an
 Nvidia RTX PRO 6000 that other jobs were using and on 16 of the host's 48 cores:
