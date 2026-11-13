@@ -924,6 +924,10 @@ uncorrected image, against the model's predictions for the same blocks.
   over eight parts of the scene). After the GLO-30 correction they still do, in the collapsed area. After the
   lidar correction the parts agree on a residual of -0.35 +- 0.08 rad, which the contrast test then declines:
   it is too small to raise the contrast of an image whose pit is corrected for the wrong depth.
+- Against exact backprojection onto the DEM's surface on the four 256-pixel chips the validation harness picks
+  from the first image with GLO-30: 75 m above the plane (1.2 rad), -54.9 dB (0.3.0's correction: -37.1 dB);
+  68 m below it (1.1 rad), -53.7 dB (-39.3); near the plane, -53.7 dB (-49.9); 122 m below it (2.0 rad), -52.8 dB
+  (-35.0). The plane's image is within -53.2 to -55.2 dB of exact backprojection on the plane there.
 - Against exact backprojection onto the DEM's surface, on three 256-pixel chips of the first image (590,000
   points; the rms of the complex difference over the rms of the chip): the plane's image differs from it by -11.5
   dB on high ground (+74 m) and the corrected image by -48 dB; in the collapsed area with the lidar surface (-190

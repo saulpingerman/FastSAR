@@ -582,6 +582,17 @@ def _plan(model, hm, sets, bins, B, nx, ny, wmax, tol):
                    dl=dl.astype(np.float32), um=um, C=Cm, C0=C0, D1=D1, E1=E1, terms=terms, x=x, xw=xw, xe=xe, left=left)
 
 
+def _expj(xp, ph):
+    """exp(-1j ph), complex64 (on the host without temporaries)."""
+    if xp is np:
+        q = np.empty(ph.shape, np.complex64)
+        np.cos(ph, out=q.real)
+        np.sin(ph, out=q.imag)
+        np.negative(q.imag, out=q.imag)
+        return q
+    return xp.cos(ph) - 1j * xp.sin(ph)
+
+
 def _strip(xp, ft, blk, bins, C, C0, D1, E1, Hr, Wr, hb, dl, um, terms, B, pad, kw):
     """The azimuth part of one strip's correction on the device of blk [B + 2 pad, columns] (xp: its array module,
     ft: its FFT module, kw: the FFT's keyword arguments): the image corrected for the height of each pixel, by
@@ -597,7 +608,7 @@ def _strip(xp, ft, blk, bins, C, C0, D1, E1, Hr, Wr, hb, dl, um, terms, B, pad, 
     z, Emid = 0, None
     for m in range(M):
         ph = sum(V[k][:, None] * C[m][k][None, :] for k in range(V.shape[0]))
-        E = xp.cos(ph) - 1j * xp.sin(ph)
+        E = _expj(xp, ph)
         Z = ft.ifft(F * E, axis=0, **kw)[pad:pad + B]
         if M > 1:
             L = 1.0
@@ -612,7 +623,7 @@ def _strip(xp, ft, blk, bins, C, C0, D1, E1, Hr, Wr, hb, dl, um, terms, B, pad, 
     if terms:
         if Emid is None:
             ph = sum(V[k][:, None] * C0[k][None, :] for k in range(V.shape[0]))
-            Emid = xp.cos(ph) - 1j * xp.sin(ph)
+            Emid = _expj(xp, ph)
         PD = sum(Vd[k][:, None] * D1[k][None, :] for k in range(Vd.shape[0])) if len(Vd) else 0
         PE = sum(Ve[k][:, None] * E1[k][None, :] for k in range(Ve.shape[0])) if len(Ve) else 0
         G, qa, qb = F * Emid, max(t[0] for t in terms), max(t[1] for t in terms)
@@ -691,8 +702,9 @@ def _apply(img, plan, bins, Wq, B, pad, nr, stats):
                 out[r0:p['s0'] + B] = one(rows(p['s0']), dev[:3], dev[3], *a)[r0 - p['s0']:]
         return jnp.concatenate(parts, axis=0) if k == 'jax' else out
     out = np.empty((nx, ny), np.complex64)
-    w = int(max(64, af._BLOCK['numpy'] // (2 * (B + 2 * pad))))
-    with ThreadPoolExecutor(os.cpu_count() or 1) as ex:
+    ncpu = os.cpu_count() or 1                                      # column blocks: cache-sized, and enough for all cores
+    w = int(max(64, min(af._BLOCK['numpy'] // (2 * (B + 2 * pad)), -(-ny // ncpu))))
+    with ThreadPoolExecutor(ncpu) as ex:
         for p, r0 in strips():
             _host_strip(ex, p, r0, rows, args, keep0, bins, Wq, B, pad, nr, ny, w, out)
     return out
