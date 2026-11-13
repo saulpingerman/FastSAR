@@ -75,8 +75,9 @@ def as_dem(dem, geoid=None):
     """The surface as the function dem(lat, lon) -> height above the WGS-84 ellipsoid (m; arrays of degrees) that
     focus, products.geolocate and products.geocode_image take.
 
-    dem: a GeoTIFF path, or a list of them (tiles; the first that covers a point gives its height); a function of
-    (lat, lon); or a number, a surface of that constant height.
+    dem: a GeoTIFF path, or a list of them (tiles: those on one grid, as adjacent Copernicus tiles are, joined
+    into one raster so that heights are interpolated across their seams; else the first that covers a point gives
+    its height); a function of (lat, lon); or a number, a surface of that constant height.
     geoid: the height of the geoid above the ellipsoid at the scene (the undulation N, m), added to every height:
     h_ellipsoid = H_geoid + N. Copernicus GLO-30 and GLO-90 give heights above EGM2008, SRTM above EGM96; N is
     +22 m in Hawaii and -26 m in North Dakota, and reaches -106 and +85 m. A file needs it stated: 0.0 for a DEM
@@ -86,16 +87,7 @@ def as_dem(dem, geoid=None):
             raise ValueError('a DEM file needs geoid=: the height of the geoid above the ellipsoid at the scene in '
                              'meters (Copernicus DEM: EGM2008; SRTM: EGM96), or 0.0 for a DEM of ellipsoid heights')
         from .products import read_dem
-        tiles = [read_dem(p, offset=float(geoid)) for p in (dem if isinstance(dem, (list, tuple)) else [dem])]
-        if len(tiles) == 1:
-            return tiles[0]
-
-        def mosaic(lat, lon):
-            h = tiles[0](lat, lon)
-            for t in tiles[1:]:
-                h = np.where(np.isfinite(h), h, t(lat, lon))
-            return h
-        return mosaic
+        return read_dem(list(dem) if isinstance(dem, (list, tuple)) else dem, offset=float(geoid))
     n = 0.0 if geoid is None else float(geoid)
     if callable(dem):
         return dem if n == 0 else (lambda lat, lon: dem(lat, lon) + n)

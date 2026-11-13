@@ -408,6 +408,12 @@ def test_dem_conventions(tmp_path, need):
     assert np.isnan(west(LAT, LON + 0.02))
     both = terrain.as_dem([tmp_path / 'w.tif', tmp_path / 'e.tif'], geoid=-30.0)
     assert np.abs(both(lat, lon) - surf(lat, lon)).max() < 1e-6
+    # the seam: between the last post of one tile and the first of the next, half a post either side of their
+    # common edge, each tile alone has no height; the joined tiles interpolate across it
+    seam = LON + 0.005 + np.linspace(-0.0005, 0.0005, 11)
+    assert np.isnan(west(LAT, seam[6:])).all() and np.isnan(terrain.as_dem(str(tmp_path / 'e.tif'), 0.0)(LAT, seam[:5])).all()
+    assert np.abs(both(np.full(11, LAT), seam) - surf(LAT, seam)).max() < 1e-6
+    np.testing.assert_array_equal(both(lat, lon), products.read_dem([tmp_path / 'w.tif', tmp_path / 'e.tif'], -30.0)(lat, lon))
     assert terrain.as_dem(120.0)(lat, lon).shape == (5, 5)
     assert np.all(terrain.as_dem(120, geoid=5.0)(lat, lon) == 125.0) and terrain.as_dem(surf) is surf
     assert np.all(terrain.as_dem(surf, geoid=-30.0)(lat, lon) == surf(lat, lon) - 30.0)
