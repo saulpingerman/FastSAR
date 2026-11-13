@@ -549,6 +549,17 @@ class ImageFormer:
         if staged is None and self.range_gate is not None:
             S = self._gate(S)                                      # windowed and checked there; on the device for cuda
             if self.backend == 'cuda':
+                if type(S).__module__.startswith('cupy'):
+                    # the gate's transform plans keep work areas in cupy's plan cache; and the former copies a device
+                    # history into its planes beside it, where a host one is uploaded or streamed: a gated history
+                    # whose planes would stream from the host is given to the former from the host
+                    _mem.cuda_release()
+                    isz = 4 if self.precision == 'float16' else 8
+                    if _mem.cuda_streams(isz * S.shape[0] * S.shape[1], _mem.cuda_free()):
+                        S = S.get()
+                        _mem.cuda_release()
+                        self.range_gate['note'] += ('; the gated history left the GPU for the former, which streams it '
+                                                    'from the host (device memory)')
                 return _to_host(self._form(S))
             staged = _Staged(S, None, None, None, None)            # the host history as the former takes it
         if self.backend == 'cuda' and staged is None and not type(S).__module__.startswith('cupy'):

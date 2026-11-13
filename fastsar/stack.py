@@ -1740,8 +1740,11 @@ def coherent_sum(a, b, window=15, *, equalize=True, coherence_window=7, dark=0.0
     -> a product dict with a's geometry: image [nx, ny] complex64 (a + b as brought to it, on its carrier; 0
     where either is 0), product 'coherent_sum', phase_window, fringe (cycles per pixel), amplitude_factor (applied
     to b), gain (dict, dB, against the first image: signal, the intensity of the sum over a's on the most
-    coherent tenth of the scene; noise, the same on the darkest ground, the fraction `dark` of the pixels by the
-    two images' intensity averaged over 15 x 15; snr, their difference; second, the same against the second
+    coherent tenth of the scene; noise, the same on the darkest incoherent ground, as many pixels as the fraction
+    `dark` of the scene, by the two images' intensity averaged over 15 x 15, among those whose coherence over 31 x
+    31 pixels is at most twice that estimator's floor on the pair (the second image displaced by 64 pixels): dark
+    ground the two images share adds coherently and is not noise (noise_reference 'incoherent'; 'darkest', the
+    darkest ground of all, where under 1% of the scene is incoherent); snr, their difference; second, the same against the second
     image, which differs where the two images' signal-to-noise ratios do (the sum gains most against the
     noisier); expected, 10 log10(1 + g) for the mean coherence g of that tenth and equal noise; incoherent, the
     signal gain of the sum of the intensities; coherence, that g), timing."""
@@ -1767,13 +1770,34 @@ def coherent_sum(a, b, window=15, *, equalize=True, coherence_window=7, dark=0.0
     ref = _box(x, w) * xp.float32(w * w) - (_box(x, 5) * xp.float32(25.0) if w > 7 else 0)
     del x
     zb = _unfringe(zb, f, sign=+1)
+    # the ground the noise is read on must be incoherent: dark ground that the two images share (a smooth playa, a
+    # calm water surface near the noise level) adds coherently and would read as noise that gained more than 3 dB.
+    # Coherence over 31 x 31 pixels, against its floor on the same images with the second displaced by 64 pixels
+    gw, sh = 31, 64
+    def coh31(v, pv, ok):
+        d = xp.sqrt(_box(pa, gw)) * xp.sqrt(_box(pv, gw))
+        return xp.where(ok & (d > 0), xp.abs(_box(_rowwise(lambda u, t: u * xp.conj(t), za, v), gw)) / xp.maximum(d, 1e-30), 0)
+    g31 = coh31(zb, pb, valid).astype(xp.float32)
+    okf = valid & xp.roll(valid, (sh, sh), axis=(0, 1))
+    gf = coh31(xp.roll(zb, (sh, sh), axis=(0, 1)), xp.roll(pb, (sh, sh), axis=(0, 1)), okf)
+    floor31 = float(_percentile(xp.where(okf, gf, np.inf), [50.0 * _scalar(okf.mean())], step=3)[0])
+    del gf, okf
+    quiet = valid & (g31 <= 2.0 * floor31)
+    del g31
     tot = _rowwise(lambda u, v, r: u + xp.complex64(amp) * v * (r / xp.maximum(xp.abs(r), 1e-30)), za, zb, ref)
     del ref, zb
     tot = xp.where(valid, tot, 0).astype(xp.complex64)
     ps = _power(tot)
     one = 0.5 * (pa + xp.float32(amp * amp) * pb)
     lev = _box(one, 15)
-    dk = (lev <= _percentile(xp.where(valid, lev, np.inf), [100.0 * float(dark)], step=2)[0]) & valid
+    nq, nv = _scalar(quiet.sum()), max(_scalar(valid.sum()), 1.0)
+    rule = 'incoherent' if nq >= 0.01 * nv else 'darkest'
+    pool = quiet if rule == 'incoherent' else valid           # too little incoherent ground: the darkest, as it is
+    frac = float(dark) * nv / max(_scalar(pool.sum()), 1.0) if rule == 'incoherent' else float(dark)
+    if frac >= 1.0:                                          # the incoherent ground is all the noise there is
+        dk = pool
+    else:
+        dk = (lev <= _percentile(xp.where(pool, lev, np.inf), [100.0 * frac * _scalar(pool.mean())], step=2)[0]) & pool
     sig = _scalar(xp.where(stable, ps, 0).sum()) / ns
     nsum, na, nb = (_scalar(xp.where(dk, v, 0).sum()) for v in (ps, pa, pb))
     first = (sig / max(sa, 1e-30)) / (nsum / max(na, 1e-30))
@@ -1786,7 +1810,8 @@ def coherent_sum(a, b, window=15, *, equalize=True, coherence_window=7, dark=0.0
                fringe=(float(f[0]), float(f[1])), grid=_grid_of(a),
                gain=dict(signal=db(sig / max(sa, 1e-30)), noise=db(nsum / max(na, 1e-30)), snr=db(first),
                          second=db(second), expected=db(1 + gs),
-                         incoherent=db((sa + amp * amp * sb) / max(sa, 1e-30)), coherence=gs),
+                         incoherent=db((sa + amp * amp * sb) / max(sa, 1e-30)), coherence=gs,
+                         noise_reference=rule, noise_pixels=int(_scalar(dk.sum())), floor31=floor31),
                notes=list(a.get('notes', [])) + ['coherent sum of two images, the second brought to the phase and '
                                                  'amplitude of the first'],
                timing=dict(coherent_sum=dt, megapixels_per_second=tot.size / 1e6 / max(dt, 1e-9)))
