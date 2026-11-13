@@ -928,6 +928,9 @@ uncorrected image, against the model's predictions for the same blocks.
   from the first image with GLO-30: 75 m above the plane (1.2 rad), -54.9 dB (0.3.0's correction: -37.1 dB);
   68 m below it (1.1 rad), -53.7 dB (-39.3); near the plane, -53.7 dB (-49.9); 122 m below it (2.0 rad), -52.8 dB
   (-35.0). The plane's image is within -53.2 to -55.2 dB of exact backprojection on the plane there.
+- Over the whole first image with GLO-30, on 42 chips of 128 pixels drawn by phase (up to 2 rad) and slope as
+  on Etna below: -51.3 dB in the median and -42.9 dB at worst (0.3.0: -35.5 and -22.4 dB). The worst chips
+  are gentle in phase (0.2 to 0.8 rad) with slopes of 1 to 3.4 m per meter.
 - On three further 256-pixel chips of the first image's unweighted product, against exact backprojection onto
   each DEM's surface: on high ground (+74 m) -54.6 dB (0.3.0's correction: -37.1 dB; uncorrected -4.8 dB); in
   the collapsed area with the lidar surface (189 to 233 m below the plane within the chip, where the lidar
@@ -937,9 +940,13 @@ uncorrected image, against the model's predictions for the same blocks.
   for their 590,000 points on an otherwise idle GPU (215 s on one shared with other work), 0.07 megapixels per
   second, where formation and the correction make 30: the surface costs about 400 times the plane with its
   correction.
-- The stage takes 1.9 to 5.8 s for the 206 and 299 megapixel images on a GPU shared with other work (50 to 140
-  megapixels per second) and 3 to 15 s on the host's 48 shared cores (19 to 72 megapixels per second), of which
-  0.4 to 1.0 s is the height map; formation took 40 and 84 s on the same GPU.
+- The stage, its height map included, on the first image (299 megapixels) and on Etna's (121 megapixels), the
+  least of three runs alternated with 0.3.0's: on the GPU 0.74 and 1.29 s (0.3.0: 0.55 and 1.26 s), of which
+  the height map on the host takes 0.29 and 1.0 s; on the host's CPU (16 cores) 4.1 and 3.4 s (1.8 and 2.1 s);
+  with JAX on the same cores 6.1 and 3.5 s (5.5 and 3.3 s). The correction itself, the height map aside, costs
+  1.7 to 1.8 times what 0.3.0's did on the GPU, 2.3 to 2.6 times on the host and 1.1 times with JAX: more heights
+  per strip on steep ground and the range walk's transforms along rows. Formation took
+  9 and 6 s on the same GPU.
 - A flat control, an Umbra spotlight of Fargo, North Dakota: with the EGM2008 undulation (-26.2 m) the DEM's
   median is 1.6 m below the image plane with 1.8 m of relief, the predicted phase stays under 0.012 rad, nothing
   is applied and the product is the one without a DEM, sample for sample; the stage takes 0.6 s for its height
@@ -992,8 +999,8 @@ where 0.3.0's mosaic left a band without heights (1.1% of the image uncorrected)
   surface is formed. In layover the heights that share a pixel are averaged (as `surface_points` takes them), so
   each scatterer is corrected for the wrong height by up to the relief folded into the pixel. The interpolation
   in height stops at eight heights per strip column, which covers 4.3 rad of phase across one column's heights
-  within a strip at the band edge; Etna's steepest strips need 1.6 rad and five heights. `terrain.focus(block=)`
-  sets the rows of a strip.
+  within a strip at the band edge; Etna's steepest strips need 0.9 rad and four heights, Kilauea's pit with the
+  lidar surface 1.6 rad and five. `terrain.focus(block=)` sets the rows of a strip.
 - *Range walk.* The walk is removed by a series of at most eight terms. Beyond about 4.5 rad of walk at the
   band's corners the series would not converge, and the walk of that strip is left as 0.3.0 left it everywhere
   (`walk_left_rad` says how much): from orbit the walk is about `B / (2 fc)` of the phase, 0.25 rad on Etna's
