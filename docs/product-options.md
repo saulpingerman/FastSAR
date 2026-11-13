@@ -1077,8 +1077,23 @@ it with a correction that follows the strip.
   image, and blocks overlap by half: the pixels of a block share at least half of their pulses.
 - **Estimate.** `autofocus.quadratic`'s: map drift on the brightest 30% of up to 1024 columns, for all of them
   together and for eight contiguous sets of them across the swath. The band is the processed band, so an
-  estimate is in radians at the edge of the synthetic aperture.
-- **Guard, first test.** `quadratic`'s, on every block: the correlation peaks of all columns and of at least half
+  estimate is in radians at the edge of the synthetic aperture. The estimate reads a Taylor-weighted copy of
+  those columns (nbar 4, 35 dB: on the two looks along the track, and across range a column with its neighbors
+  one resolution cell to either side), and the correction is applied to the image as it was delivered, so the
+  estimate does not depend on the product's weighting. In an unweighted image a bright scatterer whose range
+  moves over its aperture leaves different parts of its band in two neighboring columns; the two looks of
+  either column are then different parts of the scatterer, their correlation has two peaks, and the iteration
+  alternates between them. On a Capella sliding spotlight an injected error of 15 rad was not found in the
+  unweighted product before this copy was used. A Taylor-weighted product (`weighting='taylor'`) is read as it
+  is.
+- **Capture range.** An error of c rad at the band edge moves the two looks apart by about c / (pi hf) rows,
+  and the correlation peak is sought within a quarter of a block, so a block captures errors up to about
+  pi hf B / 4 rad for B rows at a band of hf cycles per row (`info['capture']`): 96 rad for 256 rows of an image
+  sampled at 0.96 of its band. Beyond it another peak is found and the second test below returns the image as
+  it came.
+- **Guard, first test.** The block's iteration must have settled (its last update under ten times the
+  tolerance, `info['settled']`): an estimate that still alternates between two peaks is that of neither. Then
+  `quadratic`'s, on every block: the correlation peaks of all columns and of at least half
   of the sets must be significant, the estimate of all columns must lie within three standard errors of the sets'
   median, and no more than a quarter of the sets may lie far from it. A block that passes counts, also when its
   estimate is small: it says that its part of the strip is focused.

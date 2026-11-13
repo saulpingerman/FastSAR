@@ -197,6 +197,12 @@ was published on PyPI.
   limit less the group's usage with its page cache counted, so that a collection just read from disk counted
   twice and `form_cphd` could refuse, with "... GiB is available", an image that fit. The group's file cache,
   which the kernel gives back before it enforces the limit, is no longer counted (`memory.host_available`).
+- The autofocus of a moving-beam product without weighting (the default SICD of 0.3.0) could miss a large error:
+  on a Capella sliding spotlight it found an injected quadratic error of 5 rad and not one of 15 rad, which the
+  Taylor-weighted product of the same collection found. `moving.autofocus` now estimates on a Taylor-weighted
+  copy of the columns it reads (along the track and across range) and corrects the image as it was delivered,
+  and its guard counts a block only when the iteration of its estimate has settled (`taper=`, `range_band=`,
+  `info['settled']`, `info['capture']`).
 - `docs/products.md` said that two passes formed onto one grid are coregistered by construction; that holds for
   the geometry as known, and real repeat collections lay 9 to 22 m apart. `products.coherence` gave its bias for
   independent pixels; the note now states the measured floor of oversampled images.
