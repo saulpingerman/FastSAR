@@ -930,7 +930,9 @@ uncorrected image, against the model's predictions for the same blocks.
   (-35.0). The plane's image is within -53.2 to -55.2 dB of exact backprojection on the plane there.
 - Over the whole first image with GLO-30, on 42 chips of 128 pixels drawn by phase (up to 2 rad) and slope as
   on Etna below: -51.3 dB in the median and -42.9 dB at worst (0.3.0: -35.5 and -22.4 dB). The worst chips
-  are gentle in phase (0.2 to 0.8 rad) with slopes of 1 to 3.4 m per meter.
+  are gentle in phase (0.2 to 0.8 rad) with slopes of 1 to 3.4 m per meter, 10 dB above the plane's agreement
+  there; on the one examined the residual sits in a few pixels where the surface is smooth, and the exact phase
+  applied pixel by pixel through the local spectrum leaves the same. Its source is not identified.
 - On three further 256-pixel chips of the first image's unweighted product, against exact backprojection onto
   each DEM's surface: on high ground (+74 m) -54.6 dB (0.3.0's correction: -37.1 dB; uncorrected -4.8 dB); in
   the collapsed area with the lidar surface (189 to 233 m below the plane within the chip, where the lidar
@@ -979,7 +981,8 @@ surface by -50.2 dB in the median and -44.7 dB at worst (0.3.0: -35.0 and -25.2 
 
 Slope costs little once each pixel has its own height: the steepest cells (over 2.5 m per meter, 70 to 225 m of
 relief inside a 58 m chip) are at -48 to -53 dB, within about 3 dB of the gentlest at the same phase, where
-0.3.0's correction lost up to 9 dB to them.
+0.3.0's correction lost up to 9 dB to them. The six worst chips lie 2 to 7 dB above the plane's own agreement
+with exact backprojection on them (-49 to -53 dB).
 
 What limited 0.3.0's correction there, measured on the same chips with the correction's parts varied: the range
 walk. With each pixel's exact height but the phase along azimuth alone the chips reach only -34.6, -36.0, -50.7
