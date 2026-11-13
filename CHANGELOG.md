@@ -193,6 +193,10 @@ was published on PyPI.
 - `fastsar._xp.device(a, 'cuda')` returned before a page-locked host array (the image a cuda former returns) had
   been read, so that writing the host array afterwards changed the device copy. No path of 0.2.0 wrote it. The
   copy is now complete when the call returns.
+- Under a memory limit (a container, a systemd scope, a batch job) the memory FastSAR took as available was the
+  limit less the group's usage with its page cache counted, so that a collection just read from disk counted
+  twice and `form_cphd` could refuse, with "... GiB is available", an image that fit. The group's file cache,
+  which the kernel gives back before it enforces the limit, is no longer counted (`memory.host_available`).
 - `docs/products.md` said that two passes formed onto one grid are coregistered by construction; that holds for
   the geometry as known, and real repeat collections lay 9 to 22 m apart. `products.coherence` gave its bias for
   independent pixels; the note now states the measured floor of oversampled images.
