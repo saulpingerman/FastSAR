@@ -68,10 +68,28 @@ def _pinned(n):
     return cp.cuda.alloc_pinned_memory(_pinned_size(n))
 
 
+def _cgroup_file_cache(stat):
+    """Bytes of page cache in a control group's usage, from its memory.stat (the file lists; of a v1 hierarchy the
+    totals), or 0 where it cannot be read."""
+    try:
+        with open(stat) as fh:
+            kv = dict(line.split()[:2] for line in fh if len(line.split()) >= 2)
+    except (OSError, ValueError):
+        return 0
+    try:
+        if 'total_inactive_file' in kv or 'total_active_file' in kv:
+            return int(kv.get('total_inactive_file', 0)) + int(kv.get('total_active_file', 0))
+        return int(kv.get('inactive_file', 0)) + int(kv.get('active_file', 0))
+    except ValueError:
+        return 0
+
+
 def _cgroup_available():
     """Bytes this process may still use under its control group's memory limit (a container, a systemd scope, a
     batch job), or None where there is no limit: the least of limit minus usage over the group and its ancestors
-    (cgroup v2, else v1)."""
+    (cgroup v2, else v1). The usage is taken without the group's page cache: the kernel charges a group for the
+    cache of the files it reads (a phase history just read counts twice, once in the process and once as cache)
+    and gives that cache back before it enforces the limit, as MemAvailable counts it for the host."""
     try:
         with open('/proc/self/cgroup') as fh:
             lines = fh.read().split()
@@ -95,7 +113,8 @@ def _cgroup_available():
                     v = fh.read().strip()
                 if v != 'max' and int(v) < 1 << 60:                 # (v1 writes a huge number for no limit)
                     with open(f'{base}{d}/{use}') as fh:
-                        left = int(v) - int(fh.read().strip())
+                        used = int(fh.read().strip())
+                    left = int(v) - max(used - _cgroup_file_cache(f'{base}{d}/memory.stat'), 0)
                     best = left if best is None else min(best, left)
             except (OSError, ValueError):
                 pass
