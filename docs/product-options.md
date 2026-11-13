@@ -955,6 +955,23 @@ validation harness (the rms of the complex difference over the rms of the exact 
 - 1,050 m below it (5.9 to 6.1 rad): -49.6 dB; before -25.2.
 - The plane's image against exact backprojection on the plane: -50.9 to -52.4 dB, which bounds the comparison.
 
+Over the whole image, on 72 chips of 128 pixels drawn three to a cell from every combination of phase (the
+chip's median, 0 to 8 rad at the band edge) and steepest slope inside the chip (under 0.2 to over 2.5 m per
+meter, up to 225 m of relief within one chip), the corrected image differs from exact backprojection onto the
+surface by -50.2 dB in the median and -44.7 dB at worst (0.3.0: -35.0 and -25.2 dB):
+
+| phase at the band edge | 0.3.0, median of the cells | now, median of the cells | now, worst chip |
+| --- | --- | --- | --- |
+| under 0.5 rad | -45 to -49 dB | -51 to -53 dB | -47 dB |
+| 0.5 to 1.5 rad | -36 to -45 dB | -48 to -52 dB | -47 dB |
+| 1.5 to 3 rad | -34 to -35 dB | -49 to -51 dB | -45 dB |
+| 3 to 5 rad | -28 to -31 dB | -48 to -50 dB | -46 dB |
+| 5 to 8 rad | -25 to -27 dB | -48 to -50 dB | -46 dB |
+
+Slope costs little once each pixel has its own height: the steepest cells (over 2.5 m per meter, 70 to 225 m of
+relief inside a 58 m chip) are at -48 to -53 dB, within about 3 dB of the gentlest at the same phase, where
+0.3.0's correction lost up to 9 dB to them.
+
 What limited 0.3.0's correction there, measured on the same chips with the correction's parts varied: the range
 walk. With each pixel's exact height but the phase along azimuth alone the chips reach only -34.6, -36.0, -50.7
 and -27.6 dB; with the phase over both frequencies and a constant height per 64-pixel tile -43.4 dB on the
