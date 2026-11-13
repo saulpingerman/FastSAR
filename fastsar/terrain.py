@@ -53,11 +53,14 @@ mosaic on its track axes.
 
 Formation onto the surface itself is the exact kernel's work: fastsar.backproject at surface_points.
 """
+import math
 import warnings
 
 import numpy as np
+import scipy.fft as sfft
 
 from . import _xp, planes
+from . import autofocus as af
 
 C = 299792458.0
 
@@ -175,14 +178,40 @@ def coefficients(out, i, j, h, *, order=4, band=None, pulses=257):
     return c, band, res
 
 
-class _Model:
-    """The coefficients as functions of pixel and height, fitted to the exact model at 5 x 5 points of the image
-    and four heights: sum over m = 1..3, a, b = 0..2 of K h^m s^a t^b (s, t, h scaled to -1 .. 1; no term without
-    h, which is the plane). self.err: the largest misfit at the nodes (rad)."""
+def _spectrum(grid, fr, ant, fc, bw, eta_c, band, y, h, nf=5):
+    """The exact phase over the 2-D spectrum: for plane points y [..., 3] showing heights h [...], at pulse p and
+    frequency f (nf of them over the band bw about fc), (v, w, psi) [..., p, f]: v the azimuth frequency as
+    coefficients takes it, w = eta / eta_c the range frequency (eta in cycles per pixel of axis 1), and
+    psi = f / fc phi_p, the phase the image's spectrum carries there."""
+    o, e1, e2, spx, spy = grid[2], grid[3], grid[4], grid[5], grid[6]
+    a, r = planes.ground_to_slant(fr, y)
+    x = planes.slant_to_ground(fr, a, r, o[2] + h)
+    d = y[..., None, :] - ant
+    R = np.linalg.norm(d, axis=-1)
+    dR = R - np.linalg.norm(x[..., None, :] - ant, axis=-1)
+    u = d / R[..., None]
+    uc = y - fr['arp']
+    uc = uc / np.linalg.norm(uc, axis=-1, keepdims=True)
+    f = fc + 0.5 * bw * np.linspace(-1.0, 1.0, nf)
+    k = lambda e, sp: 2 / C * sp * (f * (u @ e)[..., None] - fc * (uc @ e)[..., None, None])
+    return (k(e1, spx) - band[0]) / band[1], k(e2, spy) / eta_c, 4 * np.pi / C * f * dR[..., None]
 
-    def __init__(self, grid, fr, ant, fc, band, order, hmin, hmax):
+
+class _Model:
+    """The phase over the image's 2-D spectrum as a function of pixel and height, fitted to the exact model at 5 x 5
+    points of the image and four heights, over the pulses and five frequencies of the band:
+        psi = sum_n c_n v^n + w sum_n d_n v^n  (+ terms in w^2, fitted and left: a few thousandths of psi),
+    v the azimuth frequency as coefficients takes it, w = eta / eta_c the range frequency relative to the center
+    frequency (eta in cycles per pixel of axis 1, eta_c its value at the center frequency on the line of sight of
+    the scene center). c is the phase along axis 0 at the center of the range band; d the range walk, the part of
+    the phase that scales with frequency (with the frequency, each pulse's azimuth frequency moves too). Each
+    coefficient is sum over m = 1..3, a, b = 0..2 of K h^m s^a t^b (s, t, h scaled to -1 .. 1; no term without h,
+    which is the plane). self.res: the largest residual of the fits; self.err: the largest misfit at the nodes
+    (rad)."""
+
+    def __init__(self, grid, fr, ant, fc, band, order, hmin, hmax, bw, eta_c):
         nx, ny, o, e1, e2, spx, spy = grid
-        self.n, self.H = (nx, ny), max(abs(hmin), abs(hmax), 1e-3)
+        self.n, self.H, self.order = (nx, ny), max(abs(hmin), abs(hmax), 1e-3), order
         lo, hi = min(hmin, 0.0), max(hmax, 0.0)
         hs = np.array([lo + (hi - lo) * q for q in (0.0, 1 / 3, 2 / 3, 1.0)])
         hs = hs[np.abs(hs) > 1e-6 * self.H]
@@ -191,20 +220,41 @@ class _Model:
         s = np.linspace(-1, 1, 5)
         S, T, Hh = np.meshgrid(s, s, hs, indexing='ij')
         y = o + ((S + 1) * (nx - 1) / 2 * spx)[..., None] * e1 + ((T + 1) * (ny - 1) / 2 * spy)[..., None] * e2
-        c, self.res = _fit(*_phase(grid, fr, _some(ant, 129), fc, y, Hh), band, order)
+        v, w, psi = (q.reshape(q.shape[:3] + (-1,)) for q in _spectrum(grid, fr, _some(ant, 129), fc, bw, eta_c, band,
+                                                                         y, Hh))
+        A = np.concatenate([w[..., None] ** k * v[..., None] ** np.arange(order + 1) for k in (0, 1, 2)], -1)
+        c = (np.linalg.pinv(A) @ psi[..., None])[..., 0]
+        self.res = float(np.abs((A @ c[..., None])[..., 0] - psi).max())
+        self.e = float(np.abs(c[..., 2 * (order + 1):]).sum(-1).max())          # the w^2 part, left (rad at w = 1)
+        c = c[..., :2 * (order + 1)].reshape(-1, 2 * (order + 1))
         A = self._basis(S.ravel(), T.ravel(), Hh.ravel() / self.H)
-        self.K = np.linalg.lstsq(A, c.reshape(-1, order + 1), rcond=None)[0]              # [27, order + 1]
-        self.err = float(np.abs(A @ self.K - c.reshape(-1, order + 1)).max())
+        self.K = np.linalg.lstsq(A, c, rcond=None)[0]                            # [27, 2 (order + 1)]
+        self.err = float(np.abs(A @ self.K - c).max())
 
     @staticmethod
     def _basis(s, t, h):
         return np.stack([h ** m * s ** a * t ** b for m in (1, 2, 3) for a in range(3) for b in range(3)], -1)
 
     def __call__(self, i, j, h):
-        """-> c [order + 1, ...] at pixels (i, j) showing heights h (broadcast)."""
+        """-> (c, d) stacked [2 (order + 1), ...] at pixels (i, j) showing heights h (broadcast)."""
         i, j, h = np.broadcast_arrays(*(np.asarray(v, np.float64) for v in (i, j, h)))
         A = self._basis(2 * i / max(self.n[0] - 1, 1) - 1, 2 * j / max(self.n[1] - 1, 1) - 1, h / self.H)
         return np.moveaxis(A @ self.K, -1, 0)
+
+    def parts(self, i, j):
+        """The polynomial in height at row i and columns j [...]: P [3, 2 (order + 1), ...], the coefficients being
+        sum_m P[m - 1] (h / H)^m."""
+        s = 2 * float(i) / max(self.n[0] - 1, 1) - 1
+        t = 2 * np.asarray(j, np.float64) / max(self.n[1] - 1, 1) - 1
+        st = np.stack([s ** a * t ** b for a in range(3) for b in range(3)])           # [9, ...]
+        return np.stack([np.tensordot(self.K[9 * m:9 * m + 9], st, axes=(0, 0)) for m in range(3)])
+
+    def at(self, P, h, deriv=False):
+        """The coefficients (or their derivatives in height, per meter) [2 (order + 1), ...] of parts P at h."""
+        q = np.asarray(h, np.float64) / self.H
+        if deriv:
+            return (P[0] + 2 * q * P[1] + 3 * q * q * P[2]) / self.H
+        return q * (P[0] + q * (P[1] + q * P[2]))
 
 
 def _lattice(n, sp, post):
@@ -322,8 +372,6 @@ def focus(out, dem, *, order=None, block=None, post=None, tol=0.05, check=True):
     height: (least, median, greatest) of the surface above the image plane (m); offset, relief: the median and
     the standard deviation of the DEM above the plane at the pixels' own positions (m); layover, outside: heights';
     block, post; order; fit_rad: the largest misfit of the polynomial and of its model over the image (rad))."""
-    from . import autofocus as af
-    import scipy.fft as sfft
     if order is not None and not 2 <= int(order) <= 8:
         raise ValueError(f'order must be 2 to 8, got {order!r}')
     grid, fr, ant, fc = _scene(out)
@@ -348,11 +396,14 @@ def focus(out, dem, *, order=None, block=None, post=None, tol=0.05, check=True):
         notes.append('terrain: ' + msg)
     if hm['outside'] > 0:
         notes.append(f"terrain: {100 * hm['outside']:.1f}% of the image is outside the DEM and is left as it is")
+    bw = float(out['band'][1] - out['band'][0])
+    eta_c = 2 / C * fc * spy * float(fr['e2'] @ e2)                  # cycles per pixel of axis 1 at w = 1
     for n in range(2, 9) if order is None else [int(order)]:
-        model = _Model(grid, fr, ant, fc, band, n, float(h.min()), float(h.max()))
+        model = _Model(grid, fr, ant, fc, band, n, float(h.min()), float(h.max()), bw, eta_c)
         if model.res <= tol / 5:
             break
-    c = model(hm['i'][:, None], hm['j'][None, :], h)                           # [order + 1, ni, nj]
+    cd = model(hm['i'][:, None], hm['j'][None, :], h)                          # [2 (order + 1), ni, nj]
+    c, d = cd[:n + 1], cd[n + 1:]
     info.update(order=n, fit_rad=max(model.res, model.err))
     top = np.abs(c).reshape(len(c), -1).max(1)
     info['quadratic_rad'] = (float(c[2].min()), float(c[2].max()))
@@ -360,42 +411,206 @@ def focus(out, dem, *, order=None, block=None, post=None, tol=0.05, check=True):
         info['reason'] = 'the terrain phase is below tol everywhere'
         return info
     keep = np.flatnonzero(top >= tol / 10)
-    c = c[keep]
-    # strips along azimuth: each column's coefficients are the lattice's, averaged over the strip's rows
     hf = min(band[1], 0.5)
-    blur = (np.abs(c) * keep[:, None, None]).sum(0).max() / (2 * np.pi * hf)
+    blur = (np.abs(c[keep]) * keep[:, None, None]).sum(0).max() / (2 * np.pi * hf)
     B = int(block) if block is not None else max(32, 2 * int(round(32.0 / spx)), 16 * int(np.ceil(blur / 2)))
     B = max(1, min(B, nx))
-    st = af._starts(nx, B, max(1, B // 2))
-    raw = np.sin(np.pi * (np.arange(B) + 0.5) / B) ** 2
-    tot = np.zeros(nx)
-    for i0 in st:
-        tot[i0:i0 + B] += raw
-    win = np.stack([raw / tot[i0:i0 + B] for i0 in st])
-    li, lj = hm['i'], hm['j']
-    f = np.clip((np.arange(nx) - li[0]) / (li[1] - li[0]), 0, len(li) - 1 - 1e-9)
-    k0, fr0 = f.astype(np.intp), f % 1.0
-    jc = np.arange(ny)
-
-    def coef(k):
-        w = np.zeros(len(li))
-        sl = slice(st[k], st[k] + B)
-        np.add.at(w, k0[sl], win[k] * (1 - fr0[sl]))
-        np.add.at(w, k0[sl] + 1, win[k] * fr0[sl])
-        row = np.tensordot(w / w.sum(), c, axes=(0, 1))                                    # [terms, nj]
-        return np.stack([np.interp(jc, lj, r) for r in row]).astype(np.float32)
-    n = sfft.next_fast_len(B + 2 * min(B, int(np.ceil(blur)) + 8), real=False)
-    n += (n - B) % 2
-    vb = af._offsets(n, band[0], hf)
-    roll = 0.5 * (1 + np.cos(np.pi * np.clip((np.abs(vb) - 1) / max(0.5 / hf - 1, 1e-9), 0, 1)))
-    V = np.stack([vb ** p * roll for p in keep]).astype(np.float32)
-    out['image'] = af._apply_strips(img, st, B, (n - B) // 2, win.astype(np.float32), V, coef)
+    pad = min(B, int(np.ceil(blur)) + 16)
+    nb = sfft.next_fast_len(B + 2 * pad, real=False)
+    nb += (nb - B) % 2
+    pad = (nb - B) // 2
+    V = _bins(nb, band[0], hf, keep)                                           # [terms, nb]
+    # the range walk: d along axis 1, through each row's spectrum (eta / eta_c, continued smoothly past the band)
+    eb = min(0.5, float(np.abs(np.asarray(planes.support(fr, ant, out['band'], e1, e2)['k2'])).max() * spy))
+    nr = sfft.next_fast_len(ny + 64, real=False)
+    Wq = (eb / eta_c * _bins(nr, 0.0, eb, [1])[0]).astype(np.float32)
+    wmax = float(np.abs(Wq).max())
+    dtop = np.abs(d).reshape(len(d), -1).max(1) * wmax
+    dkeep = np.flatnonzero(dtop >= tol / 10)
+    Vd = _bins(nb, band[0], hf, dkeep)
+    plan = _plan(model, hm, keep, dkeep, V, Vd, B, nx, ny, wmax, 0.5 * tol)
+    out['image'] = _apply(img, plan, V, Vd, Wq, B, pad, nr)
     info.update(applied=True, powers=tuple(int(p) for p in keep), block=B,
-                edge_rad=np.stack([c.reshape(len(c), -1).min(1), c.reshape(len(c), -1).max(1)], 1))
+                edge_rad=np.stack([c[keep].reshape(len(keep), -1).min(1), c[keep].reshape(len(keep), -1).max(1)], 1),
+                levels=max(len(p['um']) for p in plan), walk_terms=max(p['Mw'] for p in plan),
+                walk_rad=float(dtop.sum()), height_rad=max(p['x'] for p in plan))
     q, hh = info['quadratic_rad'], info['height']
     notes.append(f'terrain: focused with the DEM, quadratic phase {q[0]:+.2f} to {q[1]:+.2f} rad at the band edge for '
                  f'surface heights {hh[0]:+.0f} to {hh[2]:+.0f} m about the image plane')
     return info
+
+
+def _bins(n, f0, hf, powers):
+    """v^p [len(powers), n] on the bins of an n-point FFT (v as autofocus._offsets: |v| <= 1 in the band f0 +- hf),
+    continued across the gap between the band's two edges (|v| > 1, out to the bin where they meet) by the cubic
+    that joins the values and slopes of v^p at the edges: a phase built of them is smooth around the circle, so its
+    impulse response stays short, and blocks cut from the image need no more padding than the defocus itself."""
+    v = af._offsets(n, f0, hf)
+    L = max(1.0 / hf - 2.0, 1e-9)                                     # the gap's length in units of v
+    g = np.clip(np.where(v > 1, v - 1, v + 1 / hf - 1) / L, 0.0, 1.0)  # 0 at the upper edge, 1 at the lower
+    h00, h10, h01, h11 = 2 * g ** 3 - 3 * g ** 2 + 1, g ** 3 - 2 * g ** 2 + g, 3 * g ** 2 - 2 * g ** 3, g ** 3 - g ** 2
+    rows = []
+    for p in powers:
+        p = int(p)
+        gap = h00 + h10 * p * L + h01 * (-1.0) ** p + h11 * p * (-1.0) ** (p - 1) * L
+        rows.append(np.where(np.abs(v) <= 1, v ** p, gap))
+    return np.array(rows, np.float32).reshape(len(rows), n)
+
+
+_MOST = 8                                       # Chebyshev nodes in height at most, per strip
+
+
+def _nodes(x, tol):
+    """The fewest Chebyshev nodes in u at which interpolation of exp(-1j x u), |u| <= 1, errs by at most tol
+    (the bound x^M / (2^(M - 1) M!)), up to _MOST."""
+    for m in range(1, _MOST + 1):
+        if x ** m / (2.0 ** (m - 1) * math.factorial(m)) <= tol:
+            return m
+    return _MOST
+
+
+def _plan(model, hm, keep, dkeep, V, Vd, B, nx, ny, wmax, tol):
+    """Per strip of B rows (the last one ends at the image's last row): the heights its pixels show, as lattice
+    rows Hr [r, ny] interpolated along columns and the weights Wr [B, r] of each row; per column the middle hb and
+    half range dl of its heights; Chebyshev nodes um in u = (h - hb) / dl, as many as keep the interpolation in
+    height within tol at the band edge in the strip's worst column; the coefficients C [len(um), terms, ny] at
+    the nodes' heights; the range walk per meter of height D1 [dterms, ny] and its exponent's coefficients C0 at
+    hb; and the terms Mw of exp(-1j w D) - 1 that leave tol. float32, for the device."""
+    li, lj, h = hm['i'], hm['j'], np.nan_to_num(hm['h'])
+    jc = np.arange(ny, dtype=np.float64)
+    st = list(range(0, nx - B + 1, B))
+    if st[-1] + B < nx:
+        st.append(nx - B)
+    step = li[1] - li[0] if len(li) > 1 else 1.0
+    r = int(np.ceil(B / step)) + 2
+    vmax = np.abs(V).max(1)
+    vdmax = np.abs(Vd).max(1) if len(Vd) else np.zeros(0)
+    n1 = model.order + 1
+    plan = []
+    for s0 in st:
+        f = np.clip((np.arange(s0, s0 + B) - li[0]) / step, 0, max(len(li) - 1 - 1e-9, 0))
+        k0 = f.astype(np.intp)
+        lo = int(k0.min())
+        rows = [min(q, len(li) - 1) for q in range(lo, lo + r)]
+        Hr = np.stack([np.interp(jc, lj, h[q]) for q in rows])               # [r, ny]
+        Wr = np.zeros((B, r))
+        Wr[np.arange(B), k0 - lo] = 1 - (f - k0)
+        Wr[np.arange(B), np.minimum(k0 - lo + 1, r - 1)] += f - k0
+        span = np.concatenate([Wr[[0, -1]] @ Hr, Hr[1 + k0[0] - lo:k0[-1] - lo + 1]])
+        hlo, hhi = span.min(0), span.max(0)
+        hb, dl = 0.5 * (hlo + hhi), 0.5 * (hhi - hlo)
+        P = model.parts(s0 + 0.5 * (B - 1), jc)                               # [3, 2 n1, ny]
+        dh = model.at(P, hb, deriv=True)
+        x = float((dl * (np.abs(dh[keep]) * vmax[:, None]).sum(0)).max())
+        M = _nodes(x, tol)
+        um = np.cos(np.pi * (2 * np.arange(M) + 1) / (2 * M)) if M > 1 else np.zeros(1)
+        Cm = np.stack([model.at(P, hb + dl * u)[keep] for u in um]).astype(np.float32)
+        D1 = dh[n1 + dkeep].astype(np.float32)
+        xw = wmax * float(((np.abs(hb) + dl) * (np.abs(D1) * vdmax[:, None]).sum(0)).max()) if len(dkeep) else 0.0
+        Mw = 0
+        if xw > tol:
+            Mw = 1
+            while Mw < 4 and xw ** (Mw + 1) / math.factorial(Mw + 1) > tol:
+                Mw += 1
+        C0 = model.at(P, hb)[keep].astype(np.float32) if Mw and M % 2 == 0 else None
+        plan.append(dict(s0=s0, Hr=Hr.astype(np.float32), Wr=Wr.astype(np.float32), hb=hb.astype(np.float32),
+                         dl=dl.astype(np.float32), um=um, C=Cm, C0=C0, D1=D1, Mw=Mw, x=x))
+    return plan
+
+
+def _strip(xp, ft, blk, V, Vd, Wq, C, C0, D1, Hr, Wr, hb, dl, um, Mw, B, pad, nr, kw):
+    """One strip's correction on the device of blk [B + 2 pad, ny] (xp: its array module, ft: its FFT module, kw:
+    the FFT's keyword arguments): the image corrected for the height of each pixel, by interpolation between the
+    corrections at the Chebyshev nodes of the strip's heights, column by column, and the range walk, -> [B, ny]."""
+    ny = blk.shape[1]
+    F = ft.fft(blk, axis=0, **kw)
+    h = sum(Wr[:, q][:, None] * Hr[q][None, :] for q in range(Wr.shape[1]))     # [B, ny]: not a matrix product
+    M = len(um)
+    if M > 1:
+        u = xp.clip((h - hb[None, :]) / xp.where(dl > 0, dl, 1)[None, :], -1, 1)
+    z, Emid = 0, None
+    for m in range(M):
+        ph = sum(V[k][:, None] * C[m][k][None, :] for k in range(V.shape[0]))
+        E = xp.cos(ph) - 1j * xp.sin(ph)
+        Z = ft.ifft(F * E, axis=0, **kw)[pad:pad + B]
+        if M > 1:
+            L = 1.0
+            for l in range(M):
+                if l != m:
+                    L = L * ((u - float(um[l])) / float(um[m] - um[l]))
+            Z = Z * L
+        z = z + Z
+        if 2 * m + 1 == M:
+            Emid = E
+    if Mw:
+        if Emid is None:
+            ph = sum(V[k][:, None] * C0[k][None, :] for k in range(V.shape[0]))
+            Emid = xp.cos(ph) - 1j * xp.sin(ph)
+        P = sum(Vd[k][:, None] * D1[k][None, :] for k in range(Vd.shape[0]))
+        G, a = F * Emid, -1j * h
+        for q in range(1, Mw + 1):
+            G = G * P
+            T = ft.ifft(G, axis=0, **kw)[pad:pad + B]
+            R = ft.ifft(ft.fft(T, n=nr, axis=1, **kw) * Wq ** q, axis=1, **kw)[:, :ny]
+            z = z + (a ** q / math.factorial(q)) * R
+    return xp.where(blk[pad:pad + B] != 0, z, 0).astype(xp.complex64)
+
+
+_JIT = {}
+
+
+def _apply(img, plan, V, Vd, Wq, B, pad, nr):
+    """The strips of plan on the device of img (NumPy: all cores; CuPy; JAX, one compilation per number of nodes
+    and walk terms) -> the corrected image, complex64, on the same device. The strips do not overlap; the last one,
+    which ends at the last row, gives only the rows the others leave."""
+    nx, ny = img.shape
+    k, xp = _xp.kind(img), _xp.module(img)
+
+    def rows(s0, cols=slice(None)):                                  # strip rows s0 - pad .. s0 + B + pad, zeros beyond
+        r0, r1 = max(0, s0 - pad), min(nx, s0 + B + pad)
+        blk = img[r0:r1, cols].astype(xp.complex64)
+        if r1 - r0 == B + 2 * pad:
+            return blk
+        return xp.pad(blk, ((r0 - (s0 - pad), s0 + B + pad - r1), (0, 0)))
+    done = [min(p['s0'], plan[i - 1]['s0'] + B) if i else 0 for i, p in enumerate(plan)]   # first row each one gives
+    args = lambda p: (p['C'], p['C0'], p['D1'], p['Hr'], p['Wr'], p['hb'], p['dl'])
+    if k == 'jax':
+        import jax
+        import jax.numpy as jnp
+        Vj, Vdj, Wqj = jnp.asarray(V), jnp.asarray(Vd), jnp.asarray(Wq)
+        parts = []
+        for p, r0 in zip(plan, done):
+            key = (len(p['um']), p['Mw'], B, pad, nr, tuple(np.round(p['um'], 12)))
+            if key not in _JIT:
+                um, Mw = p['um'], p['Mw']
+                _JIT[key] = jax.jit(lambda blk, V, Vd, Wq, C, C0, D1, Hr, Wr, hb, dl, um=um, Mw=Mw: _strip(
+                    jnp, jnp.fft, blk, V, Vd, Wq, C, C0, D1, Hr, Wr, hb, dl, um, Mw, B, pad, nr, {}))
+            a = [None if v is None else jnp.asarray(v) for v in args(p)]
+            parts.append(_JIT[key](rows(p['s0']), Vj, Vdj, Wqj, *a)[r0 - p['s0']:])
+        return jnp.concatenate(parts, axis=0)
+    if k == 'cupy':
+        import cupyx.scipy.fft as cf
+        out, Vc, Vdc, Wqc = xp.empty((nx, ny), xp.complex64), xp.asarray(V), xp.asarray(Vd), xp.asarray(Wq)
+        for p, r0 in zip(plan, done):
+            a = [None if v is None else xp.asarray(v) for v in args(p)]
+            z = _strip(xp, cf, rows(p['s0']), Vc, Vdc, Wqc, *a, p['um'], p['Mw'], B, pad, nr, {})
+            out[r0:p['s0'] + B] = z[r0 - p['s0']:]
+        return out
+    out = np.empty((nx, ny), np.complex64)
+    w = int(max(64, af._BLOCK['numpy'] // (2 * (B + 2 * pad))))
+    for p, r0 in zip(plan, done):
+        if not p['Mw']:                                             # column blocks on all cores
+            def work(j):
+                cs = slice(j, j + w)
+                z = _strip(np, sfft, rows(p['s0'], cs), V, Vd, Wq, p['C'][:, :, cs],
+                           None if p['C0'] is None else p['C0'][:, cs], p['D1'][:, cs], p['Hr'][:, cs], p['Wr'],
+                           p['hb'][cs], p['dl'][cs], p['um'], 0, B, pad, nr, {})
+                out[r0:p['s0'] + B, cs] = z[r0 - p['s0']:]
+            af._threads(work, range(0, ny, w))
+        else:                                                       # the walk's transforms span whole rows
+            z = _strip(np, sfft, rows(p['s0']), V, Vd, Wq, *args(p), p['um'], p['Mw'], B, pad, nr, dict(workers=-1))
+            out[r0:p['s0'] + B] = z[r0 - p['s0']:]
+    return out
 
 
 def _stage(out, dem):
