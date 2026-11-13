@@ -153,9 +153,9 @@ was published on PyPI.
 - The noise measurement of `rgiqe.Radiometry` is bounded and no longer reads the file a second time from
   `process_cphd`: about 8 million samples at most (64 pulses of an Umbra collection with 120,736 samples per
   pulse, 0.03 dB from the level of 512), taken from the phase history in memory (`Radiometry(..., history=)`). On
-  that collection the whole radiometric model, with the check of the antenna block, takes 0.55 to 1.2 s (0.6 to
-  1.3 s of CPU) where that of 0.2.0 took 0.8 to 3.6 s (1.5 to 4.2 s of CPU), in a process held to 16 cores on a
-  machine at a load of 67; on a machine oversubscribed several times over, 0.4 to 0.9 s where it took 52 to 181 s.
+  that collection the whole radiometric model, with the check of the antenna block, takes 0.55 to 1.2 s on 16
+  cores where that of 0.2.0 took 0.8 to 3.6 s, and it no longer slows by orders of magnitude on a host whose
+  cores are oversubscribed.
 - `area='black'` ends where a scene of sigma zero -10 dB has a signal-to-noise ratio of 1, ambiguities counted as
   noise: where the noise-equivalent sigma zero plus the ambiguity level reaches -10 dB. In 0.2.0 the reference was
   the RGIQE's scene (0 dB for a co-polarized channel), which put the edge about 10 dB further down the beam, past
