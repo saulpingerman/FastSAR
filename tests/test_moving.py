@@ -7,7 +7,8 @@ CPHD reader.
     squinted one and a sliding spotlight; the product at baseband on both axes. Apodization: no sidelobe above
     -30 dB of its target around the main lobe, which keeps the unweighted width; refused where the squint shears
     the spectrum. The defaults, which are a spotlight's: an unweighted SICD and an apodized SIDD, the SIDD Taylor
-    weighted with a note where apodization is ruled out and was not asked for by name.
+    weighted with a note where apodization is ruled out and was not asked for by name. A sliding spotlight whose
+    SRPs move slower than its beam: the product states and samples the band the beam gives.
 (b) Autofocus. A quadratic phase error over slow time injected into the phase history (2, 5 and 15 rad at the edge
     of a synthetic aperture), an error that changes along the track, and targets above the focus plane seen from a
     curved track (one height, and a height that changes across the swath): the impulse response returns to the
@@ -205,6 +206,34 @@ def test_small_squint_is_apodized():
     sl = sidelobes(o, c)
     print(f'  0.5 degree squint: sidelobes {sl.round(1)} dB')
     assert sl.max() < -30, sl
+
+
+def test_band_of_a_beam_that_outruns_its_reference_points():
+    """A sliding spotlight whose SRPs move at a quarter of the platform's speed while the beam, as the echoes and
+    the file's antenna block both have it, moves at half of it (a Capella C10 sliding spotlight's SRPs move at 0.09
+    of the speed a fixed point's look sweeps at, its antenna's footprint at 0.16). About the SRPs the processed
+    spread takes each pixel through twice the pulses the beam lights it with, half of them beyond the Doppler band
+    the PRF samples about the beam, where its echo is not. The beam center is the antenna's boresight, a note says
+    why, and the product states the band the beam gives, 2 dsin / lambda times its own slide, and holds it: the
+    unweighted impulse response is 0.886 of the band's reciprocal wide. With the SRPs as the beam center the
+    product stated twice that band, sampled four times as finely as the image needs."""
+    tg = np.array([[0.0, 0.0, 0.0], [6.0, 9.0, 0.0]])
+    kw = dict(slide=4.0, antenna=ANT, P=5200, noise=1e-3)          # noise: no pulse is empty, as under clutter
+    c = ms.collection('outrun.cphd', tg, beam=2.0, **kw)
+    o = fastsar.process_cphd('outrun.cphd', backend='cpu', extent=EXT, weighting='uniform', autofocus=False)
+    said = [n for n in o['notes'] if n.startswith('beam center:')]
+    w = [quality.point_target(o['image'], (round(i), round(j)), o['spx'], o['spy'], half=24)['res_az']
+         for i, j in ms.to_pixels(o, o['meta'], c.tg)]
+    print(f"  band {o['bandwidth'][0]:.3f} cycles/m (the beam's {1 / c.beam_ares:.3f}, the SRPs' {1 / c.ares:.3f}), "
+          f"spacing {o['spx']:.4f} m, width x band {np.round(np.array(w) * o['bandwidth'][0], 3)}")
+    assert abs(o['bandwidth'][0] * c.beam_ares - 1) < 0.02, o['bandwidth']
+    assert 0.9 < o['spx'] / (0.96 * c.beam_ares) < 1.001
+    assert np.abs(np.array(w) * o['bandwidth'][0] / 0.886 - 1).max() < 0.03, w
+    assert len(said) == 1 and "antenna's boresight" in said[0] and 'the PRF samples' in said[0], o['notes']
+    # the same beam on its SRPs: the beam center stays there, and the band is the SRPs'
+    c2 = ms.collection('onsrp.cphd', tg, **kw)
+    o2 = fastsar.process_cphd('onsrp.cphd', backend='cpu', extent=EXT, weighting='uniform', autofocus=False)
+    assert abs(o2['bandwidth'][0] * c2.ares - 1) < 0.02 and not any(n.startswith('beam center:') for n in o2['notes'])
 
 
 def test_errors(strip):

@@ -13,6 +13,9 @@ flight and s_p the same for the pulse's scene reference point (SRP). Along e1 th
 (2 f / c) [s - dsin / 2, s + dsin / 2] about the beam center's s at the time the beam crosses the pixel: its
 center follows the squint, which under a sliding or drifting beam changes along the track, and its width at the
 center frequency is 2 dsin / lambda times the ratio of the platform's speed to the footprint's (1 for a stripmap).
+The beam center is each pulse's SRP, unless the SRPs move so much slower than the antenna's footprint that their
+processed spread takes a pixel through pulses outside the Doppler band the PRF samples about the antenna's beam:
+process_cphd then centers it on the antenna's boresight (plan, _steer).
 Along e2 it is the range band times the horizontal part of the line of sight, (2 B / c) cos(graze), on the carrier
 (2 fc / c) cos(graze), both of which change across the swath.
 
@@ -64,14 +67,16 @@ def _poly(c, x):
     return out
 
 
-def beam_model(ant, srp, t, dsin):
+def beam_model(ant, srp, t, dsin, sine=None):
     """A smooth model of a moving beam, from the pulses: antenna positions ant [P, 3] and scene reference points
     srp [P, 3] (local frame, m), times t [P] (s), dsin the processed spread of sin(look) about the beam center.
+    sine [P]: the beam center's sine of look from broadside at each pulse in place of the SRP's (antenna_sine's,
+    where the antenna's boresight is the beam center: plan).
 
     -> dict(t0, th: the time x = (t - t0) / th runs from -1 to 1 over the pulses; A [3, n]: the position as
     polynomials in x (lowest power first); dA, ddA: their derivatives; Q: s |da/dx| as a polynomial, s the sine of
-    the look angle of the SRP from broadside, forward positive; dQ, G: its derivative and integral; d [P, 3] and
-    s [P]: the pulses' own
+    the look angle of the beam center (the SRP) from broadside, forward positive; dQ, G: its derivative and
+    integral; d [P, 3] and s [P]: the pulses' own
     direction of flight and sine, as form_cphd's weighting takes them; dsin; fit: the largest distance of a pulse
     from the fitted track (m); drift: the largest departure of s from the model after a running mean over an
     eighth of an aperture, as a fraction of dsin)."""
@@ -85,7 +90,7 @@ def beam_model(ant, srp, t, dsin):
     d /= np.linalg.norm(d, axis=1, keepdims=True)
     w = srp - ant
     R = np.linalg.norm(w, axis=1)
-    s = np.einsum('ij,ij->i', w, d) / R
+    s = np.einsum('ij,ij->i', w, d) / R if sine is None else np.asarray(sine, np.float64)
     reach = float(np.median(R)) * dsin                               # the length of a synthetic aperture
     for deg in range(min(5, P - 1), min(11, P - 1) + 1, 2):
         A = pf.polyfit(x, ant, deg).T                                # [3, deg + 1]
@@ -180,6 +185,100 @@ def band(out):
     """(f0, hf) of a baseband moving-beam product for autofocus: center 0 and half width (cycles/pixel) of the
     processed azimuth band, from the product's bandwidth entry."""
     return 0.0, min(0.5, 0.5 * float(out['bandwidth'][0]) * float(out['spx']))
+
+
+def antenna_sine(cphd, meta, ant, pulses=None, channel=0):
+    """The sine of the look angle from broadside of the antenna's two-way electrical boresight at each pulse, as
+    form_cphd's weighting takes the SRP's (d . u, d the pulse's direction of flight, u the mean of the transmit and
+    receive boresights), from the antenna block of a CPHD 1.x file (rgiqe.antenna_frames), or None where the
+    file has none or its boresight does not point at the scene. meta: read_cphd's; ant [P, 3]: the positions of
+    the pulses used (local frame), pulses (first, last + 1) of those read (None: all)."""
+    from . import rgiqe
+    from .io import _open_cphd
+    if 'cphd_version' not in meta:                                  # a raw collection's reader: no antenna block
+        return None
+    r = _open_cphd(str(cphd))
+    m = r.cphd_meta
+    ch = int(meta.get('channel_index', channel))
+    par = rgiqe._parameters(m, meta, ch)
+    if par is None or getattr(m, 'Antenna', None) is None:
+        return None
+    pv = r.read_pvp_array(ch)
+    lo, hi = meta.get('pulses', (0, len(meta['tx'])))
+    sel = slice(*(pulses if pulses is not None else (0, hi - lo)))
+    fi = np.arange(lo, hi)[sel]
+    t_tx = np.asarray(meta['tx_time'], np.float64)[sel]
+    t_rcv = np.asarray(meta['rcv_time'], np.float64)[sel] if 'rcv_time' in meta else t_tx
+    ant = np.asarray(ant, np.float64)
+    if len(fi) != len(ant):
+        return None
+    f = rgiqe.antenna_frames(m, par, pv, fi, t_tx, t_rcv, meta['R'])
+    if f is None:
+        return None
+    w = np.asarray(meta['srp_pulses'], np.float64)[sel] - ant
+    w /= np.linalg.norm(w, axis=1, keepdims=True)
+    u = 0.0
+    for k in ('tx', 'rcv'):
+        _, ax, ay, eb, _ = f[k]
+        z = np.cross(ax, ay)
+        z *= np.where(np.einsum('ij,ij->i', z, w) < 0, -1.0, 1.0)[:, None]      # toward the scene, either hand
+        b = eb[:, :1] * ax + eb[:, 1:] * ay + np.sqrt(np.clip(1.0 - (eb ** 2).sum(1), 0.0, 1.0))[:, None] * z
+        u = u + b / np.linalg.norm(b, axis=1, keepdims=True)
+    u = u / np.linalg.norm(u, axis=1, keepdims=True)
+    if not np.all(np.isfinite(u)) or np.median(np.einsum('ij,ij->i', u, w)) < 0.99:
+        return None                                                 # not toward the scene: frames read otherwise
+    d = np.gradient(ant, axis=0)
+    d /= np.linalg.norm(d, axis=1, keepdims=True)
+    return np.einsum('ij,ij->i', u, d)
+
+
+def _steer(g, bm, b, opt, lam):
+    """The beam center of a process_cphd product: the SRP of each pulse (bm, beam_model's), or the antenna's
+    boresight (antenna_sine) where the SRPs' processed spread reaches pulses on which a point of the tasked
+    rectangle b lies outside the Doppler band the PRF samples about the antenna's beam, sin(look) within
+    +-lambda PRF / (4 v) of the boresight's. Such pulses hold no echo of the point that is not ambiguous with
+    others: under a sliding spotlight whose SRPs move slower than the antenna's footprint (a Capella C10 sliding
+    spotlight: 0.09 of the speed a fixed point's look moves at, against the boresight's 0.16) the spread of the
+    SRPs takes a pixel through pulses well outside the beam, which add noise and no band. The antenna's track is
+    taken only where it reaches every point and is as smooth as the beam model needs, and only for a processed
+    spread the PRF samples (not a vendor's band wider than that). -> (beam model, the boresight's sine [P] or
+    None, note or None)."""
+    ant, dsin = np.asarray(g['ant'], np.float64), float(g['dsin'])
+    if g.get('grid') is not None or 'cphd_version' not in g['meta']:
+        return bm, None, None
+    half = lam / (4 * np.linalg.norm(np.gradient(ant, axis=0), axis=1).mean())      # lambda PRF / (4 v)
+    if dsin / 2 > half:
+        return bm, None, None
+    bs = antenna_sine(opt['cphd'], g['meta'], ant, g['pulses'], opt['channel'])
+    if bs is None:
+        return bm, None, None
+    c, e1, e2 = g['center'], g['e1'], g['e2']
+    pts = c + (np.linspace(b[0], b[1], 7)[:, None, None] * e1 + np.linspace(b[2], b[3], 5)[None, :, None] * e2
+               ).reshape(-1, 3)
+    reach, seen = 0.0, True
+    for x in pts:
+        w = x[None] - ant
+        sx = np.einsum('ij,ij->i', w, bm['d']) / np.linalg.norm(w, axis=1)
+        on = np.abs(sx - bm['s']) <= dsin / 2
+        if on.any():
+            reach = max(reach, float(np.abs(sx[on] - bs[on]).max()))
+        seen = seen and int((np.abs(sx - bs) <= dsin / 2).sum()) > 1
+    if reach <= half:
+        return bm, None, None
+    if not seen:
+        return bm, None, ('beam center: the SRPs of the pulses take the tasked area beyond the Doppler band the PRF '
+                          "samples about the antenna's boresight, which does not reach all of it: the SRPs are kept")
+    am = beam_model(ant, g['srp'], g['meta']['tx_time'], dsin, sine=bs)
+    if am['drift'] > bm['drift'] and am['drift'] > 0.05:
+        return bm, None, ("beam center: the SRPs of the pulses take the tasked area beyond the Doppler band the PRF "
+                          "samples about the antenna's boresight, which does not move smoothly: the SRPs are kept")
+    k = lambda m: 2.0 / max(abs(float(center_time(m, (c + e1)[None])[0] - center_time(m, (c - e1)[None])[0]))
+                            * m['th'], 1e-12)                       # the beam center's speed along e1 (m/s)
+    note = (f"beam center: the antenna's boresight (the file's antenna block), not the SRPs of the pulses. The "
+            f'SRPs move {k(bm):.0f} m/s along the track at the scene center and the boresight {k(am):.0f} m/s, '
+            f'so the processed spread about the SRPs reaches pulses on which the scene lies up to {reach:.4f} '
+            f'from the boresight in sin(look), beyond the {half:.4f} the PRF samples: they hold no echo of it')
+    return am, bs, note
 
 
 def _model(out):
@@ -1062,13 +1161,16 @@ def plan(g, st, opt):
         d = g['corners'] - c
         b = np.array([(d @ e1).min(), (d @ e1).max(), (d @ e2).min(), (d @ e2).max()])
     notes, valid, tasked = g['notes'], None, b
+    lam = C / (f0 + K / 2 * df)
+    bm, steer, why = _steer(g, bm, b, opt, lam)                      # the SRPs, or the antenna's boresight
+    if why:
+        notes.append(why)
     if area != 'tasked':
         import time
         tr = time.perf_counter()
         b, valid = _range_area(g, bm, b, opt)
         st['model_s'] = time.perf_counter() - tr                     # process_cphd's 'radiometry' stage
     smooth = bm['drift'] <= 0.05
-    lam = C / (f0 + K / 2 * df)
     own = (0.96 * lam / (2 * dsin), 0.96 * C / (2 * K * df) / np.cos(g['graze']))        # form_cphd's spacing
 
     def bands(over):
@@ -1171,6 +1273,8 @@ def plan(g, st, opt):
               footprint=float(np.median((sp['pulses'] * sp['speed'])[use])))
     out.update(window=wt == 'taylor', azimuth_window='taylor' if wt == 'taylor' else 'uniform', azimuth_pad=pad,
                fit_patch=True)
+    if steer is not None:                                            # form_cphd's weighting about the boresight
+        out['beam_sine'] = steer
     return out
 
 
