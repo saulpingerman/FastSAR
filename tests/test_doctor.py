@@ -124,5 +124,17 @@ def test_available_memory_honors_a_control_group_limit(tmp_path, monkeypatch):
     monkeypatch.setattr(builtins, 'open', fake)
     assert memory._cgroup_available() == 7 * 2 ** 30
     assert memory.host_available() == 7 * 2 ** 30
+    # the group's page cache is not counted against it: a 4 GiB file just read is in the usage and can be given back
+    files['/sys/fs/cgroup/user.slice/job.scope/memory.current'] = f'{5 * 2 ** 30}\n'
+    files['/sys/fs/cgroup/user.slice/job.scope/memory.stat'] = (f'anon {2 ** 30}\nfile {4 * 2 ** 30}\ninactive_anon 0\n'
+                                                                 f'inactive_file {3 * 2 ** 30}\nactive_file {2 ** 30}\n')
+    assert memory._cgroup_available() == 7 * 2 ** 30 and memory.host_available() == 7 * 2 ** 30
+    files['/sys/fs/cgroup/user.slice/job.scope/memory.stat'] = 'inactive_file many\n'       # unreadable: the usage as it is
+    assert memory._cgroup_available() == 3 * 2 ** 30
+    files['/sys/fs/cgroup/user.slice/job.scope/memory.stat'] = (f'inactive_file 1\nactive_file 1\n'
+                                                                 f'total_inactive_file {2 ** 30}\ntotal_active_file {2 ** 30}\n')
+    assert memory._cgroup_available() == 5 * 2 ** 30                                         # a v1 hierarchy: the totals
+    del files['/sys/fs/cgroup/user.slice/job.scope/memory.stat']
+    files['/sys/fs/cgroup/user.slice/job.scope/memory.current'] = '1073741824\n'
     files['/sys/fs/cgroup/user.slice/job.scope/memory.max'] = 'max\n'
     assert memory._cgroup_available() is None and memory.host_available() == 104857600 * 1024
