@@ -65,6 +65,30 @@ def test_fused_final2(toy, passes, lim):
     assert e < lim, f'final2 {passes}: {e:.1f} dB (limit {lim} dB)'
 
 
+def test_fused_final2_weighted(toy):
+    """The recurrence version under an aperture weight by row and pulse on each ramp, (w0 + gx dx)(1 + gyr dy) of
+    the cpu final stage: against the float64 sum with the weights, three passes."""
+    import jax.numpy as jnp
+    from fastsar.pallas_ffbp import fused_final2
+    rng = np.random.default_rng(1)
+    dl = (np.arange(T) - (T - 1) / 2) * 0.5
+    w0, gx, gyr = rng.integers(0, 2, (B, Pf)) * rng.uniform(0.2, 1.0, (B, Pf)), rng.uniform(-0.1, 0.1, (B, Pf)), rng.uniform(-0.05, 0.05, (B, Pf))
+    wx = w0[:, None, :] + gx[:, None, :] * dl[None, :, None]                                   # [B, T, Pf]
+    wy = 1.0 + gyr[:, None, :] * dl[None, :, None]
+    ref = np.zeros((B, T, T), np.complex128)
+    for b in range(B):
+        A = wx[b][:, :, None] * toy.data[b][None] * np.exp(-2j * np.pi * toy.gx[b][:, :, None] * toy.qv[None, None, :])
+        Bm = wy[b][:, :, None] * np.exp(-2j * np.pi * toy.gy[b][:, :, None] * toy.qv[None, None, :])
+        ref[b] = A.reshape(T, -1) @ Bm.reshape(T, -1).T
+    pad = lambda w: jnp.asarray(np.pad(w, ((0, 0), (0, 0), (0, toy.gxp.shape[2] - Pf))), jnp.float32)
+    dT = toy.dT
+    cre, cim = fused_final2(jnp.asarray(dT.real, jnp.float32), jnp.asarray(dT.imag, jnp.float32), jnp.asarray(toy.gxp), jnp.asarray(toy.gyp),
+                            float(a0), float(a1), Qf, passes=3, interpret=True, weights=(pad(wx), pad(wy)))
+    e = err_db(np.asarray(cre) + 1j * np.asarray(cim), ref)
+    print(f'final kernel 2 (recurrence) with weights: error {e:.1f} dB')
+    assert e < -84, f'final2 weighted: {e:.1f} dB'
+
+
 @pytest.mark.parametrize('passes, lim', [(1, -48), (3, -84)])
 def test_fused_final3(toy, passes, lim):
     """The stacked-tile version (B = 3 tiles here -> pad to 4)."""

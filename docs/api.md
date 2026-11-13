@@ -71,17 +71,20 @@
   `target_db` apply to `'ffbp'`, `pfa_guard` and `pfa_support` to `'pfa'`; `interp` (`'cubic'` or `'linear'`), `upsample` and
   `center` (the point the grid is centered on) apply to `'bp'` only and raise `ValueError` with the others.
 - `ImageFormer(ant, fmin, df, K, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 1.0, 0.0), *, backend='auto',
-  precision='float32', ..., aperture_weight=None, ref=None, range_gate='auto')`: plans and compiles once;
-  `former(S)` forms each image.
+  precision='float32', ..., aperture_weight=None, ref=None, range_gate='auto', padded=None)`: plans and compiles
+  once; `former(S)` forms each image.
   Arguments after `e2` are keyword-only. Attributes `T`, `predicted_error_db`, `range_gate` (None, or what the
   gate kept). `range_gate`: the history gated in range to the image's swath before formation: `'auto'` where the
   cuda backend's first level could not hold its filter otherwise, `True` wherever the gate keeps under half of
   the samples, `False` never ([stack.md](stack.md#the-range-gate)); `form_image` takes it too. On the cuda backend
   the gate sizes its blocks to the device memory that is free and runs on the host where the device has no room
   for it; the gate's `note` says so. `aperture_weight(points, pulses) -> W [n, m]` weights pulses
-  per pixel. `memory()`: the bytes full speed needs and the bytes free, as
-  `dict(backend, needed, available, full_speed, parts)`. `stage(S)`: the checks, scaling and upload of `S` ahead
-  of formation on the JAX and TPU backends; `former(former.stage(S))` equals `former(S)`.
+  per pixel, per final subaperture and tile. `padded=(first, count, pulse)`: `ant` is an aperture of `count`
+  pulses from pulse `first` with zero pulses around it, and the weight is laid out as on that aperture alone,
+  with the pulse decimations `pulse` of its own plan (`ffbp2.pulse_plan`): the mosaic's JAX and TPU patches under
+  a window with a step ([stripmap-burst.md](stripmap-burst.md)). `memory()`: the bytes full speed needs and the
+  bytes free, as `dict(backend, needed, available, full_speed, parts)`. `stage(S)`: the checks, scaling and upload
+  of `S` ahead of formation on the JAX and TPU backends; `former(former.stage(S))` equals `former(S)`.
 - `ExactFormer(ant, fmin, df, K, nx, ny, spx, spy, e1, e2, *, backend='auto', window=True, interp='cubic',
   upsample=None, ref=None, center=None, chunk=1024)`: exact backprojection onto the `form_image` grid (centered on
   `center`, default the origin), set up once; `former(S)` forms each image (`S` may be a CuPy array on the cuda

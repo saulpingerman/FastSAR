@@ -51,6 +51,11 @@ was published on PyPI.
   (`FASTSAR_JAX_BLOCK_MB`), with an image the device cannot hold kept on the host and passed through it.
 - `form_cphd(..., azimuth_window=)`: the per-pixel azimuth window of a moving beam, `'hann'` (the default, as
   before), `'taylor'` or `'uniform'`; `patches.form_mosaic(..., amask=)` cuts a window at the edge of the band.
+  The step this leaves at the edge is placed per final subaperture of the former, and every backend places it at
+  the same pulses: under such a window the jax and tpu backends, which pad a patch's pulses and range gate to the
+  sizes their compiled programs are shared at, lay the patch out as the cpu and cuda backends form it and apply
+  the weight in their form, in one final stage instead of three (`ImageFormer(padded=)`,
+  `ffbp2.make_plan(pulse=)`).
 - Radiometric calibration in the SICD. `process_cphd` writes the `Radiometric` block of a spotlight SICD when the
   CPHD file supports it, and only then: `NoiseLevel` (ABSOLUTE) and `RCSSFPoly`, `SigmaZeroSFPoly`,
   `BetaZeroSFPoly` and `GammaZeroSFPoly`, by SICD's definitions. With `PTRef` and `PNRef` in the file both the

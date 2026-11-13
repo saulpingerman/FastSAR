@@ -189,10 +189,14 @@ def fir(F, D, m):
     return dict(kern=kern, pl=int(pl), pr=int(pr), n_out=int(n_out), L=int(L))
 
 
-def make_plan(col, nx, ny, spx, spy, T=32, nlev=3, pmax=0.4, atten=70.0, splits=None, e1=(1.0, 0.0, 0.0), e2=(0.0, 1.0, 0.0)):
+def make_plan(col, nx, ny, spx, spy, T=32, nlev=3, pmax=0.4, atten=70.0, splits=None, e1=(1.0, 0.0, 0.0), e2=(0.0, 1.0, 0.0),
+              pulse=None):
     """Tile grid, decimation factors and filters for an nx x ny image with pixel spacings spx, spy in the
     plane spanned by the orthonormal vectors e1, e2 (the ground plane by default), centered on the origin of
-    the collection's coordinates. Depends on the imaging mode only."""
+    the collection's coordinates. Depends on the imaging mode only.
+    pulse: each level's pulse decimation and passband, [(Dp, pass_p)], in place of those this antenna path gives:
+    the levels' of the plan of the same aperture before zero pulses were added around it (pulse_plan; ImageFormer's
+    padded=), so that both plans cut the aperture into the same subapertures with the same filters."""
     e1, e2 = np.asarray(e1, np.float64), np.asarray(e2, np.float64)
     sxs = choose_splits(nx, T, nlev) if splits is None else tuple(s[0] for s in splits)
     sys_ = choose_splits(ny, T, nlev) if splits is None else tuple(s[1] for s in splits)
@@ -203,7 +207,7 @@ def make_plan(col, nx, ny, spx, spy, T=32, nlev=3, pmax=0.4, atten=70.0, splits=
     i0 = np.zeros((1, 2))
     cx, cy = Nx, Ny
     out = dict(levels=[], T=T, nx=nx, ny=ny, Nx=Nx, Ny=Ny, ox=ox, oy=oy, spx=spx, spy=spy, split=list(zip(sxs, sys_)), e1=e1, e2=e2)
-    for sx, sy in zip(sxs, sys_):
+    for n, (sx, sy) in enumerate(zip(sxs, sys_)):
         cx, cy = cx // sx, cy // sy
         gi, gj = np.meshgrid(np.arange(sx) * cx, np.arange(sy) * cy, indexing='ij')
         ci0 = i0[:, None, :] + np.stack([gi.ravel(), gj.ravel()], axis=1)[None, :, :]          # [B, C, 2]
@@ -221,6 +225,8 @@ def make_plan(col, nx, ny, spx, spy, T=32, nlev=3, pmax=0.4, atten=70.0, splits=
         # a mosaic with nearly equal geometry get identical filters and share one compiled JAX program
         pass_k = math.ceil(64 * rk / (C / (2.0 * df * Dk) / 2.0)) / 64
         pass_p = math.ceil(64 * 2.0 * (2.0 * (f0 + K * df) / C) * dop * Dp) / 64
+        if pulse is not None:
+            Dp, pass_p = int(pulse[n][0]), float(pulse[n][1])
         Fk, Fp = LazyDecimator(K, Dk, min(pass_k, 0.95), atten), LazyDecimator(P, Dp, min(pass_p, 0.95), atten)
         mk, mp = Fk.m, Fp.m
         # an axis shorter than its decimation kernel (late levels of small or wide-angle collections) is not decimated
@@ -242,6 +248,12 @@ def make_plan(col, nx, ny, spx, spy, T=32, nlev=3, pmax=0.4, atten=70.0, splits=
     assert (cx, cy) == (T, T)
     out['final'] = dict(cen=ref, f0=f0, df=df, K=K, P=P, fc=f0 + (K - 1) / 2.0 * df)
     return out
+
+
+def pulse_plan(plan):
+    """A plan's pulse decimations and passbands by level, [(Dp, pass_p)], and the product of the decimations: the
+    pulses of the input that one final subaperture spans. make_plan's pulse= lays another plan out the same way."""
+    return [(lv['Dp'], lv['pass_p']) for lv in plan['levels']], _prod(lv['Dp'] for lv in plan['levels'])
 
 
 def plan_signature(plan):
@@ -767,7 +779,10 @@ def make_ffbp(policy, plan, filt='dense', budget=1 << 26, trig='split', pallas_p
 
     fused_fin = (filt == 'pallas2' and int(pallas_final)) or 0            # 0: XLA final; 1: direct-trig kernel; 2: recurrence kernel; 3: recurrence, four tiles per step
 
-    def final(hre, him, fa):
+    def final(hre, him, fa, wts=None):
+        """wts: None, or an aperture weight per tile and final subaperture in the cpu former's form, (w0, gx, gyr)
+        [B, Pf] each: the weight (w0 + gx dx)(1 + gyr dy) at the pixel (dx, dy) from the tile's center, its first
+        factor on the data's table and its second on the other one."""
         B = hre.shape[0]
         tb = B if fused_fin else _chunk(B, T * Pf * Qf, budget)
         dlx, dly = jnp.asarray(dlx_host, f), jnp.asarray(dly_host, f)
@@ -778,7 +793,11 @@ def make_ffbp(policy, plan, filt='dense', budget=1 << 26, trig='split', pallas_p
             return ramp(c - jnp.round(c), g * (-a1), Qf, 0.0)
 
         def per_chunk(a):
-            tre, tim, cen = a
+            tre, tim, cen = a[:3]
+            lwx = lwy = None
+            if wts is not None:                                  # [tb, T, Pf]: by row of each table and subaperture
+                lwx = a[3][:, None, :] + a[4][:, None, :] * dlx[None, :, None]
+                lwy = 1.0 + a[5][:, None, :] * dly[None, :, None]
             u, r0 = fa['u'], fa['r0']
             wx = r0[None, :] * u[None, :, 0] - cen[:, 0:1]
             wy = r0[None, :] * u[None, :, 1] - cen[:, 1:2]
@@ -805,13 +824,15 @@ def make_ffbp(policy, plan, filt='dense', budget=1 << 26, trig='split', pallas_p
                 # the kernel holds T x Q x Pl ramp products in VMEM; past FINAL_VMEM_TQP the frequency rows go in
                 # chunks, each starting its ramp at its first row, and the chunks' products are summed
                 Qc = max(8, (FINAL_VMEM_TQP // (T * Pl * tiles)) // 8 * 8)
+                wxy = None if wts is None else tuple(jnp.pad(v, padg).astype(jnp.float32) for v in (lwx, lwy))
                 cre = cim = 0.0
                 for q0 in range(0, Qp8, Qc):
                     q1 = min(Qp8, q0 + Qc)
                     if fused_fin == 3:
                         r_, i_ = fused_final3(dTr[:, q0:q1], dTi[:, q0:q1], gxT, gyT, a0, a1, min(Qf, q1) - q0, passes=npass, tiles=tiles, q0=q0)
                     else:
-                        r_, i_ = fused_final2(dTr[:, q0:q1], dTi[:, q0:q1], gxT, gyT, a0, a1, min(Qf, q1) - q0, passes=npass, q0=q0)
+                        r_, i_ = fused_final2(dTr[:, q0:q1], dTi[:, q0:q1], gxT, gyT, a0, a1, min(Qf, q1) - q0, passes=npass, q0=q0,
+                                              weights=wxy)
                     cre, cim = cre + r_, cim + i_
                 cre, cim = cre[:tb].astype(f), cim[:tb].astype(f)
             elif fused_fin:
@@ -830,8 +851,13 @@ def make_ffbp(policy, plan, filt='dense', budget=1 << 26, trig='split', pallas_p
                 cre, cim = cre.astype(f), cim.astype(f)
             else:
                 cs, sn = rot(ux[:, None, :] * dlx[None, :, None])
-                A = jnp.concatenate([tre[:, None] * cs - tim[:, None] * sn, tre[:, None] * sn + tim[:, None] * cs], axis=1)
+                are, aim = tre[:, None] * cs - tim[:, None] * sn, tre[:, None] * sn + tim[:, None] * cs
+                if wts is not None:
+                    are, aim = are * lwx[..., None].astype(are.dtype), aim * lwx[..., None].astype(aim.dtype)
+                A = jnp.concatenate([are, aim], axis=1)
                 cs, sn = rot(uy[:, None, :] * dly[None, :, None])
+                if wts is not None:
+                    cs, sn = cs * lwy[..., None].astype(cs.dtype), sn * lwy[..., None].astype(sn.dtype)
                 Bm = jnp.concatenate([cs, sn], axis=1)
                 M = mmul(A.reshape(tb, 2 * T, Pf * Qf), jnp.swapaxes(Bm.reshape(tb, 2 * T, Pf * Qf), 1, 2).astype(mm))
                 cre = M[:, :T, :T] - M[:, T:, T:]
@@ -843,7 +869,10 @@ def make_ffbp(policy, plan, filt='dense', budget=1 << 26, trig='split', pallas_p
             c, s = jnp.cos(ang), jnp.sin(ang)
             return cre * c - cim * s, cre * s + cim * c
 
-        xs = tuple(v.reshape((B // tb, tb) + v.shape[1:]) for v in (hre, him, fa['cen']))
+        if wts is not None and not (fused_fin == 0 or (fused_fin == 2 and on_tpu)):
+            raise ValueError("an aperture weight in the cpu former's form is built into XLA's final stage and the "
+                             'TPU kernel fused_final2 (pallas_final 0 and 2)')
+        xs = tuple(v.reshape((B // tb, tb) + v.shape[1:]) for v in (hre, him, fa['cen']) + tuple(wts or ()))
         ire, iim = lax.map(per_chunk, xs)
         return ire.reshape(B, T, T), iim.reshape(B, T, T)
 
@@ -856,8 +885,12 @@ def make_ffbp(policy, plan, filt='dense', budget=1 << 26, trig='split', pallas_p
     def final_w(a, b, fa, g):
         """The final stage of first-level tile g, with ImageFormer's aperture weight when fa holds one (w [3, ntiles,
         Pf]: the weight per final subaperture and tile and its gradient along e1 and e2): three final stages, combined
-        with the pixel offsets."""
+        with the pixel offsets. wp [3, ntiles, Pf] instead: the weight in the cpu former's form (final's wts), in one
+        final stage."""
         cen = fa['cen'].reshape(G, -1, 3)[g]
+        if 'wp' in fa:
+            w = fa['wp'].reshape(3, G, -1, Pf)[:, g].astype(f)
+            return final(a, b, dict(fa, cen=cen), (w[0], w[1], w[2]))
         if 'w' not in fa:
             return final(a, b, dict(fa, cen=cen))
         w = fa['w'].reshape(3, G, -1, Pf)[:, g][..., None].astype(a.dtype)
