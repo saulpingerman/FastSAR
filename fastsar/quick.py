@@ -18,19 +18,25 @@ the ground sheared by the plane's twist (zero at broadside, tens of degrees for 
 angle), and the product gives that angle.
 
 Only those pulses and samples are read (io.read_cphd's pulses= and samples=), and the cut history is formed by polar
-format in four stages, each a pass whose cost follows the picture, not the collection:
+format in stages whose cost follows the picture, not the collection:
 
-  1. Range gate. Each pulse's inverse transform is cut to the range bins the picture spans (a raised-cosine edge
-     beyond them) and transformed back, to a spectrum sampled 1.5 times finer than the gate needs; a 16-tap
-     Kaiser-windowed sinc then reads it at the range wavenumbers of the rectangular raster (the keystone).
-  2. Azimuth gate. Each range wavenumber's pulse sequence is transformed, cut to the picture's azimuth extent, and
-     transformed back at the pulse spacing that extent needs; the same kernel reads it at the raster's azimuth
-     wavenumbers, at the pulse positions of the collection's own, uneven, spacing in the tangent of the look angle.
+  1. Range. Each pulse is weighted, transformed to a range profile, cut to the range bins the picture spans (a
+     raised-cosine edge beyond them) and transformed back, to a spectrum sampled 1.5 times finer than the gate
+     needs; a 16-tap Kaiser-windowed sinc then reads it at the range wavenumbers of the rectangular raster.
+  2. Azimuth. Each range wavenumber's pulse sequence is transformed, cut to the picture's azimuth extent (a gate
+     set in meters for that wavenumber's own bins), and transformed back at the pulse spacing that extent needs;
+     the same kernel reads it at the raster's azimuth wavenumbers, at the pulse positions of the collection's own,
+     uneven, spacing in the tangent of the look angle. The pulses are not resampled separately.
   3. A two-dimensional FFT of the raster. Uncorrected (correct=False) this is the picture: polar format's planar
      wavefronts leave each scatterer displaced by a smooth field that grows with the square of its distance from
      the center (the product's notes give its size in pixels).
   4. Corrected (the default): the transform is taken on a raster padded to twice the sampling and read at each
      pixel's apparent position (pfa2.distortion's polynomial) with a 6-tap Lanczos kernel.
+
+What the correction does not remove is polar format's defocus far from the center at fine resolution: the complex
+image is within -40 dB of exact backprojection of the same history at the sizes a quick look is for, and at full
+resolution on a scene of several kilometers it falls to -15 to -25 dB at the corners, as form_image(algorithm='pfa')
+does.
 
 Devices. 'cpu': scipy's FFTs on all cores, every one along the rows of its array (the arrays are turned between
 the stages), and the C++ kernels of quicklook_cpu.cpp, which read their weights from polyphase tables. 'cuda': the

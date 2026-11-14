@@ -298,6 +298,33 @@ def test_uneven_pulse_spacing():
     assert e < -30
 
 
+def test_wide_band_keeps_the_far_edge_clean():
+    """Over a wide band the bins of the azimuth gate's transform differ from one range wavenumber to the next (5%
+    here). A strong point just beyond the gate must be rejected at every wavenumber: where the gate is set in bins,
+    the low end of the band passes it and it wraps into the picture's far edge."""
+    rng = np.random.default_rng(9)
+    col = sim.make_collect(res=0.3, scene=220.0, r0=30e3)
+    P = col.Np
+    a = col.ant[P // 2]
+    e2 = -a / np.linalg.norm(a)
+    n = np.cross(e2, col.ant[P // 2 + 1] - col.ant[P // 2 - 1])
+    n *= np.sign(n[2]) / np.linalg.norm(n)
+    e1 = np.cross(e2, n)
+    grid = (256, 256, 0.28, 0.28, e1, e2)
+    g = quick._geometry(col.ant, col.fmin, col.df, col.K, *grid, True)
+    assert g['bins_a'].max() / g['bins_a'].min() > 1.04
+    out = (g['Ex'] + 1.02 * g['gx']) * e1                        # just past the gate's zero, on the +x side
+    tg = np.concatenate([np.stack([rng.uniform(-30, 30, 30), rng.uniform(-30, 30, 30), np.zeros(30)], 1) @ np.stack([e1, e2, n]),
+                         out[None]])
+    amp = np.concatenate([rng.standard_normal(30) + 1j * rng.standard_normal(30), [40.0]])
+    S = sim.simulate_brute(col, tg, amp).astype(np.complex64)
+    ex = fastsar.ExactFormer(col.ant, col.fmin, col.df, col.K, *grid, backend='cpu', window=True)(S)
+    img = quick._pfa(S, col.ant, col.fmin, col.df, *grid, window=True)
+    e_far, e_all = rel_db(img[:48], ex[:48]), rel_db(img, ex)
+    print(f'wide band: far edge {e_far:.1f} dB, whole {e_all:.1f} dB')
+    assert e_far < -20 and e_all < -25
+
+
 # ------------------------------------------------------------------------------------------------------ files
 
 def test_png_round_trip(tmp_path):
