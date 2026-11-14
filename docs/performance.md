@@ -384,8 +384,9 @@ the runs. On the same machine `form_cphd` takes 30.9 s, 365 s and 43.5 s on the 
 file is read (0.7 to 12.8 s): neither falls with the size of the picture.
 
 Bytes. The samples are read with `pread`, a block of pulses per thread, with the per-pulse parameters of those
-pulses alone, so the process asks the file for the megabytes above and the header. Read cold, the 2048-pixel cut of
-the 9.13 GB file took 77 MB from storage for 59 MB of samples, in 0.04 s. The Umbra file needs the most because
+pulses alone, so the process asks the file for the megabytes above and the header. The times are warm: the
+machine is shared and its page cache was not dropped. On a run that found its part of the 9.13 GB file out of the
+cache, a cut of 59 MB took 77 MB from storage and 0.04 s. The Umbra file needs the most because
 its frequency step leaves 34 km unambiguous for a 2 km swath: a contiguous cut keeps that step, and the range gate
 removes the rest after the read.
 

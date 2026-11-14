@@ -533,6 +533,20 @@ def test_auto_backend_without_importing_jax(monkeypatch):
             sys.modules['jax'] = saved
 
 
+@pytest.mark.tpu
+def test_tpu(spot):
+    """On a TPU: 'auto' picks it, the cut history is formed by the factorized former at precision 'single-pass',
+    and the picture agrees with polar format's on the host."""
+    ref = look(spot['path'], size=128, complex_image=True)
+    out = fastsar.quicklook(spot['path'], size=128, complex_image=True)
+    assert out['backend'] == 'tpu' and out['algorithm'] == 'ffbp' and out['corner_error'] is None
+    assert any('single-pass' in n for n in out['notes']) and out['cut'] == ref['cut']
+    e = rel_db(out['image'], ref['image'])
+    print(f'factorized former on the TPU against polar format on the host: {e:.1f} dB')
+    assert e < -20
+    assert np.mean(np.abs(out['display'].astype(int) - ref['display'].astype(int)) <= 16) > 0.9
+
+
 @pytest.mark.cuda
 def test_cuda_without_room_forms_on_the_host(spot, monkeypatch):
     """A device with less free memory than the stages hold there: the picture is formed on the host, with a note."""
