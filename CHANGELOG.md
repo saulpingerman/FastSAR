@@ -199,6 +199,23 @@ was published on PyPI.
 
 ### Fixed
 
+- `process_cphd` stated, and sampled for, an azimuth band the image does not have on a sliding spotlight whose
+  scene reference points (SRPs) move slower than its beam. On a Capella C10 sliding spotlight (2024-04-05) the
+  default SICD of a 1 by 3 km cut stated 11.29 cycles/m and was sampled at 0.083 m. Its SRPs move 612 m/s along
+  the track at the scene center, and the beam, as the file's antenna block points it, 1,061 m/s: the processed
+  spread about the SRPs took each pixel through pulses up to 0.0149 in sin(look) from the boresight, beyond the
+  0.0111 the PRF samples, which hold no echo of it. The image showed it: the -3, -6 and -10 dB widths of its
+  azimuth spectrum were 3.35, 5.2 and 7.0 cycles/m, against 3.8, 5.3 and 6.9 predicted from the boresight's
+  motion and the file's pattern and 6.0, 8.5 and 11.0 from the SRPs'. Where the SRPs' spread takes the tasked
+  area beyond the band the PRF samples about the antenna's two-way boresight, the boresight is now the beam
+  center (`moving.antenna_sine`; a note beginning `beam center:`), and the product states the band the beam
+  gives, sampled at 0.96 of its reciprocal as before: 7.76 cycles/m at 0.120 m on that cut (8,324 rows for
+  12,024). Its spectrum fills that band and ends at the edge (98% of the energy within 6.9 cycles/m, 0.06%
+  beyond 7.76, against 4.4% before), and the formation takes 14.5 s on the GPU for 21.7 s. The vendor's SICD
+  processes 2.5 cycles/m of it. The C09 sliding spotlight and stripmap and the C14 sliding spotlight of the
+  documentation keep their SRPs and are the same to the bit; `form_cphd` keeps the SRPs. The brightest returns
+  of the C10 scene are specular (each lit over 0.3 to 1.2 cycles/m of the band) and are 0.5 to 5.4 m long along
+  the track with either beam center (docs/product-options.md, Real collections).
 - The cuda backend refused an image narrow in range from a wide-band collection ("the cuda backend's first-level
   window ... exceeds the GPU's shared memory", for example a 2 km image of a collection with 76,032 samples per
   pulse). Such a history is now gated in range to the image's swath first, on the device where it has room and

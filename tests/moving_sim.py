@@ -9,7 +9,8 @@ y_srp = y_p / slide + r0 tan(squint): slide = 1 is a stripmap, slide > 1 a slidi
 moves at 1 / slide of the platform's speed), squint the look angle of the beam center from broadside. The two-way
 azimuth pattern is flat over 0.88 of the Doppler band the pulse spacing samples and falls to zero at 0.98 of it,
 so that the weighting of the processed band (0.8 of it by default) is the processor's alone. With `antenna` the
-file carries a CPHD 1.x antenna block (per-pulse axes with the boresight on the SRP, a gain polynomial of
+file carries a CPHD 1.x antenna block (per-pulse axes with the boresight on the SRP, or on the beam's own center
+where `beam` gives it one, a gain polynomial of
 -A (dcx^2 + dcy^2) dB one-way) and the per-pulse receive windows TOA1..TOA2 and TOAE1..TOAE2; the echoes are then
 weighted by that elevation pattern too.
 """
@@ -77,7 +78,7 @@ def unit(v):
 
 def collection(path, targets, amp=None, *, P=1400, dy=0.25, r0=5e3, graze_deg=30.0, lam0=0.03125, B=300e6, df=1.5e6,
                squint=0.0, slide=1.0, curve=0.0, phase=None, v=100.0, antenna=None, toa=None, toae=None, noise=0.0,
-               seed=0):
+               seed=0, beam=None):
     """Register the collection under `path` and return what the tests compare with: a namespace of the antenna and
     SRP positions [P, 3] (simulator frame), the targets, lam (center wavelength), fc, K, f0, df, dsin (the processed
     spread of sin(look) at 0.8 of the sampled band), ares, rres (the unweighted -3 dB to -3 dB reciprocal bands:
@@ -86,7 +87,9 @@ def collection(path, targets, amp=None, *, P=1400, dy=0.25, r0=5e3, graze_deg=30
     on the history.
     antenna: (A_az, A_el), the one-way gain's fall in dB per squared direction cosine along and across track; toa,
     toae: half widths (s) of the receive window and of its extension about the SRP's delay. noise: the standard
-    deviation of complex white noise added to each sample."""
+    deviation of complex white noise added to each sample. beam: the beam's own slide where it is not the SRPs'
+    (its footprint moves at 1 / beam of the platform's speed while the SRPs move at 1 / slide): the azimuth
+    pattern and the antenna block's boresight are then centered on it, and the SRPs only reference the echoes."""
     tg = np.atleast_2d(np.asarray(targets, np.float64)) + [0.0, r0 * np.tan(squint), 0.0]
     amp = np.ones(len(tg), np.complex128) if amp is None else np.asarray(amp, np.complex128)
     fc = C / lam0
@@ -102,14 +105,18 @@ def collection(path, targets, amp=None, *, P=1400, dy=0.25, r0=5e3, graze_deg=30
     ref = np.linalg.norm(ant - srp, axis=1)
     s_srp = np.einsum('ij,ij->i', srp - ant, d) / ref
     full = lam / (2 * dy)                                           # the spread of sin(look) the pulse spacing samples
-    zb = unit(srp - ant)                                            # antenna axes: boresight on the SRP
+    bc, s_beam = srp, s_srp                                         # the beam's center: the SRP, or its own track
+    if beam is not None:
+        bc = np.stack([np.zeros(P), y / beam + r0 * np.tan(squint), np.zeros(P)], 1)
+        s_beam = np.einsum('ij,ij->i', bc - ant, d) / np.linalg.norm(bc - ant, axis=1)
+    zb = unit(bc - ant)                                             # antenna axes: boresight on the beam's center
     xa = unit(d - np.einsum('ij,ij->i', d, zb)[:, None] * zb)
     ya = np.cross(zb, xa)
     S = np.zeros((P, K), np.complex128)
     for x, a in zip(tg, amp):
         w = x[None] - ant
         R = np.linalg.norm(w, axis=1)
-        u = np.abs(np.einsum('ij,ij->i', w, d) / R - s_srp) / (full / 2)
+        u = np.abs(np.einsum('ij,ij->i', w, d) / R - s_beam) / (full / 2)
         pat = np.where(u <= 0.88, 1.0, np.where(u < 0.98, np.cos(np.pi / 2 * (u - 0.88) / 0.10) ** 2, 0.0))
         if antenna is not None:                                     # two-way, relative to the SRP's
             dcy = np.einsum('ij,ij->i', w, ya) / R
@@ -150,7 +157,8 @@ def collection(path, targets, amp=None, *, P=1400, dy=0.25, r0=5e3, graze_deg=30
     dsin = 0.8 * lam * prf / (2 * v)
     return NS(ant=ant, srp=srp, tg=tg, amp=amp, lam=lam, fc=f0 + K / 2 * df, K=K, f0=f0, df=df, P=P, dy=dy, r0=r0,
               graze=g, dsin=dsin, ares=lam / (2 * dsin * slide), rres=C / (2 * K * df), ya=ya, ref=ref, prf=prf, v=v,
-              aperture=r0 * dsin * slide / dy, s_srp=s_srp, d=d)
+              aperture=r0 * dsin * slide / dy, s_srp=s_srp, d=d, s_beam=s_beam,
+              beam_ares=lam / (2 * dsin * (slide if beam is None else beam)))
 
 
 def to_pixels(out, meta, pts):

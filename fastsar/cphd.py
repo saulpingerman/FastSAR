@@ -9,7 +9,8 @@ dynamic stripmap collections move it with the beam. mode='auto' tells them apart
 one range resolution: a moving beam). A spotlight is formed as one image by factorized backprojection over the full
 aperture (ImageFormer, with the phase reference moved to the grid center); a moving beam is formed as a mosaic of
 range-gated patches (patches.form_mosaic), each pixel weighted by a window over the azimuth band the beam
-illuminates around it (the beam center of each pulse is its own SRP): the pulses p for which the sine of the look
+illuminates around it (the beam center of each pulse is its own SRP; process_cphd takes the antenna's boresight
+where the SRPs fall behind the antenna's footprint, moving.plan): the pulses p for which the sine of the look
 angle of the pixel, d_p . (x - a_p) / |x - a_p| with d_p the direction of flight, lies within half the processed
 spread of the SRP's. The window is a Hann window over that spread by default; azimuth_window selects a Taylor
 window (nbar 4, 35 dB) or a rectangle, both zero outside the spread.
@@ -403,6 +404,8 @@ def form_cphd(cphd, sicd=None, *, mode='auto', backend='auto', window=True, spac
         origin = c - (nx / 2.0) * spx * e1 - (ny / 2.0) * spy * e2
     else:
         sp = ((srp - ant) * d).sum(1) / np.linalg.norm(srp - ant, axis=1)        # beam center: each pulse's SRP
+        if plan.get('beam_sine') is not None:         # or the antenna's boresight (process_cphd: moving.plan)
+            sp = np.asarray(plan['beam_sine'], np.float64)
 
         def beam(idx, pts):
             w = np.asarray(pts)[None] - ant[idx][:, None]

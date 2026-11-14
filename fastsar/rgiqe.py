@@ -110,6 +110,42 @@ def _xyz_poly(p, t):
     return np.stack([_poly1(getattr(p, c), t) for c in 'XYZ'], -1)
 
 
+def antenna_frames(m, par, pv, fi, t_tx, t_rcv, R):
+    """The antenna block of a CPHD 1.x file at its pulses fi (the file's numbers) at times t_tx and t_rcv: for 'tx'
+    and 'rcv', (pattern entry, X axes [n, 3] and Y axes [n, 3] (unit, local frame: ECF rotated by R), electrical
+    boresight steering [n, 2] (DCX, DCY), where the axes come from), or None where the file has no usable block.
+    The mechanical boresight is X x Y and the electrical one has the direction cosines of the steering on X and Y."""
+    ant, pa = getattr(m, 'Antenna', None), getattr(par, 'Antenna', None)
+    if ant is None or pa is None:
+        return None
+    names, R = pv.dtype.names, np.asarray(R, np.float64)
+    out = {}
+    for k, K, t in (('tx', 'Tx', t_tx), ('rcv', 'Rcv', t_rcv)):
+        pat = _find(getattr(ant, 'AntPattern', None), getattr(pa, K + 'APATId', None))
+        apc = _find(getattr(ant, 'AntPhaseCenter', None), getattr(pa, K + 'APCId', None))
+        acf = _find(getattr(ant, 'AntCoordFrame', None), getattr(apc, 'ACFId', None))
+        pvp_axes = K + 'ACX' in names and K + 'ACY' in names
+        if pat is None or (acf is None and not pvp_axes):
+            return None
+        if pvp_axes:
+            ax, ay = _pvp(pv, K + 'ACX')[fi], _pvp(pv, K + 'ACY')[fi]
+            how = 'per-pulse antenna axes'
+        else:
+            ax, ay = _xyz_poly(acf.XAxisPoly, t), _xyz_poly(acf.YAxisPoly, t)
+            how = 'antenna axis polynomials'
+        ax, ay = ax @ R.T, ay @ R.T
+        ax, ay = ax / np.linalg.norm(ax, axis=1, keepdims=True), ay / np.linalg.norm(ay, axis=1, keepdims=True)
+        ebp = getattr(pat, 'EB', None)
+        if K + 'EB' in names:
+            eb = _pvp(pv, K + 'EB')[fi].reshape(len(fi), 2)
+        elif ebp is not None and getattr(ebp, 'DCXPoly', None) is not None:
+            eb = np.stack([_poly1(ebp.DCXPoly, t), _poly1(ebp.DCYPoly, t)], -1) * np.ones((len(fi), 1))
+        else:
+            eb = np.zeros((len(fi), 2))
+        out[k] = (pat, ax, ay, eb, how)
+    return out
+
+
 class _Pattern:
     """A one-way antenna gain (dB, up to a constant) over direction cosines, held as a table read bilinearly, with
     its edge values beyond the table. A gain polynomial is trusted from its peak outward until it has fallen
@@ -749,34 +785,14 @@ class Radiometry:
 
     def _antenna(self, r, m, par, pv, fi, t_tx, t_rcv):
         """The transmit and receive patterns and their per-pulse axes (local frame) and steering, or None."""
-        ant, pa = getattr(m, 'Antenna', None), getattr(par, 'Antenna', None)
-        if ant is None or pa is None:
+        frames = antenna_frames(m, par, pv, fi, t_tx, t_rcv, self.meta['R'])
+        if frames is None:
             return None
-        names, R = pv.dtype.names, np.asarray(self.meta['R'], np.float64)
         sup = getattr(getattr(m, 'SupportArray', None), 'AntGainPhase', None)
         out, src = {}, set()
-        for k, K, t in (('tx', 'Tx', t_tx), ('rcv', 'Rcv', t_rcv)):
-            pat = _find(ant.AntPattern, getattr(pa, K + 'APATId', None))
-            apc = _find(ant.AntPhaseCenter, getattr(pa, K + 'APCId', None))
-            acf = _find(ant.AntCoordFrame, getattr(apc, 'ACFId', None))
-            pvp_axes = K + 'ACX' in names and K + 'ACY' in names
-            if pat is None or (acf is None and not pvp_axes):
-                return None
-            if pvp_axes:
-                ax, ay = _pvp(pv, K + 'ACX')[fi], _pvp(pv, K + 'ACY')[fi]
-                src.add('per-pulse antenna axes')
-            else:
-                ax, ay = _xyz_poly(acf.XAxisPoly, t), _xyz_poly(acf.YAxisPoly, t)
-                src.add('antenna axis polynomials')
-            ax, ay = ax @ R.T, ay @ R.T
-            ax, ay = ax / np.linalg.norm(ax, axis=1, keepdims=True), ay / np.linalg.norm(ay, axis=1, keepdims=True)
-            ebp = getattr(pat, 'EB', None)
-            if K + 'EB' in names:
-                eb = _pvp(pv, K + 'EB')[fi].reshape(len(fi), 2)
-            elif ebp is not None and getattr(ebp, 'DCXPoly', None) is not None:
-                eb = np.stack([_poly1(ebp.DCXPoly, t), _poly1(ebp.DCYPoly, t)], -1) * np.ones((len(fi), 1))
-            else:
-                eb = np.zeros((len(fi), 2))
+        for k in ('tx', 'rcv'):
+            pat, ax, ay, eb, how = frames[k]
+            src.add(how)
             parts = {}
             for part, tags in (('array', ('Array',)), ('elem', ('Elem', 'Element'))):
                 gp = next((g for g in (getattr(pat, tag, None) for tag in tags) if g is not None), None)
