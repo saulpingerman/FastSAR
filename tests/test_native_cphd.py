@@ -371,3 +371,26 @@ def test_real_file(path):
     r = _cphdxml.open_cphd(path)
     print(f'{os.path.basename(path)} (CPHD {r.cphd_version}, {len(r.read_pvp_array(0).dtype.names)} per-vector parameters): '
           f'{n} metadata values and per-vector parameters equal to sarpy')
+
+
+def test_pvp_size_in_bytes():
+    """An added per-vector parameter whose Size is written in bytes where the standard counts 8-byte words (a Capella
+    file of 2023: RefTime, F8, Offset 34, Size 8 at the end of a 280-byte vector) is read as the words of its format,
+    with a warning; a Size that fits as words is taken as words, and one that fits neither way is refused."""
+    import warnings
+    import xml.etree.ElementTree as ET
+    from fastsar import _cphdxml
+    def pvp(size, nbytes):
+        x = ('<PVP><TxTime><Offset>0</Offset><Size>1</Size><Format>F8</Format></TxTime>'
+             '<SIGNAL><Offset>33</Offset><Size>1</Size><Format>I8</Format></SIGNAL>'
+             f'<AddedPVP><Name>RefTime</Name><Offset>34</Offset><Size>{size}</Size><Format>F8</Format></AddedPVP></PVP>')
+        return _cphdxml.pvp_dtype(ET.fromstring(x), nbytes, '>')
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter('always')
+        dt = pvp(8, 280)
+    assert dt.fields['RefTime'][1] == 272 and dt.itemsize == 280 and any('read as bytes' in str(x.message) for x in w)
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter('always')
+        assert pvp(8, 336).fields['RefTime'][1] == 272 and not w            # fits as words: as the standard says
+    with pytest.raises(ValueError, match='do not fit'):
+        pvp(3, 280)

@@ -128,6 +128,15 @@ def pvp_dtype(pvp, nbytes, order='>'):
             except (TypeError, ValueError):
                 raise ValueError(f'CPHD per-vector parameter {name}: Offset and Size must be whole numbers') from None
             dt = format_dtype(kids['Format'].text or '', order)
+            if (off >= 0 and size == dt.itemsize and size % 8 == 0 and 8 * (off + size) > int(nbytes)
+                    and 8 * off + dt.itemsize <= int(nbytes)):
+                # Size written in bytes, not 8-byte words (a Capella file of 2023 gives an added F8 parameter Size 8 at
+                # the end of its 280-byte vector): the parameter is the format's own words
+                import warnings
+                warnings.warn(f'CPHD per-vector parameter {name}: Size {size} read as bytes ({size // 8} words), the '
+                              f'size of its format {kids["Format"].text!r}; as 8-byte words it would run past the '
+                              f'{nbytes}-byte vector', stacklevel=2)
+                size //= 8
             if off < 0 or size < 1 or dt.itemsize > 8 * size or 8 * (off + size) > int(nbytes):
                 raise ValueError(f'CPHD per-vector parameter {name}: Offset {off}, Size {size} (8-byte words) and '
                                  f'Format {kids["Format"].text!r} ({dt.itemsize} bytes) do not fit a vector of '
