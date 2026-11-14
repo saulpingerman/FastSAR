@@ -247,6 +247,9 @@ was published on PyPI.
 - `fastsar._xp.device(a, 'cuda')` returned before a page-locked host array (the image a cuda former returns) had
   been read, so that writing the host array afterwards changed the device copy. No path of 0.2.0 wrote it. The
   copy is now complete when the call returns.
+- The CPHD reader refused a file whose added per-vector parameter states its Size in bytes where the standard
+  counts 8-byte words (a Capella spotlight of 2023: RefTime, F8, Size 8 at the end of a 280-byte vector). Where the
+  Size equals its format's bytes and fits only as bytes, it is read as the format's words, with a warning.
 - The cpu backend's first level in pulse blocks (the path it takes when memory is short) raised a shape error when
   a block of output rows lay wholly past the last pulse (the pulse filter's halo), as on a long sliding spotlight
   under a memory limit. Such a block reads zeros.
