@@ -10,9 +10,9 @@ CPHD reader.
     weighted with a note where apodization is ruled out and was not asked for by name. A sliding spotlight whose
     SRPs move slower than its beam: the product states and samples the band the beam gives.
 (b) Autofocus. A quadratic phase error over slow time injected into the phase history (2, 5 and 15 rad at the edge
-    of a synthetic aperture), an error that changes along the track, and targets above the focus plane seen from a
-    curved track (one height, and a height that changes across the swath): the impulse response returns to the
-    error-free one. A focused collection comes back unchanged. These are measured on Taylor-weighted images, whose
+    of a synthetic aperture), an error that changes along the track, targets above the focus plane seen from a
+    curved track (one height, and a height that changes across the swath), and bright specular returns lit over
+    part of the band, whose looks do not measure the error: the impulse response returns to the error-free one. A focused collection comes back unchanged. These are measured on Taylor-weighted images, whose
     main lobe the product's own sampling resolves; the unweighted default is tested for the same recovery.
 (c) Areas. With an antenna block in the file, the area in ground range against the two-way gain computed here
     from the beam's formula, the edge of 'black' at the sigma zero asked for (black_sigma0_db), the receive window
@@ -370,6 +370,30 @@ def test_autofocus_follows_an_error_along_the_track(focused):
     print(f'  along track: estimates {info["estimates"].round(2)}, fit {info["fit"].round(2)}, width {r[:, 0].max():.3f}')
     assert info['applied'] and info['fit'][0] < 3.7 and info['fit'][-1] > 4.3 and abs(info['fit'][1] - 4.0) < 0.2
     assert np.abs(r[:, 0] / r0[:, 0] - 1).max() < 0.06 and np.abs(r[:, 4] / r0[:, 4] - 1).max() < 0.05
+
+
+def test_autofocus_sets_aside_returns_that_are_not_points(focused):
+    """Specular returns off a curved surface, one in the middle of each block, 23.5 dB over the points and beyond
+    them in range, over a noise floor 33 dB under a point, with 5 rad injected. Each is lit over -0.55 to 0.25 of
+    the band, most of it in one look, and carries 9 rad of its own: its set reads 13 to 14 rad, and its
+    brightness carries the estimate of all columns there. The first test compared that estimate with the sets'
+    median and refused every block, as on a Capella C14 sliding spotlight whose brightest return, lit over a
+    quarter of the band, read 9 rad off the rest of the scene. The estimate is now made again from the sets that
+    agree, and the sets from it."""
+    c, ref, r0 = focused
+    tg, amp = scene()
+    glint = np.array([[18.0, y, 0.0] for y in (-60.0, 0.0, 60.0)])          # between the points along the track
+    s = (np.arange(PL) - PL / 2) / (c.aperture / 2)
+    ms.collection('glint.cphd', np.concatenate([tg, glint]), np.concatenate([amp, np.full(3, 15.0)]), P=PL,
+                  phase=5.0 * s ** 2, noise=10.0, aspect=[None] * len(tg) + [(-0.55, 0.25, 9.0)] * 3)
+    o = fastsar.process_cphd('glint.cphd', backend='cpu', extent=LONG, **TAYLOR)
+    info, r = o['autofocus_info'], responses(o, c, 12, 10)
+    print(f'  specular returns: sets {info["subsets"].round(2)}, estimates {info["estimates"].round(2)}, fit '
+          f'{info["fit"].round(2)}, {info["reason"]}, width {np.median(r[:, 0]):.3f} (focused {np.median(r0[:, 0]):.3f})')
+    assert info['applied'] and info['counted'].all() and np.abs(info['fit'] / 5.0 - 1).max() < 0.02
+    far = [np.flatnonzero((info['subset_significance'][i] > 0) & ~info['pooled'][i]) for i in range(3)]
+    assert all(len(f) == 1 and info['subsets'][i, f[0]] > 12.0 for i, f in enumerate(far)), far
+    assert np.abs(r[:, 0] / r0[:, 0] - 1).max() < 0.06
 
 
 @pytest.mark.parametrize('heights', ['level', 'tilted'])

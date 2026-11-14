@@ -808,15 +808,21 @@ def autofocus(img, mode='quadratic', *, band=None, footprint=None, block=None, o
     half of its sets (and four) must stand min_significance robust deviations above the other lags; the estimate
     of all columns must lie within three standard errors (from the sets' scatter about their median) of that
     median; and no more than a quarter of the sets may lie far from it (4.5 times the scatter and twice tol, the
-    iteration's own precision). A block with a small estimate counts: it says that its part of the strip is
-    focused. Without the guard every block that has settled with significant peaks counts.
+    iteration's own precision). Where the estimate of all columns lies off the median while no more than a quarter
+    of the sets are far from it, those sets have pulled it there: a bright return that is not a point (a specular
+    one, lit over part of the aperture, whose two looks hold different parts of its band and so do not measure the
+    error) carries the correlation of all columns. The estimate is then made again from the columns of the sets
+    that agree, starting from their median; it must have settled, its peak must be significant, and it must pass
+    the same test (info['pooled']: the sets each block's estimate holds). A block with a small estimate counts: it
+    says that its part of the strip is focused. Without the guard every block that has settled with significant
+    peaks counts.
     Fit. Across the swath, the departures of the sets that agree from their block's median are fitted against
     their offset from the block's middle, locally along the track (tricube weights over `span` block steps,
     Tukey's biweight against outliers): a linear trend where it is three times its standard error
     ('spatially_variant': a parabola, always). The trend is held at its end values beyond the columns the sets
-    cover. Along the track, the estimates of all columns of the blocks that count, made again with the trend
-    removed column by column wherever there is one (the columns in best focus would otherwise carry the
-    estimate), are tied by a local line with the same weights. Blocks that do not count take the fit of their
+    cover. Along the track, the estimates of the blocks that count (of the columns of the sets they hold), made
+    again with the trend removed column by column wherever there is one (the columns in best focus would otherwise
+    carry the estimate), are tied by a local line with the same weights. Blocks that do not count take the fit of their
     neighbors.
     Correction. autofocus.spatially_variant's: strips of `block` rows, each extended by the length of the blur,
     the phase of the fit at the strip's center removed column by column, cross-faded along the track with weights
@@ -838,8 +844,9 @@ def autofocus(img, mode='quadratic', *, band=None, footprint=None, block=None, o
     the device the same way (process_cphd's, for an image the device cannot hold) and the result is on the host.
 
     -> (img2 complex64 [nx, ny] where img is; info: dict(mode, band (f0, hf), block, starts [n] (first row of
-    each block), estimates [n] (rad at the band edge, all columns; nan without one), estimates_std [n], subsets
-    [n, sets], subset_significance, subset_position [n, sets] (-1 to 1 across the swath), settled [n], capture
+    each block), estimates [n] (rad at the band edge, of the columns of the sets marked in pooled [n, sets]: all of
+    them, or those that agree; nan without one), estimates_std [n], subsets [n, sets], subset_significance,
+    subset_position [n, sets] (-1 to 1 across the swath), settled [n], capture
     (rad: the capture range), counted [n] (the first
     test), fit [n], slope [n], curve [n], offset [n], reach (the correction at a block's center is fit + slope d +
     curve d^2, d = y - offset with y from -1 to 1 across the swath, held within reach = (least, greatest y of the
@@ -894,7 +901,7 @@ def autofocus(img, mode='quadratic', *, band=None, footprint=None, block=None, o
     info = dict(mode=mode, band=(f0, hf), block=B0, starts=st0, estimates=np.full(nb, np.nan),
                 estimates_std=np.full(nb, np.nan), subsets=np.full((nb, ks), np.nan),
                 subset_significance=np.zeros((nb, ks)), subset_position=np.full((nb, ks), np.nan),
-                settled=np.zeros(nb, bool), capture=float(np.pi * hf * B0 / 4),
+                pooled=np.zeros((nb, ks), bool), settled=np.zeros(nb, bool), capture=float(np.pi * hf * B0 / 4),
                 counted=np.zeros(nb, bool), fit=np.zeros(nb), slope=np.zeros(nb), curve=np.zeros(nb),
                 offset=np.zeros(nb), reach=(-1.0, 1.0),
                 applied_blocks=np.zeros(nb, bool), block_gain=np.zeros(nb), edge_rad=(0.0, 0.0), contrast_before=0.0,
@@ -954,6 +961,7 @@ def autofocus(img, mode='quadratic', *, band=None, footprint=None, block=None, o
         info['estimates'][i], info['subsets'][i, :k] = float(est['c'][0]), sets['c']
         info['subset_significance'][i, :k] = np.where(np.isfinite(sets['c']), sets['sig'], 0.0)
         info['subset_position'][i, :k], ends[0, i, :k], ends[1, i, :k] = ycol.mean(1), ycol.min(1), ycol.max(1)
+        info['pooled'][i, :k] = True
         info['settled'][i] = abs(float(est['step'][0])) < _SETTLED * tol
         kept[i] = (sel[:k * m], k, m, (f0, hf, sep), ycol)
         cand[i] = (info['settled'][i] and est['sig'][0] >= sig0
@@ -972,15 +980,36 @@ def autofocus(img, mode='quadratic', *, band=None, footprint=None, block=None, o
     across = 2 if mode == 'spatially_variant' else 'auto'
     # the first test, quadratic's, block by block: the estimate of all columns against its sets
     use = np.zeros((nb, ks), bool)                                  # the sets that agree: the trend's data
-    for i in np.flatnonzero(cand):
+
+    def first(i):
+        """quadratic's test of block i's estimate against its sets -> (whether it passes, the significant sets that
+        agree with their median, whether those far from it are no more than a quarter, the median)"""
         g = sig[i] >= sig0
         med = float(np.median(sets[i, g]))
         dev = np.abs(sets[i] - med)
         sd = 1.4826 * float(np.median(dev[g]))
         info['estimates_std'][i] = sd / np.sqrt(g.sum())
-        use[i] = g & (dev <= 4.5 * sd + 2 * tol)
-        info['counted'][i] = (abs(info['estimates'][i] - med) <= 3 * info['estimates_std'][i] + tol
-                              and (g & ~use[i]).sum() <= g.sum() // 4)
+        agree = g & (dev <= 4.5 * sd + 2 * tol)
+        few = (g & ~agree).sum() <= g.sum() // 4
+        return abs(info['estimates'][i] - med) <= 3 * info['estimates_std'][i] + tol and few, agree, few, med
+    for i in np.flatnonzero(cand):
+        info['counted'][i], use[i], few, med = first(i)
+        if guard and few and not info['counted'][i] and ((sig[i] >= sig0) & ~use[i]).any():
+            # the sets far from the median pull the estimate of all columns away from it (a bright return that is
+            # not a point, whose two looks hold different parts of it): the estimate is made again from the sets
+            # that agree, starting from their median, and the sets again from it, as from the first estimate
+            sel, kk, mm, bandi, _ = kept[i]
+            on = np.flatnonzero(use[i, :kk])
+            A = grab(i)[:, sel].reshape(B0, kk, mm)
+            est = af._map_drift(A[:, on], bandi, iterations, tol, -1, c0=med, pool=True, contrast=False, taper=tw)
+            if abs(float(est['step'][0])) < _SETTLED * tol and est['sig'][0] >= sig0:
+                sub = af._map_drift(A, bandi, iterations, tol, -1, c0=float(est['c'][0]), contrast=False, taper=tw)
+                s2 = np.where(np.isfinite(sub['c']), sub['sig'], 0.0)
+                if (s2 >= sig0).sum() >= max(4, (kk + 1) // 2):
+                    info['estimates'][i], sets[i, :kk], sig[i, :kk] = float(est['c'][0]), sub['c'], s2
+                    info['pooled'][i] = np.isin(np.arange(ks), on)
+                    info['counted'][i], use[i], few, med = first(i)
+            del A
     blocks = info['counted'] if guard else cand
     if not blocks.any():
         return af._skip(img, info, 'the parts of the blocks disagree on the estimate'), info
@@ -1006,9 +1035,10 @@ def autofocus(img, mode='quadratic', *, band=None, footprint=None, block=None, o
     for i in np.flatnonzero(blocks):
         if np.abs(trend[i]).max() >= tol:
             sel, kk, mm, bandi, ycol = kept[i]
-            A = grab(i)[:, sel].reshape(B0, kk, mm)
+            on = np.flatnonzero(info['pooled'][i, :kk])                  # the sets the block's estimate holds
+            A = grab(i)[:, sel.reshape(kk, mm)[on].ravel()].reshape(B0, len(on), mm)
             G = af._jit('fft0')(A) if jx else af._ft(A, 'fft', -1)
-            d = ycol - ybar[i]
+            d = ycol[on] - ybar[i]
             q = np.exp(-1j * (trend[i, 0] * d + trend[i, 1] * d * d)[None] * vq[:, None, None]).astype(np.complex64)
             G = G * xp.asarray(q)
             level[i] = float(af._map_drift(G, bandi, iterations, tol, -1, c0=float(level[i]), pool=True, G=G,
