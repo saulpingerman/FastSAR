@@ -664,12 +664,27 @@ def test_tpu(spot, monkeypatch):
 
 
 @pytest.mark.cuda
-def test_cuda_without_room_forms_on_the_host(spot, monkeypatch):
-    """A device with less free memory than the stages hold there: the picture is formed on the host, with a note."""
-    monkeypatch.setenv('FASTSAR_CUDA_BLOCK_MB', '1')
-    out = look(spot['path'], size=256, backend='cuda')
-    assert out['backend'] == 'cpu' and any('formed on the host' in n for n in out['notes'])
-    assert np.array_equal(out['display'], look(spot['path'], size=256, backend='cpu')['display'])
+@pytest.mark.parametrize('megabytes', ['0.4', '2'])
+def test_cuda_streams_what_does_not_fit(spot, squinted, monkeypatch, megabytes):
+    """A device with less memory to give than the arrays take: the stages work in smaller blocks and the arrays that
+    do not fit stay on the host, their blocks crossing as the stages need them; the picture is the same and a note
+    says what was kept on the host."""
+    import cupy as cp
+    full = {k: look(f['path'], size=256, backend='cuda', complex_image=True) for k, f in (('spot', spot), ('squinted', squinted))}
+    monkeypatch.setenv('FASTSAR_CUDA_BLOCK_MB', megabytes)
+    for k, f in (('spot', spot), ('squinted', squinted)):
+        for correct in (True, False):
+            out = look(f['path'], size=256, backend='cuda', correct=correct, complex_image=True)
+            ref = full[k] if correct else None
+            assert out['backend'] == 'cuda' and any('kept on the host' in n for n in out['notes'])
+            if ref is not None:
+                e = rel_db(out['image'], ref['image'])
+                print(f'{k}, {megabytes} MB of device memory: {e:.1f} dB against the picture formed with room')
+                assert e < -80 and np.array_equal(out['display'], ref['display'])
+    col = quick._collection(spot['path'], size=256)
+    g = quick._geometry(col['ant'], col['fmin'], col['df'], col['S'].shape[1], *(col[k] for k in ('nx', 'ny', 'spx', 'spy', 'e1', 'e2')), True)
+    assert quick._cuda_plan(g, True, False, 1 << 40, 1 << 20)['kept'] == []
+    assert len(quick._cuda_plan(g, True, False, 1 << 10, 1 << 8)['kept']) == 4
 
 
 @pytest.mark.cuda

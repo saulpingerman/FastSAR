@@ -858,19 +858,12 @@ def _pfa(S, ant, fmin, df, nx, ny, spx, spy, e1, e2, *, correct=True, window=Tru
     info = {} if info is None else info
     info.update(shift_px=g['dist']['max_shift_px'], fit_rms_px=g['dist']['rms_px'], raster=(g['nkr'], g['nka']),
                 fft=(g['nfy'], g['nfx']), range_gate=(g['Kf'], g['Nr']), azimuth_gate=(g['Pf'], g['Na']), dts=g['dts'])
-    if backend == 'cuda':
-        from . import _xp
-        need, free = _cuda_bytes(g, correct), _xp.cuda_budget()
-        if need > free:                                # the stages hold whole arrays on the device
-            info['host'] = (f'formed on the host: the quick look\'s arrays take {need / 1e9:.1f} GB on the device at '
-                            f'this size and {free / 1e9:.1f} GB are free')
-            backend = 'cpu'
     if callable(scale):
         scale = scale(g)
     if scale is not None:
         g['gain'] = g['gain'] * float(scale)
     if backend == 'cuda':
-        img = _pfa_cuda(box, g, window, correct, complex_image, timing, phase)
+        img = _pfa_cuda(box, g, window, correct, complex_image, timing, phase, info)
     else:
         box[0] = np.ascontiguousarray(box[0], np.complex64)
         if phase is not None:
@@ -911,17 +904,6 @@ def _apply_phase(S, ph0, ph1):
         c = ph0[sl, None] + k[None, :] * ph1[sl, None]
         S[sl] *= np.exp(2j * np.pi * (c - np.floor(c))).astype(np.complex64)
     _blocks(rows, S.shape[0], int(max(1, (1 << 17) // S.shape[1])))
-
-
-def _cuda_bytes(g, correct):
-    """Device memory the CUDA path holds at its largest stage: the azimuth stage's arrays (the raster's range
-    wavenumbers by the pulses, the padded copy and its transform, the gate and its transform), or the image
-    stage's (the raster, the padded range transform, the image and a block of the padded azimuth transform)."""
-    P, nkr, nka, Pf, Na, nx, ny = g['P'], g['nkr'], g['nka'], g['Pf'], g['Na'], g['nx'], g['ny']
-    ov = g['ov'] if correct else 1
-    az = P * nkr + 2 * Pf * nkr + 2 * Na * nkr + nkr * nka
-    im = nkr * nka + 2 * ov * g['nfy'] * nka + 2 * nx * ny + (2 << 28) // 8
-    return 8 * max(az, im)
 
 
 # ------------------------------------------------------------------------------------------------------- CUDA
@@ -992,13 +974,14 @@ extern "C" __global__ void ql_gather(const float2* base, int span, int Nx2, int 
   const float cr = (float)cs, ci = (float)sn;
   out[2 * o] = ar * cr - ai * ci; out[2 * o + 1] = ar * ci + ai * cr;
 }
-// The passes that are not transforms, one kernel each: a thread per output value, x along a row, y the row (the
-// launches take the rows in runs of at most 32,768, from r0 on).
+// The passes that are not transforms, one kernel each: a thread per output value, x along a row, y the row of a
+// block of at most 32,768 rows, whose first row is row r0 of the whole array (the arrays that hold a value per row
+// are given from that row on).
 // out [n, Kf] = S[r, k - k0] wk wp[r] exp(2 pi j (ph0[r] + (k - k0) ph1[r])) inside the band, 0 in the padding
 extern "C" __global__ void ql_weight(const float2* S, const float* wk, const float* wp, const double* ph0,
                                      const double* ph1, int K, int k0, int Kf, int ref, int r0, int nr, float2* out) {
-  const int kk = blockIdx.x * blockDim.x + threadIdx.x, r = r0 + blockIdx.y;
-  if (kk >= Kf || blockIdx.y >= nr) return;
+  const int kk = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y;
+  if (kk >= Kf || r >= nr) return;
   const int k = kk - k0;
   float2 v = make_float2(0.f, 0.f);
   if (k >= 0 && k < K) {
@@ -1016,8 +999,8 @@ extern "C" __global__ void ql_weight(const float2* S, const float* wk, const flo
 }
 // out [n, Nr] = the profile's bins about bin 0 (cut out of Kf, or set among zeros), times the taper
 extern "C" __global__ void ql_rgate(const float2* prof, const float* tap, int Kf, int Nr, int r0, int nr, float2* out) {
-  const int m = blockIdx.x * blockDim.x + threadIdx.x, r = r0 + blockIdx.y;
-  if (m >= Nr || blockIdx.y >= nr) return;
+  const int m = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y;
+  if (m >= Nr || r >= nr) return;
   const int keep = min(Nr, Kf), pos = keep - keep / 2, neg = keep / 2;
   float2 v = make_float2(0.f, 0.f);
   if (m < pos) v = prof[(long)r * Kf + m];
@@ -1043,14 +1026,14 @@ extern "C" __global__ void ql_pulses(const float2* A, const int* jlo, const int*
       if (c >= 0 && c < W) v = A[(long)p * W + c];
     }
   }
-  out[(long)J * Pf + q] = v;
+  out[(long)blockIdx.y * Pf + q] = v;
 }
 // out [nkr, Na] = the bins about bin 0 of each row's transform along the pulses (prof [nkr, Pf]), times the scale and
 // the gate at the bin's distance |bin| binm[J] in meters (quicklook_cpu.cpp's ql_azimuth_gate)
 extern "C" __global__ void ql_agate(const float2* prof, const float* binm, int Pf, int Na, float edge, float guard,
                                     float scale, int r0, int nr, float2* out) {
-  const int k = blockIdx.x * blockDim.x + threadIdx.x, J = r0 + blockIdx.y;
-  if (k >= Na || blockIdx.y >= nr) return;
+  const int k = blockIdx.x * blockDim.x + threadIdx.x, J = blockIdx.y;
+  if (k >= Na || J >= nr) return;
   const int keep = min(Na, Pf), pos = keep - keep / 2, neg = keep / 2;
   const int n = k < Na - Na / 2 ? k : k - Na;
   float w = 0.f;
@@ -1070,8 +1053,8 @@ extern "C" __global__ void ql_agate(const float2* prof, const float* binm, int P
 extern "C" __global__ void ql_resample_az(const float2* A, int R, const double* inv_kr, double ka0, double dka,
                                           const double* qtab, int nt, double t0, double inv_dt, int n_out,
                                           const float* tab, int r0, int nr, float2* out) {
-  const int j = blockIdx.x * blockDim.x + threadIdx.x, m = r0 + blockIdx.y;
-  if (j >= n_out || blockIdx.y >= nr) return;
+  const int j = blockIdx.x * blockDim.x + threadIdx.x, m = blockIdx.y;
+  if (j >= n_out || m >= nr) return;
   float2 acc = make_float2(0.f, 0.f);
   const double u = ((ka0 + j * dka) * inv_kr[m] - t0) * inv_dt;
   if (u >= 0.0 && u < nt - 1) {
@@ -1112,14 +1095,14 @@ extern "C" __global__ void ql_place(const float2* B, int nkr, int nka, int hy, i
     const float2 b = B[(long)J * nka + a];
     if (signs && ((J - hy + a - sx0) & 1)) { v.x -= b.x; v.y -= b.y; } else { v.x += b.x; v.y += b.y; }
   }
-  out[(long)a * Ny + c] = v;
+  out[(long)blockIdx.y * Ny + c] = v;
 }
 // out [rows, Nx] = range bins (rb0 + r) mod Ny of F [nka, Ny] (the range transform done), each along a row with
 // azimuth wavenumber a at (a - hx) mod Nx and zeros between: what the azimuth transform of those range bins takes
 extern "C" __global__ void ql_aplace(const float2* F, int nka, int Ny, int hx, int Nx, int rb0, int r0, int nr,
                                      float2* out) {
-  const int x = blockIdx.x * blockDim.x + threadIdx.x, r = r0 + blockIdx.y;
-  if (x >= Nx || blockIdx.y >= nr) return;
+  const int x = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y;
+  if (x >= Nx || r >= nr) return;
   const int a = (x + hx) % Nx;
   out[(long)r * Nx + x] = a < nka ? F[(long)a * Ny + (rb0 + r) % Ny] : make_float2(0.f, 0.f);
 }
@@ -1127,8 +1110,8 @@ extern "C" __global__ void ql_aplace(const float2* F, int nka, int Ny, int hx, i
 // (x - nx / 2) mod nfx, with its carriers, or its amplitude (detect)
 extern "C" __global__ void ql_cut(const float2* T, const float2* cy, const float2* cx, int nfx, int nx, int detect,
                                   int r0, int nr, float* out) {
-  const int x = blockIdx.x * blockDim.x + threadIdx.x, y = r0 + blockIdx.y;
-  if (x >= nx || blockIdx.y >= nr) return;
+  const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y;
+  if (x >= nx || y >= nr) return;
   const float2 t = T[(long)y * nfx + (x - nx / 2 + nfx) % nfx];
   const long o = (long)y * nx + x;
   if (detect) { out[o] = sqrtf(t.x * t.x + t.y * t.y); return; }
@@ -1142,8 +1125,8 @@ _CUDA = {}
 
 def _cuda(npow=10, deg=3):
     """The CUDA kernels and tables of the quick look, compiled and loaded once a process (and once more for a
-    distortion polynomial of another length or degree than the usual): dict of the kernels by name, the tables
-    'kaiser' and 'lanczos', and 'run', which launches a kernel over the rows of its output in runs of 32,768."""
+    distortion polynomial of another length or degree than the usual): dict of the kernels by name and the tables
+    'kaiser' and 'lanczos'."""
     key = ('module', npow, deg)
     if key not in _CUDA:
         import cupy as cp
@@ -1157,35 +1140,70 @@ def _cuda(npow=10, deg=3):
             _CUDA['lanczos'] = cp.asarray(_polyphase('lanczos', LANCZOS, PHASES))
             _CUDA['rows'] = pfa2._resample_kernels(TAPS)[0]
         k.update(kaiser=_CUDA['kaiser'], lanczos=_CUDA['lanczos'], rows=_CUDA['rows'])
-
-        def run(name, width, rows, args, out):
-            for r0 in range(0, rows, 32768):
-                nr = min(32768, rows - r0)
-                k[name]((-(-width // 256), nr), (256,), args + (np.int32(r0), np.int32(nr), out))
-        k['run'] = run
         _CUDA[key] = k
     return _CUDA[key]
 
 
-def _pfa_cuda(S, g, window, correct, complex_image, timing, phase=None):
-    """The quick look's polar format on a GPU -> a CuPy image, range-major [ny, nx]. S: the host history (it goes up
-    in blocks of pulses through two page-locked buffers, each block weighted, gated and resampled while the next is
-    copied) or a CuPy array. phase: (ph0, ph1) [P] float64, a reference phase exp(2 pi j (ph0 + k ph1)) of pulse p's
-    sample k that the device applies with the weights (the history is then as the reader left it). timing: the
-    stages' seconds; with timing['detail'] a dict, the device is brought to completion after every step and the
-    steps' seconds are added to it (the steps then do not overlap, so their sum is longer than the call)."""
+def _cuda_plan(g, correct, complex_image, budget, block):
+    """Where the arrays of the CUDA path live for a device with `budget` bytes to give and `block` bytes for a
+    stage's temporaries: dict(A, B, F, out: True on the device, False on the host, from where blocks go up and
+    come down; kept: the names of those on the host). The stages hold at most two of the four at a time (the
+    range stage's output A [P, nwin] and the raster B [nkr, nka]; B and its range transform F [nka, Ny]; F and the
+    picture), so the largest go to the host first until what is left fits."""
+    P, nwin, nkr, nka, nx, ny = g['P'], g['nwin'], g['nkr'], g['nka'], g['nx'], g['ny']
+    Ny = (g['ov'] if correct else 1) * g['nfy']
+    size = dict(A=8 * P * nwin, B=8 * nkr * nka, F=8 * nka * Ny, out=(8 if complex_image else 4) * nx * ny)
+    names = dict(A="the range stage's output", B='the raster', F="the raster's range transform", out='the picture')
+    on = dict.fromkeys(size, True)
+
+    def peak():
+        s = {k: size[k] if on[k] else 0 for k in size}
+        return max(s['A'] + s['B'], s['B'] + s['F'], s['F'] + s['out']) + 2 * block
+    for k in sorted(size, key=lambda k: -size[k]):
+        if peak() <= budget:
+            break
+        on[k] = False
+    return dict(on, kept=[names[k] for k in size if not on[k]])
+
+
+def _pfa_cuda(S, g, window, correct, complex_image, timing, phase=None, info=None):
+    """The quick look's polar format on a GPU -> the image, range-major [ny, nx]: a CuPy array, or a NumPy array
+    where the picture does not fit on the device beside the arrays that form it. S: the host history (it goes up in
+    blocks of pulses through two page-locked buffers, each block weighted, gated and resampled while the next is
+    copied) or a CuPy array. Every stage works in blocks sized from the device's free memory (_xp.cuda_budget), and
+    of the four large arrays (_cuda_plan) those that do not fit there stay on the host, their blocks going up and
+    coming down as the stages need them; info['stream'] then says which. phase: (ph0, ph1) [P] float64, a
+    reference phase exp(2 pi j (ph0 + k ph1)) of pulse p's sample k that the device applies with the weights (the
+    history is then as the reader left it). timing: the stages' seconds; with timing['detail'] a dict, the device
+    is brought to completion after every step and the steps' seconds are added to it (the steps then do not overlap,
+    so their sum is longer than the call)."""
+    import ctypes
     import cupy as cp
     import cupyx.scipy.fft as cf
     from . import _xp, memory
     powers = g['dist']['powers']
     kern = _cuda(len(powers), max(a + b for a, b in powers))
-    run = kern['run']
     S = S.pop() if isinstance(S, list) else S
     P, K, Kf, Nr, k0 = g['P'], g['K'], g['Kf'], g['Nr'], g['k0']
     nkr, nka, nfy, nfx, nx, ny = g['nkr'], g['nka'], g['nfy'], g['nfx'], g['nx'], g['ny']
-    i32, f32, f64 = np.int32, np.float32, np.float64
+    i32, f32, f64, c64 = np.int32, np.float32, np.float64, np.complex64
     detail = timing.get('detail') if isinstance(timing.get('detail'), dict) else None
     sync = cp.cuda.get_current_stream().synchronize
+    budget, blk = _xp.cuda_budget(), _xp.cuda_block()
+    plan = _cuda_plan(g, correct, complex_image, budget, blk)
+    if plan['kept'] and info is not None:
+        info['stream'] = (f"the device has {budget / 1e9:.1f} GB to give: {', '.join(plan['kept'])} "
+                          f"{'is' if len(plan['kept']) == 1 else 'are'} kept on the host and cross in blocks")
+    new = lambda on, shape, dtype=c64: cp.empty(shape, dtype) if on else np.empty(shape, dtype)
+    ptr = lambda a: a.ctypes.data_as(ctypes.c_void_p)
+    at = lambda a, row=0, col=0: ctypes.c_void_p(a.ctypes.data + row * a.strides[0] + col * a.strides[1])
+
+    def run(name, width, rows, r0, args, out):
+        """Kernel `name` over the rows of a block (at most 32,768 of them, r0 the first one's place in the whole)."""
+        kern[name]((-(-width // 256), rows), (256,), args + (i32(r0), i32(rows), out))
+
+    def rows_of(n, per_row, floor=1):
+        return int(max(floor, min(n, 32768, blk // max(int(per_row), 1))))
 
     def lap(name, t0):
         sync()
@@ -1209,11 +1227,12 @@ def _pfa_cuda(S, g, window, correct, complex_image, timing, phase=None):
     t0 = lap('kernels', t0)
     # 1. range, a block of pulses at a time: each pulse on its rows of the raster (all of them, or its own)
     nwin, jlo = g['nwin'], g['jlo']
-    A = cp.empty((P, nwin), cp.complex64)
+    A = new(plan['A'], (P, nwin))
     on_host = isinstance(S, np.ndarray)
-    nb = int(max(1, min(P, 1024, _xp.cuda_block() // (24 * max(Kf, Nr)), (128 << 20) // (8 * K) if on_host else P)))
+    nb = rows_of(P, 24 * max(Kf, Nr))
     if on_host:
-        S = np.ascontiguousarray(S, np.complex64)
+        S = np.ascontiguousarray(S, c64)
+        nb = int(max(1, min(nb, 1024, (128 << 20) // (8 * K))))
         bufs = [memory._pinned(nb * K * 8) for _ in range(2)]
         events = [None, None]
         stream = cp.cuda.get_current_stream()
@@ -1224,133 +1243,194 @@ def _pfa_cuda(S, g, window, correct, complex_image, timing, phase=None):
         if on_host:
             if events[b % 2] is not None:
                 events[b % 2].synchronize()                  # its last copy has left the buffer
-            hb = np.frombuffer(bufs[b % 2], np.complex64, nb * K).reshape(nb, K)[:n]
+            hb = np.frombuffer(bufs[b % 2], c64, nb * K).reshape(nb, K)[:n]
 
             def copy(sl, r=r, hb=hb):
                 np.copyto(hb[sl], S[r + sl.start:r + sl.stop])
             _blocks(copy, n, cb)
-            x = cp.empty((n, K), cp.complex64)
+            x = cp.empty((n, K), c64)
             x.set(hb, stream=stream)
             events[b % 2] = cp.cuda.Event()
             events[b % 2].record(stream)
         else:
             x = S[r:r + n]
         t1 = step('upload', t1)
-        buf = cp.empty((n, Kf), cp.complex64)
-        run('weight', Kf, n, (x, wk, wp[r:r + n], ph0[r:r + n] if ref else ph0, ph1[r:r + n] if ref else ph1, i32(K),
-                              i32(k0), i32(Kf), i32(ref)), buf)
+        buf = cp.empty((n, Kf), c64)
+        run('weight', Kf, n, 0, (x, wk, wp[r:r + n], ph0[r:r + n] if ref else ph0, ph1[r:r + n] if ref else ph1, i32(K),
+                                 i32(k0), i32(Kf), i32(ref)), buf)
         del x
         t1 = step('weights and padding', t1)
         prof = cf.ifft(buf, axis=1, overwrite_x=True)
         del buf
         t1 = step('range transforms', t1)
-        gate = cp.empty((n, Nr), cp.complex64)
-        run('rgate', Nr, n, (prof, tap_r, i32(Kf), i32(Nr)), gate)
+        gate = cp.empty((n, Nr), c64)
+        run('rgate', Nr, n, 0, (prof, tap_r, i32(Kf), i32(Nr)), gate)
         del prof
         t1 = step('range gate', t1)
-        G = cp.ascontiguousarray(cf.fft(gate, axis=1, overwrite_x=True))
+        G = cf.fft(gate, axis=1, overwrite_x=True)
         del gate
         t1 = step('range transforms', t1)
-        kern['rows']((-(-nwin // 128), n), (128,), (G, i32(n), i32(Nr), alpha[r:r + n], beta[r:r + n], i32(nwin), tab, A[r:r + n]))
+        Ab = A[r:r + n] if plan['A'] else cp.empty((n, nwin), c64)
+        kern['rows']((-(-nwin // 128), n), (128,), (G, i32(n), i32(Nr), alpha[r:r + n], beta[r:r + n], i32(nwin), tab, Ab))
         del G
-        step('range resampling', t1)
+        t1 = step('range resampling', t1)
+        if not plan['A']:
+            Ab.get(out=A[r:r + n])
+            step('blocks to the host', t1)
+        del Ab
     if on_host:
         sync()
         del bufs
     S = None
     t0 = lap('range', t0)
-    # 2. azimuth, with the pulses of each range wavenumber along a row: every transform of this path runs along
-    # the rows of its array, and the kernels that pass over an array turn it where the next transform needs it
-    # turned. The transform along the pulses, the gate in meters with its cut and the scale, the transform back on
-    # Na pulses, the read at the raster's azimuth wavenumbers
-    t1 = time.perf_counter()
+    # 2. azimuth, in blocks of range wavenumbers, the pulses of each along a row: every transform of this path runs
+    # along the rows of its array, and the kernels that pass over an array turn it where the next transform needs
+    # it turned. The transform along the pulses, the gate in meters with its cut and the scale, the transform back
+    # on Na pulses, the read at the raster's azimuth wavenumbers
     Pf, Na, p0, Pp, place = g['Pf'], g['Na'], g['p0'], g['Pp'], g['place']
-    pad = cp.empty((nkr, Pf), cp.complex64)
     src = None
     if place is not None:
         src = np.full(Pp, -1, np.int32)
         src[place] = np.arange(P, dtype=np.int32)
     dummy = cp.zeros(1, cp.int32)
-    run('pulses', Pf, nkr, (A, dummy if jlo is None else cp.asarray(jlo), dummy if src is None else cp.asarray(src),
-                            i32(jlo is not None), i32(src is not None), i32(nwin), i32(P), i32(Pp), i32(p0), i32(Pf)), pad)
-    del A
-    t1 = step('azimuth layout', t1)
-    prof = cf.fft(pad, axis=1, overwrite_x=True)
-    del pad
-    t1 = step('azimuth transforms', t1)
+    d_jlo, d_src = dummy if jlo is None else cp.asarray(jlo), dummy if src is None else cp.asarray(src)
     scale = f32(g['gain'] * (g['ov'] * nfy if correct else nfy) * Na / Pf)     # the pulses lie at p0 here: no phase
-    gate = cp.empty((nkr, Na), cp.complex64)
-    run('agate', Na, nkr, (prof, cp.asarray(g['bins_a'].astype(np.float32)), i32(Pf), i32(Na), f32(g['Ex']), f32(g['gx']),
-                           scale), gate)
-    del prof
-    t1 = step('azimuth gate', t1)
-    A2 = cf.ifft(gate, axis=1, overwrite_x=True)
-    del gate
-    t1 = step('azimuth transforms', t1)
-    B = cp.empty((nkr, nka), cp.complex64)
-    run('resample_az', nka, nkr, (A2, i32(Na), cp.asarray(1.0 / g['kr']), f64(g['ka_lo']), f64(g['dka']),
-                                  cp.asarray(g['qtab']), i32(len(g['qtab'])), f64(g['tg0']), f64(g['tg_inv']), i32(nka), tab), B)
-    del A2
-    step('azimuth resampling', t1)
+    binm, inv_kr, qtab = cp.asarray(g['bins_a'].astype(np.float32)), cp.asarray(1.0 / g['kr']), cp.asarray(g['qtab'])
+    B = new(plan['B'], (nkr, nka))
+    nJ = rows_of(nkr, 24 * max(Pf, Na))
+    lib = None if plan['A'] and plan['B'] and plan['F'] else _lib()
+    for J0 in range(0, nkr, nJ):
+        n = min(nJ, nkr - J0)
+        t1 = time.perf_counter()
+        if plan['A']:
+            pad = cp.empty((n, Pf), c64)
+            run('pulses', Pf, n, J0, (A, d_jlo, d_src, i32(jlo is not None), i32(src is not None), i32(nwin), i32(P), i32(Pp),
+                                      i32(p0), i32(Pf)), pad)
+            t1 = step('azimuth layout', t1)
+        else:                                         # the block's rows from the host's array, the host's kernels
+            hb = np.empty((n, Pf), c64)
+            hb[:, :p0] = 0
+            if jlo is None and place is None:
+                lib.ql_transpose(at(A, 0, J0), nwin, P, n, at(hb, 0, p0), Pf, None, 0)
+            else:
+                lib.ql_unshear(ptr(A), nwin, P, None if jlo is None else ptr(jlo), None if place is None else ptr(place),
+                               Pp, J0, n, at(hb, 0, p0), Pf)
+            hb[:, p0 + Pp:] = 0
+            pad = cp.asarray(hb)
+            del hb
+            t1 = step('blocks to the device', t1)
+        prof = cf.fft(pad, axis=1, overwrite_x=True)
+        del pad
+        t1 = step('azimuth transforms', t1)
+        gate = cp.empty((n, Na), c64)
+        run('agate', Na, n, J0, (prof, binm[J0:J0 + n], i32(Pf), i32(Na), f32(g['Ex']), f32(g['gx']), scale), gate)
+        del prof
+        t1 = step('azimuth gate', t1)
+        A2 = cf.ifft(gate, axis=1, overwrite_x=True)
+        del gate
+        t1 = step('azimuth transforms', t1)
+        Bb = B[J0:J0 + n] if plan['B'] else cp.empty((n, nka), c64)
+        run('resample_az', nka, n, J0, (A2, i32(Na), inv_kr[J0:J0 + n], f64(g['ka_lo']), f64(g['dka']), qtab,
+                                        i32(len(g['qtab'])), f64(g['tg0']), f64(g['tg_inv']), i32(nka), tab), Bb)
+        del A2
+        t1 = step('azimuth resampling', t1)
+        if not plan['B']:
+            Bb.get(out=B[J0:J0 + n])
+            step('blocks to the host', t1)
+        del Bb
+    del A
     t0 = lap('azimuth', t0)
-    t1 = time.perf_counter()
-    if not correct:
-        Z = cp.empty((nka, nfy), cp.complex64)
-        run('place', nfy, nka, (B, i32(nkr), i32(nka), i32(0), i32(nfy), i32(0), i32(0)), Z)
-        del B
-        F = cf.ifft(Z, axis=1, overwrite_x=True)                             # [nka, nfy]: range done
-        del Z
-        Z = cp.empty((ny, nfx), cp.complex64)                                # the picture's range bins alone
-        run('aplace', nfx, ny, (F, i32(nka), i32(nfy), i32(0), i32(nfx), i32(nfy - ny // 2)), Z)
-        del F
-        T = cf.fft(Z, axis=1, overwrite_x=True)
+    # 3. the raster's range transform, in blocks of azimuth wavenumbers (each along a row, its range wavenumbers in
+    # the order the transform takes, the rows of a sheared raster that meet in one bin summed)
+    ov = g['ov'] if correct else 1
+    Ny, hy, hx = ov * nfy, (g['hy'] if correct else 0), (nka // 2 if correct else 0)
+    F = new(plan['F'], (nka, Ny))
+    na = rows_of(nka, 16 * Ny)
+    if not plan['B'] and correct:
+        sy = ((-1.0) ** (np.arange(nkr) - hy)).astype(np.float32)
+        sx = ((-1.0) ** (np.arange(nka) - hx)).astype(np.float32)
+    for a0 in range(0, nka, na):
+        n = min(na, nka - a0)
+        t1 = time.perf_counter()
+        if plan['B']:
+            Z = cp.empty((n, Ny), c64)
+            run('place', Ny, n, a0, (B, i32(nkr), i32(nka), i32(hy), i32(Ny), i32(1 if correct else 0), i32(hx)), Z)
+        else:
+            M = np.ascontiguousarray(B[:, a0:a0 + n].T)
+            if correct:
+                M *= sy[None, :] * sx[a0:a0 + n, None]
+            Z = cp.asarray(_fold(M, Ny, hy))
+            del M
+            t1 = step('blocks to the device', t1)
+        Fb = cf.ifft(Z, axis=1, overwrite_x=True)
         del Z
         t1 = step('image transforms', t1)
-        y, x = (np.arange(ny) - ny / 2.0) * g['spy'], (np.arange(nx) - nx / 2.0) * g['spx']
-        img = cp.empty((ny, nx), cp.complex64 if complex_image else cp.float32)
-        run('cut', nx, ny, (T, cp.asarray(np.exp(1j * g['kr_min'] * y).astype(np.complex64)),
-                            cp.asarray(np.exp(-1j * g['ka_lo'] * x).astype(np.complex64)), i32(nfx), i32(nx),
-                            i32(0 if complex_image else 1)), img)
-        del T
-        step('picture', t1)
-        lap('image', t0)
-        return img
-    ov, dist = g['ov'], g['dist']
-    Ny2, Nx2 = ov * nfy, ov * nfx
-    hy, hx = g['hy'], nka // 2
-    Z = cp.empty((nka, Ny2), cp.complex64)
-    run('place', Ny2, nka, (B, i32(nkr), i32(nka), i32(hy), i32(Ny2), i32(1), i32(hx)), Z)
+        if plan['F']:
+            F[a0:a0 + n] = Fb
+        else:
+            Fb.get(out=F[a0:a0 + n])
+            step('blocks to the host', t1)
+        del Fb
     del B
-    F1 = cf.ifft(Z, axis=1, overwrite_x=True)                                # [nka, Ny2]: range done
-    del Z
-    step('image transforms', t1)
     t0 = lap('range transform', t0)
-    gather = kern['gather']
-    d_cx, d_cy = cp.asarray(np.asarray(dist['cx'], np.float64)), cp.asarray(np.asarray(dist['cy'], np.float64))
-    d_pw = cp.asarray(np.asarray(powers, np.int32).ravel())
-    kr_c, ka_c = g['kr_min'] + hy * g['dkr'], g['ka_lo'] + hx * g['dka']
-    shear = float(g['shear'] * g['spy'] / g['spx'])
-    msy = int(math.ceil(g['shift'][1] / g['spy'])) * ov + LANCZOS + 2
-    out = cp.empty((ny, nx), cp.complex64 if complex_image else cp.float32)      # range-major
-    bw = int(max(16, min(ny, _xp.cuda_block() // (16 * Nx2 * ov))))
-    for jb in range(0, ny, bw):
-        n = min(bw, ny - jb)
-        rb0 = max(0, Ny2 // 2 + ov * (jb - ny // 2) - msy)
-        span = min(Ny2, Ny2 // 2 + ov * (jb + n - ny // 2) + msy) - rb0
+    # 4. the azimuth transform and the picture, in blocks of range pixels: uncorrected, the picture's range bins
+    # transformed and cut; corrected, the padded transform of the bins a block's pixels read, and the read at their
+    # apparent positions
+    out = new(plan['out'], (ny, nx), c64 if complex_image else np.float32)
+    Nx = ov * nfx
+    if correct:
+        dist = g['dist']
+        d_cx, d_cy = cp.asarray(np.asarray(dist['cx'], f64)), cp.asarray(np.asarray(dist['cy'], f64))
+        d_pw = cp.asarray(np.asarray(powers, np.int32).ravel())
+        kr_c, ka_c = g['kr_min'] + hy * g['dkr'], g['ka_lo'] + hx * g['dka']
+        shear = float(g['shear'] * g['spy'] / g['spx'])
+        msy = int(math.ceil(g['shift'][1] / g['spy'])) * ov + LANCZOS + 2
+        bw = rows_of(ny, 16 * Nx * ov, 16)
+        blocks = [(jb, min(bw, ny - jb)) for jb in range(0, ny, bw)]
+    else:
+        y, x = (np.arange(ny) - ny / 2.0) * g['spy'], (np.arange(nx) - nx / 2.0) * g['spx']
+        cy = cp.asarray(np.exp(1j * g['kr_min'] * y).astype(c64))
+        cx = cp.asarray(np.exp(-1j * g['ka_lo'] * x).astype(c64))
+        bw = rows_of(ny, 16 * Nx, 16)                 # the blocks end where the bins wrap: at the picture's center
+        blocks = [(jb, min(bw, e - jb)) for s, e in ((0, ny // 2), (ny // 2, ny)) for jb in range(s, e, bw)]
+    for jb, n in blocks:
         t1 = time.perf_counter()
-        Z = cp.empty((span, Nx2), cp.complex64)
-        run('aplace', Nx2, span, (F1, i32(nka), i32(Ny2), i32(hx), i32(Nx2), i32(rb0)), Z)
+        if correct:
+            rb0 = max(0, Ny // 2 + ov * (jb - ny // 2) - msy)
+            span = min(Ny, Ny // 2 + ov * (jb + n - ny // 2) + msy) - rb0
+        else:
+            rb0, span = (nfy - ny // 2 + jb) % nfy, n
+        if plan['F']:
+            Z = cp.empty((span, Nx), c64)
+            run('aplace', Nx, span, 0, (F, i32(nka), i32(Ny), i32(hx), i32(Nx), i32(rb0)), Z)
+        else:
+            hb = np.empty((span, Nx), c64)
+            lib.ql_transpose(at(F, hx, rb0), Ny, nka - hx, span, ptr(hb), Nx, None, 0)
+            if hx:
+                lib.ql_transpose(at(F, 0, rb0), Ny, hx, span, at(hb, 0, Nx - hx), Nx, None, 0)
+            hb[:, nka - hx:Nx - hx] = 0
+            Z = cp.asarray(hb)
+            del hb
+            t1 = step('blocks to the device', t1)
         base = cf.fft(Z, axis=1, overwrite_x=True)
         del Z
         t1 = step('image transforms', t1)
-        gather((-(-nx // 128), n), (128,),
-               (base, i32(span), i32(Nx2), i32(Ny2), i32(rb0), i32(n), i32(jb), i32(nx), i32(ny), f64(g['spx']),
-                f64(g['spy']), f64(ov), f64(dist['sx']), f64(dist['sy']), d_cx, d_cy, d_pw, f64(kr_c), f64(ka_c),
-                f64(shear), kern['lanczos'], i32(0 if complex_image else 1), np.float32(1.0), out[jb:]))
+        ob = out[jb:jb + n] if plan['out'] else cp.empty((n, nx), out.dtype)
+        if correct:
+            kern['gather']((-(-nx // 128), n), (128,),
+                           (base, i32(span), i32(Nx), i32(Ny), i32(rb0), i32(n), i32(jb), i32(nx), i32(ny), f64(g['spx']),
+                            f64(g['spy']), f64(ov), f64(dist['sx']), f64(dist['sy']), d_cx, d_cy, d_pw, f64(kr_c), f64(ka_c),
+                            f64(shear), kern['lanczos'], i32(0 if complex_image else 1), np.float32(1.0), ob))
+        else:
+            run('cut', nx, n, jb, (base, cy[jb:jb + n], cx, i32(Nx), i32(nx), i32(0 if complex_image else 1)), ob)
         del base
-        step('read at the apparent positions', t1)
-    del F1
-    lap('correction', t0)
+        t1 = step('read at the apparent positions' if correct else 'picture', t1)
+        if not plan['out']:
+            ob.get(out=out[jb:jb + n])
+            step('blocks to the host', t1)
+        del ob
+    del F
+    lap('correction' if correct else 'image', t0)
     return out
 
 
@@ -1669,9 +1749,8 @@ def quicklook(cphd, output=None, *, size=2048, resolution=None, correct=True, re
                      + (" (precision 'single-pass')" if backend == 'tpu' else '') + ': polar format\'s resampling '
                      'steps are gathers, which are slow on this device; correct does not apply')
     else:
-        if info.get('host'):
-            notes.append(info['host'])
-            backend = 'cpu'
+        if info.get('stream'):
+            notes.append(info['stream'])
         algorithm, corrected, shift = 'pfa', bool(correct), tuple(float(v) for v in info['shift_px'])
         notes.append(f'polar format: its displacement of scatterers, up to {shift[0]:.1f} by {shift[1]:.1f} pixels '
                      '(azimuth by range) over the picture, ' + ('removed' if corrected else 'left in (correct=False)'))
