@@ -227,6 +227,9 @@ was published on PyPI.
 - `fastsar._xp.device(a, 'cuda')` returned before a page-locked host array (the image a cuda former returns) had
   been read, so that writing the host array afterwards changed the device copy. No path of 0.2.0 wrote it. The
   copy is now complete when the call returns.
+- The cpu backend's first level in pulse blocks (the path it takes when memory is short) raised a shape error when
+  a block of output rows lay wholly past the last pulse (the pulse filter's halo), as on a long sliding spotlight
+  under a memory limit. Such a block reads zeros.
 - `stack.coherent_sum` read its noise on the darkest ground of the scene, which can be ground the two images share
   (a desert playa): it adds coherently, and the measured gain fell short of what the pair's coherence gives (1.18
   dB for 2.11 on a Capella pair of the Black Rock Desert). The noise is now read on dark ground that is

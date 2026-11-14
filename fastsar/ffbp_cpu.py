@@ -124,7 +124,8 @@ def _level0_blocked(pre, pim, c0, sl, lv, pool):
             return a[(slice(None),) * axis + (slice(p0, p1),)]
         shp = list(a.shape); shp[axis] = p1 - p0
         out = np.zeros(shp, a.dtype)
-        out[(slice(None),) * axis + (slice(lo - p0, hi - p0),)] = a[(slice(None),) * axis + (slice(lo, hi),)]
+        if hi > lo:                         # a block wholly past either end of the pulses reads zeros only
+            out[(slice(None),) * axis + (slice(lo - p0, hi - p0),)] = a[(slice(None),) * axis + (slice(lo, hi),)]
         return out
 
     for i0 in range(0, Po, nb):
