@@ -232,7 +232,7 @@ def antenna_sine(cphd, meta, ant, pulses=None, channel=0):
     return np.einsum('ij,ij->i', u, d)
 
 
-def _steer(g, bm, b, opt, lam):
+def _steer(g, bm, b, opt, lam, dsin=None):
     """The beam center of a process_cphd product: the SRP of each pulse (bm, beam_model's), or the antenna's
     boresight (antenna_sine) where the SRPs' processed spread reaches pulses on which a point of the tasked
     rectangle b lies outside the Doppler band the PRF samples about the antenna's beam, sin(look) within
@@ -242,8 +242,8 @@ def _steer(g, bm, b, opt, lam):
     SRPs takes a pixel through pulses well outside the beam, which add noise and no band. The antenna's track is
     taken only where it reaches every point and is as smooth as the beam model needs, and only for a processed
     spread the PRF samples (not a vendor's band wider than that). -> (beam model, the boresight's sine [P] or
-    None, note or None)."""
-    ant, dsin = np.asarray(g['ant'], np.float64), float(g['dsin'])
+    None, note or None). dsin: the spread it is decided for (default g['dsin'])."""
+    ant, dsin = np.asarray(g['ant'], np.float64), float(g['dsin'] if dsin is None else dsin)
     if g.get('grid') is not None or 'cphd_version' not in g['meta']:
         return bm, None, None
     half = lam / (4 * np.linalg.norm(np.gradient(ant, axis=0), axis=1).mean())      # lambda PRF / (4 v)
@@ -279,6 +279,108 @@ def _steer(g, bm, b, opt, lam):
             f'so the processed spread about the SRPs reaches pulses on which the scene lies up to {reach:.4f} '
             f'from the boresight in sin(look), beyond the {half:.4f} the PRF samples: they hold no echo of it')
     return am, bs, note
+
+
+def _vendor_center(sm, g):
+    """The center of a vendor's processed azimuth band at each pulse, as the sine of the look from the direction of
+    flight (the beam center's, for form_cphd's weighting), from its SICD: Grid.TimeCOAPoly gives each pixel's center
+    of aperture, and the pixel y meters along the columns from the scene center point, seen from the antenna at
+    that time (Position.ARPPoly, matched to the pulses by its place along the track), has that sine there. A
+    Capella sliding spotlight's centers of aperture move with the antenna's footprint, not with its SRPs. ->
+    [P], a quadratic in the pulse number fitted over the scene's columns, or None where the SICD gives no centers of
+    aperture that move along the track (one time for every pixel, as FastSAR's own SICDs state)."""
+    from . import io
+    try:
+        tc = np.atleast_2d(np.asarray(sm.Grid.TimeCOAPoly.get_array(), np.float64))
+        arp = [np.asarray(getattr(sm.Position.ARPPoly, k).get_array(), np.float64) for k in 'XYZ']
+        cu = np.asarray(sm.Grid.Col.UVectECF.get_array(), np.float64)
+        scp = np.asarray(sm.GeoData.SCP.ECF.get_array(), np.float64)
+        col0 = float(sm.ImageData.SCPPixel.Col) - float(getattr(sm.ImageData, 'FirstCol', 0) or 0)
+        nc, cs = int(sm.ImageData.NumCols), float(sm.Grid.Col.SS)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    meta, ant = g['meta'], np.asarray(g['ant'], np.float64)
+    P = len(ant)
+    d = np.gradient(ant, axis=0)
+    d /= np.linalg.norm(d, axis=1, keepdims=True)
+    y = (np.linspace(0, nc - 1, 65) - col0) * cs
+    t = np.polynomial.polynomial.polyval2d(np.zeros_like(y), y, tc)
+    flight = d[P // 2]
+    along = ant @ flight
+    a_c = io.ecf_to_local(np.stack([np.polynomial.polynomial.polyval(t, c) for c in arp], -1), meta)
+    k = np.interp(a_c @ flight, along, np.arange(P, dtype=np.float64))
+    if np.ptp(k) < 0.01 * P or not np.all(np.diff(along) > 0):
+        return None
+    x = io.ecf_to_local(scp[None] + y[:, None] * cu[None], meta)
+    i0 = np.clip(np.floor(k).astype(int), 0, P - 2)
+    f = (k - i0)[:, None]
+    a, dd = ant[i0] * (1 - f) + ant[i0 + 1] * f, d[i0] * (1 - f) + d[i0 + 1] * f
+    u = x - a
+    sc = np.einsum('ij,ij->i', u, dd) / (np.linalg.norm(u, axis=1) * np.linalg.norm(dd, axis=1))
+    q = np.arange(P, dtype=np.float64) / P
+    return np.polynomial.polynomial.polyval(q, np.polynomial.polynomial.polyfit(k / P, sc, 2))
+
+
+def _vendor_band(g, sm, b, opt, lam):
+    """The azimuth band of a process_cphd product given the vendor's SICD: the band the vendor processed, ImpRespBW
+    wide (Grid.Col) about the center of aperture of each pixel (_vendor_center), so that the product has the
+    support the vendor's image has. The spread of sin(look) about that center at each pulse is the one that gives a
+    pixel ImpRespBW along the grid's first axis: under a sliding beam it is narrower than ImpRespBW lambda / 2, the
+    spread form_cphd takes about each pulse's SRP, which widens at a pixel by the ratio of the platform's speed to
+    the footprint's (11.3 cycles/m for 2.5 on a Capella C10 sliding spotlight, 7.0 for 1.23 on a C09). A SICD
+    without centers of aperture that move along the track takes the beam center of the product without a SICD
+    (_steer at 0.8 of the PRF). Where the antenna's boresight (else the SRPs) lies farther from the pulses of the
+    band than the Doppler band the PRF samples, a note says that part of the area is not lit there. -> (beam model,
+    the band's center as a sine per pulse, note or None)."""
+    ant = np.asarray(g['ant'], np.float64)
+    t = g['meta']['tx_time']
+    want = float(sm.Grid.Col.ImpRespBW)
+    step = float(np.linalg.norm(np.gradient(ant, axis=0), axis=1).mean())
+    half = lam / (4 * step)                                          # lambda PRF / (4 v)
+    d = np.gradient(ant, axis=0)
+    d /= np.linalg.norm(d, axis=1, keepdims=True)
+    c, e1, e2 = g['center'], g['e1'], g['e2']
+    pts = c + (np.linspace(b[0], b[1], 7)[:, None, None] * e1 + np.linspace(b[2], b[3], 5)[None, :, None] * e2
+               ).reshape(-1, 3)
+    K, f0, df = g['S'].shape[1], float(g['fmin']), float(g['df'])
+    band = (f0, f0 + (K - 1) * df)
+    sine, why, how = _vendor_center(sm, g), None, "the vendor SICD's centers of aperture"
+    if sine is None:
+        bm, sine, why = _steer(g, beam_model(ant, g['srp'], t, 1.6 * half), b, opt, lam, dsin=1.6 * half)
+        sine = bm['s'] if sine is None else sine                     # the SRPs' where the beam is on them
+        how = 'the beam center of the product without a SICD'
+    bm = beam_model(ant, g['srp'], t, 0.5 * half, sine=sine)
+
+    def b1(dsin):
+        sp = spectrum(dict(bm, dsin=dsin), ant, band, K, pts, e1, e2)
+        use = sp['full'] if sp['full'].any() else sp['pulses'] > 1
+        return float(np.median(sp['b1'][use])) if use.any() else 0.0
+    dsin = want * 0.5 * half / max(b1(0.5 * half), 1e-12)            # found on a window inside the collection
+    dsin *= want / max(b1(min(dsin, 2 * half)), 1e-12)
+    capped = dsin > 2 * half
+    dsin = min(dsin, 2 * half)
+    bm = beam_model(ant, g['srp'], t, dsin, sine=sine)
+    # how far the band lies from the beam: the antenna's boresight, else the SRPs
+    bs = None
+    if g.get('grid') is None and 'cphd_version' in g['meta']:
+        bs = antenna_sine(opt['cphd'], g['meta'], ant, g['pulses'], opt['channel'])
+    if bs is None:
+        w = np.asarray(g['srp'], np.float64) - ant
+        bs = np.einsum('ij,ij->i', w, d) / np.linalg.norm(w, axis=1)
+    reach = 0.0
+    for x in pts:
+        w = x[None] - ant
+        sx = np.einsum('ij,ij->i', w, d) / np.linalg.norm(w, axis=1)
+        on = np.abs(sx - sine) <= dsin / 2
+        if on.any():
+            reach = max(reach, float(np.abs(sx[on] - bs[on]).max()))
+    if reach > half:
+        why = (f"azimuth band: the vendor's band reaches pulses on which the tasked area lies up to {reach:.4f} from "
+               f'the beam in sin(look), beyond the {half:.4f} the PRF samples: part of it is not lit there')
+    g['notes'].append(f"azimuth band: the vendor SICD's, {want:.3f} cycles/m about {how}: a spread of sin(look) of "
+                      f'{dsin:.5f} about it at each pulse' + (
+                          ', held at the Doppler band the PRF samples, which the band asked for exceeds' if capped else ''))
+    return bm, sine, why
 
 
 def _model(out):
@@ -1162,7 +1264,12 @@ def plan(g, st, opt):
         b = np.array([(d @ e1).min(), (d @ e1).max(), (d @ e2).min(), (d @ e2).max()])
     notes, valid, tasked = g['notes'], None, b
     lam = C / (f0 + K / 2 * df)
-    bm, steer, why = _steer(g, bm, b, opt, lam)                      # the SRPs, or the antenna's boresight
+    sm = g.get('sicd')
+    if sm is None:
+        bm, steer, why = _steer(g, bm, b, opt, lam)                  # the SRPs, or the antenna's boresight
+    else:
+        bm, steer, why = _vendor_band(g, sm, b, opt, lam)
+        dsin = bm['dsin']
     if why:
         notes.append(why)
     if area != 'tasked':
@@ -1172,6 +1279,9 @@ def plan(g, st, opt):
         st['model_s'] = time.perf_counter() - tr                     # process_cphd's 'radiometry' stage
     smooth = bm['drift'] <= 0.05
     own = (0.96 * lam / (2 * dsin), 0.96 * C / (2 * K * df) / np.cos(g['graze']))        # form_cphd's spacing
+    if sm is not None:                                               # the vendor's, as form_cphd takes it
+        from .cphd import _sicd_spacing
+        own = _sicd_spacing(sm)
 
     def bands(over):
         """The spectrum over the rectangle that sets the sampling -> (spectrum at 7 x 5 points, the points that
@@ -1275,6 +1385,8 @@ def plan(g, st, opt):
                fit_patch=True)
     if steer is not None:                                            # form_cphd's weighting about the boresight
         out['beam_sine'] = steer
+    if sm is not None:                                               # and its spread for the vendor's band
+        out['dsin'] = dsin
     return out
 
 

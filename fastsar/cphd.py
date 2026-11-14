@@ -47,6 +47,16 @@ def _sicd_meta(sicd):
     return _sicdxml.read(sicd)
 
 
+def _sicd_spacing(sm):
+    """form_cphd's spacing from a vendor SICD (along, across; m): its sample spacing, widened to 0.8 of its impulse
+    response width, with slant-plane rows projected onto the ground."""
+    spx = max(float(sm.Grid.Col.SS), 0.8 * float(sm.Grid.Col.ImpRespWid))
+    spy = max(float(sm.Grid.Row.SS), 0.8 * float(sm.Grid.Row.ImpRespWid))
+    if getattr(sm.Grid, 'ImagePlane', 'SLANT') != 'GROUND':          # slant-plane rows: project onto the ground
+        spy /= np.cos(np.radians(float(sm.SCPCOA.GrazeAng)))
+    return spx, spy
+
+
 def _image_area(cphd, meta):
     """Corners [4, 3] of the CPHD's image area rectangle and its reference point [3] (local frame), or (None, IARP or
     None)."""
@@ -280,6 +290,8 @@ def form_cphd(cphd, sicd=None, *, mode='auto', backend='auto', window=True, spac
     plan = {} if _plan is None else (_plan(dict(S=S, ant=ant, fmin=f0, df=df, center=center, e1=e1, e2=e2, graze=graze,
                                                 corners=corners, mode=mode, meta=meta, sicd=sm, notes=notes,
                                                 pulses=used, srp=srp, dsin=dsin, grid=gl)) or {})
+    if plan.get('dsin') is not None:                  # a moving beam's spread for the vendor's band (moving.plan)
+        dsin = float(plan['dsin'])
     if plan.get('window') is not None:
         window = bool(plan['window'])
     if plan.get('azimuth_window') is not None:
@@ -344,10 +356,7 @@ def form_cphd(cphd, sicd=None, *, mode='auto', backend='auto', window=True, spac
         sp_ = np.ravel(np.asarray(spacing, np.float64))
         spx, spy = (float(sp_[0]), float(sp_[0])) if sp_.size == 1 else (float(sp_[0]), float(sp_[1]))
     elif sm is not None:
-        spx = max(float(sm.Grid.Col.SS), 0.8 * float(sm.Grid.Col.ImpRespWid))
-        spy = max(float(sm.Grid.Row.SS), 0.8 * float(sm.Grid.Row.ImpRespWid))
-        if getattr(sm.Grid, 'ImagePlane', 'SLANT') != 'GROUND':      # slant-plane rows: project onto the ground
-            spy /= np.cos(np.radians(float(sm.SCPCOA.GrazeAng)))
+        spx, spy = _sicd_spacing(sm)
     else:
         spx, spy = 0.8 * 1.2 * ares, 0.8 * 1.2 * rres / np.cos(graze)          # 1.2: the Taylor window's broadening
     # grid
