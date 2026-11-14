@@ -9,8 +9,8 @@ regions of [precision.md](precision.md), worst to best. FastSAR's rows (truth) a
 backprojection at 64 times, since the reference's own error, -67.3 to -68.8 dB, is above that of FastSAR's exact
 backprojection; ISCE3 was scored on three 256 by 256 patches of its own grid after removal of a common linear phase
 ramp. Times are for the full image, host to host; FastSAR's factorized rows use a warm former. Estimates (est.) scale
-one region's time by the pixel count and, if the codes scale as FastSAR does, overstate the full-image time; applied to FastSAR's exact backprojection, the same estimate gives 28
-min against 364 s measured.
+one region's time by the pixel count and, if the codes scale as FastSAR does, overstate the full-image time; applied to FastSAR's exact backprojection, the same estimate gives 27
+min against 369 s measured.
 
 | CPU (c4d-highmem-16) | Error (dB) | Time |
 |---|---|---|
@@ -19,7 +19,7 @@ min against 364 s measured.
 | AFRL `bpBasic` (Octave), FFT length 2^18 | -52.9 to -55.4 | 69 h (est.) |
 | ISCE3 `backproject`, 16 threads | -31.5 to -54.9 | 4.8 h (est.) |
 | GRDL, factorized | no image | 77.5 s |
-| FastSAR, exact backprojection, cubic, 8x | -77.5 to -81.7 (truth) | 364 s |
+| FastSAR, exact backprojection, cubic, 8x | -77.5 to -81.7 (truth) | 369 s |
 | FastSAR, factorized, float32 | -57.2 to -62.6 (truth) | 11.2 s |
 
 | GPU (Nvidia L4) | Error (dB) | Time |
@@ -30,8 +30,8 @@ min against 364 s measured.
 | MatX `sar_bp`, `taylor_fast`, as shipped, 8x | -37.7 to -43.2 | 12.5 s |
 | MatX `sar_bp`, `taylor_fast`, float64 pixel coordinates, 8x | -54.9 to -58.6 | 11.6 s |
 | FastSAR, exact backprojection, linear, 8x | -54.9 to -58.7 | 10.8 s |
-| FastSAR, exact backprojection, cubic, 8x | -77.5 to -81.7 (truth) | 16.8 s |
-| FastSAR, factorized, float32 | -57.1 to -62.6 (truth) | 2.9 s |
+| FastSAR, exact backprojection, cubic, 8x | -77.5 to -81.7 (truth) | 16.9 s |
+| FastSAR, factorized, float32 | -57.1 to -62.6 (truth) | 2.8 s |
 | FastSAR, factorized, float16 throughout | -55.6 to -61.6 (truth) | 2.5 s |
 
 - RITSAR: a `linspace` range axis too coarse by one part in N_fft - 1, and a frequency axis that assumes an even
@@ -52,13 +52,13 @@ min against 364 s measured.
   linear interpolation at 8 times, within 0.1 dB of FastSAR's linear row, which uses the same scheme.
 
 With the algorithm held fixed, FastSAR's exact backprojection (cubic) is 47 times faster than ISCE3's estimated time
-on the CPU and 96 times on the L4, with lower errors in every region; with linear interpolation it takes 10.8 s
+on the CPU and 95 times on the L4, with lower errors in every region; with linear interpolation it takes 10.8 s
 against 11.6 s for MatX's corrected form at matched accuracy, a difference of the size seen between L4 instances
-from day to day. The factorized algorithm cuts the time by a further factor of 5.8 on the L4 and 33 on the CPU.
+from day to day. The factorized algorithm cuts the time by a further factor of 6.0 on the L4 and 33 on the CPU.
 
 On the same CPU, the AFRL toolbox's `pfa_mem` (Octave) forms a polar-format image in 44.5 s and GRDL's polar format in 24.5 s.
 Neither corrects the planar-wavefront displacement. Their log-amplitude correlations with the reference are 0.80 to
-0.89 and 0.78 to 0.93, against 0.996 to 0.999 for FastSAR's corrected polar format (8.9 s on the CPU, 1.4 s on the L4).
+0.89 and 0.78 to 0.93, against 0.996 to 0.999 for FastSAR's corrected polar format (9.0 s on the CPU, 1.4 s on the L4).
 
 Scripts and records: [sar-accel-study](https://github.com/saulpingerman/sar-accel-study), directories `oss` and
 `results/comparison`.

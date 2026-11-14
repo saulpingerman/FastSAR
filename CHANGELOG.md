@@ -155,6 +155,10 @@ was published on PyPI.
 
 ### Changed
 
+- README and docs carry the 0.3.0 release records, measured at the tag on the six devices of the 0.2.0 records.
+  The images of the three Umbra collections and the five Capella collections are bitwise those of 0.2.0, and the
+  median change in time is -1.3 to +0.6% per device; the largest single changes are stated in
+  [docs/performance.md](docs/performance.md).
 - The defaults of `process_cphd` (a change of behavior from 0.2.0). The default SICD is now on the ground plane
   and unweighted: `plane=None` is `'ground'` for every product, and `weighting=None` is `'uniform'` for a SICD
   (`'sva'` for a SIDD, as before). 0.2.0 wrote a slant-plane SICD with Taylor weighting, and

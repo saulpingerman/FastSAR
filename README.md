@@ -11,7 +11,7 @@ map GeoTIFFs and SICD and SIDD output.
 
 ![FastSAR image of the Panama Canal's Pacific entrance from an Umbra spotlight collection](https://raw.githubusercontent.com/saulpingerman/FastSAR/main/docs/images/hero_panama.jpg)
 
-*Panama Canal, Pacific entrance (Umbra open data, 2023-07-18): 12,207 by 8,808 pixels in 2.9 s on an Nvidia L4
+*Panama Canal, Pacific entrance (Umbra open data, 2023-07-18): 12,207 by 8,808 pixels in 2.8 s on an Nvidia L4
 (warm former, transfers included; float32, -59.9 dB against the float64 reference of
 [precision.md](https://github.com/saulpingerman/FastSAR/blob/main/docs/precision.md)), downsampled. A
 c4d-highmem-16 CPU instance (16 vCPUs, 8 cores) takes 11.2 s. The fastest open-source exact backprojection that forms this
