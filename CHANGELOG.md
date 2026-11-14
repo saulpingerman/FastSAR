@@ -299,6 +299,26 @@ was published on PyPI.
   the geometry as known, and real repeat collections lay 9 to 22 m apart. `products.coherence` gave its bias for
   independent pixels; the note now states the measured floor of oversampled images.
 
+### Known issues
+
+- Polar format on two Umbra spotlight collections of 2023 (UMBRA-04 and UMBRA-05 over Myra, North Dakota) differs
+  from exact backprojection by -24.9 and -24.4 dB, where most collections checked give -26 to -33 dB. 0.2.0 gives the
+  same images.
+- A moving-beam collection can carry its own quadratic phase error (about 3.1 rad on a Capella sliding spotlight
+  of 2024 near Tampa). The default product removes it with autofocus; a product made with `autofocus=False` keeps
+  it, and its points are then wider than the stated band gives (1.7 reciprocal bands where the antenna pattern
+  alone gives 1.04).
+- Range widths follow the range spectrum the collection holds: on a Capella stripmap of 2024 whose spectrum falls
+  by 2.3 dB over the outer 15 per cent of the band at each edge, they are 1.06 times those of a flat band, as
+  that spectrum predicts.
+- On a moving beam, quadratic autofocus finds errors of 2 to 15 rad on the collections checked, within 0.1 rad.
+  Where an image's contrast rests on a few bright returns, an error that also moves them along the track (its
+  linear part) leaves the corrected image's contrast a few per cent under the original's (0.953 at 15 rad on a
+  Capella sliding spotlight of 2025), with the points' widths restored.
+- Some scenes have no compact points: the brightest returns of a Capella sliding spotlight of 2024 over Yerevan
+  are lit over 5 to 13 per cent of each pixel's aperture and are 0.5 to 8.5 m long along the track in any image
+  formed from the whole aperture. Exact backprojection gives the same lengths.
+
 ## [0.2.0] - 2026-11-10
 
 ### Added
