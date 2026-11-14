@@ -690,6 +690,27 @@ def test_cuda_sheared_raster(squinted):
 
 
 @pytest.mark.cuda
+def test_cuda_missing_pulses():
+    """The CUDA path on a history that lacks pulses: the host's image."""
+    import cupy as cp
+    rng = np.random.default_rng(8)
+    col = sim.make_collect(res=0.5, scene=200.0, r0=60e3)
+    keep = np.ones(col.Np, bool)
+    keep[[40, 41, 300, 500]] = False
+    tg = np.stack([rng.uniform(-60, 60, 20), rng.uniform(-60, 60, 20), np.zeros(20)], 1)
+    S = np.ascontiguousarray(sim.simulate_brute(col, tg, np.ones(20) + 0j).astype(np.complex64)[keep])
+    ant = col.ant[keep]
+    grid = (300, 240, 0.5, 0.6, np.array([0.0, 1.0, 0.0]), np.array([1.0, 0.0, 0.0]))
+    assert quick._geometry(ant, col.fmin, col.df, col.K, *grid, True)['place'] is not None
+    for correct in (True, False):
+        h = quick._pfa(S, ant, col.fmin, col.df, *grid, correct=correct)
+        d = quick._pfa(S, ant, col.fmin, col.df, *grid, correct=correct, backend='cuda')
+        e = rel_db(cp.asnumpy(d), h)
+        print(f'cuda against the host with pulses missing, correct {correct}: {e:.1f} dB')
+        assert e < -60
+
+
+@pytest.mark.cuda
 def test_cuda(spot):
     """The CUDA path (CuPy alone): the same image as the host's to rounding, corrected and uncorrected, complex and
     detected, and the same picture."""
