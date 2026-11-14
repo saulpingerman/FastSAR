@@ -396,7 +396,8 @@ def _distortion(ant, nx, ny, spx, spy, e1, e2, weights=None, n=21, deg=3):
                 max_shift_px=(float(np.abs(xa - X).max() / spx), float(np.abs(ya - Y).max() / spy)))
 
 
-def _geometry(ant, fmin, df, K, nx, ny, spx, spy, e1, e2, correct, ov=OVERSAMPLE, window=True):
+def _geometry(ant, fmin, df, K, nx, ny, spx, spy, e1, e2, correct, ov=OVERSAMPLE, window=True, warn=False,
+              support='union'):
     """The float64 setup of the quick look's polar format for a cut history: the raster, the two gates, the
     resampling positions and the distortion model. e1, e2: the picture's axes, any pair that spans its plane with
     e2 away from the radar (a slant plane along the line of sight, the ground plane along the ground range): the
@@ -414,6 +415,13 @@ def _geometry(ant, fmin, df, K, nx, ny, spx, spy, e1, e2, correct, ov=OVERSAMPLE
                          'pulse, and it does not; use fastsar.process_cphd or form_image with algorithm=\'ffbp\'')
     dts = (t[-1] - t[0]) / (P - 1)                                    # signed, per pulse
     dtp = np.gradient(t)
+    if warn and abs(float(t[P // 2])) > math.tan(math.radians(2.0)):   # form_image's caller chose the grid
+        import warnings
+        warnings.warn(f"polar format: the grid's range axis e2 is {abs(math.degrees(math.atan(float(t[P // 2])))):.1f} "
+                      'degrees from the mid-aperture line of sight in the image plane; the polar raster is taken about '
+                      'e2 and the image degrades quickly with this angle. Rotate the grid so that e2 points along the '
+                      "line of sight (the vendors' image grids do), or use algorithm='ffbp' or 'bp'", UserWarning,
+                      stacklevel=4)
     f = fmin + df * np.arange(K)
     fc = fmin + (K // 2) * df
     Hx, Hy = 0.5 * nx * spx, 0.5 * ny * spy
@@ -442,7 +450,13 @@ def _geometry(ant, fmin, df, K, nx, ny, spx, spy, e1, e2, correct, ov=OVERSAMPLE
     nkr = int((kr_max - kr_min) / dkr) + 1                                        # the rows the bands reach together
     nwin = int(float((kr_hi - kr_lo).max()) / dkr) + 1                           # and those of one pulse
     jlo, hy, shear = None, None, 0.0
-    if nkr - nwin > max(8, 0.05 * nwin):
+    if support == 'inscribed':                      # form_image's pfa_support: the rows every pulse reaches
+        kr_min, kr_max = float(kr_lo.max()), float(kr_hi.min())
+        if kr_max <= kr_min:
+            raise ValueError("polar format: no range band is common to all pulses (support='inscribed'); use "
+                             "support='union'")
+        nkr = min(int((kr_max - kr_min) / dkr) + 1, nfy)
+    elif nkr - nwin > max(8, 0.05 * nwin):
         # The band drifts along the aperture: e2 is not the line of sight (a picture on the ground under a slant
         # plane twisted about it), ur changes from pulse to pulse and the samples fill a sheared parallelogram of
         # the raster. Each pulse is resampled on its own nwin rows, from row jlo; the rows are then taken across
@@ -461,15 +475,27 @@ def _geometry(ant, fmin, df, K, nx, ny, spx, spy, e1, e2, correct, ov=OVERSAMPLE
         first, last = kr_min + dkr * jlo, kr_min + dkr * (jlo + nwin - 1)
         ka_lo, ka_hi = float(min((first * t).min(), (last * t).min())), float(max((first * t).max(), (last * t).max()))
     elif nkr > nfy:                                 # a band wider than the spacing resolves: its center
+        if warn and nkr > 1.03 * nfy:
+            import warnings
+            warnings.warn(f'polar format: the range band ({nkr} samples) exceeds the {nfy}-sample raster of the grid; '
+                          f'the central {nfy} are kept, so the range resolution is limited by the pixel spacing',
+                          UserWarning, stacklevel=4)
         kr_min += ((nkr - nfy) // 2) * dkr
         nkr = nfy
     kr = kr_min + dkr * np.arange(nkr)
     kr_max = kr[-1]
     if jlo is None:
         nwin, hy = nkr, nkr // 2
-        ka_lo, ka_hi = kr_max * t.min(), kr_max * t.max()
+        kref = kr_min if support == 'inscribed' else kr_max          # the azimuth band common to the rows, or the widest
+        ka_lo, ka_hi = kref * t.min(), kref * t.max()
     nka = int((ka_hi - ka_lo) / dka) + 1
     if nka > nfx:
+        if warn and nka > 1.03 * nfx:
+            import warnings
+            warnings.warn(f'polar format: the azimuth band of the aperture ({nka} samples) exceeds the {nfx}-sample '
+                          'raster of the grid; the central ones are kept, so the azimuth resolution is limited by the '
+                          'pixel spacing (a finer spacing or a shorter aperture keeps the whole band)', UserWarning,
+                          stacklevel=4)
         ka_lo += ((nka - nfx) // 2) * dka
         nka = nfx
     # range gate: K samples at k0 of Kf, the profile's bins C / (2 df Kf), Nr bins kept (or the Kf there are, in a
@@ -798,7 +824,7 @@ def _abs(img, scale):
 
 
 def _pfa(S, ant, fmin, df, nx, ny, spx, spy, e1, e2, *, correct=True, window=True, backend='cpu', complex_image=True,
-         timing=None, info=None):
+         timing=None, info=None, warn=False, support='union'):
     """The quick look's polar format of a history S [P, K] referenced to |ant| on the grid of form_image (e2 along
     the mid-aperture line of sight, away from the radar) -> the image [nx, ny]: complex64 as backprojection gives
     it, or its amplitude (float32, complex_image False); a NumPy array, or a CuPy array for backend 'cuda'.
@@ -808,16 +834,16 @@ def _pfa(S, ant, fmin, df, nx, ny, spx, spy, e1, e2, *, correct=True, window=Tru
     t0 = time.perf_counter()
     e1, e2 = np.asarray(e1, np.float64), np.asarray(e2, np.float64)
     ant = np.asarray(ant, np.float64)
-    if nx % 2 or ny % 2:
-        raise ValueError(f'the quick look takes even pixel counts, got {nx} by {ny}')
+    if (nx % 2 or ny % 2) and not correct:             # corrected, every pixel is read at its own position
+        raise ValueError(f'the uncorrected image takes even pixel counts, got {nx} by {ny}')
     box = S if isinstance(S, list) else [S]            # a one-element list hands the history over: it is freed
     del S                                              # as soon as the range stage has read it
     g = _geometry(ant, float(fmin), float(df), box[0].shape[1], int(nx), int(ny), float(spx), float(spy), e1, e2, correct,
-                  window=bool(window))
+                  window=bool(window), warn=warn, support=support)
     timing['geometry'] = timing.get('geometry', 0.0) + time.perf_counter() - t0
     info = {} if info is None else info
     info.update(shift_px=g['dist']['max_shift_px'], fit_rms_px=g['dist']['rms_px'], raster=(g['nkr'], g['nka']),
-                fft=(g['nfy'], g['nfx']), range_gate=(g['Kf'], g['Nr']), azimuth_gate=(g['Pf'], g['Na']))
+                fft=(g['nfy'], g['nfx']), range_gate=(g['Kf'], g['Nr']), azimuth_gate=(g['Pf'], g['Na']), dts=g['dts'])
     if backend == 'cuda':
         from . import _xp
         need, free = _cuda_bytes(g, correct), _xp.cuda_budget()

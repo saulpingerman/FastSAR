@@ -685,7 +685,11 @@ def form_image(S, ant, fmin, df, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
             if np.shape(ref) != (P,):
                 raise ValueError(f'ref must hold one range per pulse ({P}), got shape {np.shape(ref)}')
             S = rereference(S, float(fmin), float(df), np.asarray(ref, np.float64) - np.linalg.norm(col.ant, axis=1))
-        return _pfa(S, col, nx, ny, spx, spy, np.asarray(e1, np.float64), np.asarray(e2, np.float64), pfa_guard, window, pfa_support)
+        e1, e2 = np.asarray(e1, np.float64), np.asarray(e2, np.float64)
+        how = _pfa_stages(backend, pfa_support)
+        if how is not None:
+            return _pfa_staged(S, col, nx, ny, spx, spy, e1, e2, pfa_guard, window, pfa_support, how)
+        return _pfa(S, col, nx, ny, spx, spy, e1, e2, pfa_guard, window, pfa_support)
     return ImageFormer(ant, fmin, df, S.shape[1], nx, ny, spx, spy, e1, e2, backend=backend, precision=precision,
                        window=window, T=T, levels=levels, pmax=pmax, target_db=target_db, ref=ref,
                        range_gate=range_gate)(S)
@@ -693,6 +697,44 @@ def form_image(S, ant, fmin, df, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
 
 _PFA_PROGRAMS = {}
 _PFA_LOCK = threading.Lock()
+
+
+def _pfa_stages(backend, support):
+    """Which polar format forms on `backend`: 'cpu' or 'cuda' for the stages of fastsar.quick (C++ on the host's
+    cores, CuPy on a GPU), or None for the JAX program of fastsar.pfa2, which the jax and tpu backends and
+    FASTSAR_PFA_PROGRAM=jax keep."""
+    v = os.environ.get('FASTSAR_PFA_PROGRAM', '').strip().lower() or 'auto'
+    if v not in ('auto', 'jax', 'stages'):
+        raise ValueError(f"FASTSAR_PFA_PROGRAM must be 'jax', 'stages' or 'auto', got {v!r}")
+    b = _backend(backend)
+    if support not in ('union', 'inscribed'):
+        raise ValueError(f"support must be 'union' or 'inscribed', not {support!r}")
+    if v == 'jax' or b in ('jax', 'tpu'):
+        return None
+    return 'cuda' if b == 'cuda' else 'cpu'
+
+
+def _pfa_staged(S, col, nx, ny, spx, spy, e1, e2, guard, window, support, backend):
+    """Polar format by the stages of fastsar.quick (each pulse gated to the scene's range bins and read at the
+    raster's range wavenumbers, each range wavenumber gated to the scene's azimuth extent and read at the raster's
+    azimuth wavenumbers at the pulses' own spacing, the padded transforms, the read at the apparent positions): the
+    image of the JAX program to its accuracy, at its scale, which is the raster's sum over the transform's range
+    period and not backprojection's sum over the samples. guard sets that scale as it did (the size of the
+    program's azimuth transform) and nothing else: the stages set their own gate edges."""
+    from . import pfa2, quick
+    P, K = S.shape
+    info = {}
+    img = quick._pfa(S, col.ant, col.fmin, col.df, nx, ny, spx, spy, e1, e2, correct=True, window=window, backend=backend,
+                     complex_image=True, info=info, warn=True, support=support)
+    ur = float(-(col.ant[P // 2] / np.linalg.norm(col.ant[P // 2])) @ e2)
+    nfx = pfa2._fft_size(nx + int(2 * guard / spx))
+    k = np.float32(4.0 * (col.fmin + (K // 2) * col.df) * col.df * abs(info["dts"]) * ur * ur * spx * spy * nfx / 299792458.0 ** 2)
+    if type(img).__module__.startswith('cupy'):
+        img *= k
+        return _to_host(img)
+    img = np.ascontiguousarray(img)
+    img *= k
+    return img
 
 
 def _pfa(S, col, nx, ny, spx, spy, e1, e2, guard=300.0, window=True, support='union'):
