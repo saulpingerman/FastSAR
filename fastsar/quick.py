@@ -57,6 +57,7 @@ C = 299792458.0
 TAPS, KAISER = 16, 8.0        # the resampling kernel of the range and azimuth stages (polar format's)
 PASS = 0.65                   # the part of a gated transform's period that the kernel reads to its accuracy
 OVERSAMPLE, LANCZOS = 2, 6    # the corrected image: the raster's padding and the taps of the final kernel
+PHASES = 2048                 # fractional positions per sample in the host kernels' weight tables
 _LIB = []
 _POOL = []
 _LOCK = threading.Lock()
@@ -64,6 +65,8 @@ _LOCK = threading.Lock()
 
 def _lib():
     """The C++ kernels of quicklook_cpu.cpp, compiled on first use as the other CPU kernels."""
+    if TAPS != 16:
+        raise RuntimeError('quicklook_cpu.cpp is written for 16 taps')
     if not _LIB:
         import ctypes
         from ._build import shared_object, default_flags
@@ -71,11 +74,12 @@ def _lib():
             src = fh.read()
         L = ctypes.CDLL(shared_object('quicklook_cpu', src, default_flags() + ['-std=c++17', '-fopenmp-simd']))
         i, n, d, fl, p = ctypes.c_int, ctypes.c_long, ctypes.c_double, ctypes.c_float, ctypes.c_void_p
-        L.ql_resample_cols.argtypes = [p, i, i, p, d, d, p, i, d, d, i, i, p, i, p]
-        L.ql_gather.argtypes = [p, n, n, n, n, n, n, i, i, i, i, i, i, d, d, d, d, d, p, p, p, i, i, d, d, i, fl, i, p, i,
-                                i, p, n]
+        L.ql_resample_rows.argtypes = [p, n, n, p, p, n, p, i, p]
+        L.ql_resample_cols.argtypes = [p, n, n, p, d, d, p, n, d, d, n, p, i, p]
+        L.ql_gather.argtypes = [p, n, n, n, n, n, n, i, i, i, i, i, i, d, d, d, d, d, p, p, p, i, i, d, d, i, fl, i, p, p,
+                                i, i, p, n]
         L.ql_weight_pad.argtypes = [p, n, n, p, p, n, n, p]
-        L.ql_resample_cols.restype = L.ql_gather.restype = L.ql_weight_pad.restype = None
+        L.ql_resample_rows.restype = L.ql_resample_cols.restype = L.ql_gather.restype = L.ql_weight_pad.restype = None
         _LIB.append(L)
     return _LIB[0]
 
@@ -129,17 +133,29 @@ def _taylor(n, nbar=4, sll=35.0):
     return 1 + 2 * Fm @ np.cos(2 * np.pi * ma[:, None] * (np.arange(n) - n / 2.0 + 0.5) / n)
 
 
-def _lanczos_table(taps, tabn=1024):
-    """The Lanczos kernel of `taps` taps (a sinc times a sinc window) at tabn points per unit offset over
-    [0, taps / 2], and two guard points: the final resampling's kernel (pfa2's CUDA and C++ gathers compute it)."""
-    half = taps // 2
-    d = np.arange(tabn * half + 2) / tabn
-    return np.where(d < half, np.sinc(d) * np.sinc(d / half), 0.0).astype(np.float32)
+_TABLES = {}
+
+
+def _polyphase(kind, taps, q):
+    """The weights of a resampling kernel for the host kernels (quicklook_cpu.cpp), float32 [q + 1, taps]: row r holds
+    the taps for the fractional position r / q, at the offsets r / q - (t - taps / 2 + 1), normalised to unit sum.
+    kind 'kaiser': polar format's Kaiser-windowed sinc (pfa2._kernel, beta KAISER); 'lanczos': a sinc times a sinc
+    window, the final resampling's kernel (pfa2's gathers compute it)."""
+    key = (kind, taps, q)
+    if key not in _TABLES:
+        from .pfa2 import _kernel
+        d = np.arange(q + 1)[:, None] / q - (np.arange(taps)[None, :] - taps // 2 + 1)
+        if kind == 'kaiser':
+            w = _kernel(d, taps, KAISER)
+        else:
+            w = np.where(np.abs(d) < taps // 2, np.sinc(d) * np.sinc(d / (taps // 2)), 0.0)
+        _TABLES[key] = np.ascontiguousarray(w / w.sum(1, keepdims=True), np.float32)
+    return _TABLES[key]
 
 
 # ------------------------------------------------------------------------------------------------------- the plan
 
-def _plan(r, cphd, channel, size, resolution, extent, ref_freq, notes):
+def _plan(r, cphd, channel, size, resolution, extent, ref_freq, looks, notes):
     """The cut and the grid, from the header and a few hundred per-pulse parameters (no sample is read): dict of the
     pulses and samples to read, the picture's center, slant-plane axes and plane normal (ECF), its half extents and
     spacings along the axes (m), its pixel on the ground, and the collection's facts the notes and the product
@@ -263,31 +279,40 @@ def _plan(r, cphd, channel, size, resolution, extent, ref_freq, notes):
         p = p_min
     spx, spy = p / s1, p / s2
     nx, ny = (2 * int(np.ceil(H / sp - 1e-6)) for H, sp in ((Hx, spx), (Hy, spy)))
-    # the cut: the central samples and pulses whose bands are 0.96 / spacing
+    # the cut: the central samples and pulses whose bands are 0.96 / spacing; for several looks, as many such runs
+    # side by side as were asked for and the collection holds
     Kc = int(min(Kv, max(2, round(0.96 / spy * C / (2 * df)))))
-    k0 = (k_lo + (Kv - Kc) // 2) // 16 * 16           # from a multiple of 16: the reader's rows as they are read
-    k0 += 16 if k0 < k_lo and k0 + 16 + Kc <= k_hi else 0
-    Kc = min(Kc, K - k0)
-    fc = f0 + (k0 + 0.5 * (Kc - 1)) * df
-    need = 0.96 / spx * C / (2 * fc)                  # the span of t
+    lr = int(max(1, min(looks[1], Kv // Kc)))
+    k0 = (k_lo + (Kv - lr * Kc) // 2) // 16 * 16      # from a multiple of 16: the reader's rows as they are read
+    k0 += 16 if k0 < k_lo and k0 + 16 + lr * Kc <= k_hi else 0
+    if k0 + lr * Kc > K:
+        lr, Kc = (lr - 1, Kc) if lr > 1 else (1, K - k0)
+    fc = f0 + (k0 + 0.5 * (lr * Kc - 1)) * df
+    need = 0.96 / spx * C / (2 * fc)                  # the span of t of one look
+    la = int(max(1, min(looks[0], np.floor(abs(t[-1] - t[0]) / need + 1e-9))))
     order = np.argsort(t)
-    ends = np.interp([t[mid] - need / 2, t[mid] + need / 2], t[order], idx[order].astype(np.float64))
+    ends = np.interp([t[mid] - la * need / 2, t[mid] + la * need / 2], t[order], idx[order].astype(np.float64))
     pa, pb = int(max(idx[0], np.floor(ends.min()))), int(min(idx[-1], np.ceil(ends.max()))) + 1
-    if pb - pa < 2 * TAPS:
-        raise ValueError(f'the picture asked for needs {pb - pa} pulses, fewer than the {2 * TAPS} polar format '
-                         'resamples: ask for more pixels or a finer resolution')
+    if (pb - pa) // la < 2 * TAPS:
+        raise ValueError(f'the picture asked for needs {(pb - pa) // la} pulses, fewer than the {2 * TAPS} polar '
+                         'format resamples: ask for more pixels or a finer resolution')
+    if (la, lr) != tuple(looks):
+        notes.append(f'{la} by {lr} looks (sub-apertures by sub-bands), not the {looks[0]} by {looks[1]} asked for: '
+                     'the collection holds no more at this resolution')
     graze = float(np.degrees(np.arcsin(np.clip(-(e2 @ up), -1, 1))))
-    return dict(channel=channel, pulses=(pa, pb), samples=(k0, k0 + Kc), P=P, K=K, valid=(k_lo, k_hi), center=c, e1=e1,
+    return dict(channel=channel, pulses=(pa, pb), samples=(k0, k0 + lr * Kc), looks=(la, lr), P=P, K=K,
+                valid=(k_lo, k_hi), center=c, e1=e1,
                 e2=e2, normal=n, up=up, Hx=Hx, Hy=Hy, spx=spx, spy=spy, nx=nx, ny=ny, pixel=p, s=(s1, s2),
                 resolution=p / 0.96, finest=p_min / 0.96, extents=(Xa, Xr), graze=graze, twist=twist, f0=f0, df=df)
 
 
 # --------------------------------------------------------------------------------------------- the cut collection
 
-def _collection(cphd, size=2048, resolution=None, extent=None, channel=0, reader_options=None):
+def _collection(cphd, size=2048, resolution=None, extent=None, channel=0, reader_options=None, looks=(1, 1)):
     """Plan the cut and read it: dict(S [P, K] (referenced to the grid center, unweighted), ant [P, 3] (about that
     center, local frame), fmin, df, nx, ny, spx, spy, e1, e2 (local): what form_image, ExactFormer and _pfa take;
-    center [3] (local), meta (read_cphd's), plan, notes, timing (plan, read, reference: seconds))."""
+    center [3] (local), meta (read_cphd's), plan, notes, timing (plan, read, reference: seconds)). looks: (sub-apertures,
+    sub-bands): S then holds that many runs of pulses and of samples side by side (plan['looks'] of them)."""
     from ._xmlmeta import reading
     opts = dict(reader_options or {})
     bad = sorted(set(opts) - {'troposphere', 'phase_sign', 'ref_freq', 'drop_flagged', 'regrid_tol'})
@@ -298,7 +323,7 @@ def _collection(cphd, size=2048, resolution=None, extent=None, channel=0, reader
     t0 = time.perf_counter()
     with reading(cphd, 'CPHD file', wrap=False):
         r = io._open_cphd(cphd)
-        plan = _plan(r, cphd, channel, size, resolution, extent, opts.get('ref_freq'), notes)
+        plan = _plan(r, cphd, channel, size, resolution, extent, opts.get('ref_freq'), tuple(looks), notes)
         timing['plan'] = time.perf_counter() - t0
         t0 = time.perf_counter()
         col, meta = io._read_cphd(cphd, None, plan['channel'], True, opts.get('regrid_tol', 1e-3),
@@ -455,12 +480,11 @@ def _pfa_cpu(S, g, window, correct, complex_image, timing):
     threads."""
     import ctypes
     import scipy.fft as sf
-    from . import pfa2
-    lib, plib = _lib(), pfa2._cpu_gather_lib()
+    lib = _lib()
     W = _workers()
     P, K, Kf, Nr, k0 = g['P'], g['K'], g['Kf'], g['Nr'], g['k0']
     nkr, nka, nfy, nfx, nx, ny = g['nkr'], g['nka'], g['nfy'], g['nfx'], g['nx'], g['ny']
-    tab = pfa2.kernel_table(TAPS, KAISER)
+    tab = _polyphase('kaiser', TAPS, PHASES)
     ptr = lambda a: a.ctypes.data_as(ctypes.c_void_p)
     t0 = time.perf_counter()
     wk = np.ascontiguousarray(g['wk'] * (_taylor(K) if window else 1.0), np.float32)
@@ -483,14 +507,13 @@ def _pfa_cpu(S, g, window, correct, complex_image, timing):
         np.multiply(prof[:, Kf - neg:], tap_r[Nr - neg:], out=gate[:, Nr - neg:])
         G[sl] = sf.fft(gate, axis=1, overwrite_x=True)
     _blocks(rows, P, int(max(1, min(64, (1 << 21) // (8 * Kf)))))
-    timing['range gate'] = time.perf_counter() - t0
+    timing['range gate'] = timing.get('range gate', 0.0) + time.perf_counter() - t0
     t0 = time.perf_counter()
     A = np.empty((P, nkr), np.complex64)
-    plib.pfa_resample_rows(G.view(np.float32).reshape(P, 2 * Nr), P, Nr, np.ascontiguousarray(g['alpha'], np.float32),
-                           np.ascontiguousarray(g['beta'], np.float32), nkr, TAPS, tab, pfa2.TABN,
-                           A.view(np.float32).reshape(P, 2 * nkr))
+    alpha, beta = np.ascontiguousarray(g['alpha'], np.float64), np.ascontiguousarray(g['beta'], np.float64)
+    lib.ql_resample_rows(ptr(G), P, Nr, ptr(alpha), ptr(beta), nkr, ptr(tab), PHASES, ptr(A))
     del G
-    timing['range resampling'] = time.perf_counter() - t0
+    timing['range resampling'] = timing.get('range resampling', 0.0) + time.perf_counter() - t0
     t0 = time.perf_counter()
     # 2. azimuth gate: the pulses of every range wavenumber transformed (padded to Pf), cut to Na bins, and back on
     # Na pulses. The gate carries the image's scale and the phase that sets the pulses p0 rows into the Na
@@ -521,15 +544,15 @@ def _pfa_cpu(S, g, window, correct, complex_image, timing):
     del prof
     A2 = np.ascontiguousarray(sf.ifft(gate, axis=0, workers=W, overwrite_x=True))
     del gate
-    timing['azimuth gate'] = time.perf_counter() - t0
+    timing['azimuth gate'] = timing.get('azimuth gate', 0.0) + time.perf_counter() - t0
     t0 = time.perf_counter()
     B = np.empty((nkr, nka), np.complex64)
     inv_kr = np.ascontiguousarray(1.0 / g['kr'])
     qtab = np.ascontiguousarray(g['qtab'])
     lib.ql_resample_cols(ptr(A2), Na, nkr, ptr(inv_kr), g['ka_lo'], g['dka'], ptr(qtab), len(qtab), g['tg0'],
-                         g['tg_inv'], nka, TAPS, ptr(tab), pfa2.TABN, ptr(B))
+                         g['tg_inv'], nka, ptr(tab), PHASES, ptr(B))
     del A2
-    timing['azimuth resampling'] = time.perf_counter() - t0
+    timing['azimuth resampling'] = timing.get('azimuth resampling', 0.0) + time.perf_counter() - t0
     t0 = time.perf_counter()
     out = np.empty((ny, nx), np.complex64 if complex_image else np.float32)
     cb = int(max(1, (1 << 18) // nx))
@@ -555,7 +578,7 @@ def _pfa_cpu(S, g, window, correct, complex_image, timing):
                     o *= cy[r_out + sl.start:r_out + sl.stop, None]
             _blocks(put, ny // 2, cb)
             del T
-        timing['image'] = time.perf_counter() - t0
+        timing['image'] = timing.get('image', 0.0) + time.perf_counter() - t0
         return out
     # 4. the same on a raster padded by ov, at baseband, in blocks of range pixels read at the apparent positions.
     # The spectrum is set about index 0 of the padded transforms with alternating signs, so that their outputs
@@ -582,8 +605,10 @@ def _pfa_cpu(S, g, window, correct, complex_image, timing):
     del B
     F1 = sf.ifft(Z, axis=0, workers=W, overwrite_x=True)                   # [Ny2, nka]: range done
     del Z
-    timing['range transform'] = time.perf_counter() - t0
-    ltab = _lanczos_table(LANCZOS)
+    timing['range transform'] = timing.get('range transform', 0.0) + time.perf_counter() - t0
+    ltab = _polyphase('lanczos', LANCZOS, PHASES)
+    ltab16 = np.zeros((PHASES + 1, 16), np.float32)                         # each weight for a sample's two parts
+    ltab16[:, 0:2 * LANCZOS:2] = ltab16[:, 1:2 * LANCZOS:2] = ltab
     cx, cy = np.ascontiguousarray(dist['cx'], np.float64), np.ascontiguousarray(dist['cy'], np.float64)
     pw = np.ascontiguousarray(np.asarray(dist['powers'], np.int32).ravel())
     deg = max(a + b for a, b in dist['powers'])
@@ -610,12 +635,13 @@ def _pfa_cpu(S, g, window, correct, complex_image, timing):
         t2 = time.perf_counter()
         lib.ql_gather(ptr(base), span, Nx2, Nx2, Ny2, rb0, 0, nx, n, 0, jb, nx, ny, float(g['spx']),
                       float(g['spy']), float(ov), float(dist['sx']), float(dist['sy']), ptr(cx), ptr(cy), ptr(pw),
-                      len(cx), deg, float(kr_c), float(ka_c), 1, 1.0, LANCZOS, ptr(ltab), 1024,
+                      len(cx), deg, float(kr_c), float(ka_c), 1, 1.0, LANCZOS, ptr(ltab), ptr(ltab16), PHASES,
                       0 if complex_image else 1, ctypes.c_void_p(out.ctypes.data + jb * out.strides[0]), nx)
         del base
         tt[0] += t2 - t1
         tt[1] += time.perf_counter() - t2
-    timing['azimuth transform'], timing['correction'] = tt
+    timing['azimuth transform'] = timing.get('azimuth transform', 0.0) + tt[0]
+    timing['correction'] = timing.get('correction', 0.0) + tt[1]
     return out
 
 
@@ -656,7 +682,7 @@ def _pfa(S, ant, fmin, df, nx, ny, spx, spy, e1, e2, *, correct=True, window=Tru
     if nx % 2 or ny % 2:
         raise ValueError(f'the quick look takes even pixel counts, got {nx} by {ny}')
     g = _geometry(ant, float(fmin), float(df), S.shape[1], int(nx), int(ny), float(spx), float(spy), e1, e2, correct)
-    timing['geometry'] = time.perf_counter() - t0
+    timing['geometry'] = timing.get('geometry', 0.0) + time.perf_counter() - t0
     if info is not None:
         info.update(shift_px=g['dist']['max_shift_px'], fit_rms_px=g['dist']['rms_px'], raster=(g['nkr'], g['nka']),
                     fft=(g['nfy'], g['nfx']), range_gate=(g['Kf'], g['Nr']), azimuth_gate=(g['Pf'], g['Na']))
@@ -856,10 +882,10 @@ def _ffbp(col, backend, window, timing):
     former = ImageFormer(col['ant'], col['fmin'], col['df'], K, col['nx'], col['ny'], col['spx'], col['spy'], col['e1'],
                          col['e2'], backend=backend, precision='single-pass' if backend == 'tpu' else 'float32',
                          window=False, range_gate=True)
-    timing['plan and compile'] = time.perf_counter() - t0
+    timing['plan and compile'] = timing.get('plan and compile', 0.0) + time.perf_counter() - t0
     t0 = time.perf_counter()
     img = former(S)
-    timing['formation'] = time.perf_counter() - t0
+    timing['formation'] = timing.get('formation', 0.0) + time.perf_counter() - t0
     return img, former
 
 
@@ -879,7 +905,7 @@ def write_png(path, image, level=1):
     raw = np.zeros((rows, 1 + cols * (1 if a.ndim == 2 else a.shape[2])), np.uint8)       # filter type 0 on every row
     raw[:, 1:] = a.reshape(rows, -1)
     raw = raw.reshape(-1)
-    step = max(1 << 20, -(-raw.size // 256))
+    step = int(min(4 << 20, max(1 << 16, -(-raw.size // (4 * _workers())))))
     cuts = list(range(0, raw.size, step))
     parts = [None] * len(cuts)
 
@@ -977,7 +1003,7 @@ _KINDS = {'.png': 'png', '.nitf': 'sicd', '.ntf': 'sicd'}
 
 
 def quicklook(cphd, output=None, *, size=2048, resolution=None, correct=True, remap='nrl', backend='auto',
-              weighting='taylor', complex_image=False, channel=0, extent=None, reader_options=None):
+              weighting='taylor', looks=1, complex_image=False, channel=0, extent=None, reader_options=None):
     """A reduced-resolution picture of a spotlight CPHD collection, by polar format on the part of the file that
     resolution needs (see the module docstring).
 
@@ -995,6 +1021,11 @@ def quicklook(cphd, output=None, *, size=2048, resolution=None, correct=True, re
     backend: 'auto', 'cpu', 'cuda', 'jax' or 'tpu'. cpu and cuda form by polar format; jax and tpu form the same
         cut history on the same grid by the factorized former (ImageFormer), where correct does not apply.
     weighting: 'taylor' (nbar 4, 35 dB, along frequency and along pulses: the default) or 'uniform'.
+    looks: n, or (sub-apertures, sub-bands): the picture is the mean power of that many images of the same pixels
+        and resolution, formed from runs of pulses and of samples side by side (n by n for one number), for less
+        speckle: the standard deviation of the power falls as the square root of their count. As many as the
+        collection holds at the resolution; they cost their count in bytes read and in formation time. The complex
+        image is of one look.
     complex_image: also return the complex image [nx, ny] (complex64, with backprojection's phase when corrected).
     channel: index, identifier or polarization. extent: (across, along) the line of sight in meters on the ground,
         about the scene's reference point, in place of the file's image area. reader_options: troposphere,
@@ -1011,7 +1042,8 @@ def quicklook(cphd, output=None, *, size=2048, resolution=None, correct=True, re
     angle, and the angle by which the slant plane shears the ground in the picture), pulses (of those read) and cut:
     dict(pulses, of_pulses, samples, of_samples: the file's vectors and samples read; signal_bytes, of_bytes: their
     size and the signal array's); algorithm ('pfa' or 'ffbp'), backend, correct, displacement_px (polar format's
-    largest displacement along e1 and e2 over the picture, in pixels; removed when correct), remap, meta
+    largest displacement along e1 and e2 over the picture, in pixels; removed when correct), looks (sub-apertures,
+    sub-bands), remap, meta
     (read_cphd's), notes, timing (seconds by stage, and total), and path when a file was written). A moving-beam
     collection raises ValueError; process_cphd forms those."""
     from . import _xp, planes, sidd
@@ -1035,10 +1067,18 @@ def quicklook(cphd, output=None, *, size=2048, resolution=None, correct=True, re
         if kind is None:
             raise ValueError(f'output {os.fspath(output)!r}: a .png file (the picture) or a .nitf or .ntf file (the '
                              'complex image as a SICD)')
+    try:
+        looks = tuple(int(v) for v in np.broadcast_to(np.asarray(looks), (2,)))
+        if min(looks) < 1 or not np.all(np.asarray(looks) == np.broadcast_to(np.asarray(looks), (2,))):
+            raise ValueError
+    except (TypeError, ValueError):
+        raise ValueError(f'looks must be a count, or (sub-apertures, sub-bands), 1 or more, got {looks!r}') from None
+    want = bool(complex_image) or kind == 'sicd'
+    if want and looks != (1, 1):
+        raise ValueError('the complex image (complex_image=True, a .nitf output) is of one look: leave looks=1')
     backend = _backend(backend)
     window = weighting == 'taylor'
-    want = bool(complex_image) or kind == 'sicd'
-    col = _collection(cphd, size, resolution, extent, channel, reader_options)
+    col = _collection(cphd, size, resolution, extent, channel, reader_options, looks)
     timing, notes, plan, meta = col['timing'], col['notes'], col['plan'], col['meta']
     nx, ny, spx, spy, e1, e2, c = col['nx'], col['ny'], col['spx'], col['spy'], col['e1'], col['e2'], col['center']
     S, ant, f0, df = col['S'], col['ant'], col['fmin'], col['df']
@@ -1054,31 +1094,58 @@ def quicklook(cphd, output=None, *, size=2048, resolution=None, correct=True, re
                  f"(0.96 of the reciprocal of the band on each axis), which are {plan['pixel']:.3f} m across and along "
                  f"the ground range direction (grazing angle {plan['graze']:.1f} degrees). The picture is not projected "
                  f"to the ground: it is the ground sheared by the slant plane's twist, {plan['twist']:.1f} degrees")
-    info, shift = {}, None
+    la, lr = plan['looks']
+    Pl, Kl = P // la, K // lr                                            # pulses and samples of a look
+
+    def look(i, j):
+        """The collection of look (i, j): its pulses and samples, on their own."""
+        if (la, lr) == (1, 1):
+            return col
+        rows, cols = slice(i * Pl, (i + 1) * Pl), slice(j * Kl, (j + 1) * Kl)
+        return dict(col, S=np.ascontiguousarray(S[rows, cols]), ant=ant[rows], fmin=f0 + j * Kl * df)
+    info, shift, acc, cimg = {}, None, None, None
+    xp = np
+    for i in range(la):
+        for j in range(lr):
+            sub = look(i, j)
+            if backend in ('jax', 'tpu'):
+                img = _ffbp(sub, backend, window, timing)[0]
+                cimg = img if want else None
+                rm = np.ascontiguousarray(img.T)
+                complex_rm = True
+            else:
+                out = _pfa(sub['S'], sub['ant'], sub['fmin'], df, nx, ny, spx, spy, e1, e2, correct=bool(correct),
+                           window=window, backend=backend, complex_image=want, timing=timing, info=info)
+                rm = out.T                                               # range-major, where it was formed
+                xp = _xp.module(rm)
+                complex_rm = want
+                if want:
+                    cimg = np.ascontiguousarray(_xp.host(rm).T)
+            t0 = time.perf_counter()
+            if complex_rm:
+                rm = _abs(rm, np.float32(1.0)) if _xp.kind(rm) == 'numpy' else xp.abs(rm)
+            if (la, lr) == (1, 1):
+                amp = rm
+            else:                                                        # the looks' mean power
+                rm *= rm
+                acc = rm if acc is None else acc + rm
+            del sub, rm
+            timing['detect'] = timing.get('detect', 0.0) + time.perf_counter() - t0
+    if acc is not None:
+        acc *= np.float32(1.0 / (la * lr))
+        amp = xp.sqrt(acc)
+        del acc
+        notes.append(f'{la} by {lr} looks (sub-apertures of {Pl} pulses by sub-bands of {Kl} samples), their power '
+                     'averaged')
     if backend in ('jax', 'tpu'):
-        img = _ffbp(col, backend, window, timing)[0]
         algorithm, corrected = 'ffbp', True
         notes.append(f"formed by factorized backprojection on the '{backend}' backend"
                      + (" (precision 'single-pass')" if backend == 'tpu' else '') + ': polar format\'s resampling '
                      'steps are gathers, which are slow on this device; correct does not apply')
-        t0 = time.perf_counter()
-        amp = _abs(np.ascontiguousarray(img.T), np.float32(1.0))
-        cimg = img if want else None
-        timing['detect'] = time.perf_counter() - t0
     else:
-        out = _pfa(S, ant, f0, df, nx, ny, spx, spy, e1, e2, correct=bool(correct), window=window, backend=backend,
-                   complex_image=want, timing=timing, info=info)
         algorithm, corrected, shift = 'pfa', bool(correct), tuple(float(v) for v in info['shift_px'])
         notes.append(f'polar format: its displacement of scatterers, up to {shift[0]:.1f} by {shift[1]:.1f} pixels '
                      '(azimuth by range) over the picture, ' + ('removed' if corrected else 'left in (correct=False)'))
-        t0 = time.perf_counter()
-        rm = out.T                                                       # range-major, where it was formed
-        if want:
-            cimg = np.ascontiguousarray(_xp.host(rm).T)
-            amp = _abs(rm, np.float32(1.0)) if _xp.kind(rm) == 'numpy' else _xp.module(rm).abs(rm)
-        else:
-            cimg, amp = None, rm
-        timing['detect'] = time.perf_counter() - t0
     del S, col
     # the picture: remapped where the image is, laid out shadows down
     t0 = time.perf_counter()
@@ -1109,7 +1176,7 @@ def quicklook(cphd, output=None, *, size=2048, resolution=None, correct=True, re
         pixel=float(plan['pixel']), resolution=float(plan['resolution']), finest=float(plan['finest']),
         band=(f0, f0 + (K - 1) * df), bandwidth=(2 * fc / C * float(abs(tt[-1] - tt[0])), 2 * K * df / C),
         window=('taylor', 'taylor') if window else None, pulses=(0, P), cut=cut, algorithm=algorithm, backend=backend,
-        correct=corrected, displacement_px=shift, remap=remap, graze=float(np.radians(plan['graze'])),
+        correct=corrected, displacement_px=shift, looks=(la, lr), remap=remap, graze=float(np.radians(plan['graze'])),
         twist=float(np.radians(plan['twist'])), meta=meta,
         notes=notes, timing=timing)
     if kind is not None:
