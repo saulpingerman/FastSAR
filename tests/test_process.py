@@ -386,7 +386,8 @@ def test_small_jax_device_gives_the_same_product(cphd, kw, monkeypatch, tmp_path
         # the complex samples differ in their last bits (the transforms of other blocks of lines); display values
         # on a rounding boundary by one count
         assert a.size == b.size
-        assert ext == 'sicd' or np.count_nonzero(a != b) < (1e-3 if kw.get('remap') != 'log' else 1e-2) * a.size, mb
+        # (0.07 per cent of the bytes on this machine, 0.12 on a CI runner whose processor rounds the transforms otherwise)
+        assert ext == 'sicd' or np.count_nonzero(a != b) < (2e-3 if kw.get('remap') != 'log' else 1e-2) * a.size, mb
     assert len({tuple(p['place'].values()) for p in plans}) >= min(2, len(plans[0]['place']))
     monkeypatch.setenv('FASTSAR_JAX_BLOCK_MB', '0')
     with pytest.raises(ValueError, match='FASTSAR_JAX_BLOCK_MB'):
