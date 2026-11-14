@@ -1208,14 +1208,22 @@ it with a correction that follows the strip.
   tolerance, `info['settled']`): an estimate that still alternates between two peaks is that of neither. Then
   `quadratic`'s, on every block: the correlation peaks of all columns and of at least half
   of the sets must be significant, the estimate of all columns must lie within three standard errors of the sets'
-  median, and no more than a quarter of the sets may lie far from it. A block that passes counts, also when its
-  estimate is small: it says that its part of the strip is focused.
+  median, and no more than a quarter of the sets may lie far from it. A bright return that is not a point can
+  carry the estimate of all columns away from the median while its own set is the only one far from it: a
+  specular return, lit over part of the aperture, puts most of its band into one look, so its looks do not move
+  apart as a point's do and its set reads something other than the error (a Capella C14 sliding spotlight below).
+  Where the sets that are far are no more than a quarter, the estimate is then made again from the columns of
+  the sets that agree, starting from their median, and the sets again from it; it must have settled, its peak
+  must be significant, and it must pass the same test (`info['pooled']` marks the sets each block's estimate
+  holds). A block that passes
+  counts, also when its estimate is small: it says that its part of the strip is focused.
 - **Fit.** Along the track the estimates of the blocks that count are tied by a robust local line (tricube
   weights over four block steps, Tukey's biweight); a block that does not count takes the fit of its neighbors.
   Across the swath the departures of a block's agreeing sets from their median give a linear trend where it is
   three times its standard error (`'spatially_variant'`: a parabola, always), held at its end values beyond the
-  columns the sets cover; where there is a trend, the block's estimate of all columns is made again with the
-  trend removed column by column, because the columns in best focus would otherwise carry it.
+  columns the sets cover; where there is a trend, the block's estimate (of the columns of the sets it holds) is
+  made again with the trend removed column by column, because the columns in best focus would otherwise carry
+  it.
 - **Guard, second test.** `quadratic`'s rule on the corrected rows: their contrast must rise, the median gain of
   the parts must not be below minus twice its standard error, and one of the two gains must be twice its
   standard error, or the image is returned as it came. For a spotlight the parts are 16 sets of columns, because
@@ -1435,6 +1443,44 @@ fell to -20 dB only at 12 cycles/m). On the C09, 20 points stand 25 dB above the
 with a median width of 0.78 m (the vendor's impulse response: 0.72 m). On the C10 the brightest returns stay narrow in azimuth frequency (0.1 to 0.4
 cycles/m) wherever the band is placed, and long along the track, while the vendor's image shows them 0.5 m
 long: not a matter of the band, and not of a quadratic phase across it.
+
+**Sliding spotlight whose brightest return is specular** (Capella C14, 2025-02-19, HH, 164,855 pulses in 15 s at
+a PRF of 10.8 kHz; a 1 by 3 km cut at the center, in the San Fernando Valley of Los Angeles at 34.19 N,
+118.50 W). A pixel takes 77,155 pulses; the default product is 4,579 by 4,240 pixels of 0.218 by 0.708 m, and
+autofocus has two blocks of 4,096 rows. Autofocus used to decline it, as it came and with 2, 5 and 15 rad
+injected, with "the parts of the blocks disagree on the estimate", and so did `'spatially_variant'`, whose first
+test is the same. In both blocks seven of the eight sets of columns agree, 1.72 to 2.42 rad about a median of
+2.16 rad with a standard error of 0.07 and 0.11 rad. The eighth holds the scene's brightest return, 51 dB over
+the median pixel; it reads -6.9 rad with a correlation peak 5,600 robust deviations high and carries the
+estimate of all columns to -6.46 rad, 78 and 123 standard errors from the median. An injected error moves every
+set by its amount (the eighth reads -4.89, -1.89 and 8.13 rad at 2, 5 and 15 rad, the others 4.12, 7.04 and
+17.01 at their median), so the refusal stayed. The return is specular: in the four columns through it 86 to
+92% of its azimuth energy lies in one quarter of the band, its lower look is 8 to 54 times as bright as its
+upper one, and the 16 columns about it read -6.4 rad by themselves, where columns elsewhere whose peak is
+significant read 1.8 to 2.3 rad. Relief does not explain it. Under the cut the GLO-30 surface lies 132 m below the image plane (the scene
+reference point's height), which at -0.025 rad per meter of height in this geometry predicts +3.3 rad over the
+whole cut; within the cut the surface varies by +-7 m (5 to 95%), +-0.2 rad, and under the eighth set it lies
+at the height of its neighbors. The estimate is now made again from the sets that agree (widths: the median
+over the 40 brightest compact points):
+
+| Injected | Contrast, blurred | Azimuth width, blurred | Fit over the two blocks | Contrast after | Azimuth width after |
+|---|---|---|---|---|---|
+| none | 37.41 | 0.261 m | 2.19 rad | 38.89 | 0.240 m |
+| 2 rad | 36.55 | 0.537 m | 4.18 to 4.26 rad | 38.73 | 0.241 m |
+| 5 rad | 36.23 | 0.896 m | 7.18 to 7.19 rad | 38.38 | 0.240 m |
+| 15 rad | 35.13 | 1.354 m | 17.19 to 17.27 rad | 37.05 | 0.240 m |
+
+The fits are the injected error plus the collection's own 2.19 rad to within 0.08 rad, both blocks are
+corrected, and the median contrast gain of the cells is 24 to 30 standard errors. At 15 rad the contrast after
+correction is 0.953 of the delivered product's although the points are as narrow. The injected error's linear
+part over each pixel's aperture, which autofocus leaves (above), moves the scatterers along the track, by up to
+0.7 rows at the ends of the cut, and this scene's contrast is carried by a dozen bright returns (38.9 with the
+30 brightest, 9.5 without them), whose peak samples in an unweighted image sampled at 0.96 of its band fall by
+up to half when they move by half a row. The delivered product moved by that linear part alone keeps 0.968 of
+its contrast; the residual quadratic phase at those returns is 0.01 to 0.03 rad; interpolated four times along
+the track, the corrected product has 0.983 of the delivered contrast; and without the 30 brightest returns it
+has 9.61 against 9.54. The C09 sliding spotlight and stripmap above, whose blocks pass the first test as they
+did, give the same products to the bit.
 
 **Speed.** Seconds per stage for the stripmap cut, second call, with megapixels per second in parentheses, on an
 Nvidia RTX PRO 6000 that other jobs were using and on 16 of the host's 48 cores:

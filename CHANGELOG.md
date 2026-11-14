@@ -280,6 +280,18 @@ was published on PyPI.
   copy of the columns it reads (along the track and across range) and corrects the image as it was delivered,
   and its guard counts a block only when the iteration of its estimate has settled (`taper=`, `range_band=`,
   `info['settled']`, `info['capture']`).
+- `moving.autofocus` declined a moving beam whose brightest return is not a point. On a Capella C14 sliding
+  spotlight (2025-02-19) seven of the eight sets of columns of both blocks agreed on 2.2 rad, and the eighth,
+  which holds a specular return 51 dB over the median pixel (86 to 92% of its band in one quarter, one look 8 to
+  54 times as bright as the other), read -6.9 rad and carried the estimate of all columns to -6.5 rad. The
+  guard's first test compared that estimate with the sets' median and declined every block, as the collection
+  came and with 2, 5 and 15 rad injected. Where the estimate of all columns lies off the median and the sets
+  far from it are no more than a quarter, the estimate is now made again from the columns of the sets that
+  agree, and the sets again from it, under the same test (`info['pooled']`). The injected errors are found to
+  within 0.08 rad and the points return to 1.001 to 1.004 times the delivered product's width; the second test,
+  the guard's promise of no harm, is unchanged, and blocks that passed the first test are untouched (the C09
+  sliding spotlight and stripmap of the documentation give the same products to the bit). Relief is not the
+  cause: the GLO-30 surface under the cut varies by +-7 m, +-0.2 rad.
 - `docs/products.md` said that two passes formed onto one grid are coregistered by construction; that holds for
   the geometry as known, and real repeat collections lay 9 to 22 m apart. `products.coherence` gave its bias for
   independent pixels; the note now states the measured floor of oversampled images.

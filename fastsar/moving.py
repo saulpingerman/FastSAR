@@ -812,8 +812,8 @@ def autofocus(img, mode='quadratic', *, band=None, footprint=None, block=None, o
     of the sets are far from it, those sets have pulled it there: a bright return that is not a point (a specular
     one, lit over part of the aperture, whose two looks hold different parts of its band and so do not measure the
     error) carries the correlation of all columns. The estimate is then made again from the columns of the sets
-    that agree, starting from their median; it must have settled, its peak must be significant, and it must pass
-    the same test (info['pooled']: the sets each block's estimate holds). A block with a small estimate counts: it
+    that agree, starting from their median, and the sets again from it; it must have settled, its peak must be
+    significant, and it must pass the same test (info['pooled']: the sets each block's estimate holds). A block with a small estimate counts: it
     says that its part of the strip is focused. Without the guard every block that has settled with significant
     peaks counts.
     Fit. Across the swath, the departures of the sets that agree from their block's median are fitted against
