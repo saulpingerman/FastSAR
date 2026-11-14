@@ -308,12 +308,15 @@ def test_png_round_trip(tmp_path):
         p = str(tmp_path / 'a.png')
         quick.write_png(p, a)
         assert np.array_equal(quick.read_png(p), a)
-        with open(p, 'rb') as fh:                                              # one valid zlib stream, valid chunks
+        with open(p, 'rb') as fh:                                              # valid chunks, one valid zlib stream
             b = fh.read()
         assert b[:8] == b'\x89PNG\r\n\x1a\n' and b[-12:-8] == b'\x00\x00\x00\x00' and b[-8:-4] == b'IEND'
-        n = int.from_bytes(b[33:37], 'big')
-        assert b[37:41] == b'IDAT' and zlib.crc32(b[37:41 + n]) == int.from_bytes(b[41 + n:45 + n], 'big')
-        assert len(zlib.decompress(b[41:41 + n])) == a.shape[0] * (1 + a[0].size)
+        at, data = 33, b''
+        while b[at + 4:at + 8] == b'IDAT':
+            n = int.from_bytes(b[at:at + 4], 'big')
+            assert zlib.crc32(b[at + 4:at + 8 + n]) == int.from_bytes(b[at + 8 + n:at + 12 + n], 'big')
+            data, at = data + b[at + 8:at + 8 + n], at + 12 + n
+        assert at == len(b) - 12 and len(zlib.decompress(data)) == a.shape[0] * (1 + a[0].size)
     for bad in (np.zeros((4, 4), np.float32), np.zeros((4,), np.uint8), np.zeros((4, 4, 2), np.uint8)):
         with pytest.raises(ValueError, match='uint8'):
             quick.write_png(str(tmp_path / 'b.png'), bad)
@@ -350,8 +353,8 @@ def test_output_files(spot, tmp_path):
     a = a[::-1] if lay['flip_rows'] else a
     a = a[:, ::-1] if lay['flip_cols'] else a
     assert np.abs(np.abs(pix) - a).max() < 1e-5 * a.max()
-    assert set(out['timing']) >= {'plan', 'read', 'reference', 'geometry', 'range gate', 'range resampling', 'azimuth gate',
-                                  'azimuth resampling', 'correction', 'display', 'write', 'total'}
+    assert set(out['timing']) >= {'plan', 'read', 'reference', 'geometry', 'range', 'azimuth', 'range transform',
+                                  'azimuth transform', 'correction', 'display', 'write', 'total'}
     assert out['timing']['total'] >= sum(v for k, v in out['timing'].items() if k != 'total') * 0.5
 
 
@@ -483,7 +486,7 @@ def test_cuda(spot):
     b = look(spot['path'], size=256, backend='cpu')
     assert a['backend'] == 'cuda' and isinstance(a['display'], np.ndarray) and a['display'].shape == b['display'].shape
     assert np.mean(np.abs(a['display'].astype(int) - b['display'].astype(int)) <= 1) > 0.999
-    assert a['cut'] == b['cut'] and 'range gate' in a['timing']
+    assert a['cut'] == b['cut'] and {'range', 'azimuth', 'correction'} <= set(a['timing'])
     assert fastsar.quicklook(spot['path'], size=64)['backend'] == 'cuda'       # 'auto' on a machine with a GPU
     c = look(spot['path'], size=256, backend='cuda', complex_image=True)
     d = look(spot['path'], size=256, backend='cpu', complex_image=True)

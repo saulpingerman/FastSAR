@@ -76,9 +76,9 @@ def _lib():
             src = fh.read()
         L = ctypes.CDLL(shared_object('quicklook_cpu', src, default_flags() + ['-std=c++17', '-fopenmp-simd']))
         i, n, d, fl, p = ctypes.c_int, ctypes.c_long, ctypes.c_double, ctypes.c_float, ctypes.c_void_p
-        L.ql_resample_rows.argtypes = [p, n, n, p, p, n, p, i, p]
-        L.ql_resample_az.argtypes = [p, n, n, p, d, d, p, n, d, d, n, p, i, p]
-        L.ql_transpose.argtypes = [p, n, n, n, p, n, p]
+        L.ql_resample_rows.argtypes = [p, n, n, p, p, n, p, i, p, i]
+        L.ql_resample_az.argtypes = [p, n, n, p, d, d, p, n, d, d, n, p, i, p, n, i]
+        L.ql_transpose.argtypes = [p, n, n, n, p, n, p, i]
         L.ql_gather.argtypes = [p, n, n, n, n, n, n, i, i, i, i, i, i, d, d, d, d, d, p, p, p, i, i, d, d, i, fl, i, p, p,
                                 i, i, p, n]
         L.ql_weight_pad.argtypes = [p, n, n, p, p, n, n, p]
@@ -490,77 +490,65 @@ def _pfa_cpu(S, g, window, correct, complex_image, timing):
     tab = _polyphase('kaiser', TAPS, PHASES)
     ptr = lambda a: a.ctypes.data_as(ctypes.c_void_p)
     t0 = time.perf_counter()
+    at = lambda a, row=0, col=0: ctypes.c_void_p(a.ctypes.data + row * a.strides[0] + (col * a.strides[1] if col else 0))
     wk = np.ascontiguousarray(g['wk'] * (_taylor(K) if window else 1.0), np.float32)
     wp = np.ascontiguousarray(g['wp'] * (_taylor(P) if window else 1.0), np.float32)
-    # 1. range gate, in blocks of pulses on the pool: weighted and padded (one pass), to range profiles, the gate,
-    # and back to the spectrum on Nr samples
+    # 1. range, in blocks of pulses on the pool, each block on its thread from the history to the raster's range
+    # wavenumbers: weighted and padded (one pass), to range profiles, the gate, back to the spectrum on Nr samples,
+    # and the kernel. Only the blocks' own arrays are made, a few megabytes each
     tap_r = _taper(Nr, g['Er'], g['gy'], g['bin_r'])
     keep = min(Nr, Kf)
     pos, neg = keep - keep // 2, keep // 2
-    G = np.empty((P, Nr), np.complex64)
+    alpha, beta = np.ascontiguousarray(g['alpha'], np.float64), np.ascontiguousarray(g['beta'], np.float64)
+    A = np.empty((P, nkr), np.complex64)
 
     def rows(sl):
         n = sl.stop - sl.start
         buf = np.empty((n, Kf), np.complex64)
-        lib.ql_weight_pad(ctypes.c_void_p(S.ctypes.data + sl.start * S.strides[0]), n, K, ptr(wk),
-                          ctypes.c_void_p(wp.ctypes.data + 4 * sl.start), k0, Kf, ptr(buf))
+        lib.ql_weight_pad(at(S, sl.start), n, K, ptr(wk), at(wp, sl.start), k0, Kf, ptr(buf))
         prof = sf.ifft(buf, axis=1, overwrite_x=True)
         gate = np.empty((n, Nr), np.complex64) if Nr <= Kf else np.zeros((n, Nr), np.complex64)
         np.multiply(prof[:, :pos], tap_r[:pos], out=gate[:, :pos])
         np.multiply(prof[:, Kf - neg:], tap_r[Nr - neg:], out=gate[:, Nr - neg:])
-        G[sl] = sf.fft(gate, axis=1, overwrite_x=True)
-    _blocks(rows, P, int(max(1, min(64, (1 << 21) // (8 * Kf)))))
-    timing['range gate'] = timing.get('range gate', 0.0) + time.perf_counter() - t0
+        G = np.ascontiguousarray(sf.fft(gate, axis=1, overwrite_x=True))
+        lib.ql_resample_rows(ptr(G), n, Nr, at(alpha, sl.start), at(beta, sl.start), nkr, ptr(tab), PHASES,
+                             at(A, sl.start), 1)
+    _blocks(rows, P, int(max(1, min(64, (1 << 21) // (8 * max(Kf, Nr))))))
+    timing['range'] = timing.get('range', 0.0) + time.perf_counter() - t0
     t0 = time.perf_counter()
-    A = np.empty((P, nkr), np.complex64)
-    alpha, beta = np.ascontiguousarray(g['alpha'], np.float64), np.ascontiguousarray(g['beta'], np.float64)
-    lib.ql_resample_rows(ptr(G), P, Nr, ptr(alpha), ptr(beta), nkr, ptr(tab), PHASES, ptr(A))
-    del G
-    timing['range resampling'] = timing.get('range resampling', 0.0) + time.perf_counter() - t0
-    t0 = time.perf_counter()
-    # 2. azimuth gate. The array is turned so that the pulses of each range wavenumber lie along a row (every
-    # transform from here on runs along rows); they are transformed (padded to Pf), cut to Na bins, and transformed
-    # back to Na pulses. The gate carries the image's scale and the phase that sets the pulses p0 places into the Na
+    # 2. azimuth, in blocks of range wavenumbers on the pool. A block is turned so that the pulses of each
+    # wavenumber lie along a row (every transform runs along rows), transformed (padded to Pf), cut to Na bins,
+    # transformed back to Na pulses and read by the kernel at the raster's azimuth wavenumbers. The gate carries
+    # the image's scale and the phase that sets the pulses p0 places into the Na. The raster is written
+    # azimuth-wavenumber major, for the range transform that follows
     Pf, Na, p0 = g['Pf'], g['Na'], g['p0']
     ov = g['ov']
     Nfft = ov * nfy if correct else nfy
-    at = lambda a, row=0, col=0: ctypes.c_void_p(a.ctypes.data + row * a.strides[0] + (col * a.strides[1] if col else 0))
-    AT = np.empty((nkr, Pf), np.complex64)
-    lib.ql_transpose(ptr(A), nkr, P, nkr, ptr(AT), Pf, None)
-    del A
-    rb = int(max(1, (1 << 18) // Pf))
-    if Pf > P:
-        def pad(sl):
-            AT[sl, P:] = 0
-        _blocks(pad, nkr, rb)
-    prof = sf.fft(AT, axis=1, workers=W, overwrite_x=True)
-    del AT
     k = np.arange(Na)
     k = np.where(k < Na - Na // 2, k, k - Na)
     tap_a = (_taper(Na, g['Ex'], g['gx'], g['bin_a']) * (g['gain'] * Nfft * Na / Pf)
              * np.exp(-2j * np.pi * (k * p0 % Pf) / Pf)).astype(np.complex64)
     keep = min(Na, Pf)
     pos, neg = keep - keep // 2, keep // 2
-    gate = np.empty((nkr, Na), np.complex64)
-
-    def cut(sl):
-        np.multiply(prof[sl, :pos], tap_a[:pos], out=gate[sl, :pos])
-        np.multiply(prof[sl, Pf - neg:], tap_a[Na - neg:], out=gate[sl, Na - neg:])
-        if Na > Pf:                                                    # a longer array than the transform: zeros
-            gate[sl, pos:Na - neg] = 0
-    _blocks(cut, nkr, rb)
-    del prof
-    A2 = np.ascontiguousarray(sf.ifft(gate, axis=1, workers=W, overwrite_x=True))       # [nkr, Na]
-    del gate
-    timing['azimuth gate'] = timing.get('azimuth gate', 0.0) + time.perf_counter() - t0
-    t0 = time.perf_counter()
-    B = np.empty((nka, nkr), np.complex64)                              # azimuth-wavenumber major
     inv_kr = np.ascontiguousarray(1.0 / g['kr'])
     qtab = np.ascontiguousarray(g['qtab'])
-    lib.ql_resample_az(ptr(A2), nkr, Na, ptr(inv_kr), g['ka_lo'], g['dka'], ptr(qtab), len(qtab), g['tg0'],
-                       g['tg_inv'], nka, ptr(tab), PHASES, ptr(B))
-    del A2
-    timing['azimuth resampling'] = timing.get('azimuth resampling', 0.0) + time.perf_counter() - t0
+    B = np.empty((nka, nkr), np.complex64)
+
+    def cols(sl):
+        n = sl.stop - sl.start
+        buf = np.empty((n, Pf), np.complex64)
+        lib.ql_transpose(at(A, 0, sl.start), nkr, P, n, ptr(buf), Pf, None, 1)
+        buf[:, P:] = 0
+        prof = sf.fft(buf, axis=1, overwrite_x=True)
+        gate = np.empty((n, Na), np.complex64) if Na <= Pf else np.zeros((n, Na), np.complex64)
+        np.multiply(prof[:, :pos], tap_a[:pos], out=gate[:, :pos])
+        np.multiply(prof[:, Pf - neg:], tap_a[Na - neg:], out=gate[:, Na - neg:])
+        A2 = np.ascontiguousarray(sf.ifft(gate, axis=1, overwrite_x=True))
+        lib.ql_resample_az(ptr(A2), n, Na, at(inv_kr, sl.start), g['ka_lo'], g['dka'], ptr(qtab), len(qtab), g['tg0'],
+                           g['tg_inv'], nka, ptr(tab), PHASES, at(B, 0, sl.start), nkr, 1)
+    _blocks(cols, nkr, int(max(8, min(64, (1 << 22) // (8 * max(Pf, Na))))))
+    del A
+    timing['azimuth'] = timing.get('azimuth', 0.0) + time.perf_counter() - t0
     t0 = time.perf_counter()
     out = np.empty((ny, nx), np.complex64 if complex_image else np.float32)
     cb = int(max(1, (1 << 18) // nx))
@@ -571,8 +559,8 @@ def _pfa_cpu(S, g, window, correct, complex_image, timing):
         F = sf.ifft(B, n=nfy, axis=1, workers=W)                        # [nka, nfy]
         del B
         Z = np.empty((ny, nfx), np.complex64)
-        lib.ql_transpose(at(F, 0, nfy - ny // 2), nfy, nka, ny // 2, ptr(Z), nfx, None)
-        lib.ql_transpose(ptr(F), nfy, nka, ny - ny // 2, at(Z, ny // 2), nfx, None)
+        lib.ql_transpose(at(F, 0, nfy - ny // 2), nfy, nka, ny // 2, ptr(Z), nfx, None, 0)
+        lib.ql_transpose(ptr(F), nfy, nka, ny - ny // 2, at(Z, ny // 2), nfx, None, 0)
         del F
         rb = int(max(1, (1 << 18) // nfx))
         if nfx > nka:
@@ -636,8 +624,8 @@ def _pfa_cpu(S, g, window, correct, complex_image, timing):
         t1 = time.perf_counter()
         # the block's range rows, turned to range-major about index 0 of the padded azimuth transform
         Z = np.empty((span, Nx2), np.complex64)
-        lib.ql_transpose(at(F1, hx, rb0), Ny2, nka - hx, span, ptr(Z), Nx2, at(sx, hx))
-        lib.ql_transpose(at(F1, 0, rb0), Ny2, hx, span, at(Z, 0, Nx2 - hx), Nx2, ptr(sx))
+        lib.ql_transpose(at(F1, hx, rb0), Ny2, nka - hx, span, ptr(Z), Nx2, at(sx, hx), 0)
+        lib.ql_transpose(at(F1, 0, rb0), Ny2, hx, span, at(Z, 0, Nx2 - hx), Nx2, ptr(sx), 0)
 
         def pad(sl, Z=Z):
             Z[sl, nka - hx:Nx2 - hx] = 0
@@ -805,7 +793,7 @@ def _pfa_cuda(S, g, window, correct, complex_image, timing):
         del gate
         k_rows((-(-nkr // 128), n), (128,), (G, i32(n), i32(Nr), alpha[r:r + n], beta[r:r + n], i32(nkr), tab, A[r:r + n]))
         del G
-    t0 = lap('range gate', t0)
+    t0 = lap('range', t0)
     # 2. azimuth gate and azimuth resampling
     Pf, Na, p0 = g['Pf'], g['Na'], g['p0']
     pad = cp.zeros((Pf, nkr), cp.complex64)
@@ -816,13 +804,12 @@ def _pfa_cuda(S, g, window, correct, complex_image, timing):
     gate *= cp.asarray((_taper(Na, g['Ex'], g['gx'], g['bin_a']) * (g['gain'] * (g['ov'] * nfy if correct else nfy) * Na / Pf)).astype(np.float32))[:, None]
     A2 = cp.ascontiguousarray(cf.ifft(gate, axis=0, overwrite_x=True))
     del gate
-    t0 = lap('azimuth gate', t0)
     B = cp.empty((nkr, nka), cp.complex64)
     qtab = cp.asarray(g['qtab'])
     k_cols((-(-nkr // 128), nka), (128,), (A2, i32(Na), i32(nkr), cp.asarray(1.0 / g['kr']), f64(g['ka_lo']), f64(g['dka']),
                                           qtab, i32(len(g['qtab'])), f64(g['tg0']), f64(g['tg_inv']), i32(nka), tab, B))
     del A2
-    t0 = lap('azimuth resampling', t0)
+    t0 = lap('azimuth', t0)
     if not correct:
         F = _wrap_shift(cf.ifft(B, n=nfy, axis=0), ny, 0)
         del B
@@ -905,35 +892,50 @@ def _ffbp(col, backend, window, timing):
 
 def write_png(path, image, level=1):
     """Write a uint8 image [rows, cols] (gray), [rows, cols, 3] (RGB) or [rows, cols, 4] (RGBA) as a PNG file, with the
-    standard library alone. The rows are deflated in blocks on all cores, each block an independent run of the one
-    zlib stream, so a 16 megapixel picture is written in a few hundredths of a second. level: zlib's, 0 to 9
-    (speckle hardly compresses, and 1 is as small as 9 on it)."""
+    standard library alone. Blocks of rows are deflated on all cores, each an independent run of the one zlib stream
+    and an IDAT chunk of its own, with its checksums made beside it, so a 16 megapixel picture is written in a few
+    hundredths of a second. level: zlib's, 0 to 9 (speckle hardly compresses, and 1 is as small as 9 on it)."""
     import struct
     import zlib
     a = np.asarray(image)
     if a.dtype != np.uint8 or a.ndim not in (2, 3) or (a.ndim == 3 and a.shape[2] not in (3, 4)) or a.size == 0:
         raise ValueError(f'write_png takes a uint8 image [rows, cols] or [rows, cols, 3 or 4], got {a.dtype} {a.shape}')
     rows, cols = a.shape[:2]
-    raw = np.zeros((rows, 1 + cols * (1 if a.ndim == 2 else a.shape[2])), np.uint8)       # filter type 0 on every row
-    raw[:, 1:] = a.reshape(rows, -1)
-    raw = raw.reshape(-1)
-    step = int(min(4 << 20, max(1 << 16, -(-raw.size // (4 * _workers())))))
-    cuts = list(range(0, raw.size, step))
-    parts = [None] * len(cuts)
-
-    def deflate(i):
-        co = zlib.compressobj(level, zlib.DEFLATED, -15)
-        last = i == len(cuts) - 1
-        parts[i] = co.compress(raw[cuts[i]:cuts[i] + step]) + co.flush(zlib.Z_FINISH if last else zlib.Z_SYNC_FLUSH)
-    _blocks(lambda sl: deflate(sl.start), len(cuts), 1)
-    data = b'\x78\x01' + b''.join(parts) + struct.pack('>I', zlib.adler32(raw))
+    a = a.reshape(rows, -1)
+    line = 1 + a.shape[1]                                       # a row and its filter byte (type 0: none)
+    per = int(max(1, min(rows, max(1 << 16, min(4 << 20, rows * line // (4 * _workers()))) // line)))
+    starts = list(range(0, rows, per))
+    parts = [None] * len(starts)
 
     def chunk(kind, body):
         return struct.pack('>I', len(body)) + kind + body + struct.pack('>I', zlib.crc32(kind + body))
-    color = {2: 0, 3: 2, 4: 6}[2 if a.ndim == 2 else a.shape[2]]
+
+    def deflate(sl):
+        i = sl.start
+        raw = np.zeros((min(per, rows - starts[i]), line), np.uint8)
+        raw[:, 1:] = a[starts[i]:starts[i] + per]
+        co = zlib.compressobj(level, zlib.DEFLATED, -15)
+        last = i == len(starts) - 1
+        body = co.compress(raw) + co.flush(zlib.Z_FINISH if last else zlib.Z_SYNC_FLUSH)
+        parts[i] = [(b'\x78\x01' if i == 0 else b'') + body, zlib.adler32(raw), raw.size]
+        if not last:
+            parts[i][0] = chunk(b'IDAT', parts[i][0])
+    _blocks(deflate, len(starts), 1)
+    # the stream's Adler-32 from the blocks' own (zlib's adler32_combine)
+    adler = 1
+    for _, a2, n2 in parts:
+        rem = n2 % 65521
+        s1 = adler & 0xffff
+        s2 = (rem * s1) % 65521
+        s1 += (a2 & 0xffff) + 65521 - 1
+        s2 += ((adler >> 16) & 0xffff) + ((a2 >> 16) & 0xffff) + 65521 - rem
+        adler = (s1 % 65521) | ((s2 % 65521) << 16)
+    color = {1: 0, 3: 2, 4: 6}[1 if np.ndim(image) == 2 else np.shape(image)[2]]
     with open(path, 'wb') as fh:
         fh.write(b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', cols, rows, 8, color, 0, 0, 0)))
-        fh.write(chunk(b'IDAT', data))
+        for body, _, _ in parts[:-1]:
+            fh.write(body)
+        fh.write(chunk(b'IDAT', parts[-1][0] + struct.pack('>I', adler)))
         fh.write(chunk(b'IEND', b''))
 
 

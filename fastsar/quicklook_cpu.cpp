@@ -15,12 +15,19 @@
 
 static const int T = 16;       // taps of the range and azimuth resampling (quick.py's TAPS)
 
+// f(i) for i < n in chunks on all cores, or, serial, on the calling thread: quick.py runs the range and the azimuth
+// stage on its own pool, a block of rows per thread, and calls the kernels there with serial set
+template <class F> static void rows_of(long n, int chunk, int serial, F&& f) {
+  if (serial) { for (long i = 0; i < n; ++i) f(i); }
+  else par::for_dynamic(n, chunk, f);
+}
+
 // out[r, j] = row r of x [R, n] (complex) at the position pos0[r] + j step[r], j < n_out; zero where the position
 // lies outside (-0.5, n - 0.5).
 extern "C" void ql_resample_rows(const float* x, long R, long n, const double* pos0, const double* step, long n_out,
-                                 const float* ptab, int Q, float* out) {
+                                 const float* ptab, int Q, float* out, int serial) {
   const int half = T / 2;
-  par::for_dynamic(R, 4, [&](long r) {
+  rows_of(R, 4, serial, [&](long r) {
     const float* xr = x + 2 * r * n;
     float* o = out + 2 * r * n_out;
     const double p0 = pos0[r], st = step[r];
@@ -53,19 +60,20 @@ extern "C" void ql_resample_rows(const float* x, long R, long n, const double* p
 // out[j, m] = row m of A [M, R] (complex: the pulses of one range wavenumber, end to end) at the position q(t) for
 // t = (ka0 + j dka) inv_kr[m], j < n_out: q by linear interpolation in qtab [nt], the position at t = t0 + i / inv_dt
 // (the pulses' own, uneven, spacing in t), formed in double. Zero where t lies outside the table or the position
-// outside (-0.5, R - 0.5). The output is azimuth-wavenumber major, [n_out, M], so that the range transform that
-// follows runs along its rows; the rows of A are taken 64 at a time, each thread writing 64 consecutive values of
-// an output row at once.
+// outside (-0.5, R - 0.5). The output is azimuth-wavenumber major, so that the range transform that follows runs
+// along its rows: out[j, m] lies at out + j ostride + m (complex values), the M columns of an array ostride wide
+// that this call's rows of A make. The rows of A are taken 64 at a time, 64 consecutive values of an output row
+// written at once.
 extern "C" void ql_resample_az(const float* A, long M, long R, const double* inv_kr, double ka0, double dka,
                                const double* qtab, long nt, double t0, double inv_dt, long n_out,
-                               const float* ptab, int Q, float* out) {
+                               const float* ptab, int Q, float* out, long ostride, int serial) {
   const int half = T / 2, MB = 64;
-  par::for_dynamic((M + MB - 1) / MB, 1, [&](long mb) {
+  rows_of((M + MB - 1) / MB, 1, serial, [&](long mb) {
     const long m0 = mb * MB;
     const int nm = (int)(std::min(M, m0 + MB) - m0);
     for (long j = 0; j < n_out; ++j) {
       const double ka = ka0 + j * dka;
-      float* o = out + 2 * (j * M + m0);
+      float* o = out + 2 * (j * ostride + m0);
       for (int c = 0; c < nm; ++c) {
         float re = 0.f, im = 0.f;
         const double u = (ka * inv_kr[m0 + c] - t0) * inv_dt;
@@ -102,9 +110,10 @@ extern "C" void ql_resample_az(const float* A, long M, long R, const double* inv
 // cores. src's rows are sstride and dst's rows dstride complex values apart; s: a real factor per source row, or
 // null. The transforms of the quick look all run along rows, the way that is three times faster than along
 // columns, and the arrays are turned between them.
-extern "C" void ql_transpose(const float* src, long sstride, long R, long C, float* dst, long dstride, const float* s) {
+extern "C" void ql_transpose(const float* src, long sstride, long R, long C, float* dst, long dstride, const float* s,
+                             int serial) {
   const long TB = 32;
-  par::for_dynamic((C + TB - 1) / TB, 1, [&](long cb) {
+  rows_of((C + TB - 1) / TB, 1, serial, [&](long cb) {
     const long c0 = cb * TB, c1 = std::min(C, c0 + TB);
     for (long r0 = 0; r0 < R; r0 += TB) {
       const long r1 = std::min(R, r0 + TB);
