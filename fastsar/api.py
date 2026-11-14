@@ -670,8 +670,9 @@ def form_image(S, ant, fmin, df, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
         for n, v in (('interp', interp), ('upsample', upsample), ('center', center)):
             if v is not None:
                 raise ValueError(f"{n} applies to exact backprojection (algorithm='bp'), not to algorithm={algorithm!r}")
-    # the formers scan S for NaN and inf themselves; polar format is checked here
-    S = _check_history(np.asarray(S), len(_check_positions(ant)), finite=algorithm == 'pfa')
+    # the formers scan S for NaN and inf themselves; polar format is checked here (its stages on their own threads)
+    how = _pfa_stages(backend, pfa_support) if algorithm == 'pfa' else None
+    S = _check_history(np.asarray(S), len(_check_positions(ant)), finite=algorithm == 'pfa' and how is None)
     if algorithm == 'bp':
         from .exact import ExactFormer
         return ExactFormer(ant, fmin, df, S.shape[1], nx, ny, spx, spy, e1, e2, backend=backend, window=window,
@@ -686,7 +687,6 @@ def form_image(S, ant, fmin, df, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
                 raise ValueError(f'ref must hold one range per pulse ({P}), got shape {np.shape(ref)}')
             S = rereference(S, float(fmin), float(df), np.asarray(ref, np.float64) - np.linalg.norm(col.ant, axis=1))
         e1, e2 = np.asarray(e1, np.float64), np.asarray(e2, np.float64)
-        how = _pfa_stages(backend, pfa_support)
         if how is not None:
             return _pfa_staged(S, col, nx, ny, spx, spy, e1, e2, pfa_guard, window, pfa_support, how)
         return _pfa(S, col, nx, ny, spx, spy, e1, e2, pfa_guard, window, pfa_support)
@@ -723,18 +723,22 @@ def _pfa_staged(S, col, nx, ny, spx, spy, e1, e2, guard, window, support, backen
     program's azimuth transform) and nothing else: the stages set their own gate edges."""
     from . import pfa2, quick
     P, K = S.shape
-    info = {}
-    img = quick._pfa(S, col.ant, col.fmin, col.df, nx, ny, spx, spy, e1, e2, correct=True, window=window, backend=backend,
-                     complex_image=True, info=info, warn=True, support=support)
+    bad = []
+
+    def scan(sl):                                   # NaN and inf: a sum per block of pulses, on the stages' threads
+        if not np.isfinite(complex(S[sl].sum())):
+            bad.append(sl.start)
+    quick._blocks(scan, P, int(max(1, (1 << 18) // K)))
+    if bad:
+        _check_history(S, P)                        # raises, naming the first pulse
     ur = float(-(col.ant[P // 2] / np.linalg.norm(col.ant[P // 2])) @ e2)
     nfx = pfa2._fft_size(nx + int(2 * guard / spx))
-    k = np.float32(4.0 * (col.fmin + (K // 2) * col.df) * col.df * abs(info["dts"]) * ur * ur * spx * spy * nfx / 299792458.0 ** 2)
-    if type(img).__module__.startswith('cupy'):
-        img *= k
-        return _to_host(img)
-    img = np.ascontiguousarray(img)
-    img *= k
-    return img
+    k = 4.0 * (col.fmin + (K // 2) * col.df) * col.df * ur * ur * spx * spy * nfx / 299792458.0 ** 2      # times |dt|
+    info = {}
+    img = quick._pfa(S, col.ant, col.fmin, col.df, nx, ny, spx, spy, e1, e2, correct=True, window=window, backend=backend,
+                     complex_image=True, info=info, warn=True, support=support, scale=lambda g: k * abs(g['dts']),
+                     layout='azimuth')
+    return _to_host(img) if type(img).__module__.startswith('cupy') else img
 
 
 def _pfa(S, col, nx, ny, spx, spy, e1, e2, guard=300.0, window=True, support='union'):

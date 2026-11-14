@@ -102,7 +102,7 @@ def _lib():
         L.ql_gather.argtypes = [p, n, n, n, n, n, n, i, i, i, i, i, i, d, d, d, d, d, p, p, p, i, i, d, d, i, fl, i, p, p,
                                 i, i, p, n, d]
         L.ql_weight_pad.argtypes = [p, n, n, p, p, n, n, p]
-        L.ql_unshear.argtypes = [p, n, n, p, n, n, p, n]
+        L.ql_unshear.argtypes = [p, n, n, p, p, n, n, n, p, n]
         L.ql_resample_rows.restype = L.ql_resample_az.restype = L.ql_gather.restype = L.ql_weight_pad.restype = None
         L.ql_transpose.restype = L.ql_unshear.restype = None
         _LIB.append(L)
@@ -320,11 +320,15 @@ def _plan(r, cphd, channel, size, resolution, extent, ref_freq, looks, notes):
 
 # --------------------------------------------------------------------------------------------- the cut collection
 
-def _collection(cphd, size=2048, resolution=None, extent=None, channel=0, reader_options=None, looks=(1, 1)):
+def _collection(cphd, size=2048, resolution=None, extent=None, channel=0, reader_options=None, looks=(1, 1),
+                backend='cpu'):
     """Plan the cut and read it: dict(S [P, K] (referenced to the grid center, unweighted), ant [P, 3] (about that
     center, local frame), fmin, df, nx, ny, spx, spy, e1, e2 (local): what form_image, ExactFormer and _pfa take;
     center [3] (local), meta (read_cphd's), plan, notes, timing (plan, read, reference: seconds)). looks: (sub-apertures,
-    sub-bands): S then holds that many runs of pulses and of samples side by side (plan['looks'] of them)."""
+    sub-bands): S then holds that many runs of pulses and of samples side by side (plan['looks'] of them). backend:
+    'auto' is resolved once the cut is planned (_auto) and returned as 'backend'; for 'cuda' the reference to the
+    grid center is left to the device, which applies it with the weights: S is then as the reader left it and
+    'phase' holds the pulses' (ph0, ph1) for _pfa."""
     from ._xmlmeta import reading
     opts = dict(reader_options or {})
     bad = sorted(set(opts) - {'troposphere', 'phase_sign', 'ref_freq', 'drop_flagged', 'regrid_tol'})
@@ -336,6 +340,8 @@ def _collection(cphd, size=2048, resolution=None, extent=None, channel=0, reader
     with reading(cphd, 'CPHD file', wrap=False):
         r = io._open_cphd(cphd)
         plan = _plan(r, cphd, channel, size, resolution, extent, opts.get('ref_freq'), tuple(looks), notes)
+        if backend == 'auto':
+            backend = _auto((plan['pulses'][1] - plan['pulses'][0]) * (plan['samples'][1] - plan['samples'][0]))
         timing['plan'] = time.perf_counter() - t0
         t0 = time.perf_counter()
         col, meta = io._read_cphd(cphd, None, plan['channel'], True, opts.get('regrid_tol', 1e-3),
@@ -354,15 +360,20 @@ def _collection(cphd, size=2048, resolution=None, extent=None, channel=0, reader
     rel = np.asarray(col['ant'], np.float64) - c
     # referenced to the grid center, |ant - center| (as form_cphd moves a spotlight's reference)
     dref = np.asarray(meta['ref'], np.float64) - np.linalg.norm(rel, axis=1)
-    fk = f0 + df * np.arange(K)
+    phase = None
+    if backend == 'cuda':                             # S[p, k] exp(-2 pi j (f0 + k df) 2 dref[p] / c), on the device
+        a = -f0 * (2 * dref / C)
+        phase = (a - np.floor(a), -df * (2 * dref / C))
+    else:
+        fk = f0 + df * np.arange(K)
 
-    def freq(sl, out):
-        out[:] = fk
-    io._phase_rows(S, freq, 2 * dref / C, -1, linear=(f0, df))
+        def freq(sl, out):
+            out[:] = fk
+        io._phase_rows(S, freq, 2 * dref / C, -1, linear=(f0, df))
     timing['reference'] = time.perf_counter() - t0
     notes = list(meta.get('notes', [])) + notes
     return dict(S=S, ant=rel, fmin=f0, df=df, nx=plan['nx'], ny=plan['ny'], spx=plan['spx'], spy=plan['spy'], e1=e1,
-                e2=e2, center=c, meta=meta, plan=plan, notes=notes, timing=timing)
+                e2=e2, center=c, meta=meta, plan=plan, notes=notes, timing=timing, backend=backend, phase=phase)
 
 
 # ------------------------------------------------------------------------------------------------ polar format
@@ -396,6 +407,25 @@ def _distortion(ant, nx, ny, spx, spy, e1, e2, weights=None, n=21, deg=3):
                 max_shift_px=(float(np.abs(xa - X).max() / spx), float(np.abs(ya - Y).max() / spy)))
 
 
+def _places(t):
+    """The place of each pulse in the evenly timed sequence, from the tangents t of the look angle [P]: 0 .. P - 1
+    where no pulse is missing; where the step to a pulse is a whole multiple (to a fifth) of the steps around it,
+    the pulses between were not recorded and the places skip them. A sequence whose rate changes smoothly, or one
+    with more gaps than a twentieth of its pulses, is taken as it is."""
+    P = len(t)
+    d = np.abs(np.diff(t))
+    if P < 16:
+        return np.arange(P)
+    k = np.arange(P - 1)
+    near = np.stack([d[np.clip(k + o, 0, P - 2)] for o in (-4, -3, -2, 2, 3, 4)])
+    r = d / np.median(near, axis=0)
+    m = np.rint(r)
+    gap = (m >= 2) & (np.abs(r - m) < 0.2)
+    if not gap.any() or (m[gap] - 1).sum() > P / 20:
+        return np.arange(P)
+    return np.concatenate([[0], np.cumsum(np.where(gap, m, 1.0))]).astype(np.int64)
+
+
 def _geometry(ant, fmin, df, K, nx, ny, spx, spy, e1, e2, correct, ov=OVERSAMPLE, window=True, warn=False,
               support='union'):
     """The float64 setup of the quick look's polar format for a cut history: the raster, the two gates, the
@@ -413,8 +443,13 @@ def _geometry(ant, fmin, df, K, nx, ny, spx, spy, e1, e2, correct, ov=OVERSAMPLE
     if not np.all(np.diff(t) * sgn > 0):
         raise ValueError('polar format needs the look angle in the image plane to change monotonically from pulse to '
                          'pulse, and it does not; use fastsar.process_cphd or form_image with algorithm=\'ffbp\'')
-    dts = (t[-1] - t[0]) / (P - 1)                                    # signed, per pulse
-    dtp = np.gradient(t)
+    # the pulses' places in the evenly timed sequence: a collection may lack pulses (an Umbra collection lacked six
+    # of 9,038), and along the pulses that are there the phase of a scatterer away from the center then steps. Each
+    # pulse is set at its place, a missing one's left zero, as backprojection sums nothing for it
+    place = _places(t)
+    Pp = int(place[-1]) + 1
+    dts = (t[-1] - t[0]) / (Pp - 1)                                   # signed, per place
+    dtp = np.gradient(t, place.astype(np.float64)) if Pp > P else np.gradient(t)
     if warn and abs(float(t[P // 2])) > math.tan(math.radians(2.0)):   # form_image's caller chose the grid
         import warnings
         warnings.warn(f"polar format: the grid's range axis e2 is {abs(math.degrees(math.atan(float(t[P // 2])))):.1f} "
@@ -515,22 +550,22 @@ def _geometry(ant, fmin, df, K, nx, ny, spx, spy, e1, e2, correct, ov=OVERSAMPLE
     Xa = 2 * math.pi / (kr_max * abs(dts))          # the shortest period, the highest wavenumber's
     rho_a = 2 * (Ex + gx) / PASS / Xa
     p0 = int(np.ceil((TAPS // 2 + 1) / rho_a)) + 1
-    Pf = _fft_size(P + 2 * p0)
+    Pf = _fft_size(Pp + 2 * p0)
     Na = _fft_size(int(np.ceil(rho_a * Pf)))
     bin_a = Xa / Pf
     bins_a = 2 * math.pi / (kr * abs(dts) * Pf)     # the bin of each range wavenumber's transform (m): wider at a lower one
     # the row position (in the Na pulses) of a tangent t, from the pulses' own t: a table at four points per pulse
     # over the aperture and a few pulses beyond it (linear continuation)
-    nt = 4 * (P + 2 * TAPS) + 1
+    nt = 4 * (Pp + 2 * TAPS) + 1
     tg = (t[0] - TAPS * dts) + (dts / 4) * np.arange(nt)
-    pp = np.arange(P, dtype=np.float64)
+    pp = place.astype(np.float64)
     if sgn > 0:
         ptab = np.interp(tg, t, pp)
     else:
         ptab = np.interp(tg[::-1], t[::-1], pp[::-1])[::-1]
     out_lo, out_hi = (tg - t[0]) / dts < 0, (tg - t[-1]) / dts > 0
     ptab[out_lo] = ((tg - t[0]) / dtp[0])[out_lo]
-    ptab[out_hi] = (P - 1 + (tg - t[-1]) / dtp[-1])[out_hi]
+    ptab[out_hi] = (Pp - 1 + (tg - t[-1]) / dtp[-1])[out_hi]
     qtab = (ptab + p0) * (Na / Pf)
     # weights: the polar Jacobian (the raster's density of samples: backprojection sums the samples as they come)
     wk = fc / f
@@ -541,7 +576,7 @@ def _geometry(ant, fmin, df, K, nx, ny, spx, spy, e1, e2, correct, ov=OVERSAMPLE
                 ka_lo=ka_lo, nka=nka, kr=kr, k0=k0, Kf=Kf, Nr=Nr, bin_r=bin_r, Er=Er, gy=gy, alpha=alpha, beta=beta,
                 p0=p0, Pf=Pf, Na=Na, bin_a=bin_a, bins_a=bins_a, Ex=Ex, gx=gx, qtab=qtab, tg0=float(tg[0]), tg_inv=float(4 / dts),
                 wk=wk, wp=wp, gain=gain, dist=dist, shift=(shx, shy), ov=ov, t=t, dts=dts, nwin=nwin, jlo=jlo, hy=hy,
-                shear=shear)
+                shear=shear, Pp=Pp, place=place.astype(np.int32) if Pp > P else None)
 
 
 def _corner_error(ant, fmin, df, K, nx, ny, spx, spy, e1, e2, window=True):
@@ -583,23 +618,6 @@ def _taper(n, edge, guard, binsize):
     d = np.minimum(k, n - k) * binsize
     return np.where(d <= edge, 1.0, np.where(d >= edge + guard, 0.0,
                                              0.5 + 0.5 * np.cos((d - edge) * (math.pi / guard)))).astype(np.float32)
-
-
-def _wrap_cut(x, n, axis):
-    """The n bins about bin 0 of a transform x along an axis, in wrapped order (bin 0 first, the negative bins at
-    the end): cut out of a longer transform, or set into a longer array of zeros."""
-    N = x.shape[axis]
-    if n == N:
-        return x
-    xp = np if isinstance(x, np.ndarray) else __import__('cupy')
-    keep = min(n, N)
-    pos, neg = keep - keep // 2, keep // 2
-    sl = lambda a, b: tuple(slice(a, b) if k == axis else slice(None) for k in range(x.ndim))
-    shape = tuple(n if k == axis else s for k, s in enumerate(x.shape))
-    out = xp.empty(shape, x.dtype) if n < N else xp.zeros(shape, x.dtype)
-    out[sl(0, pos)] = x[sl(0, pos)]
-    out[sl(n - neg, n)] = x[sl(N - neg, N)]
-    return out
 
 
 def _fold(B, n, origin):
@@ -668,7 +686,7 @@ def _pfa_cpu(S, g, window, correct, complex_image, timing):
     # transformed back to Na pulses and read by the kernel at the raster's azimuth wavenumbers. The gate carries
     # the image's scale and the phase that sets the pulses p0 places into the Na. The raster is written
     # azimuth-wavenumber major, for the range transform that follows
-    Pf, Na, p0 = g['Pf'], g['Na'], g['p0']
+    Pf, Na, p0, Pp, place = g['Pf'], g['Na'], g['p0'], g['Pp'], g['place']
     ov = g['ov']
     Nfft = ov * nfy if correct else nfy
     k = np.arange(Na)
@@ -682,11 +700,12 @@ def _pfa_cpu(S, g, window, correct, complex_image, timing):
     def cols(sl):
         n = sl.stop - sl.start
         buf = np.empty((n, Pf), np.complex64)
-        if jlo is None:
+        if jlo is None and place is None:
             lib.ql_transpose(at(A, 0, sl.start), nkr, P, n, ptr(buf), Pf, None, 1)
         else:
-            lib.ql_unshear(ptr(A), nwin, P, ptr(jlo), sl.start, n, ptr(buf), Pf)
-        buf[:, P:] = 0
+            lib.ql_unshear(ptr(A), nwin, P, None if jlo is None else ptr(jlo), None if place is None else ptr(place), Pp,
+                           sl.start, n, ptr(buf), Pf)
+        buf[:, Pp:] = 0
         prof = np.ascontiguousarray(sf.fft(buf, axis=1, overwrite_x=True))
         gate = np.empty((n, Na), np.complex64)
         lib.ql_azimuth_gate(ptr(prof), n, Pf, Na, ptr(fac), at(bins, sl.start), g['Ex'], g['gx'], ptr(gate))
@@ -800,18 +819,6 @@ def _pfa_cpu(S, g, window, correct, complex_image, timing):
     return out
 
 
-def _wrap_shift(x, n, axis):
-    """The n outputs of a transform along an axis that are the pixels -n / 2 .. n / 2 - 1 about the center (the last
-    n / 2 outputs, then the first n / 2), as a new array."""
-    N = x.shape[axis]
-    xp = np if isinstance(x, np.ndarray) else __import__('cupy')
-    sl = lambda a, b: tuple(slice(a, b) if k == axis else slice(None) for k in range(x.ndim))
-    out = xp.empty(tuple(n if k == axis else s for k, s in enumerate(x.shape)), x.dtype)
-    out[sl(0, n // 2)] = x[sl(N - n // 2, N)]
-    out[sl(n // 2, n)] = x[sl(0, n - n // 2)]
-    return out
-
-
 def _abs(img, scale):
     """The amplitude of a complex host image times a scale (float32), in row blocks on the pool."""
     out = np.empty(img.shape, np.float32)
@@ -824,12 +831,17 @@ def _abs(img, scale):
 
 
 def _pfa(S, ant, fmin, df, nx, ny, spx, spy, e1, e2, *, correct=True, window=True, backend='cpu', complex_image=True,
-         timing=None, info=None, warn=False, support='union'):
+         timing=None, info=None, warn=False, support='union', scale=None, layout='range', phase=None):
     """The quick look's polar format of a history S [P, K] referenced to |ant| on the grid of form_image (e2 along
     the mid-aperture line of sight, away from the radar) -> the image [nx, ny]: complex64 as backprojection gives
     it, or its amplitude (float32, complex_image False); a NumPy array, or a CuPy array for backend 'cuda'.
     window: the Taylor window (nbar 4, 35 dB) along frequency and along pulses. info: a dict that receives the
-    geometry's facts (the displacement, the raster and gate sizes)."""
+    geometry's facts (the displacement, the raster and gate sizes). scale: a factor for the image, or a function of
+    the geometry that gives one (form_image's polar format keeps its JAX program's scale). layout: 'range' returns
+    the image as it is formed, range-major, as the transposed view [nx, ny]; 'azimuth' returns a contiguous
+    [nx, ny] array (form_image's). phase: (ph0, ph1) [P] float64 in cycles, a phase exp(2 pi j (ph0 + k ph1)) still to
+    be given to sample k of each pulse (the quick look's reference to the grid center): the device applies it with
+    the weights, the host in a pass of its own."""
     timing = {} if timing is None else timing
     t0 = time.perf_counter()
     e1, e2 = np.asarray(e1, np.float64), np.asarray(e2, np.float64)
@@ -851,12 +863,52 @@ def _pfa(S, ant, fmin, df, nx, ny, spx, spy, e1, e2, *, correct=True, window=Tru
             info['host'] = (f'formed on the host: the quick look\'s arrays take {need / 1e9:.1f} GB on the device at '
                             f'this size and {free / 1e9:.1f} GB are free')
             backend = 'cpu'
+    if callable(scale):
+        scale = scale(g)
+    if scale is not None:
+        g['gain'] = g['gain'] * float(scale)
     if backend == 'cuda':
-        img = _pfa_cuda(box, g, window, correct, complex_image, timing)
+        img = _pfa_cuda(box, g, window, correct, complex_image, timing, phase)
     else:
         box[0] = np.ascontiguousarray(box[0], np.complex64)
+        if phase is not None:
+            _apply_phase(box[0], *phase)
         img = _pfa_cpu(box, g, window, correct, complex_image, timing)
-    return img.T
+    if layout == 'range':
+        return img.T
+    t0 = time.perf_counter()
+    if type(img).__module__.startswith('cupy'):
+        out = __import__('cupy').ascontiguousarray(img.T)
+    elif img.dtype == np.complex64:                    # turned in tiles on all cores
+        import ctypes
+        out = np.empty(img.shape[::-1], np.complex64)
+        _lib().ql_transpose(img.ctypes.data_as(ctypes.c_void_p), img.shape[1], img.shape[0], img.shape[1],
+                            out.ctypes.data_as(ctypes.c_void_p), img.shape[0], None, 0)
+    else:
+        out = np.ascontiguousarray(img.T)
+    timing['layout'] = timing.get('layout', 0.0) + time.perf_counter() - t0
+    return out
+
+
+def _host(d):
+    """A CuPy array on the host; a large one through page-locked memory, several times faster than into pageable
+    memory (the array returned then lies in that memory, which CuPy's pool takes back when it is released)."""
+    from . import memory
+    if d.nbytes < (16 << 20):
+        return d.get()
+    host = np.frombuffer(memory._pinned(d.nbytes), d.dtype, d.size).reshape(d.shape)
+    d.get(out=host)
+    return host
+
+
+def _apply_phase(S, ph0, ph1):
+    """S[p, k] *= exp(2 pi j (ph0[p] + k ph1[p])) in place, in blocks of pulses on the pool."""
+    k = np.arange(S.shape[1])
+
+    def rows(sl):
+        c = ph0[sl, None] + k[None, :] * ph1[sl, None]
+        S[sl] *= np.exp(2j * np.pi * (c - np.floor(c))).astype(np.complex64)
+    _blocks(rows, S.shape[0], int(max(1, (1 << 17) // S.shape[1])))
 
 
 def _cuda_bytes(g, correct):
@@ -871,9 +923,16 @@ def _cuda_bytes(g, correct):
 
 
 # ------------------------------------------------------------------------------------------------------- CUDA
+# The stages on a GPU, written for it: the history goes up in blocks of pulses through two page-locked buffers while
+# the device works on the block before; each pass over an array that is not a transform is one kernel (the weights,
+# the padding and the reference phase; the range gate and its cut; the azimuth gate, its cut and the scale; the
+# raster's place in the padded transforms with its signs; the read at the apparent positions with the detection);
+# the transforms keep their plans between calls (CuPy's plan cache) and the kernels and tables stay compiled and
+# loaded (_CUDA).
 
-_CUDA_COLS_SRC = r"""
+_CUDA_SRC = r"""
 #define HALF_T (TAPS / 2)
+#define HALF_L (LTAPS / 2)
 __device__ __forceinline__ float tabled(float d, const float* tab) {
   const float ad = fabsf(d);
   if (ad >= HALF_T) return 0.f;
@@ -881,13 +940,13 @@ __device__ __forceinline__ float tabled(float d, const float* tab) {
   const int k = (int)u;
   return fmaf(tab[k + 1] - tab[k], u - k, tab[k]);
 }
-// out[m, j] = column m of A [R, M] (complex) at the row position q(t), t = (ka0 + j dka) inv_kr[m]: q by linear
-// interpolation in qtab [nt] (quicklook_cpu.cpp's ql_resample_cols); threads along m read consecutive addresses
+// out[m, j0 + j] = column m of A [R, M] (complex) at the row position q(t), t = (ka0 + (j0 + j) dka) inv_kr[m]: q by
+// linear interpolation in qtab [nt] (quicklook_cpu.cpp's ql_resample_az); threads along m read consecutive addresses
 extern "C" __global__ void ql_resample_cols(const float2* A, int R, int M, const double* inv_kr, double ka0, double dka,
-                                            const double* qtab, int nt, double t0, double inv_dt, int n_out,
-                                            const float* tab, float2* out) {
-  const int m = blockIdx.x * blockDim.x + threadIdx.x, j = blockIdx.y;
-  if (m >= M || j >= n_out) return;
+                                            const double* qtab, int nt, double t0, double inv_dt, int n_out, int j0,
+                                            int nj, const float* tab, float2* out) {
+  const int m = blockIdx.x * blockDim.x + threadIdx.x, j = j0 + blockIdx.y;
+  if (m >= M || blockIdx.y >= nj) return;
   float2 acc = make_float2(0.f, 0.f);
   const double u = ((ka0 + j * dka) * inv_kr[m] - t0) * inv_dt;
   if (u >= 0.0 && u < nt - 1) {
@@ -915,9 +974,6 @@ extern "C" __global__ void ql_resample_cols(const float2* A, int R, int M, const
   }
   out[(long)m * n_out + j] = acc;
 }
-"""
-_CUDA_GATHER_SRC = r"""
-#define HALF_L (LTAPS / 2)
 // quicklook_cpu.cpp's ql_gather on the device: one thread per pixel, i along azimuth (fastest), c the range pixel of
 // the block. The apparent position from the distortion polynomial in float64, the baseband image (the block's rows
 // rb0 .. of [Ny2, Nx2], oversampled by ov) read there with LTAPS x LTAPS taps whose weights come from the polyphase
@@ -969,17 +1025,104 @@ extern "C" __global__ void ql_gather(const float2* base, int span, int Nx2, int 
   out[2 * o] = ar * cr - ai * ci; out[2 * o + 1] = ar * ci + ai * cr;
 }
 """
+# The one-pass kernels (CuPy ElementwiseKernels over the output array, whose index i gives the row and the column).
+# weight: out [n, Kf] = S[r, k - k0] wk wp[r] exp(2 pi j (ph0[r] + (k - k0) ph1[r])) inside the band, 0 in the padding
+_K_WEIGHT = """
+const long long r = i / Kf; const int k = (int)(i - r * Kf) - k0;
+if (k < 0 || k >= K) { out = complex<float>(0.f, 0.f); }
+else {
+  const complex<float> s = S[r * K + k];
+  const float w = wk[k] * wp[r];
+  if (ref) {
+    double c = ph0[r] + k * ph1[r]; c -= floor(c);
+    float sn, cs; sincosf((float)(6.283185307179586 * c), &sn, &cs);
+    out = complex<float>(w * (s.real() * cs - s.imag() * sn), w * (s.real() * sn + s.imag() * cs));
+  } else out = complex<float>(w * s.real(), w * s.imag());
+}"""
+# rgate: out [n, Nr] = the profile's bins about bin 0 (cut out of Kf, or set among zeros), times the taper
+_K_RGATE = """
+const long long r = i / Nr; const int m = (int)(i - r * Nr);
+const int keep = min(Nr, Kf), pos = keep - keep / 2, neg = keep / 2;
+if (m < pos) out = prof[r * Kf + m] * tap[m];
+else if (m >= Nr - neg) out = prof[r * Kf + (Kf - (Nr - m))] * tap[m];
+else out = complex<float>(0.f, 0.f);"""
+# agate: out [Na, nkr] = the bins about bin 0 of the transform along the pulses, times the scale and the gate at the
+# bin's distance |bin| binm[J] in meters (quicklook_cpu.cpp's ql_azimuth_gate)
+_K_AGATE = """
+const long long k = i / nkr; const int J = (int)(i - k * nkr);
+const int keep = min(Na, Pf), pos = keep - keep / 2, neg = keep / 2;
+const int n = k < Na - Na / 2 ? (int)k : (int)k - Na;
+float w = 0.f;
+if (n < pos && n >= -neg) {
+  const float d = fabsf((float)n) * binm[J];
+  w = d <= edge ? 1.f : (d >= edge + guard ? 0.f : 0.5f + 0.5f * cosf((d - edge) * (3.14159265f / guard)));
+}
+if (w == 0.f) out = complex<float>(0.f, 0.f);
+else out = prof[(long long)(n >= 0 ? n : Pf + n) * nkr + J] * (w * scale);"""
+# unshear: out [Pp, nkr] = A[p, J - jlo[p]] for the pulse p = src[q] at place q, where there is one (src >= 0) and
+# that column exists, else 0 (quicklook_cpu.cpp's ql_unshear)
+_K_UNSHEAR = """
+const long long q = i / nkr; const int p = src[q];
+if (p < 0) { out = complex<float>(0.f, 0.f); }
+else {
+  const int c = (int)(i - q * nkr) - jlo[p];
+  out = (c >= 0 && c < W) ? A[(long long)p * W + c] : complex<float>(0.f, 0.f);
+}"""
+# place: out [Ny, Nx] = the raster B [nkr, nka] with row J at (J - hy) mod Ny, the rows that meet there summed, and
+# column a at (a - hx) mod Nx; times (-1)^(J - hy + a - sx0) when signs (the padded transforms' outputs then count
+# from the image's center)
+_K_PLACE = """
+const long long c = i / Nx; const int a = ((int)(i - c * Nx) + hx) % Nx;
+complex<float> v(0.f, 0.f);
+if (a < nka)
+  for (int J = (int)((c + hy) % Ny); J < nkr; J += Ny) {
+    const complex<float> b = B[(long long)J * nka + a];
+    if (signs && ((J - hy + a - sx0) & 1)) v -= b; else v += b;
+  }
+out = v;"""
+# aplace: out [span, Nx2] = rows rb0 .. of F1 [Ny2, nka] with column a at (a - hx) mod Nx2
+_K_APLACE = """
+const long long r = i / Nx2; const int a = ((int)(i - r * Nx2) + hx) % Nx2;
+out = a < nka ? F1[(rb0 + r) * nka + a] : complex<float>(0.f, 0.f);"""
+# cut: the uncorrected picture [ny, nx] out of the transforms T [nfy, nfx], with its carriers, or its amplitude
+_K_CUT = """
+const long long y = i / nx; const int x = (int)(i - y * nx);
+out = T[(long long)((y - ny / 2 + nfy) % nfy) * nfx + (x - nx / 2 + nfx) % nfx] * cy[y] * cx[x];"""
+_K_CUT_ABS = """
+const long long y = i / nx; const int x = (int)(i - y * nx);
+out = abs(T[(long long)((y - ny / 2 + nfy) % nfy) * nfx + (x - nx / 2 + nfx) % nfx]);"""
 _CUDA = {}
 
 
-def _cuda_cols():
-    """The CUDA kernel of the azimuth resampling, compiled once."""
-    if 'cols' not in _CUDA:
-        import cupy as cp
-        from .pfa2 import TABN
-        _CUDA['cols'] = cp.RawModule(code=_CUDA_COLS_SRC, options=(f'-DTAPS={TAPS}', f'-DTABN={TABN}')).get_function(
-            'ql_resample_cols')
-    return _CUDA['cols']
+def _cuda():
+    """The CUDA kernels and tables of the quick look, compiled and loaded once a process."""
+    if 'weight' in _CUDA:
+        return _CUDA
+    import cupy as cp
+    from . import pfa2
+    E = cp.ElementwiseKernel
+    _CUDA['cols'] = cp.RawModule(code=_CUDA_SRC, options=(f'-DTAPS={TAPS}', f'-DTABN={pfa2.TABN}', '-DLTAPS=6', '-DNPOW=1',
+                                                         '-DDEG=1', '-DQTAB=1')).get_function('ql_resample_cols')
+    _CUDA['rgate'] = E('raw complex64 prof, raw float32 tap, int32 Kf, int32 Nr', 'complex64 out', _K_RGATE,
+                       'fastsar_ql_rgate')
+    _CUDA['agate'] = E('raw complex64 prof, raw float32 binm, int32 Pf, int32 Na, int32 nkr, float32 edge, '
+                       'float32 guard, float32 scale', 'complex64 out', _K_AGATE, 'fastsar_ql_agate')
+    _CUDA['unshear'] = E('raw complex64 A, raw int32 jlo, raw int32 src, int32 W, int32 nkr', 'complex64 out', _K_UNSHEAR,
+                         'fastsar_ql_unshear')
+    _CUDA['place'] = E('raw complex64 B, int32 nkr, int32 nka, int32 hy, int32 hx, int32 Ny, int32 Nx, int32 signs, '
+                       'int32 sx0', 'complex64 out', _K_PLACE, 'fastsar_ql_place')
+    _CUDA['aplace'] = E('raw complex64 F1, int32 nka, int32 hx, int32 Nx2, int32 rb0', 'complex64 out', _K_APLACE,
+                        'fastsar_ql_aplace')
+    _CUDA['cut'] = E('raw complex64 T, raw complex64 cy, raw complex64 cx, int32 nfy, int32 nfx, int32 ny, int32 nx',
+                     'complex64 out', _K_CUT, 'fastsar_ql_cut')
+    _CUDA['cut_abs'] = E('raw complex64 T, int32 nfy, int32 nfx, int32 ny, int32 nx', 'float32 out', _K_CUT_ABS,
+                         'fastsar_ql_cut_abs')
+    _CUDA['kaiser'] = cp.asarray(pfa2.kernel_table(TAPS, KAISER))
+    _CUDA['lanczos'] = cp.asarray(_polyphase('lanczos', LANCZOS, PHASES))
+    _CUDA['rows'] = pfa2._resample_kernels(TAPS)[0]
+    _CUDA['weight'] = E('raw complex64 S, raw float32 wk, raw float32 wp, raw float64 ph0, raw float64 ph1, int32 K, '
+                        'int32 k0, int32 Kf, int32 ref', 'complex64 out', _K_WEIGHT, 'fastsar_ql_weight')
+    return _CUDA
 
 
 def _cuda_gather(npow, deg):
@@ -987,141 +1130,176 @@ def _cuda_gather(npow, deg):
     key = ('gather', npow, deg)
     if key not in _CUDA:
         import cupy as cp
-        _CUDA[key] = cp.RawModule(code=_CUDA_GATHER_SRC, options=(f'-DLTAPS={LANCZOS}', f'-DNPOW={npow}', f'-DDEG={deg}',
-                                                                  f'-DQTAB={PHASES}')).get_function('ql_gather')
+        from .pfa2 import TABN
+        _CUDA[key] = cp.RawModule(code=_CUDA_SRC, options=(f'-DTAPS={TAPS}', f'-DTABN={TABN}', f'-DLTAPS={LANCZOS}',
+                                                          f'-DNPOW={npow}', f'-DDEG={deg}', f'-DQTAB={PHASES}')
+                                  ).get_function('ql_gather')
     return _CUDA[key]
 
 
-def _cuda_unshear():
-    """pad[p, J] = A[p, J - jlo[p]] where that column exists, else 0: the rows of the raster out of a history whose
-    pulses hold their own rows (quicklook_cpu.cpp's ql_unshear)."""
-    if 'unshear' not in _CUDA:
-        import cupy as cp
-        _CUDA['unshear'] = cp.ElementwiseKernel(
-            'raw complex64 A, raw int32 jlo, int32 W, int32 nkr', 'complex64 out',
-            'const long long p = i / nkr; const int c = (int)(i - p * nkr) - jlo[p]; '
-            'out = (c >= 0 && c < W) ? A[p * W + c] : complex<float>(0.f, 0.f);', 'fastsar_ql_unshear')
-    return _CUDA['unshear']
-
-
-def _fold_dev(B, n, origin):
-    """_fold on the device, for a raster whose range wavenumbers are its rows: row J into bin (J - origin) mod n."""
-    import cupy as cp
-    Z = cp.zeros((n,) + B.shape[1:], cp.complex64)
-    J = 0
-    while J < B.shape[0]:
-        c = (J - origin) % n
-        w = min(B.shape[0] - J, n - c)
-        Z[c:c + w] += B[J:J + w]
-        J += w
-    return Z
-
-
-def _pfa_cuda(S, g, window, correct, complex_image, timing):
-    """_pfa_cpu's stages in CuPy, with the CUDA kernels of polar format (pfa2.py: the range resampling and the final
-    gather) and the azimuth kernel above. S: the host history (uploaded in blocks of pulses, each windowed and gated
-    on the device) or a CuPy array. -> a CuPy image, range-major [ny, nx]."""
+def _pfa_cuda(S, g, window, correct, complex_image, timing, phase=None):
+    """The quick look's polar format on a GPU -> a CuPy image, range-major [ny, nx]. S: the host history (it goes up
+    in blocks of pulses through two page-locked buffers, each block weighted, gated and resampled while the next is
+    copied) or a CuPy array. phase: (ph0, ph1) [P] float64, a reference phase exp(2 pi j (ph0 + k ph1)) of pulse p's
+    sample k that the device applies with the weights (the history is then as the reader left it). timing: the
+    stages' seconds; with timing['detail'] a dict, the device is brought to completion after every step and the
+    steps' seconds are added to it (the steps then do not overlap, so their sum is longer than the call)."""
     import cupy as cp
     import cupyx.scipy.fft as cf
-    from . import pfa2, _xp
+    from . import _xp, memory
+    kern = _cuda()
     S = S.pop() if isinstance(S, list) else S
     P, K, Kf, Nr, k0 = g['P'], g['K'], g['Kf'], g['Nr'], g['k0']
     nkr, nka, nfy, nfx, nx, ny = g['nkr'], g['nka'], g['nfy'], g['nfx'], g['nx'], g['ny']
-    i32, f64 = np.int32, np.float64
+    i32, f32, f64 = np.int32, np.float32, np.float64
+    detail = timing.get('detail') if isinstance(timing.get('detail'), dict) else None
+    sync = cp.cuda.get_current_stream().synchronize
 
     def lap(name, t0):
-        cp.cuda.get_current_stream().synchronize()
+        sync()
         timing[name] = timing.get(name, 0.0) + time.perf_counter() - t0
         return time.perf_counter()
+
+    def step(name, t0):
+        if detail is None:
+            return t0
+        sync()
+        detail[name] = detail.get(name, 0.0) + time.perf_counter() - t0
+        return time.perf_counter()
     t0 = time.perf_counter()
-    k_rows = pfa2._resample_kernels(TAPS)[0]
-    k_cols = _cuda_cols()
-    tab = cp.asarray(pfa2.kernel_table(TAPS, KAISER))
+    tab = kern['kaiser']
     wk = cp.asarray((g['wk'] * (_taylor(K) if window else 1.0)).astype(np.float32))
     wp = cp.asarray((g['wp'] * (_taylor(P) if window else 1.0)).astype(np.float32))
     tap_r = cp.asarray(_taper(Nr, g['Er'], g['gy'], g['bin_r']))
     alpha, beta = cp.asarray(g['alpha'].astype(np.float32)), cp.asarray(g['beta'].astype(np.float32))
+    ref = phase is not None
+    ph0, ph1 = (cp.asarray(np.ascontiguousarray(v, f64)) for v in (phase if ref else (np.zeros(1), np.zeros(1))))
     t0 = lap('kernels', t0)
-    # 1. range gate and range resampling, a block of pulses at a time (three arrays of the padded block at once)
+    # 1. range. The stage's output goes straight into the rows p0 .. of the array the azimuth transform takes (the
+    # pulses' own rows of the raster, when those differ, into an array of their own)
+    Pf, Na, p0, Pp, place = g['Pf'], g['Na'], g['p0'], g['Pp'], g['place']
     nwin, jlo = g['nwin'], g['jlo']
-    A = cp.empty((P, nwin), cp.complex64)
-    nb = int(max(1, min(P, 1024, _xp.cuda_block() // (24 * max(Kf, Nr)))))
-    for r in range(0, P, nb):
-        x = cp.asarray(S[r:r + nb])
-        n = x.shape[0]
-        buf = cp.zeros((n, Kf), cp.complex64)
-        cp.multiply(x, wk, out=buf[:, k0:k0 + K])
+    pad = cp.empty((Pf, nkr), cp.complex64)
+    pad[:p0] = 0
+    pad[p0 + Pp:] = 0
+    direct = jlo is None and place is None
+    A = pad[p0:p0 + P] if direct else cp.empty((P, nwin), cp.complex64)
+    on_host = isinstance(S, np.ndarray)
+    nb = int(max(1, min(P, 1024, _xp.cuda_block() // (24 * max(Kf, Nr)), (128 << 20) // (8 * K) if on_host else P)))
+    if on_host:
+        S = np.ascontiguousarray(S, np.complex64)
+        bufs = [memory._pinned(nb * K * 8) for _ in range(2)]
+        events = [None, None]
+        stream = cp.cuda.get_current_stream()
+        cb = int(max(1, (1 << 18) // K))
+    for b, r in enumerate(range(0, P, nb)):
+        n = min(nb, P - r)
+        t1 = time.perf_counter()
+        if on_host:
+            if events[b % 2] is not None:
+                events[b % 2].synchronize()                  # its last copy has left the buffer
+            hb = np.frombuffer(bufs[b % 2], np.complex64, nb * K).reshape(nb, K)[:n]
+
+            def copy(sl, r=r, hb=hb):
+                np.copyto(hb[sl], S[r + sl.start:r + sl.stop])
+            _blocks(copy, n, cb)
+            x = cp.empty((n, K), cp.complex64)
+            x.set(hb, stream=stream)
+            events[b % 2] = cp.cuda.Event()
+            events[b % 2].record(stream)
+        else:
+            x = S[r:r + n]
+        t1 = step('upload', t1)
+        buf = cp.empty((n, Kf), cp.complex64)
+        kern['weight'](x, wk, wp[r:r + n], ph0[r:r + n] if ref else ph0, ph1[r:r + n] if ref else ph1, i32(K), i32(k0),
+                       i32(Kf), i32(ref), buf)
         del x
-        gate = _wrap_cut(cf.ifft(buf, axis=1, overwrite_x=True), Nr, 1)
+        t1 = step('weights and padding', t1)
+        prof = cf.ifft(buf, axis=1, overwrite_x=True)
         del buf
-        gate *= tap_r
-        gate *= wp[r:r + n, None]
+        t1 = step('range transforms', t1)
+        gate = cp.empty((n, Nr), cp.complex64)
+        kern['rgate'](prof, tap_r, i32(Kf), i32(Nr), gate)
+        del prof
+        t1 = step('range gate', t1)
         G = cp.ascontiguousarray(cf.fft(gate, axis=1, overwrite_x=True))
         del gate
-        k_rows((-(-nwin // 128), n), (128,), (G, i32(n), i32(Nr), alpha[r:r + n], beta[r:r + n], i32(nwin), tab, A[r:r + n]))
+        t1 = step('range transforms', t1)
+        kern['rows']((-(-nwin // 128), n), (128,), (G, i32(n), i32(Nr), alpha[r:r + n], beta[r:r + n], i32(nwin), tab, A[r:r + n]))
         del G
+        step('range resampling', t1)
+    if on_host:
+        sync()
+        del bufs
     S = None
     t0 = lap('range', t0)
-    # 2. azimuth gate and azimuth resampling
-    Pf, Na, p0 = g['Pf'], g['Na'], g['p0']
-    pad = cp.zeros((Pf, nkr), cp.complex64)
-    if jlo is None:
-        pad[p0:p0 + P] = A
-    else:
-        _cuda_unshear()(A, cp.asarray(jlo), i32(nwin), i32(nkr), pad[p0:p0 + P])
+    # 2. azimuth: the transform along the pulses, the gate in meters with its cut and the scale, the transform back
+    # on Na pulses, the read at the raster's azimuth wavenumbers
+    t1 = time.perf_counter()
+    if not direct:                                    # each pulse at its place, on the raster's rows
+        src = np.full(Pp, -1, np.int32)
+        src[np.arange(P) if place is None else place] = np.arange(P, dtype=np.int32)
+        kern['unshear'](A, cp.asarray(np.zeros(P, np.int32) if jlo is None else jlo), cp.asarray(src), i32(nwin),
+                        i32(nkr), pad[p0:p0 + Pp])
     del A
-    gate = _wrap_cut(cf.fft(pad, axis=0, overwrite_x=True), Na, 0)
+    prof = cf.fft(pad, axis=0, overwrite_x=True)
     del pad
-    # the gate in meters, for each range wavenumber's own bins (quicklook_cpu.cpp's ql_azimuth_gate), and the scale
-    k = np.arange(Na)
-    dist = cp.asarray(np.minimum(k, Na - k).astype(np.float32))[:, None] * cp.asarray(g['bins_a'].astype(np.float32))[None, :]
-    w = cp.clip((np.float32(g['Ex'] + g['gx']) - dist) * np.float32(1.0 / g['gx']), 0.0, 1.0)
-    del dist
-    w = (0.5 - 0.5 * cp.cos(w * np.float32(np.pi))) * np.float32(g['gain'] * (g['ov'] * nfy if correct else nfy) * Na / Pf)
-    gate *= w
-    del w
+    t1 = step('azimuth transforms', t1)
+    scale = f32(g['gain'] * (g['ov'] * nfy if correct else nfy) * Na / Pf)     # the pulses lie at p0 here: no phase
+    gate = cp.empty((Na, nkr), cp.complex64)
+    kern['agate'](prof, cp.asarray(g['bins_a'].astype(np.float32)), i32(Pf), i32(Na), i32(nkr), f32(g['Ex']),
+                  f32(g['gx']), scale, gate)
+    del prof
+    t1 = step('azimuth gate', t1)
     A2 = cp.ascontiguousarray(cf.ifft(gate, axis=0, overwrite_x=True))
     del gate
+    t1 = step('azimuth transforms', t1)
     B = cp.empty((nkr, nka), cp.complex64)
-    qtab = cp.asarray(g['qtab'])
-    k_cols((-(-nkr // 128), nka), (128,), (A2, i32(Na), i32(nkr), cp.asarray(1.0 / g['kr']), f64(g['ka_lo']), f64(g['dka']),
-                                          qtab, i32(len(g['qtab'])), f64(g['tg0']), f64(g['tg_inv']), i32(nka), tab, B))
+    inv_kr, qtab = cp.asarray(1.0 / g['kr']), cp.asarray(g['qtab'])
+    for j0 in range(0, nka, 32768):
+        nj = min(32768, nka - j0)
+        kern['cols']((-(-nkr // 128), nj), (128,), (A2, i32(Na), i32(nkr), inv_kr, f64(g['ka_lo']), f64(g['dka']), qtab,
+                                                    i32(len(g['qtab'])), f64(g['tg0']), f64(g['tg_inv']), i32(nka), i32(j0),
+                                                    i32(nj), tab, B))
     del A2
+    step('azimuth resampling', t1)
     t0 = lap('azimuth', t0)
+    t1 = time.perf_counter()
     if not correct:
-        if nkr > nfy:
-            B = _fold_dev(B, nfy, 0)
-        F = _wrap_shift(cf.ifft(B, n=nfy, axis=0), ny, 0)
+        Z = cp.empty((nfy, nfx), cp.complex64)
+        kern['place'](B, i32(nkr), i32(nka), i32(0), i32(0), i32(nfy), i32(nfx), i32(0), i32(0), Z)
         del B
-        img = _wrap_shift(cf.fft(F, n=nfx, axis=1), nx, 1)
+        F = cf.ifft(Z, axis=0, overwrite_x=True)
+        del Z
+        T = cf.fft(F, axis=1, overwrite_x=True)
         del F
+        t1 = step('image transforms', t1)
         if complex_image:
             y, x = (np.arange(ny) - ny / 2.0) * g['spy'], (np.arange(nx) - nx / 2.0) * g['spx']
-            img *= cp.asarray(np.exp(1j * g['kr_min'] * y).astype(np.complex64))[:, None]
-            img *= cp.asarray(np.exp(-1j * g['ka_lo'] * x).astype(np.complex64))[None, :]
+            img = cp.empty((ny, nx), cp.complex64)
+            kern['cut'](T, cp.asarray(np.exp(1j * g['kr_min'] * y).astype(np.complex64)),
+                        cp.asarray(np.exp(-1j * g['ka_lo'] * x).astype(np.complex64)), i32(nfy), i32(nfx), i32(ny), i32(nx), img)
         else:
-            img = cp.abs(img)
+            img = cp.empty((ny, nx), cp.float32)
+            kern['cut_abs'](T, i32(nfy), i32(nfx), i32(ny), i32(nx), img)
+        del T
+        step('picture', t1)
         lap('image', t0)
         return img
     ov, dist = g['ov'], g['dist']
     Ny2, Nx2 = ov * nfy, ov * nfx
     hy, hx = g['hy'], nka // 2
-    B *= cp.asarray(((-1.0) ** (np.arange(nkr) - hy)).astype(np.float32))[:, None]
-    B *= cp.asarray(((-1.0) ** (np.arange(nka) - hx)).astype(np.float32))[None, :]
-    if nkr > Ny2:
-        Z = _fold_dev(B, Ny2, hy)
-    else:
-        Z = cp.zeros((Ny2, nka), cp.complex64)
-        Z[:nkr - hy], Z[Ny2 - hy:] = B[hy:], B[:hy]
+    Z = cp.empty((Ny2, nka), cp.complex64)
+    kern['place'](B, i32(nkr), i32(nka), i32(hy), i32(0), i32(Ny2), i32(nka), i32(1), i32(hx), Z)
     del B
     F1 = cf.ifft(Z, axis=0, overwrite_x=True)
     del Z
+    step('image transforms', t1)
     t0 = lap('range transform', t0)
     powers = dist['powers']
-    kern = _cuda_gather(len(powers), max(a + b for a, b in powers))
+    gather = _cuda_gather(len(powers), max(a + b for a, b in powers))
     d_cx, d_cy = cp.asarray(np.asarray(dist['cx'], np.float64)), cp.asarray(np.asarray(dist['cy'], np.float64))
     d_pw = cp.asarray(np.asarray(powers, np.int32).ravel())
-    ltab = cp.asarray(_polyphase('lanczos', LANCZOS, PHASES))
     kr_c, ka_c = g['kr_min'] + hy * g['dkr'], g['ka_lo'] + hx * g['dka']
     shear = float(g['shear'] * g['spy'] / g['spx'])
     msy = int(math.ceil(g['shift'][1] / g['spy'])) * ov + LANCZOS + 2
@@ -1131,16 +1309,18 @@ def _pfa_cuda(S, g, window, correct, complex_image, timing):
         n = min(bw, ny - jb)
         rb0 = max(0, Ny2 // 2 + ov * (jb - ny // 2) - msy)
         span = min(Ny2, Ny2 // 2 + ov * (jb + n - ny // 2) + msy) - rb0
-        Z = cp.zeros((span, Nx2), cp.complex64)
-        Z[:, :nka - hx], Z[:, Nx2 - hx:] = F1[rb0:rb0 + span, hx:], F1[rb0:rb0 + span, :hx]
+        t1 = time.perf_counter()
+        Z = cp.empty((span, Nx2), cp.complex64)
+        kern['aplace'](F1, i32(nka), i32(hx), i32(Nx2), i32(rb0), Z)
         base = cp.ascontiguousarray(cf.fft(Z, axis=1, overwrite_x=True))
         del Z
-        kern((-(-nx // 128), n), (128,),
-             (base, i32(span), i32(Nx2), i32(Ny2), i32(rb0), i32(n), i32(jb), i32(nx), i32(ny), f64(g['spx']),
-              f64(g['spy']), f64(ov), f64(dist['sx']), f64(dist['sy']), d_cx, d_cy, d_pw, f64(kr_c), f64(ka_c),
-              f64(shear), ltab, i32(0 if complex_image else 1), np.float32(1.0), out[jb:]))
-        cp.cuda.get_current_stream().synchronize()
+        t1 = step('image transforms', t1)
+        gather((-(-nx // 128), n), (128,),
+               (base, i32(span), i32(Nx2), i32(Ny2), i32(rb0), i32(n), i32(jb), i32(nx), i32(ny), f64(g['spx']),
+                f64(g['spy']), f64(ov), f64(dist['sx']), f64(dist['sy']), d_cx, d_cy, d_pw, f64(kr_c), f64(ka_c),
+                f64(shear), kern['lanczos'], i32(0 if complex_image else 1), np.float32(1.0), out[jb:]))
         del base
+        step('read at the apparent positions', t1)
     del F1
     lap('correction', t0)
     return out
@@ -1393,13 +1573,11 @@ def quicklook(cphd, output=None, *, size=2048, resolution=None, correct=True, re
         raise ValueError('the complex image (complex_image=True, a .nitf output) is of one look: leave looks=1')
     backend = backend if backend == 'auto' else _backend(backend)
     window = weighting == 'taylor'
-    col = _collection(cphd, size, resolution, extent, channel, reader_options, looks)
-    timing, notes, plan, meta = col['timing'], col['notes'], col['plan'], col['meta']
+    col = _collection(cphd, size, resolution, extent, channel, reader_options, looks, backend)
+    timing, notes, plan, meta, backend = col['timing'], col['notes'], col['plan'], col['meta'], col['backend']
     nx, ny, spx, spy, e1, e2, c = col['nx'], col['ny'], col['spx'], col['spy'], col['e1'], col['e2'], col['center']
-    S, ant, f0, df = col['S'], col['ant'], col['fmin'], col['df']
+    S, ant, f0, df, phase = col['S'], col['ant'], col['fmin'], col['df'], col['phase']
     P, K = S.shape
-    if backend == 'auto':
-        backend = _auto(P * K)
     (pa, pb), (k0, k1) = meta['pulses'], meta['samples']
     isz = meta['signal_bytes'] // (P * K) if P * K else 0
     cut = dict(pulses=(pa, pb), of_pulses=plan['P'], samples=(k0, k1), of_samples=plan['K'],
@@ -1417,7 +1595,8 @@ def quicklook(cphd, output=None, *, size=2048, resolution=None, correct=True, re
         if (la, lr) == (1, 1):
             return col
         rows, cols = slice(i * Pl, (i + 1) * Pl), slice(j * Kl, (j + 1) * Kl)
-        return dict(col, S=np.ascontiguousarray(S[rows, cols]), ant=ant[rows], fmin=f0 + j * Kl * df)
+        ph = None if phase is None else (phase[0][rows] + j * Kl * phase[1][rows], phase[1][rows])
+        return dict(col, S=np.ascontiguousarray(S[rows, cols]), ant=ant[rows], fmin=f0 + j * Kl * df, phase=ph)
     info, shift, acc, cimg, defocus = {}, None, None, None, None
     xp = np
     for i in range(la):
@@ -1433,7 +1612,8 @@ def quicklook(cphd, output=None, *, size=2048, resolution=None, correct=True, re
                 if (la, lr) == (1, 1):
                     S = None
                 out = _pfa(box, sub['ant'], sub['fmin'], df, nx, ny, spx, spy, e1, e2, correct=bool(correct),
-                           window=window, backend=backend, complex_image=want, timing=timing, info=info)
+                           window=window, backend=backend, complex_image=want, timing=timing, info=info,
+                           phase=sub['phase'])
                 rm = out.T                                               # range-major, where it was formed
                 xp = _xp.module(rm)
                 complex_rm = want
@@ -1480,11 +1660,18 @@ def quicklook(cphd, output=None, *, size=2048, resolution=None, correct=True, re
     grid = dict(image=np.broadcast_to(np.float32(0), (nx, ny)), origin=origin, e1=e1, e2=e2, spx=spx, spy=spy, meta=meta)
     lay = sidd.shadows_down(grid)
     tr = lay['transform']
-    d = sidd._display(dict(image=amp), remap, None, {})[0]             # uint8, range-major
+    d = sidd._display(dict(image=amp), remap, None, {})[0]             # uint8, range-major, where the image is
     d = d if tr['transpose'] else d.T
     d = d[::-1] if tr['flip_rows'] else d
     d = d[:, ::-1] if tr['flip_cols'] else d
-    display = np.ascontiguousarray(_xp.host(d))
+    if _xp.kind(d) == 'cupy':                                          # laid out there, brought over once
+        d = xp.ascontiguousarray(d)
+        xp.cuda.get_current_stream().synchronize()
+        timing['remap'] = time.perf_counter() - t0
+        t0 = time.perf_counter()
+        display = _host(d)
+    else:
+        display = np.ascontiguousarray(_xp.host(d))
     del amp, d
     rows, cols = display.shape
     rc = np.array([[0, 0], [0, cols - 1], [rows - 1, cols - 1], [rows - 1, 0]], np.float64)

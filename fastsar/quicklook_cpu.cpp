@@ -158,19 +158,23 @@ extern "C" void ql_transpose(const float* src, long sstride, long R, long C, flo
   });
 }
 
-// dst[c, r] = src[r, J0 + c - jlo[r]] where that column lies in [0, W), else 0, for c < C and r < R (complex): the
-// rows J0 .. of the raster's range wavenumbers out of a history whose pulses each hold their own W rows, from row
-// jlo[r] on (a picture on the ground under a twisted slant plane: the band of a pulse drifts along the aperture,
-// and each pulse is resampled on the rows it reaches). src's rows are W and dst's rows dstride complex values
-// apart. On the calling thread.
-extern "C" void ql_unshear(const float* src, long W, long R, const int* jlo, long J0, long C, float* dst, long dstride) {
-  for (long c = 0; c < C; ++c) std::fill(dst + 2 * c * dstride, dst + 2 * (c * dstride + R), 0.f);
+// dst[c, place[r]] = src[r, J0 + c - jlo[r]] where that column lies in [0, W), and 0 elsewhere in the Rp values of
+// each of dst's rows, for c < C and r < R (complex): the rows J0 .. of the raster's range wavenumbers out of a
+// history whose pulses each hold their own W rows, from row jlo[r] on (a picture on the ground under a twisted
+// slant plane: the band of a pulse drifts along the aperture, and each pulse is resampled on the rows it reaches),
+// with each pulse at its place in the evenly timed sequence (a collection that lacks pulses: their places stay
+// zero, as backprojection sums nothing for them). jlo null: every pulse from row 0; place null: pulse r at r.
+// src's rows are W and dst's rows dstride complex values apart. On the calling thread.
+extern "C" void ql_unshear(const float* src, long W, long R, const int* jlo, const int* place, long Rp, long J0, long C,
+                           float* dst, long dstride) {
+  for (long c = 0; c < C; ++c) std::fill(dst + 2 * c * dstride, dst + 2 * (c * dstride + Rp), 0.f);
   for (long r = 0; r < R; ++r) {
-    const long c0 = std::max(0L, (long)jlo[r] - J0), c1 = std::min(C, (long)jlo[r] + W - J0);
-    const float* p = src + 2 * (r * W + (J0 + c0 - jlo[r]));
+    const long j = jlo ? jlo[r] : 0, q = place ? place[r] : r;
+    const long c0 = std::max(0L, j - J0), c1 = std::min(C, j + W - J0);
+    const float* p = src + 2 * (r * W + (J0 + c0 - j));
     for (long c = c0; c < c1; ++c, p += 2) {
-      float* q = dst + 2 * (c * dstride + r);
-      q[0] = p[0]; q[1] = p[1];
+      float* o = dst + 2 * (c * dstride + q);
+      o[0] = p[0]; o[1] = p[1];
     }
   }
 }

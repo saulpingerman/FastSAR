@@ -340,6 +340,37 @@ def test_distortion_on_any_axes():
     assert rel_db(img, ex) < -35 and abs(np.angle(g)) < 0.01 and abs(g) == pytest.approx(1.0, abs=0.01)
 
 
+def test_missing_pulses_keep_their_places():
+    """A collection that lacks pulses of an evenly timed sequence (their neighbors' positions are a double step
+    apart): each pulse is set at its place and the missing ones' places stay zero, so that a scatterer at the edge
+    of the picture, whose phase steps across a gap, is formed as backprojection forms it."""
+    rng = np.random.default_rng(8)
+    col = sim.make_collect(res=0.5, scene=260.0, r0=60e3)
+    keep = np.ones(col.Np, bool)
+    keep[[40, 41, 300, 700, 702]] = False
+    P = col.Np
+    a = col.ant[P // 2]
+    e2 = -a / np.linalg.norm(a)
+    n = np.cross(e2, col.ant[P // 2 + 1] - col.ant[P // 2 - 1])
+    n *= np.sign(n[2]) / np.linalg.norm(n)
+    e1 = np.cross(e2, n)
+    grid = (480, 200, 0.48, 0.48, e1, e2)
+    tg = np.concatenate([rng.uniform(-110, -100, (15, 1)) * e1 + rng.uniform(-40, 40, (15, 1)) * e2,     # at the far edge
+                         rng.uniform(100, 110, (15, 1)) * e1 + rng.uniform(-40, 40, (15, 1)) * e2])
+    S = sim.simulate_brute(col, tg, rng.standard_normal(30) + 1j * rng.standard_normal(30)).astype(np.complex64)
+    ant, S = col.ant[keep], np.ascontiguousarray(S[keep])
+    u = ant / np.linalg.norm(ant, axis=1)[:, None]
+    place = quick._places((u @ e1) / -(u @ e2))
+    assert place[-1] == P - 1 and np.array_equal(place, np.nonzero(keep)[0])
+    g = quick._geometry(ant, col.fmin, col.df, col.K, *grid, True)
+    assert g['Pp'] == P and g['place'] is not None
+    ex = fastsar.ExactFormer(ant, col.fmin, col.df, col.K, *grid, backend='cpu', window=True)(S)
+    e = rel_db(quick._pfa(S, ant, col.fmin, col.df, *grid, window=True), ex)
+    print(f'five pulses missing: {e:.1f} dB against exact backprojection of the pulses there are')
+    assert e < -38
+    assert np.array_equal(quick._places(np.linspace(-1, 1, 500) ** 3 + np.linspace(-3, 3, 500)), np.arange(500))
+
+
 def test_taylor_window_is_scipys():
     from scipy.signal.windows import taylor
     for n in (2, 3, 64, 1001):
