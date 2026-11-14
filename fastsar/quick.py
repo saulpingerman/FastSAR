@@ -79,6 +79,8 @@ def _lib():
         L.ql_resample_rows.argtypes = [p, n, n, p, p, n, p, i, p, i]
         L.ql_resample_az.argtypes = [p, n, n, p, d, d, p, n, d, d, n, p, i, p, n, i]
         L.ql_transpose.argtypes = [p, n, n, n, p, n, p, i]
+        L.ql_azimuth_gate.argtypes = [p, n, n, n, p, p, d, d, p]
+        L.ql_azimuth_gate.restype = None
         L.ql_gather.argtypes = [p, n, n, n, n, n, n, i, i, i, i, i, i, d, d, d, d, d, p, p, p, i, i, d, d, i, fl, i, p, p,
                                 i, i, p, n]
         L.ql_weight_pad.argtypes = [p, n, n, p, p, n, n, p]
@@ -426,6 +428,7 @@ def _geometry(ant, fmin, df, K, nx, ny, spx, spy, e1, e2, correct, ov=OVERSAMPLE
     Pf = _fft_size(P + 2 * p0)
     Na = _fft_size(int(np.ceil(rho_a * Pf)))
     bin_a = Xa / Pf
+    bins_a = 2 * math.pi / (kr * abs(dts) * Pf)     # the bin of each range wavenumber's transform (m): wider at a lower one
     # the row position (in the Na pulses) of a tangent t, from the pulses' own t: a table at four points per pulse
     # over the aperture and a few pulses beyond it (linear continuation)
     nt = 4 * (P + 2 * TAPS) + 1
@@ -446,7 +449,7 @@ def _geometry(ant, fmin, df, K, nx, ny, spx, spy, e1, e2, correct, ov=OVERSAMPLE
     gain = (dkr * C / (4 * math.pi * df)) * (dka / (kr_cw * abs(dts)))
     return dict(P=P, K=K, nx=nx, ny=ny, spx=spx, spy=spy, nfx=nfx, nfy=nfy, dkr=dkr, dka=dka, kr_min=kr_min, nkr=nkr,
                 ka_lo=ka_lo, nka=nka, kr=kr, k0=k0, Kf=Kf, Nr=Nr, bin_r=bin_r, Er=Er, gy=gy, alpha=alpha, beta=beta,
-                p0=p0, Pf=Pf, Na=Na, bin_a=bin_a, Ex=Ex, gx=gx, qtab=qtab, tg0=float(tg[0]), tg_inv=float(4 / dts),
+                p0=p0, Pf=Pf, Na=Na, bin_a=bin_a, bins_a=bins_a, Ex=Ex, gx=gx, qtab=qtab, tg0=float(tg[0]), tg_inv=float(4 / dts),
                 wk=wk, wp=wp, gain=gain, dist=dist, shift=(shx, shy), ov=ov, t=t, dts=dts)
 
 
@@ -528,10 +531,8 @@ def _pfa_cpu(S, g, window, correct, complex_image, timing):
     Nfft = ov * nfy if correct else nfy
     k = np.arange(Na)
     k = np.where(k < Na - Na // 2, k, k - Na)
-    tap_a = (_taper(Na, g['Ex'], g['gx'], g['bin_a']) * (g['gain'] * Nfft * Na / Pf)
-             * np.exp(-2j * np.pi * (k * p0 % Pf) / Pf)).astype(np.complex64)
-    keep = min(Na, Pf)
-    pos, neg = keep - keep // 2, keep // 2
+    fac = np.ascontiguousarray((g['gain'] * Nfft * Na / Pf) * np.exp(-2j * np.pi * (k * p0 % Pf) / Pf), np.complex64)
+    bins = np.ascontiguousarray(g['bins_a'])                              # a bin of each row's transform, in meters
     inv_kr = np.ascontiguousarray(1.0 / g['kr'])
     qtab = np.ascontiguousarray(g['qtab'])
     B = np.empty((nka, nkr), np.complex64)
@@ -541,10 +542,9 @@ def _pfa_cpu(S, g, window, correct, complex_image, timing):
         buf = np.empty((n, Pf), np.complex64)
         lib.ql_transpose(at(A, 0, sl.start), nkr, P, n, ptr(buf), Pf, None, 1)
         buf[:, P:] = 0
-        prof = sf.fft(buf, axis=1, overwrite_x=True)
-        gate = np.empty((n, Na), np.complex64) if Na <= Pf else np.zeros((n, Na), np.complex64)
-        np.multiply(prof[:, :pos], tap_a[:pos], out=gate[:, :pos])
-        np.multiply(prof[:, Pf - neg:], tap_a[Na - neg:], out=gate[:, Na - neg:])
+        prof = np.ascontiguousarray(sf.fft(buf, axis=1, overwrite_x=True))
+        gate = np.empty((n, Na), np.complex64)
+        lib.ql_azimuth_gate(ptr(prof), n, Pf, Na, ptr(fac), at(bins, sl.start), g['Ex'], g['gx'], ptr(gate))
         A2 = np.ascontiguousarray(sf.ifft(gate, axis=1, overwrite_x=True))
         lib.ql_resample_az(ptr(A2), n, Na, at(inv_kr, sl.start), g['ka_lo'], g['dka'], ptr(qtab), len(qtab), g['tg0'],
                            g['tg_inv'], nka, ptr(tab), PHASES, at(B, 0, sl.start), nkr, 1)
@@ -827,7 +827,14 @@ def _pfa_cuda(S, g, window, correct, complex_image, timing):
     del A
     gate = _wrap_cut(cf.fft(pad, axis=0, overwrite_x=True), Na, 0)
     del pad
-    gate *= cp.asarray((_taper(Na, g['Ex'], g['gx'], g['bin_a']) * (g['gain'] * (g['ov'] * nfy if correct else nfy) * Na / Pf)).astype(np.float32))[:, None]
+    # the gate in meters, for each range wavenumber's own bins (quicklook_cpu.cpp's ql_azimuth_gate), and the scale
+    k = np.arange(Na)
+    dist = cp.asarray(np.minimum(k, Na - k).astype(np.float32))[:, None] * cp.asarray(g['bins_a'].astype(np.float32))[None, :]
+    w = cp.clip((np.float32(g['Ex'] + g['gx']) - dist) * np.float32(1.0 / g['gx']), 0.0, 1.0)
+    del dist
+    w = (0.5 - 0.5 * cp.cos(w * np.float32(np.pi))) * np.float32(g['gain'] * (g['ov'] * nfy if correct else nfy) * Na / Pf)
+    gate *= w
+    del w
     A2 = cp.ascontiguousarray(cf.ifft(gate, axis=0, overwrite_x=True))
     del gate
     B = cp.empty((nkr, nka), cp.complex64)

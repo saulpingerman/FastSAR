@@ -106,6 +106,35 @@ extern "C" void ql_resample_az(const float* A, long M, long R, const double* inv
   });
 }
 
+// The azimuth gate of R rows (the transforms along the pulses of R range wavenumbers, prof [R, Pf]): out[r, k], k < Na,
+// is the transform's bin n (k for k < Na - Na / 2, else k - Na: bin 0 first, the negative bins at the end), cut out
+// of the Pf there are or set among zeros in a longer row, times fac[k] (complex: the scale and a phase common to the
+// rows) and times the gate at the bin's distance |n| bin[r] in meters: 1 within edge, a raised cosine to 0 over the
+// next guard, 0 beyond. The bins of a row are 2 pi / (kr |dt| Pf) wide, wider at a lower wavenumber, so the gate is
+// set in meters row by row: one gate in bins for all rows would pass the rows of the low end of a wide band
+// further out, and what it passed there would wrap into the picture's far edge. On the calling thread.
+extern "C" void ql_azimuth_gate(const float* prof, long R, long Pf, long Na, const float* fac, const double* bin,
+                                double edge, double guard, float* out) {
+  const long keep = std::min(Na, Pf), pos = keep - keep / 2, neg = keep / 2;
+  for (long r = 0; r < R; ++r) {
+    const float* p = prof + 2 * r * Pf;
+    float* o = out + 2 * r * Na;
+    const double b = bin[r];
+    for (long k = 0; k < Na; ++k) {
+      const long n = k < Na - Na / 2 ? k : k - Na;
+      float w = 0.f;
+      if (n < pos && n >= -neg) {
+        const double d = std::fabs((double)n) * b;
+        w = d <= edge ? 1.f : (d >= edge + guard ? 0.f : (float)(0.5 + 0.5 * std::cos((d - edge) * (3.14159265358979323846 / guard))));
+      }
+      if (w == 0.f) { o[2 * k] = 0.f; o[2 * k + 1] = 0.f; continue; }
+      const float* v = p + 2 * (n >= 0 ? n : Pf + n);
+      const float fr = fac[2 * k] * w, fi = fac[2 * k + 1] * w;
+      o[2 * k] = v[0] * fr - v[1] * fi; o[2 * k + 1] = v[0] * fi + v[1] * fr;
+    }
+  }
+}
+
 // dst[c, r] = src[r, c] s[r] for r < R, c < C (complex): a transpose in tiles that fit the first-level cache, on all
 // cores. src's rows are sstride and dst's rows dstride complex values apart; s: a real factor per source row, or
 // null. The transforms of the quick look all run along rows, the way that is three times faster than along
