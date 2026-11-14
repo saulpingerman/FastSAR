@@ -1081,8 +1081,19 @@ through pulses on which it lies farther than lambda PRF / (4 v) from the boresig
 Doppler band the PRF samples about the beam: those pulses hold no echo of it that is not ambiguous with
 others, and a window over them adds noise and states a band the image does not have. A note that begins with
 `beam center:` says so. The boresight is used only where its own window reaches every point of the area, its
-track is smooth, and the processed spread fits in the PRF's band (a vendor SICD's band can exceed it).
+track is smooth, and the processed spread fits in the PRF's band.
 `form_cphd` keeps the SRPs, as before.
+
+With the vendor's SICD (`sicd=`) the product has the vendor's azimuth band: `Grid.Col.ImpRespBW` wide at each
+pixel, about the pixel's center of aperture (`Grid.TimeCOAPoly`: the direction from the antenna at that time,
+`Position.ARPPoly`, to the pixel). That center moves along the track with the beam, so the spread of a pulse
+that gives a pixel the vendor's band is narrower than ImpRespBW lambda / 2 by the ratio of the footprint's speed
+to the platform's; `form_cphd` itself takes ImpRespBW lambda / 2 about each SRP, as 0.2.0 did, which a sliding
+spotlight widens at a pixel by the inverse of that ratio. A SICD whose center of aperture does not move along
+the track (one time for every pixel) takes the beam center of the product without a SICD. The vendor's spacing
+is kept where it samples the band at the top of the frequency band, else 0.96 of the reciprocal of that band.
+A note beginning `azimuth band:` gives the band and its center, and another says where the band reaches pulses
+on which part of the area lies outside the Doppler band the PRF samples about the beam.
 
 `moving.baseband` removes both carriers with one phase, exact at every pixel as `planes.deramp` is for a
 spotlight. With F(x, t) = |x - a(t)| + G(t), G the integral of s |da/dt| over time, F is stationary in t at the
@@ -1409,6 +1420,21 @@ quadratic phase across their band does not shorten them, and none stands 25 dB a
 boresight). The two C09 collections above and a C14 sliding spotlight (2024-08-29) keep their SRPs as the beam
 center: the processed spread about their SRPs stays within the band the PRF samples about the boresight, and
 their products are the same to the bit.
+
+With the vendor's SICDs (`sicd=`, the same 1 by 3 km cuts, the GPU):
+
+| Collection | Vendor's band, spacing | Stated band, spacing before (SRP spread) | After | Spectrum after, -6 and -10 dB | Brightest points along the track, after (vendor's image) |
+|---|---|---|---|---|---|
+| C10 sliding spotlight | 2.50 cycles/m, 0.399 m | 11.29 cycles/m, 0.083 m | 2.505 cycles/m, 0.371 m | 2.49, 2.52 cycles/m | 3.1 m (0.52 m) |
+| C09 sliding spotlight (2024-08-29) | 1.23, 0.814 | 6.98, 0.135 | 1.228, 0.758 | 1.23, 1.24 | 0.95 m (0.87 m) |
+| C09 stripmap (2024-09-23) | 0.77, 1.04 | 1.37, 0.690 | 0.767, 1.04 | 0.76, 0.77 | 1.6 m |
+
+Each vendor's centers of aperture move with the antenna's footprint: 1,075 m/s on the C10 and 1,067 m/s on the
+C09, whose SRPs move 612 and 1,290 m/s. Before, the C10 product took pulses the beam does not light (its spectrum
+fell to -20 dB only at 12 cycles/m). On the C09, 20 points stand 25 dB above the mean power of their surround,
+with a median width of 0.78 m (the vendor's impulse response: 0.72 m). On the C10 the brightest returns stay narrow in azimuth frequency (0.1 to 0.4
+cycles/m) wherever the band is placed, and long along the track, while the vendor's image shows them 0.5 m
+long: not a matter of the band, and not of a quadratic phase across it.
 
 **Speed.** Seconds per stage for the stripmap cut, second call, with megapixels per second in parentheses, on an
 Nvidia RTX PRO 6000 that other jobs were using and on 16 of the host's 48 cores:

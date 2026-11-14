@@ -216,6 +216,26 @@ was published on PyPI.
   documentation keep their SRPs and are the same to the bit; `form_cphd` keeps the SRPs. The brightest returns
   of the C10 scene are specular (each lit over 0.3 to 1.2 cycles/m of the band) and are 0.5 to 5.4 m long along
   the track with either beam center (docs/product-options.md, Real collections).
+- `process_cphd(..., sicd=)` on a moving beam took the vendor SICD's azimuth band (`Grid.Col.ImpRespBW`) as the
+  spread of a pulse about its SRP, which a footprint moving at a fraction of the platform's speed widens at a
+  pixel by the inverse of that fraction: 11.29 cycles/m stated and formed for the vendor's 2.50 on the Capella
+  C10 sliding spotlight (sampled at 0.083 m for the vendor's 0.399 m, through pulses the beam does not light),
+  6.98 for 1.23 on the C09 sliding spotlight of 2024-08-29, and 1.37 for 0.77 on a C09 stripmap of 2024-09-23
+  whose SRPs also lag its beam. The product now has the vendor's band: ImpRespBW wide at each pixel about the
+  pixel's center of aperture (`Grid.TimeCOAPoly`, seen from `Position.ARPPoly`), which on both sliding
+  spotlights moves with the antenna's footprint (1,075 and 1,067 m/s), not with the SRPs (612 and 1,290 m/s). A
+  SICD whose center of aperture does not move along the track takes the beam center of the product without a
+  SICD. On the 1 by 3 km cuts the products state 2.505, 1.228 and 0.767 cycles/m, and their azimuth spectra fill
+  that band and end at its edge (-6 and -10 dB widths 2.49 and 2.52, 1.23 and 1.24, 0.76 and 0.77; 0.3 to 0.4%
+  of the energy beyond it). The vendor's spacing is kept where it samples the band at the top of the frequency
+  band (the stripmap's 1.04 m) and replaced by 0.96 of the reciprocal of that band where it does not (0.371 m
+  for 0.399, 0.758 for 0.814). The C09 sliding spotlight's brightest points are 0.95 m long along the track
+  (the vendor's image: 0.87 m), and 20 stand 25 dB over their surround. A note beginning `azimuth band:` gives
+  the band and its center, and another says where the band reaches pulses the beam does not light.
+- Forming a patch much longer on one side than the other (832 by 96 pixels in tiles of 32: a narrow cut sampled
+  finely) failed with "1 levels cannot split 832 pixels into tiles of 32": the levels were chosen for the short
+  side. A patch now takes at least the levels its long side needs (`patches._levels`); other patches are formed
+  as before.
 - The cuda backend refused an image narrow in range from a wide-band collection ("the cuda backend's first-level
   window ... exceeds the GPU's shared memory", for example a 2 km image of a collection with 76,032 samples per
   pulse). Such a history is now gated in range to the image's swath first, on the device where it has room and
