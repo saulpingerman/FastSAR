@@ -121,7 +121,8 @@ def process_cphd(cphd, output=None, *, product='sicd', area='tasked', plane=None
     extent: the tasked area's sides in meters about the scene center, for a collection that states no image area
         (and in place of the one it states): (across, along) the line of sight for a spotlight, (along, across)
         the track for a moving beam.
-    sicd: the vendor's SICD (path, .xml or SICD metadata), whose footprint is then the tasked area.
+    sicd: the vendor's SICD (path, .xml or SICD metadata), whose footprint is then the tasked area; a moving beam
+        also takes its azimuth band, Grid.Col.ImpRespBW at each pixel about its center of aperture (moving.plan).
     nesz_db, scene_sigma0_db: the noise level of the quality areas when the files give none (fastsar.rgiqe).
     black_sigma0_db: the sigma zero (dB) whose signal-to-noise ratio of 1, ambiguities counted as noise, is the edge
         of area='black': the area ends where the noise-equivalent sigma zero plus the ambiguity level reaches it.

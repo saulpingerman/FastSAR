@@ -159,10 +159,16 @@ def _taper(f, band, guard):
     return 0.5 * (1 + np.cos(np.pi * t))
 
 
-def _levels(n, T, most=3):
-    """Most levels (up to `most`) whose smallest split, 2 per level, does not pad n pixels beyond ceil(n/T) tiles."""
+def _levels(n, T, most=3, longest=None):
+    """Most levels (up to `most`) whose smallest split, 2 per level, does not pad n pixels beyond ceil(n/T) tiles;
+    and, where the patch's longer side has `longest` pixels, at least as many as split it with factors of up to 16
+    a level (ffbp2.choose_splits' largest), else an elongated patch (832 by 96 pixels in tiles of 32) has one level
+    that cannot split its long side."""
     need = -(-n // T)
-    return max(1, min(most, int(np.floor(np.log2(max(need, 1))))))
+    nlev = max(1, min(most, int(np.floor(np.log2(max(need, 1))))))
+    while longest is not None and nlev < most and 16 ** nlev < -(-longest // T):
+        nlev += 1
+    return nlev
 
 
 SUBS = ((1, 1), (1, 2), (2, 1), (2, 2), (2, 4), (4, 2), (4, 4))
@@ -801,7 +807,8 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
                 f0r, dfr, Kr = gate_axis(c, pts, lo, hi)
                 Tp, s12, err = tile_plan(af, f0r + Kr * dfr, px, py, spx, spy, e1, e2, target_db,
                                          (32, 16) if T == 'auto' else (T,), subs)
-                nlev = _levels(min(px * s12[0], py * s12[1]), Tp) if levels == 'auto' else levels
+                nlev = (_levels(min(px * s12[0], py * s12[1]), Tp, longest=max(px * s12[0], py * s12[1]))
+                        if levels == 'auto' else levels)
                 pulse, D = pulse_plan(make_plan(Collect(fmin=f0r, df=dfr, K=Kr, ant=af, res=0.5), px * s12[0], py * s12[1],
                                                 spx / s12[0], spy / s12[1], T=Tp, nlev=nlev, e1=e1, e2=e2))
             if backend in ('jax', 'tpu'):         # pulses padded (padded_pulses) so that patches share compiled
@@ -819,7 +826,8 @@ def form_mosaic(fx, ant, origin, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 
                     idx = idx + e0
             if own is None:
                 Tp, s12, err = tile_plan(af, f0 + S.shape[1] * df, px, py, spx, spy, e1, e2, target_db, tiles, subs)
-                nlev = _levels(min(px * s12[0], py * s12[1]), Tp) if levels == 'auto' else levels
+                nlev = (_levels(min(px * s12[0], py * s12[1]), Tp, longest=max(px * s12[0], py * s12[1]))
+                        if levels == 'auto' else levels)
             s1, s2 = s12
             aw = None
             if beam is not None and awin is not None and in_kernel:

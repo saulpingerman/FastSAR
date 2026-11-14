@@ -293,3 +293,13 @@ def test_jax_single_patch(dropped):
     e = 10 * np.log10(np.sum(np.abs(j1 - d.ex) ** 2) / np.sum(np.abs(d.ex) ** 2))
     print(f'jax single patch against exact backprojection: {e:.1f} dB; {info}')
     assert len(info) == 1 and e < -45, (info, e)
+
+
+def test_levels_of_an_elongated_patch():
+    """A patch much longer on one side (832 by 96 pixels in tiles of 32, a narrow cut sampled for a vendor's band)
+    takes the levels its long side needs (factors of up to 16 a level), not only those its short side allows: one
+    level cannot split 26 tiles. A square patch keeps the levels it had."""
+    from fastsar.ffbp2 import choose_splits
+    assert pt._levels(96, 32) == 1 and pt._levels(96, 32, longest=832) == 2
+    assert choose_splits(832, 32, pt._levels(96, 32, longest=832)) and choose_splits(96, 32, 2)
+    assert all(pt._levels(n, T, longest=n) == pt._levels(n, T) for n in (64, 96, 512, 1024, 4096) for T in (16, 32))

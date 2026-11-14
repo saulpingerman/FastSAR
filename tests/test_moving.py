@@ -236,6 +236,41 @@ def test_band_of_a_beam_that_outruns_its_reference_points():
     assert abs(o2['bandwidth'][0] * c2.ares - 1) < 0.02 and not any(n.startswith('beam center:') for n in o2['notes'])
 
 
+def test_band_of_a_vendor_sicd_on_a_sliding_beam(tmp_path):
+    """process_cphd with the vendor's SICD of a sliding spotlight (the beam's footprint at a quarter of the
+    platform's speed) that processed a quarter of the band the beam gives: the SICD states ImpRespBW 3.2 cycles/m and
+    centers of aperture that move with the beam (Grid.TimeCOAPoly). The product states and holds that band, about
+    those centers: the unweighted impulse response is 0.886 of its reciprocal wide. Taken as the spread of a pulse
+    about its SRP, as before, ImpRespBW lambda / 2 gave each pixel four times the band (12.8 cycles/m)."""
+    import re
+    from fastsar import _nitf, _sicdxml
+    from fastsar.products import write_sicd
+    tg = np.array([[0.0, 0.0, 0.0], [6.0, 9.0, 0.0]])
+    c = ms.collection('vendor.cphd', tg, slide=4.0, antenna=ANT, P=5200, noise=1e-3)
+    own = fastsar.process_cphd('vendor.cphd', backend='cpu', extent=EXT, weighting='uniform', autofocus=False)
+    write_sicd(str(tmp_path / 'v.nitf'), own)                        # the vendor's grid, with its band and times
+    xml = _nitf.read(str(tmp_path / 'v.nitf')).xml('SICD')[0]
+    xml = xml.decode() if isinstance(xml, bytes) else xml
+    want = float(0.25 / c.ares)
+    sm = _sicdxml.read(xml)
+    sign = float(np.sign(np.asarray(sm.Grid.Col.UVectECF.get_array()) @ ms.E))   # columns along the flight, or not
+    t0 = float(np.ravel(sm.Grid.TimeCOAPoly.get_array())[0])
+    coa = (f'<TimeCOAPoly order1="0" order2="1"><Coef exponent1="0" exponent2="0">{t0!r}</Coef>'
+           f'<Coef exponent1="0" exponent2="1">{sign / (c.v / 4.0)!r}</Coef></TimeCOAPoly>')
+    xml = re.sub(r'<TimeCOAPoly.*?</TimeCOAPoly>', coa, xml)
+    xml = re.sub(r'(<Col>(?:(?!</Col>).)*?<ImpRespBW>)[^<]*', lambda m: m.group(1) + repr(want), xml, flags=re.S)
+    sm = _sicdxml.read(xml)
+    assert abs(float(sm.Grid.Col.ImpRespBW) - want) < 1e-9
+    o = fastsar.process_cphd('vendor.cphd', backend='cpu', extent=EXT, weighting='uniform', autofocus=False, sicd=sm)
+    w = [quality.point_target(o['image'], (round(i), round(j)), o['spx'], o['spy'], half=24)['res_az']
+         for i, j in ms.to_pixels(o, o['meta'], c.tg)]
+    print(f"  band {o['bandwidth'][0]:.3f} cycles/m (the vendor's {want:.3f}, the beam's {1 / c.ares:.3f}), spacing "
+          f"{o['spx']:.4f} m, width x band {np.round(np.array(w) * o['bandwidth'][0], 3)}")
+    assert abs(o['bandwidth'][0] / want - 1) < 0.02, o['bandwidth']
+    assert np.abs(np.array(w) * o['bandwidth'][0] / 0.886 - 1).max() < 0.05, w      # 2.8% measured
+    assert sum("vendor SICD's centers of aperture" in n for n in o['notes']) == 1, o['notes']
+
+
 def test_errors(strip):
     name, c = strip
     for kw, match in ((dict(plane='slant'), 'moving beam'), (dict(weighting='sva', product='sidd', spacing=0.5), 'spacing'),
