@@ -200,7 +200,10 @@ def antenna_sine(cphd, meta, ant, pulses=None, channel=0):
     r = _open_cphd(str(cphd))
     m = r.cphd_meta
     ch = int(meta.get('channel_index', channel))
-    par = rgiqe._parameters(m, meta, ch)
+    try:
+        par = rgiqe._parameters(m, meta, ch)
+    except (AttributeError, KeyError, IndexError, TypeError, ValueError):    # an antenna block that cannot be read
+        return None
     if par is None or getattr(m, 'Antenna', None) is None:
         return None
     pv = r.read_pvp_array(ch)
