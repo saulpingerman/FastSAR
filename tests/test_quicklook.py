@@ -1,0 +1,436 @@
+"""fastsar.quicklook on simulated spotlight collections (sim.write_cphd): the reader's pulse and sample selection
+against slicing the whole read; the cut (the central band and pulses of the resolution asked for, never more than the
+file holds); the picture's geometry (point targets where the product's own geometry puts them, shadows down, the
+corners' coordinates); the complex image against exact backprojection of the same cut history on the same grid;
+the output files; the refusals; the factorized former on a JAX device; and the CUDA path under the `cuda` marker."""
+import os
+import zlib
+
+import numpy as np
+import pytest
+
+import fastsar
+from fastsar import io, planes, quick, sim
+
+C = 299792458.0
+LAT, LON = 35.0, -106.0
+# simulator frame: x across track toward the scene, y along track, z up (m)
+TARGETS = np.array([[0.0, 0.0, 0.0], [50.0, 40.0, 0.0], [-50.0, 40.0, 0.0], [50.0, -40.0, 0.0], [-50.0, -40.0, 0.0]])
+
+
+def rel_db(a, b):
+    a, b = a.astype(np.complex128).ravel(), b.astype(np.complex128).ravel()
+    g = np.vdot(a, b) / np.vdot(a, a)
+    return 10 * np.log10(np.sum(np.abs(g * a - b) ** 2) / np.sum(np.abs(b) ** 2))
+
+
+@pytest.fixture(scope='module')
+def spot(tmp_path_factory):
+    """A 0.3 m spotlight at 30 km and 35 degrees of grazing: five points, a little noise, a 150 m image area, and a
+    troposphere delay that the file states and its samples hold (the reader removes it)."""
+    rng = np.random.default_rng(5)
+    col = sim.make_collect(res=0.3, scene=200.0, r0=30e3, graze_deg=35.0)
+    S = sim.simulate_brute(col, TARGETS, np.ones(len(TARGETS)) + 0j)
+    S += 0.02 * (rng.standard_normal(S.shape) + 1j * rng.standard_normal(S.shape))
+    tropo = np.linspace(8e-9, 9e-9, col.Np)
+    S = (S * np.exp(-2j * np.pi * col.freqs[None, :] * tropo[:, None])).astype(np.complex64)
+    d = tmp_path_factory.mktemp('quicklook')
+    path = str(d / 'spot.cphd')
+    sim.write_cphd(path, col, S, LAT, LON, scene=150.0, tropo=tropo)
+    return dict(path=path, col=col, S=S, dir=d)
+
+
+# ---------------------------------------------------------------------------------------------------- the reader
+
+def test_selection_equals_slicing_the_whole_read(spot):
+    """read_cphd(pulses=, samples=) gives the rows and columns of the whole read, value for value: the samples, the
+    frequency of the first one, the antenna positions (through ECF: the local frame is the selection's own)."""
+    path, P, K = spot['path'], *spot['S'].shape
+    full, mf = io.read_cphd(path, meta=True)
+    assert 'removed the troposphere delay' in ' '.join(mf['notes'])            # the phase ramp is exercised
+    for pulses, samples in (((10, P - 7), (37, K - 21)), (None, (16, 80)), ((5, 60), None), ((0, P), (0, K)),
+                            ((3, 5), (K - 2, K))):
+        part, mp = io.read_cphd(path, meta=True, pulses=pulses, samples=samples)
+        (pa, pb), (k0, k1) = pulses or (0, P), samples or (0, K)
+        assert part['S'].shape == (pb - pa, k1 - k0) and part['S'].flags.c_contiguous
+        assert np.array_equal(part['S'], full['S'][pa:pb, k0:k1]), (pulses, samples)
+        assert part['fmin'] == pytest.approx(full['fmin'] + k0 * full['df'], rel=1e-15) and part['df'] == full['df']
+        assert mp['pulses'] == (pa, pb) and mp['samples'] == (k0, k1)
+        assert mp['signal_bytes'] <= (pb - pa) * (k1 - k0 + 15) * 8            # a multiple of 16 samples before
+        np.testing.assert_allclose(io.local_to_ecf(part['ant'], mp), io.local_to_ecf(full['ant'][pa:pb], mf), atol=1e-6)
+        np.testing.assert_allclose(mp['tx_time'], mf['tx_time'][pa:pb])
+    for bad in (dict(pulses=(5, 6)), dict(samples=(0, K + 1)), dict(pulses=(1.5, 9)), dict(samples=3), dict(pulses=(-1, 9))):
+        with pytest.raises(ValueError, match='first, last'):
+            io.read_cphd(path, **bad)
+
+
+def test_selection_without_the_compiled_pass(spot, monkeypatch):
+    """The NumPy passes (no compiler, or FASTSAR_IO_KERNEL=0) select the same values."""
+    path, P, K = spot['path'], *spot['S'].shape
+    monkeypatch.setenv('FASTSAR_IO_KERNEL', '0')
+    monkeypatch.setattr(io, '_LIB', [])
+    full = io.read_cphd(path)
+    part = io.read_cphd(path, pulses=(10, P - 7), samples=(37, K - 21))
+    assert io._lib() is None
+    assert np.array_equal(part['S'], full['S'][10:P - 7, 37:K - 21])
+
+
+def test_selection_reads_its_bytes_alone(spot):
+    """The compiled reader asks the file for the selection's bytes, in pulse blocks: read() calls counted by the
+    process's own accounting (Linux)."""
+    if not os.path.exists('/proc/self/io') or io._lib() is None:
+        pytest.skip('needs /proc/self/io and the compiled reader')
+    rchar = lambda: int(dict(line.split(': ') for line in open('/proc/self/io').read().strip().split('\n'))['rchar'])
+    path, P, K = spot['path'], *spot['S'].shape
+    io.read_cphd(path, pulses=(0, 4), samples=(0, 4))                          # the header's and the kernels' reads
+    a = rchar()
+    meta = io.read_cphd(path, meta=True, pulses=(100, 400), samples=(160, 480))[1]
+    used = rchar() - a
+    assert meta['signal_bytes'] == 300 * 320 * 8
+    assert meta['signal_bytes'] <= used < meta['signal_bytes'] + (1 << 20), used   # with the header and the 300 vectors
+    assert used < 0.2 * os.path.getsize(path)
+
+
+def test_selection_on_per_pulse_frequency_grids(spot, tmp_path):
+    """A file whose pulses start at different frequencies is resampled to one grid: a sample selection resamples
+    from the samples its kernel reaches and equals the whole read's columns."""
+    import shutil
+    from fastsar import _cphdxml
+    path = str(tmp_path / 'grids.cphd')
+    shutil.copy(spot['path'], path)
+    r = _cphdxml.open_cphd(path)
+    m = np.memmap(path, dtype=r.pvp_dtype(), mode='r+', offset=r.pvp_map(0).offset, shape=(spot['col'].Np,))
+    step = float(m['SCSS'][0])
+    m['SC0'] = m['SC0'] + step * 0.4 * np.sin(np.arange(len(m)))                # up to 0.4 samples off the median
+    m.flush()
+    del m
+    full, mf = io.read_cphd(path, meta=True)
+    assert 'resampled per-pulse frequency grids' in ' '.join(mf['notes'])
+    K = full['S'].shape[1]
+    for samples in ((40, 200), (0, 64), (K - 100, K)):
+        part = io.read_cphd(path, samples=samples)
+        assert np.array_equal(part['S'], full['S'][:, samples[0]:samples[1]]), samples
+
+
+@pytest.mark.needs('sarpy')
+def test_selection_cphd03(spot, tmp_path):
+    """The same selection of a CPHD 0.3 file."""
+    from test_cphd03 import write_cphd03
+    path = str(tmp_path / 'v03.cphd')
+    write_cphd03(path, spot['path'])
+    full, mf = io.read_cphd(path, meta=True)
+    part, mp = io.read_cphd(path, meta=True, pulses=(20, 300), samples=(48, 500))
+    assert mf['cphd_version'].startswith('0.3')
+    assert np.array_equal(part['S'], full['S'][20:300, 48:500])
+    assert mp['pulses'] == (20, 300) and mp['samples'] == (48, 500)
+    out = fastsar.quicklook(path, size=128)
+    assert out['display'].shape == (128, 128) and out['cut']['of_samples'] == full['S'].shape[1]
+
+
+# ------------------------------------------------------------------------------------------------------- the cut
+
+def test_cut_is_the_central_band_and_pulses(spot):
+    """The cut is the central run of samples and pulses whose bands are 0.96 over the pixel spacings, read alone."""
+    P, K = spot['S'].shape
+    col = spot['col']
+    out = fastsar.quicklook(spot['path'], size=256)
+    cut = out['cut']
+    (pa, pb), (k0, k1) = cut['pulses'], cut['samples']
+    assert cut['of_pulses'] == P and cut['of_samples'] == K and out['pulses'] == (0, pb - pa)
+    assert cut['signal_bytes'] == (pb - pa) * (k1 - k0) * 8 and cut['of_bytes'] == P * K * 8
+    assert max(out['display'].shape) == 256 and out['algorithm'] == 'pfa' and out['correct'] is True
+    # the band of the samples kept is 0.96 / spy, that of the pulses 0.96 / spx (to a sample and a pulse or two)
+    assert (k1 - k0) * col.df * 2 / C == pytest.approx(0.96 / out['spy'], rel=2 / (k1 - k0))
+    assert out['bandwidth'][0] == pytest.approx(0.96 / out['spx'], rel=3 / (pb - pa))
+    assert out['bandwidth'][1] == pytest.approx(0.96 / out['spy'], rel=2 / (k1 - k0))
+    # central: within the 16 samples the reader's alignment may move the band, and a pulse
+    assert abs((k0 + k1) / 2 - K / 2) <= 16 and abs((pa + pb) / 2 - P / 2) <= 2
+    assert out['band'][0] == pytest.approx(col.fmin + k0 * col.df, rel=1e-12)
+    assert out['band'][1] == pytest.approx(col.fmin + (k1 - 1) * col.df, rel=1e-12)
+    # the pixel is 0.96 of the resolution, the same on the ground along both axes
+    assert out['pixel'] == pytest.approx(0.96 * out['resolution']) and out['resolution'] > out['finest']
+    assert out['pixel'] == pytest.approx(out['spy'] / np.cos(out['graze']), rel=1e-3)      # broadside: no twist
+    assert abs(out['twist']) < 1e-3 and out['graze'] == pytest.approx(np.radians(35.0), abs=1e-3)
+    # half the pixels: half the band on both axes
+    small = fastsar.quicklook(spot['path'], size=128)
+    assert small['cut']['samples'][1] - small['cut']['samples'][0] == pytest.approx((k1 - k0) / 2, abs=2)
+    assert small['cut']['pulses'][1] - small['cut']['pulses'][0] == pytest.approx((pb - pa) / 2, abs=3)
+    assert small['pixel'] == pytest.approx(2 * out['pixel'], rel=1e-6)
+
+
+def test_never_more_than_the_collection_holds(spot):
+    """resolution='full' uses the whole of the axis that limits the resolution; a finer request gets that, with a
+    note; a resolution in meters sets the pixel."""
+    P, K = spot['S'].shape
+    full = fastsar.quicklook(spot['path'], resolution='full')
+    assert full['cut']['samples'] == (0, K) and full['cut']['pulses'][1] - full['cut']['pulses'][0] <= P
+    assert full['resolution'] == pytest.approx(full['finest'])
+    assert full['finest'] == pytest.approx(C / (2 * K * spot['col'].df) / np.cos(np.radians(35.0)), rel=1e-3)
+    fine = fastsar.quicklook(spot['path'], resolution=0.01)
+    assert fine['cut'] == full['cut'] and fine['display'].shape == full['display'].shape
+    assert any('the collection holds a resolution' in n for n in fine['notes'])
+    one = fastsar.quicklook(spot['path'], resolution=1.0, weighting='uniform')
+    assert one['pixel'] == pytest.approx(0.96) and one['window'] is None
+    assert one['display'].shape == tuple(2 * int(np.ceil(75.0 / 0.96 - 1e-6)) for _ in range(2))
+
+
+def test_extent(spot):
+    """extent=(across, along) the line of sight on the ground replaces the file's image area."""
+    out = fastsar.quicklook(spot['path'], size=128, extent=(120.0, 60.0))
+    assert out['display'].shape == (64, 128)                                   # rows along range
+    assert out['pixel'] == pytest.approx(120.0 / 128)
+
+
+# ------------------------------------------------------------------------------------------------- the picture
+
+def _expected_pixels(out):
+    """Where the product's own geometry puts the simulated targets in the display: the slant-plane point with each
+    target's range and range rate (fastsar.planes), in rows and columns."""
+    meta = out['meta']
+    g = io.ecf_to_local(sim.to_ecf(TARGETS, LAT, LON), meta)
+    fr = planes.slant_frame(meta, out['center'])
+    a, r = planes.ground_to_slant(fr, g)
+    q = out['center'] + a[:, None] * fr['e1'] + r[:, None] * fr['e2'] - out['display_origin']
+    return q @ out['row'] / out['row_ss'], q @ out['col'] / out['col_ss']
+
+
+@pytest.mark.parametrize('correct', [True, False])
+def test_points_where_they_should_be(spot, correct):
+    """Five point targets appear at the pixels the product's geometry gives, the picture is laid out shadows down
+    and seen from above, and its corners lie on the scene."""
+    out = fastsar.quicklook(spot['path'], size=256, correct=correct)
+    d = out['display']
+    assert d.dtype == np.uint8 and d.shape == (256, 256) and d.flags.c_contiguous
+    rows, cols = _expected_pixels(out)
+    for r, c in zip(rows, cols):
+        i, j = int(round(r)), int(round(c))
+        box = d[i - 4:i + 5, j - 4:j + 5].astype(int)
+        pi, pj = np.unravel_index(box.argmax(), box.shape)
+        assert box.max() >= 250 and abs(pi - 4) <= 1 and abs(pj - 4) <= 1, (r, c, pi, pj, box.max())
+    assert (d > 250).sum() < 200                                               # and nowhere else
+    # shadows down, from above: rows along the ground range away from the radar, row x col upward
+    meta = out['meta']
+    ant = 0.5 * (meta['tx'] + meta['rcv'])
+    los = out['center'] - ant[len(ant) // 2]
+    assert out['row'] @ los > 0.99 * np.linalg.norm(los) and np.cross(out['row'], out['col'])[2] > 0
+    assert out['transform']['transpose'] and out['plane'] == 'slant'
+    # the corner pixels on the ground: the 150 m area about the scene center (their centers' mean lies half a
+    # pixel from it: pixel i of n sits at (i - n / 2) spacings)
+    lat, lon = out['corners'].T
+    assert lat.mean() == pytest.approx(LAT, abs=5e-6) and lon.mean() == pytest.approx(LON, abs=5e-6)
+    ecf = io.geodetic_to_ecf(lat, lon, np.zeros(4))
+    side = np.linalg.norm(ecf - np.roll(ecf, 1, axis=0), axis=1)
+    np.testing.assert_allclose(side, 150.0 * 255 / 256, rtol=5e-3)
+    assert out['displacement_px'][0] < 1 and out['displacement_px'][1] < 1
+    assert any('displacement' in n and ('removed' if correct else 'left in') in n for n in out['notes'])
+
+
+def test_complex_image_against_exact_backprojection(spot):
+    """The corrected complex image equals exact backprojection of the same cut history on the same grid to polar
+    format's accuracy, in amplitude and phase; the amplitude image is its modulus; the product's complex image is
+    the same array."""
+    col = quick._collection(spot['path'], size=256)
+    S, ant, f0, df = col['S'], col['ant'], col['fmin'], col['df']
+    grid = tuple(col[k] for k in ('nx', 'ny', 'spx', 'spy', 'e1', 'e2'))
+    ex = fastsar.ExactFormer(ant, f0, df, S.shape[1], *grid, backend='cpu', window=True)(S)
+    info = {}
+    img = quick._pfa(S, ant, f0, df, *grid, correct=True, window=True, info=info)
+    e = rel_db(img, ex)
+    g = np.vdot(img.ravel(), ex.ravel()) / np.vdot(img.ravel(), img.ravel())
+    print(f'quick look against exact backprojection: {e:.1f} dB, gain {abs(g):.4f}, displacement {info["shift_px"]} px')
+    assert e < -30 and abs(g) == pytest.approx(1.0, abs=0.01) and abs(np.angle(g)) < 0.01
+    amp = quick._pfa(S, ant, f0, df, *grid, correct=True, window=True, complex_image=False)
+    assert amp.dtype == np.float32 and np.abs(amp - np.abs(img)).max() < 1e-5 * np.abs(img).max()
+    # uncorrected: the same amplitudes where the displacement is a small part of a pixel, as here
+    raw = quick._pfa(S, ant, f0, df, *grid, correct=False, window=True, complex_image=False)
+    assert rel_db(raw.astype(np.complex64), np.abs(ex).astype(np.complex64)) < -15
+    # unweighted, against the unweighted exact image
+    ex0 = fastsar.ExactFormer(ant, f0, df, S.shape[1], *grid, backend='cpu', window=False)(S)
+    assert rel_db(quick._pfa(S, ant, f0, df, *grid, correct=True, window=False), ex0) < -25
+    out = fastsar.quicklook(spot['path'], size=256, complex_image=True)
+    assert out['image'].shape == grid[:2] and out['image'].dtype == np.complex64 and out['image'].flags.c_contiguous
+    assert rel_db(out['image'], img) < -100
+    assert fastsar.quicklook(spot['path'], size=256)['image'] is None
+
+
+def test_taylor_window_is_scipys():
+    from scipy.signal.windows import taylor
+    for n in (2, 3, 64, 1001):
+        np.testing.assert_allclose(quick._taylor(n), taylor(n, nbar=4, sll=35.0, norm=False), rtol=0, atol=1e-13)
+
+
+def test_uneven_pulse_spacing():
+    """Pulses that are not evenly spaced along the track (a varying pulse rate) are resampled at their own
+    positions: the image keeps its accuracy against exact backprojection."""
+    rng = np.random.default_rng(3)
+    col = sim.make_collect(res=0.5, scene=90.0, r0=20e3)
+    P = col.Np
+    y = col.ant[:, 1]
+    col.ant[:, 1] = y + 0.02 * (y[-1] - y[0]) * np.sin(np.pi * np.arange(P) / (P - 1)) ** 2      # up to 6% in spacing
+    tg = np.stack([rng.uniform(-30, 30, 40), rng.uniform(-30, 30, 40), np.zeros(40)], 1)
+    S = sim.simulate_brute(col, tg, rng.standard_normal(40) + 1j * rng.standard_normal(40)).astype(np.complex64)
+    a = col.ant[P // 2]
+    e2 = -a / np.linalg.norm(a)
+    n = np.cross(e2, col.ant[P // 2 + 1] - col.ant[P // 2 - 1])
+    n *= np.sign(n[2]) / np.linalg.norm(n)
+    grid = (128, 96, 0.48, 0.48, np.cross(e2, n), e2)
+    ex = fastsar.ExactFormer(col.ant, col.fmin, col.df, col.K, *grid, backend='cpu', window=True)(S)
+    e = rel_db(quick._pfa(S, col.ant, col.fmin, col.df, *grid, window=True), ex)
+    print(f'uneven pulses: {e:.1f} dB')
+    assert e < -30
+
+
+# ------------------------------------------------------------------------------------------------------ files
+
+def test_png_round_trip(tmp_path):
+    rng = np.random.default_rng(0)
+    for a in (rng.integers(0, 256, (37, 53), dtype=np.uint8), rng.integers(0, 256, (1300, 1700), dtype=np.uint8),
+              np.zeros((5, 1), np.uint8), rng.integers(0, 256, (20, 30, 3), dtype=np.uint8),
+              rng.integers(0, 256, (20, 30, 4), dtype=np.uint8)):
+        p = str(tmp_path / 'a.png')
+        quick.write_png(p, a)
+        assert np.array_equal(quick.read_png(p), a)
+        with open(p, 'rb') as fh:                                              # one valid zlib stream, valid chunks
+            b = fh.read()
+        assert b[:8] == b'\x89PNG\r\n\x1a\n' and b[-12:-8] == b'\x00\x00\x00\x00' and b[-8:-4] == b'IEND'
+        n = int.from_bytes(b[33:37], 'big')
+        assert b[37:41] == b'IDAT' and zlib.crc32(b[37:41 + n]) == int.from_bytes(b[41 + n:45 + n], 'big')
+        assert len(zlib.decompress(b[41:41 + n])) == a.shape[0] * (1 + a[0].size)
+    for bad in (np.zeros((4, 4), np.float32), np.zeros((4,), np.uint8), np.zeros((4, 4, 2), np.uint8)):
+        with pytest.raises(ValueError, match='uint8'):
+            quick.write_png(str(tmp_path / 'b.png'), bad)
+    with open(tmp_path / 'c.png', 'wb') as fh:
+        fh.write(b'not a png')
+    with pytest.raises(ValueError, match='not a PNG'):
+        quick.read_png(str(tmp_path / 'c.png'))
+
+
+def test_png_read_by_pillow(tmp_path):
+    Image = pytest.importorskip('PIL.Image')
+    a = np.random.default_rng(1).integers(0, 256, (1100, 1500), dtype=np.uint8)
+    quick.write_png(str(tmp_path / 'a.png'), a)
+    assert np.array_equal(np.asarray(Image.open(tmp_path / 'a.png')), a)
+    Image.fromarray(a[:64, :48]).save(tmp_path / 'b.png')                      # another writer's filters
+    assert np.array_equal(quick.read_png(str(tmp_path / 'b.png')), a[:64, :48])
+
+
+def test_output_files(spot, tmp_path):
+    """.png: the display; .nitf: the complex image as a slant-plane SICD that the library's reader takes."""
+    png = str(tmp_path / 'look.png')
+    out = fastsar.quicklook(spot['path'], png, size=128)
+    assert out['path'] == png and np.array_equal(quick.read_png(png), out['display']) and 'write' in out['timing']
+    ntf = str(tmp_path / 'look.nitf')
+    out = fastsar.quicklook(spot['path'], ntf, size=128)
+    pix, sm = io.read_sicd(ntf, native=True)
+    assert out['image'] is None and out['metadata'].Grid.ImagePlane == 'SLANT'
+    assert pix.shape == (128, 128) and sm.Grid.ImagePlane == 'SLANT' and sm.Grid.Type == 'PLANE'
+    assert sm.Grid.Row.SS == pytest.approx(out['spy']) and sm.Grid.Col.SS == pytest.approx(out['spx'])
+    # the SICD's rows run along range as the display's do: the same picture, detected
+    full = fastsar.quicklook(spot['path'], size=128, complex_image=True)
+    lay = full['transform']
+    a = np.abs(full['image']).T
+    a = a[::-1] if lay['flip_rows'] else a
+    a = a[:, ::-1] if lay['flip_cols'] else a
+    assert np.abs(np.abs(pix) - a).max() < 1e-5 * a.max()
+    assert set(out['timing']) >= {'plan', 'read', 'reference', 'geometry', 'range gate', 'range resampling', 'azimuth gate',
+                                  'azimuth resampling', 'correction', 'display', 'write', 'total'}
+    assert out['timing']['total'] >= sum(v for k, v in out['timing'].items() if k != 'total') * 0.5
+
+
+# ---------------------------------------------------------------------------------------------------- refusals
+
+def test_moving_beam_is_refused(spot, tmp_path):
+    """A collection whose scene reference point moves is refused with the name of the function that forms it."""
+    col = spot['col']
+    srp = np.zeros((col.Np, 3))
+    srp[:, 1] = np.linspace(-40.0, 40.0, col.Np)                               # the beam slides along the track
+    path = str(tmp_path / 'moving.cphd')
+    sim.write_cphd(path, col, spot['S'], LAT, LON, srp=srp, scene=150.0)
+    with pytest.raises(ValueError, match=r'moving beam.*process_cphd'):
+        fastsar.quicklook(path)
+    assert not os.path.exists(tmp_path / 'x.png')
+
+
+def test_arguments_are_checked_before_the_file_is_read(spot, tmp_path, monkeypatch):
+    monkeypatch.setattr(io, '_read_cphd', lambda *a, **k: pytest.fail('the samples were read'))
+    for kw, match in ((dict(size=8), 'size'), (dict(size=2.5), 'size'), (dict(resolution=-1.0), 'resolution'),
+                      (dict(resolution='fine'), 'resolution'), (dict(weighting='hann'), 'weighting'),
+                      (dict(remap='linear'), 'remap'), (dict(remap='nope'), 'remap'), (dict(extent=(10.0,)), 'extent'),
+                      (dict(extent=(10.0, -1.0)), 'extent'), (dict(backend='gpu'), 'backend'),
+                      (dict(output=str(tmp_path / 'x.tif')), r'\.png'), (dict(reader_options=dict(sicd='x')), 'reader_options')):
+        with pytest.raises(ValueError, match=match):
+            fastsar.quicklook(spot['path'], **kw)
+    with pytest.raises(OSError):
+        fastsar.quicklook(str(tmp_path / 'absent.cphd'))
+
+
+def test_too_few_pulses(spot):
+    with pytest.raises(ValueError, match='pulses'):
+        fastsar.quicklook(spot['path'], resolution=40.0)
+
+
+# ----------------------------------------------------------------------------------------------------- devices
+
+def test_remap_and_function(spot):
+    a = fastsar.quicklook(spot['path'], size=128, remap='density')['display']
+    b = fastsar.quicklook(spot['path'], size=128)['display']
+    assert a.shape == b.shape and not np.array_equal(a, b)
+    c = fastsar.quicklook(spot['path'], size=128, remap=lambda x, valid=None: np.full(x.shape, 7, np.uint8))['display']
+    assert (c == 7).all()
+
+
+def test_factorized_former_on_jax(spot, request):
+    """backend='jax': the same cut history on the same grid by the factorized former, with a note; the picture
+    agrees with polar format's."""
+    request.getfixturevalue('jax_cpu')
+    ref = fastsar.quicklook(spot['path'], size=128, complex_image=True)
+    out = fastsar.quicklook(spot['path'], size=128, backend='jax', complex_image=True)
+    assert out['algorithm'] == 'ffbp' and out['backend'] == 'jax' and out['displacement_px'] is None
+    assert out['cut'] == ref['cut'] and out['display'].shape == ref['display'].shape
+    assert any('factorized backprojection' in n for n in out['notes'])
+    e = rel_db(out['image'], ref['image'])
+    print(f'factorized former against polar format on the quick look grid: {e:.1f} dB')
+    assert e < -25
+    assert np.mean(np.abs(out['display'].astype(int) - ref['display'].astype(int)) <= 12) > 0.9
+    rows, cols = _expected_pixels(out)
+    for r, c in zip(rows, cols):
+        assert out['display'][int(round(r)) - 2:int(round(r)) + 3, int(round(c)) - 2:int(round(c)) + 3].max() >= 250
+
+
+def test_auto_backend_without_importing_jax(monkeypatch):
+    """'auto' asks JAX for a TPU only where one may be present."""
+    import importlib.util
+    import sys
+    real = importlib.util.find_spec
+    monkeypatch.setattr(importlib.util, 'find_spec', lambda name, *a: None if name == 'libtpu' else real(name, *a))
+    monkeypatch.delenv('TPU_LIBRARY_PATH', raising=False)
+    monkeypatch.setattr(fastsar.api, 'available_backends', lambda: pytest.fail('the device probe ran'))
+    saved = sys.modules.pop('jax', None)
+    try:
+        assert quick._backend('auto') in ('cuda', 'cpu') and quick._backend('cpu') == 'cpu'
+    finally:
+        if saved is not None:
+            sys.modules['jax'] = saved
+
+
+@pytest.mark.cuda
+def test_cuda(spot):
+    """The CUDA path (CuPy alone): the same image as the host's to rounding, corrected and uncorrected, complex and
+    detected, and the same picture."""
+    import cupy as cp
+    col = quick._collection(spot['path'], size=256)
+    S, ant, f0, df = col['S'], col['ant'], col['fmin'], col['df']
+    grid = tuple(col[k] for k in ('nx', 'ny', 'spx', 'spy', 'e1', 'e2'))
+    for correct in (True, False):
+        for cplx in (True, False):
+            h = quick._pfa(S, ant, f0, df, *grid, correct=correct, complex_image=cplx)
+            d = quick._pfa(S, ant, f0, df, *grid, correct=correct, complex_image=cplx, backend='cuda')
+            assert isinstance(d, cp.ndarray) and d.dtype == h.dtype and d.shape == h.shape
+            e = rel_db(cp.asnumpy(d).astype(np.complex64), h.astype(np.complex64))
+            print(f'cuda against the host, correct {correct}, complex {cplx}: {e:.1f} dB')
+            assert e < -90
+    a = fastsar.quicklook(spot['path'], size=256, backend='cuda')
+    b = fastsar.quicklook(spot['path'], size=256, backend='cpu')
+    assert a['backend'] == 'cuda' and isinstance(a['display'], np.ndarray) and a['display'].shape == b['display'].shape
+    assert np.mean(np.abs(a['display'].astype(int) - b['display'].astype(int)) <= 1) > 0.999
+    assert a['cut'] == b['cut']
