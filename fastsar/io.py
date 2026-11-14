@@ -398,14 +398,9 @@ def _selection(sel, n, name):
     return a, b
 
 
-def _read_cphd(cphd, sicd, channel, meta, regrid_tol, drop_flagged, troposphere, phase_sign, ref_freq, pulses=None,
-               samples=None):
-    r = _open_cphd(cphd)
-    m = r.cphd_meta
-    # CPHD 0.3 (the pre-standard NGA format) keeps the per-vector positions and times under the 1.x names but sizes
-    # its channels in Data.ArraySize, gives the frequency grid as Fx0 and Fx_SS, the phase sign as Global.PhaseSGN and
-    # the collection and polarization in SICD-style CollectionInfo and RadarCollection blocks
-    v03 = str(getattr(r, 'cphd_version', '') or '').startswith('0.3')
+def _cphd_channel(r, m, v03, channel):
+    """A channel given by index, identifier or polarization -> (its index, the file's channel entries, their
+    identifiers, their polarizations)."""
     if v03:
         arrays = list(m.Data.ArraySize)
         ids = [str(i) for i in range(len(arrays))]
@@ -439,6 +434,18 @@ def _read_cphd(cphd, sicd, channel, meta, regrid_tol, drop_flagged, troposphere,
             raise ValueError(f'channel {channel!r} not among identifiers {ids} or polarizations {pols}')
     if not 0 <= channel < len(arrays):
         raise ValueError(f'channel {channel} out of range: the file has {len(arrays)} channels')
+    return channel, arrays, ids, pols
+
+
+def _read_cphd(cphd, sicd, channel, meta, regrid_tol, drop_flagged, troposphere, phase_sign, ref_freq, pulses=None,
+               samples=None, reader=None):
+    r = _open_cphd(cphd) if reader is None else reader
+    m = r.cphd_meta
+    # CPHD 0.3 (the pre-standard NGA format) keeps the per-vector positions and times under the 1.x names but sizes
+    # its channels in Data.ArraySize, gives the frequency grid as Fx0 and Fx_SS, the phase sign as Global.PhaseSGN and
+    # the collection and polarization in SICD-style CollectionInfo and RadarCollection blocks
+    v03 = str(getattr(r, 'cphd_version', '') or '').startswith('0.3')
+    channel, arrays, ids, pols = _cphd_channel(r, m, v03, channel)
     ch = arrays[channel]
     P, K = ch.NumVectors, ch.NumSamples
     if m.Global.DomainType != 'FX':

@@ -214,6 +214,7 @@ KERNELS = (('ffbp_cpu', 'ffbp_cpu.cpp', ('-funroll-loops', '-std=c++17'), True, 
            ('exact_cpu', 'exact.py:_CPU_SRC', ('-ffast-math',), True, 'exact backprojection'),
            ('bp_cpu', 'bp.py:_CPU_SRC', (), False, 'backprojection to points'),
            ('pfa_cpu', 'pfa_cpu.cpp', ('-std=c++17',), True, 'polar format'),
+           ('quicklook_cpu', 'quicklook_cpu.cpp', ('-std=c++17', '-fopenmp-simd'), True, 'quick look'),
            ('resample_cpu', 'resample_cpu.cpp', ('-std=c++17',), True, 'resampling'),
            ('io_cpu', 'io_cpu.cpp', ('-std=c++17', '-fopenmp-simd'), True, 'file readers'),
            ('s1_decode', 'sentinel1.py:_SRC', ('-std=c++17',), True, 'Sentinel-1 raw decoder'))
