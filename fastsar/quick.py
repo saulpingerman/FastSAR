@@ -485,6 +485,7 @@ def _pfa_cpu(S, g, window, correct, complex_image, timing):
     import scipy.fft as sf
     lib = _lib()
     W = _workers()
+    S = S.pop() if isinstance(S, list) else S          # handed over: freed below, once it is gated
     P, K, Kf, Nr, k0 = g['P'], g['K'], g['Kf'], g['Nr'], g['k0']
     nkr, nka, nfy, nfx, nx, ny = g['nkr'], g['nka'], g['nfy'], g['nfx'], g['nx'], g['ny']
     tab = _polyphase('kaiser', TAPS, PHASES)
@@ -514,6 +515,7 @@ def _pfa_cpu(S, g, window, correct, complex_image, timing):
         lib.ql_resample_rows(ptr(G), n, Nr, at(alpha, sl.start), at(beta, sl.start), nkr, ptr(tab), PHASES,
                              at(A, sl.start), 1)
     _blocks(rows, P, int(max(1, min(64, (1 << 21) // (8 * max(Kf, Nr))))))
+    S = None
     timing['range'] = timing.get('range', 0.0) + time.perf_counter() - t0
     t0 = time.perf_counter()
     # 2. azimuth, in blocks of range wavenumbers on the pool. A block is turned so that the pulses of each
@@ -617,13 +619,14 @@ def _pfa_cpu(S, g, window, correct, complex_image, timing):
     bw = int(max(16, min(ny, (128 << 20) // (8 * Nx2 * ov))))               # range pixels per block
     rb = int(max(1, (1 << 18) // Nx2))
     tt = [0.0, 0.0]
+    block = np.empty((min(Ny2, ov * bw + 2 * msy), Nx2), np.complex64)     # one array for every block
     for jb in range(0, ny, bw):
         n = min(bw, ny - jb)
         rb0 = max(0, Ny2 // 2 + ov * (jb - ny // 2) - msy)
         span = min(Ny2, Ny2 // 2 + ov * (jb + n - ny // 2) + msy) - rb0
         t1 = time.perf_counter()
         # the block's range rows, turned to range-major about index 0 of the padded azimuth transform
-        Z = np.empty((span, Nx2), np.complex64)
+        Z = block[:span]
         lib.ql_transpose(at(F1, hx, rb0), Ny2, nka - hx, span, ptr(Z), Nx2, at(sx, hx), 0)
         lib.ql_transpose(at(F1, 0, rb0), Ny2, hx, span, at(Z, 0, Nx2 - hx), Nx2, ptr(sx), 0)
 
@@ -681,16 +684,37 @@ def _pfa(S, ant, fmin, df, nx, ny, spx, spy, e1, e2, *, correct=True, window=Tru
     ant = np.asarray(ant, np.float64)
     if nx % 2 or ny % 2:
         raise ValueError(f'the quick look takes even pixel counts, got {nx} by {ny}')
-    g = _geometry(ant, float(fmin), float(df), S.shape[1], int(nx), int(ny), float(spx), float(spy), e1, e2, correct)
+    box = S if isinstance(S, list) else [S]            # a one-element list hands the history over: it is freed
+    del S                                              # as soon as the range stage has read it
+    g = _geometry(ant, float(fmin), float(df), box[0].shape[1], int(nx), int(ny), float(spx), float(spy), e1, e2, correct)
     timing['geometry'] = timing.get('geometry', 0.0) + time.perf_counter() - t0
-    if info is not None:
-        info.update(shift_px=g['dist']['max_shift_px'], fit_rms_px=g['dist']['rms_px'], raster=(g['nkr'], g['nka']),
-                    fft=(g['nfy'], g['nfx']), range_gate=(g['Kf'], g['Nr']), azimuth_gate=(g['Pf'], g['Na']))
+    info = {} if info is None else info
+    info.update(shift_px=g['dist']['max_shift_px'], fit_rms_px=g['dist']['rms_px'], raster=(g['nkr'], g['nka']),
+                fft=(g['nfy'], g['nfx']), range_gate=(g['Kf'], g['Nr']), azimuth_gate=(g['Pf'], g['Na']))
     if backend == 'cuda':
-        img = _pfa_cuda(S, g, window, correct, complex_image, timing)
+        from . import _xp
+        need, free = _cuda_bytes(g, correct), _xp.cuda_budget()
+        if need > free:                                # the stages hold whole arrays on the device
+            info['host'] = (f'formed on the host: the quick look\'s arrays take {need / 1e9:.1f} GB on the device at '
+                            f'this size and {free / 1e9:.1f} GB are free')
+            backend = 'cpu'
+    if backend == 'cuda':
+        img = _pfa_cuda(box, g, window, correct, complex_image, timing)
     else:
-        img = _pfa_cpu(np.ascontiguousarray(S, np.complex64), g, window, correct, complex_image, timing)
+        box[0] = np.ascontiguousarray(box[0], np.complex64)
+        img = _pfa_cpu(box, g, window, correct, complex_image, timing)
     return img.T
+
+
+def _cuda_bytes(g, correct):
+    """Device memory the CUDA path holds at its largest stage: the azimuth stage's arrays (the raster's range
+    wavenumbers by the pulses, the padded copy and its transform, the gate and its transform), or the image
+    stage's (the raster, the padded range transform, the image and a block of the padded azimuth transform)."""
+    P, nkr, nka, Pf, Na, nx, ny = g['P'], g['nkr'], g['nka'], g['Pf'], g['Na'], g['nx'], g['ny']
+    ov = g['ov'] if correct else 1
+    az = P * nkr + 2 * Pf * nkr + 2 * Na * nkr + nkr * nka
+    im = nkr * nka + 2 * ov * g['nfy'] * nka + 2 * nx * ny + (2 << 28) // 8
+    return 8 * max(az, im)
 
 
 # ------------------------------------------------------------------------------------------------------- CUDA
@@ -759,6 +783,7 @@ def _pfa_cuda(S, g, window, correct, complex_image, timing):
     import cupy as cp
     import cupyx.scipy.fft as cf
     from . import pfa2, _xp
+    S = S.pop() if isinstance(S, list) else S
     P, K, Kf, Nr, k0 = g['P'], g['K'], g['Kf'], g['Nr'], g['k0']
     nkr, nka, nfy, nfx, nx, ny = g['nkr'], g['nka'], g['nfy'], g['nfx'], g['nx'], g['ny']
     i32, f64 = np.int32, np.float64
@@ -793,6 +818,7 @@ def _pfa_cuda(S, g, window, correct, complex_image, timing):
         del gate
         k_rows((-(-nkr // 128), n), (128,), (G, i32(n), i32(Nr), alpha[r:r + n], beta[r:r + n], i32(nkr), tab, A[r:r + n]))
         del G
+    S = None
     t0 = lap('range', t0)
     # 2. azimuth gate and azimuth resampling
     Pf, Na, p0 = g['Pf'], g['Na'], g['p0']
@@ -1128,7 +1154,10 @@ def quicklook(cphd, output=None, *, size=2048, resolution=None, correct=True, re
                 rm = np.ascontiguousarray(img.T)
                 complex_rm = True
             else:
-                out = _pfa(sub['S'], sub['ant'], sub['fmin'], df, nx, ny, spx, spy, e1, e2, correct=bool(correct),
+                box = [sub.pop('S')]                                     # handed over: freed once it is gated
+                if (la, lr) == (1, 1):
+                    S = None
+                out = _pfa(box, sub['ant'], sub['fmin'], df, nx, ny, spx, spy, e1, e2, correct=bool(correct),
                            window=window, backend=backend, complex_image=want, timing=timing, info=info)
                 rm = out.T                                               # range-major, where it was formed
                 xp = _xp.module(rm)
@@ -1157,6 +1186,9 @@ def quicklook(cphd, output=None, *, size=2048, resolution=None, correct=True, re
                      + (" (precision 'single-pass')" if backend == 'tpu' else '') + ': polar format\'s resampling '
                      'steps are gathers, which are slow on this device; correct does not apply')
     else:
+        if info.get('host'):
+            notes.append(info['host'])
+            backend = 'cpu'
         algorithm, corrected, shift = 'pfa', bool(correct), tuple(float(v) for v in info['shift_px'])
         notes.append(f'polar format: its displacement of scatterers, up to {shift[0]:.1f} by {shift[1]:.1f} pixels '
                      '(azimuth by range) over the picture, ' + ('removed' if corrected else 'left in (correct=False)'))

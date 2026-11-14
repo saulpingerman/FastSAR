@@ -467,6 +467,15 @@ def test_auto_backend_without_importing_jax(monkeypatch):
 
 
 @pytest.mark.cuda
+def test_cuda_without_room_forms_on_the_host(spot, monkeypatch):
+    """A device with less free memory than the stages hold there: the picture is formed on the host, with a note."""
+    monkeypatch.setenv('FASTSAR_CUDA_BLOCK_MB', '1')
+    out = look(spot['path'], size=256, backend='cuda')
+    assert out['backend'] == 'cpu' and any('formed on the host' in n for n in out['notes'])
+    assert np.array_equal(out['display'], look(spot['path'], size=256, backend='cpu')['display'])
+
+
+@pytest.mark.cuda
 def test_cuda(spot):
     """The CUDA path (CuPy alone): the same image as the host's to rounding, corrected and uncorrected, complex and
     detected, and the same picture."""
