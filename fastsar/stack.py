@@ -1746,7 +1746,9 @@ def coherent_sum(a, b, window=15, *, equalize=True, coherence_window=7, dark=0.0
     ground the two images share adds coherently and is not noise (noise_reference 'incoherent'; 'darkest', the
     darkest ground of all, where under 1% of the scene is incoherent); snr, their difference; second, the same against the second
     image, which differs where the two images' signal-to-noise ratios do (the sum gains most against the
-    noisier); expected, 10 log10(1 + g) for the mean coherence g of that tenth and equal noise; incoherent, the
+    noisier); expected, what the sum gains against the first image for the mean coherence g of that tenth and the
+    two images' noise as measured, 10 log10(2 (1 + g) / (1 + r)) with r the second image's noise as added over the
+    first's (noise_ratio, dB), which is 10 log10(1 + g) for equal noise (expected_equal_noise); incoherent, the
     signal gain of the sum of the intensities; coherence, that g), timing."""
     t0 = time.perf_counter()
     _check_pair('coherent_sum', a, b)
@@ -1803,13 +1805,17 @@ def coherent_sum(a, b, window=15, *, equalize=True, coherence_window=7, dark=0.0
     first = (sig / max(sa, 1e-30)) / (nsum / max(na, 1e-30))
     second = (sig / max(sb, 1e-30)) / (nsum / max(nb, 1e-30))
     gs = _scalar(xp.where(stable, g, 0).sum()) / ns
+    # the second image's noise, as it is added (times amp squared), over the first's: two collections of one scene
+    # need not have equal noise, and the sum then gains 2 (1 + g) / (1 + r) against the first image, 1 + g for r = 1
+    r = amp * amp * nb / max(na, 1e-30)
     db = lambda v: float(10 * np.log10(max(v, 1e-30)))
     res = {k: v for k, v in a.items() if k not in ('image', 'phase_error', 'registration', 'valid')}
     dt = time.perf_counter() - t0
     res.update(image=tot, baseband=False, product='coherent_sum', phase_window=w, amplitude_factor=amp,
                fringe=(float(f[0]), float(f[1])), grid=_grid_of(a),
                gain=dict(signal=db(sig / max(sa, 1e-30)), noise=db(nsum / max(na, 1e-30)), snr=db(first),
-                         second=db(second), expected=db(1 + gs),
+                         second=db(second), expected=db(2 * (1 + gs) / (1 + r)), expected_equal_noise=db(1 + gs),
+                         noise_ratio=db(r),
                          incoherent=db((sa + amp * amp * sb) / max(sa, 1e-30)), coherence=gs,
                          noise_reference=rule, noise_pixels=int(_scalar(dk.sum())), floor31=floor31),
                notes=list(a.get('notes', [])) + ['coherent sum of two images, the second brought to the phase and '

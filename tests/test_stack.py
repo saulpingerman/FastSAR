@@ -609,6 +609,19 @@ def test_coherent_sum(pairs, clutter, tmp_path, need):
     d = stack.coherent_sum(a2, b2, dark=0.2)['gain']
     print(f"with shared dark ground: noise {d['noise']:+.2f} dB ({d['noise_reference']}), signal to noise {d['snr']:+.2f} dB")
     assert d['noise_reference'] == 'incoherent' and abs(d['noise'] - 3.01) < 0.3 and abs(d['snr'] - g['snr']) < 0.3
+    # a second image with more noise: the sum gains less against the first, as 2 (1 + g) / (1 + r) says, r the
+    # second's noise over the first's
+    ref = stack.coherent_sum(outs[0], outs[1], dark=0.2)['gain']
+    nz = 10 ** (ref['noise'] / 10) - 1                                     # the noise of b as added, over a's: about 1
+    pa0 = float(np.mean(np.abs(outs[0]['image'][outs[0]['image'] != 0]) ** 2))
+    b3 = dict(outs[1], image=outs[1]['image'].copy())
+    m = b3['image'] != 0
+    level = np.sqrt(pa0 * 10 ** (g['signal'] / 10 - g['snr'] / 10 - 6.0 / 10))   # about ten times the noise b has
+    b3['image'][m] += (level * (rng.standard_normal(int(m.sum())) + 1j * rng.standard_normal(int(m.sum())))).astype(np.complex64)
+    u = stack.coherent_sum(outs[0], b3, dark=0.2)['gain']
+    print(f"a noisier second image: noise ratio {u['noise_ratio']:+.2f} dB, signal to noise {u['snr']:+.2f} dB, expected "
+          f"{u['expected']:.2f} (equal noise {u['expected_equal_noise']:.2f})")
+    assert u['noise_ratio'] > 1.0 and abs(u['snr'] - u['expected']) < 0.3 and u['expected'] < u['expected_equal_noise'] - 0.3
     twice = stack.coherent_sum(outs[0], outs[0])
     assert np.allclose(twice['image'], 2 * outs[0]['image'], rtol=1e-4, atol=1e-4 * np.abs(outs[0]['image']).max())
     inc = stack.coherent_sum(clutter[0], clutter[2])['gain']

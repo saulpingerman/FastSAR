@@ -256,6 +256,11 @@ was published on PyPI.
   incoherent, where the coherence over 31 x 31 pixels is at most twice that estimator's floor on the pair
   (`gain['noise_reference']`, `gain['floor31']`). On three seen pairs the noise gain is 2.97 to 2.99 dB (3.01 for
   pure noise), and on a desert pair the signal-to-noise gain moved from 1.89 to 2.29 dB, against 2.25 expected.
+  The gain the sum is expected to reach (`gain['expected']`) now counts the two images' noise as measured on that
+  ground: 10 log10(2 (1 + g) / (1 + r)), r the second image's noise as added over the first's (`gain['noise_ratio']`),
+  which is 10 log10(1 + g) when they are equal (`gain['expected_equal_noise']`). On a Capella pair of the Black Rock
+  Desert whose second image is 1.2 dB noisier, the measured gain is 1.29 dB and the expectation 1.46 dB (2.11 dB for
+  equal noise).
 - The cuda backend could run out of device memory after its range gate (new in this version) on a long
   wide-band collection: the gated history stayed on the device and the former copied it into its planes beside
   it (a Capella sliding spotlight of 150,162 pulses and a 1,024-pixel image on a 24 GB L4). The gate's transform
