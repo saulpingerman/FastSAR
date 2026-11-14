@@ -78,7 +78,7 @@ def unit(v):
 
 def collection(path, targets, amp=None, *, P=1400, dy=0.25, r0=5e3, graze_deg=30.0, lam0=0.03125, B=300e6, df=1.5e6,
                squint=0.0, slide=1.0, curve=0.0, phase=None, v=100.0, antenna=None, toa=None, toae=None, noise=0.0,
-               seed=0, beam=None):
+               seed=0, beam=None, aspect=None):
     """Register the collection under `path` and return what the tests compare with: a namespace of the antenna and
     SRP positions [P, 3] (simulator frame), the targets, lam (center wavelength), fc, K, f0, df, dsin (the processed
     spread of sin(look) at 0.8 of the sampled band), ares, rres (the unweighted -3 dB to -3 dB reciprocal bands:
@@ -89,7 +89,12 @@ def collection(path, targets, amp=None, *, P=1400, dy=0.25, r0=5e3, graze_deg=30
     toae: half widths (s) of the receive window and of its extension about the SRP's delay. noise: the standard
     deviation of complex white noise added to each sample. beam: the beam's own slide where it is not the SRPs'
     (its footprint moves at 1 / beam of the platform's speed while the SRPs move at 1 / slide): the azimuth
-    pattern and the antenna block's boresight are then centered on it, and the SRPs only reference the echoes."""
+    pattern and the antenna block's boresight are then centered on it, and the SRPs only reference the echoes.
+    aspect [n]: None, or (lo, hi, q) for a target that is not a point but a specular return off a curved surface,
+    seen only while its sine of look from the beam center lies between lo and hi half processed spreads (dsin / 2:
+    v from -1 to 1 over a pixel's band), with a sin^2 lobe over that interval, and whose echo carries q v^2 rad more
+    than a point's (the specular point moves over the surface, so its range curves as that of the surface's center
+    of curvature does)."""
     tg = np.atleast_2d(np.asarray(targets, np.float64)) + [0.0, r0 * np.tan(squint), 0.0]
     amp = np.ones(len(tg), np.complex128) if amp is None else np.asarray(amp, np.complex128)
     fc = C / lam0
@@ -113,16 +118,22 @@ def collection(path, targets, amp=None, *, P=1400, dy=0.25, r0=5e3, graze_deg=30
     xa = unit(d - np.einsum('ij,ij->i', d, zb)[:, None] * zb)
     ya = np.cross(zb, xa)
     S = np.zeros((P, K), np.complex128)
-    for x, a in zip(tg, amp):
+    for n, (x, a) in enumerate(zip(tg, amp)):
         w = x[None] - ant
         R = np.linalg.norm(w, axis=1)
         u = np.abs(np.einsum('ij,ij->i', w, d) / R - s_beam) / (full / 2)
         pat = np.where(u <= 0.88, 1.0, np.where(u < 0.98, np.cos(np.pi / 2 * (u - 0.88) / 0.10) ** 2, 0.0))
+        own = np.ones(len(ant), np.complex128)
+        if aspect is not None and aspect[n] is not None:
+            lo, hi, q = aspect[n]
+            vb = (np.einsum('ij,ij->i', w, d) / R - s_beam) / (0.4 * full)          # dsin / 2 = 0.4 full
+            pat = pat * np.where((vb > lo) & (vb < hi), np.sin(np.pi * (vb - lo) / (hi - lo)) ** 2, 0.0)
+            own = np.exp(1j * q * vb ** 2)
         if antenna is not None:                                     # two-way, relative to the SRP's
             dcy = np.einsum('ij,ij->i', w, ya) / R
             pat = pat * 10.0 ** (-0.1 * antenna[1] * dcy ** 2) * (ref / R) ** 2
         on = pat > 0
-        S[on] += (a * pat[on])[:, None] * np.exp(-4j * np.pi * f[None, :] / C * (R[on] - ref[on])[:, None])
+        S[on] += (a * pat[on] * own[on])[:, None] * np.exp(-4j * np.pi * f[None, :] / C * (R[on] - ref[on])[:, None])
     if phase is not None:
         S *= np.exp(1j * np.asarray(phase, np.float64))[:, None]
     if noise:
