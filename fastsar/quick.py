@@ -32,11 +32,13 @@ format in four stages, each a pass whose cost follows the picture, not the colle
   4. Corrected (the default): the transform is taken on a raster padded to twice the sampling and read at each
      pixel's apparent position (pfa2.distortion's polynomial) with a 6-tap Lanczos kernel.
 
-Devices. 'cpu': scipy's FFTs on all cores and the C++ kernels (pfa_cpu.cpp, quicklook_cpu.cpp). 'cuda': the same
-stages in CuPy with the CUDA kernels of polar format (pfa2.py) and one more for the uneven pulse spacing; the history
-is windowed and gated on the device in blocks of pulses. 'jax' and 'tpu': polar format's resampling steps are
-gathers, slow on a TPU's vector unit, so the same cut history is formed on the same grid by the factorized former
-(ImageFormer; precision 'single-pass' on a TPU), and a note says so. 'auto': tpu, else cuda, else cpu.
+Devices. 'cpu': scipy's FFTs on all cores, every one along the rows of its array (the arrays are turned between
+the stages), and the C++ kernels of quicklook_cpu.cpp, which read their weights from polyphase tables. 'cuda': the
+same stages in CuPy with the CUDA kernels of polar format (pfa2.py: the range resampling and the final gather) and
+one more for the uneven pulse spacing; the history is windowed and gated on the device in blocks of pulses. 'jax'
+and 'tpu': polar format's resampling steps are gathers, slow on a TPU's vector unit, so the same cut history is
+formed on the same grid by the factorized former (ImageFormer; precision 'single-pass' on a TPU), and a note says
+so. 'auto': tpu, else cuda, else cpu.
 
 A moving-beam collection (stripmap, sliding spotlight) is refused: polar format assumes one scene reference point,
 and a moving beam's azimuth resolution is set per pixel by the processed Doppler band, not by a run of pulses, so
@@ -75,11 +77,13 @@ def _lib():
         L = ctypes.CDLL(shared_object('quicklook_cpu', src, default_flags() + ['-std=c++17', '-fopenmp-simd']))
         i, n, d, fl, p = ctypes.c_int, ctypes.c_long, ctypes.c_double, ctypes.c_float, ctypes.c_void_p
         L.ql_resample_rows.argtypes = [p, n, n, p, p, n, p, i, p]
-        L.ql_resample_cols.argtypes = [p, n, n, p, d, d, p, n, d, d, n, p, i, p]
+        L.ql_resample_az.argtypes = [p, n, n, p, d, d, p, n, d, d, n, p, i, p]
+        L.ql_transpose.argtypes = [p, n, n, n, p, n, p]
         L.ql_gather.argtypes = [p, n, n, n, n, n, n, i, i, i, i, i, i, d, d, d, d, d, p, p, p, i, i, d, d, i, fl, i, p, p,
                                 i, i, p, n]
         L.ql_weight_pad.argtypes = [p, n, n, p, p, n, n, p]
-        L.ql_resample_rows.restype = L.ql_resample_cols.restype = L.ql_gather.restype = L.ql_weight_pad.restype = None
+        L.ql_resample_rows.restype = L.ql_resample_az.restype = L.ql_gather.restype = L.ql_weight_pad.restype = None
+        L.ql_transpose.restype = None
         _LIB.append(L)
     return _LIB[0]
 
@@ -261,8 +265,8 @@ def _plan(r, cphd, channel, size, resolution, extent, ref_freq, looks, notes):
     for name, H, X, what in (('azimuth', Hx, Xa, 'pulse rate'), ('range', Hy, Xr, 'frequency step')):
         lim = 0.46 * X
         if H > lim:
-            notes.append(f'the area spans {2 * H:.0f} m in {name} on the slant plane, more than the unambiguous {name} '
-                         f'extent of the {what} ({X:.0f} m): the picture is cut to the central {2 * lim:.0f} m')
+            notes.append(f'the area spans {2 * H:.0f} m in {name} on the slant plane, and the {what} leaves '
+                         f'{X:.0f} m unambiguous: the picture is cut to the central {2 * lim:.0f} m (0.92 of that)')
             Hx, Hy = (lim, Hy) if name == 'azimuth' else (Hx, lim)
     # the pixel on the ground, and the finest one the collection holds on both axes
     bx_max, by_max = 2 * fcv / C * float(abs(t[-1] - t[0])), 2 * Kv * df / C
@@ -284,9 +288,8 @@ def _plan(r, cphd, channel, size, resolution, extent, ref_freq, looks, notes):
     Kc = int(min(Kv, max(2, round(0.96 / spy * C / (2 * df)))))
     lr = int(max(1, min(looks[1], Kv // Kc)))
     k0 = (k_lo + (Kv - lr * Kc) // 2) // 16 * 16      # from a multiple of 16: the reader's rows as they are read
-    k0 += 16 if k0 < k_lo and k0 + 16 + lr * Kc <= k_hi else 0
-    if k0 + lr * Kc > K:
-        lr, Kc = (lr - 1, Kc) if lr > 1 else (1, K - k0)
+    k0 += 16 if k0 < k_lo else 0
+    Kc = min(Kc, (k_hi - k0) // lr)                   # (the whole band: up to 15 samples short of it)
     fc = f0 + (k0 + 0.5 * (lr * Kc - 1)) * df
     need = 0.96 / spx * C / (2 * fc)                  # the span of t of one look
     la = int(max(1, min(looks[0], np.floor(abs(t[-1] - t[0]) / need + 1e-9))))
@@ -515,69 +518,84 @@ def _pfa_cpu(S, g, window, correct, complex_image, timing):
     del G
     timing['range resampling'] = timing.get('range resampling', 0.0) + time.perf_counter() - t0
     t0 = time.perf_counter()
-    # 2. azimuth gate: the pulses of every range wavenumber transformed (padded to Pf), cut to Na bins, and back on
-    # Na pulses. The gate carries the image's scale and the phase that sets the pulses p0 rows into the Na
+    # 2. azimuth gate. The array is turned so that the pulses of each range wavenumber lie along a row (every
+    # transform from here on runs along rows); they are transformed (padded to Pf), cut to Na bins, and transformed
+    # back to Na pulses. The gate carries the image's scale and the phase that sets the pulses p0 places into the Na
     Pf, Na, p0 = g['Pf'], g['Na'], g['p0']
     ov = g['ov']
     Nfft = ov * nfy if correct else nfy
+    at = lambda a, row=0, col=0: ctypes.c_void_p(a.ctypes.data + row * a.strides[0] + (col * a.strides[1] if col else 0))
+    AT = np.empty((nkr, Pf), np.complex64)
+    lib.ql_transpose(ptr(A), nkr, P, nkr, ptr(AT), Pf, None)
+    del A
+    rb = int(max(1, (1 << 18) // Pf))
+    if Pf > P:
+        def pad(sl):
+            AT[sl, P:] = 0
+        _blocks(pad, nkr, rb)
+    prof = sf.fft(AT, axis=1, workers=W, overwrite_x=True)
+    del AT
     k = np.arange(Na)
     k = np.where(k < Na - Na // 2, k, k - Na)
     tap_a = (_taper(Na, g['Ex'], g['gx'], g['bin_a']) * (g['gain'] * Nfft * Na / Pf)
              * np.exp(-2j * np.pi * (k * p0 % Pf) / Pf)).astype(np.complex64)
-    prof = sf.fft(A, n=Pf, axis=0, workers=W)
-    del A
     keep = min(Na, Pf)
     pos, neg = keep - keep // 2, keep // 2
-    gate = np.empty((Na, nkr), np.complex64)
-    rb = int(max(1, (1 << 18) // nkr))
+    gate = np.empty((nkr, Na), np.complex64)
 
     def cut(sl):
-        if sl.stop <= pos:                                             # the bins from 0 on
-            np.multiply(prof[sl], tap_a[sl, None], out=gate[sl])
-        elif sl.start >= Na - neg:                                     # the bins before 0, from the transform's end
-            np.multiply(prof[sl.start - Na + Pf:sl.stop - Na + Pf], tap_a[sl, None], out=gate[sl])
-        else:
-            gate[sl] = 0                                               # a longer array than the transform: zeros
-    edges = sorted({0, pos, Na - neg, Na})
-    for a_, b_ in zip(edges, edges[1:]):
-        _blocks(lambda sl: cut(slice(a_ + sl.start, a_ + sl.stop)), b_ - a_, rb)
+        np.multiply(prof[sl, :pos], tap_a[:pos], out=gate[sl, :pos])
+        np.multiply(prof[sl, Pf - neg:], tap_a[Na - neg:], out=gate[sl, Na - neg:])
+        if Na > Pf:                                                    # a longer array than the transform: zeros
+            gate[sl, pos:Na - neg] = 0
+    _blocks(cut, nkr, rb)
     del prof
-    A2 = np.ascontiguousarray(sf.ifft(gate, axis=0, workers=W, overwrite_x=True))
+    A2 = np.ascontiguousarray(sf.ifft(gate, axis=1, workers=W, overwrite_x=True))       # [nkr, Na]
     del gate
     timing['azimuth gate'] = timing.get('azimuth gate', 0.0) + time.perf_counter() - t0
     t0 = time.perf_counter()
-    B = np.empty((nkr, nka), np.complex64)
+    B = np.empty((nka, nkr), np.complex64)                              # azimuth-wavenumber major
     inv_kr = np.ascontiguousarray(1.0 / g['kr'])
     qtab = np.ascontiguousarray(g['qtab'])
-    lib.ql_resample_cols(ptr(A2), Na, nkr, ptr(inv_kr), g['ka_lo'], g['dka'], ptr(qtab), len(qtab), g['tg0'],
-                         g['tg_inv'], nka, ptr(tab), PHASES, ptr(B))
+    lib.ql_resample_az(ptr(A2), nkr, Na, ptr(inv_kr), g['ka_lo'], g['dka'], ptr(qtab), len(qtab), g['tg0'],
+                       g['tg_inv'], nka, ptr(tab), PHASES, ptr(B))
     del A2
     timing['azimuth resampling'] = timing.get('azimuth resampling', 0.0) + time.perf_counter() - t0
     t0 = time.perf_counter()
     out = np.empty((ny, nx), np.complex64 if complex_image else np.float32)
     cb = int(max(1, (1 << 18) // nx))
     if not correct:
-        # 3. the raster's transform, cut to the picture: of the range transform, the last ny / 2 outputs are the
-        # pixels before the center and the first ny / 2 those from it on; likewise the azimuth transform's
-        F = sf.ifft(B, n=nfy, axis=0, workers=W)
+        # 3. the raster's transform, cut to the picture: the range transform along the rows, whose last ny / 2
+        # outputs are the pixels before the center and whose first ny / 2 are those from it on, turned to
+        # range-major with those in their places; then the azimuth transform along the rows, cut likewise
+        F = sf.ifft(B, n=nfy, axis=1, workers=W)                        # [nka, nfy]
         del B
+        Z = np.empty((ny, nfx), np.complex64)
+        lib.ql_transpose(at(F, 0, nfy - ny // 2), nfy, nka, ny // 2, ptr(Z), nfx, None)
+        lib.ql_transpose(ptr(F), nfy, nka, ny - ny // 2, at(Z, ny // 2), nfx, None)
+        del F
+        rb = int(max(1, (1 << 18) // nfx))
+        if nfx > nka:
+            def pad(sl):
+                Z[sl, nka:] = 0
+            _blocks(pad, ny, rb)
+        T = sf.fft(Z, axis=1, workers=W, overwrite_x=True)              # [ny, nfx]
+        del Z
         if complex_image:
             y, x = (np.arange(ny) - ny / 2.0) * g['spy'], (np.arange(nx) - nx / 2.0) * g['spx']
             cy, cx = np.exp(1j * g['kr_min'] * y).astype(np.complex64), np.exp(-1j * g['ka_lo'] * x).astype(np.complex64)
-        for r_out, r_in in ((0, nfy - ny // 2), (ny // 2, 0)):
-            T = sf.fft(F[r_in:r_in + ny // 2], n=nfx, axis=1, workers=W)
 
-            def put(sl, T=T, r_out=r_out):
-                o = out[r_out + sl.start:r_out + sl.stop]
-                for c_out, c_in in ((0, nfx - nx // 2), (nx // 2, 0)):
-                    if complex_image:
-                        np.multiply(T[sl, c_in:c_in + nx // 2], cx[c_out:c_out + nx // 2], out=o[:, c_out:c_out + nx // 2])
-                    else:
-                        np.abs(T[sl, c_in:c_in + nx // 2], out=o[:, c_out:c_out + nx // 2])
+        def put(sl):
+            o = out[sl]
+            for c_out, c_in in ((0, nfx - nx // 2), (nx // 2, 0)):
                 if complex_image:
-                    o *= cy[r_out + sl.start:r_out + sl.stop, None]
-            _blocks(put, ny // 2, cb)
-            del T
+                    np.multiply(T[sl, c_in:c_in + nx // 2], cx[c_out:c_out + nx // 2], out=o[:, c_out:c_out + nx // 2])
+                else:
+                    np.abs(T[sl, c_in:c_in + nx // 2], out=o[:, c_out:c_out + nx // 2])
+            if complex_image:
+                o *= cy[sl, None]
+        _blocks(put, ny, cb)
+        del T
         timing['image'] = timing.get('image', 0.0) + time.perf_counter() - t0
         return out
     # 4. the same on a raster padded by ov, at baseband, in blocks of range pixels read at the apparent positions.
@@ -587,23 +605,17 @@ def _pfa_cpu(S, g, window, correct, complex_image, timing):
     Ny2, Nx2 = ov * nfy, ov * nfx
     hy, hx = nkr // 2, nka // 2
     sy = ((-1.0) ** (np.arange(nkr) - hy)).astype(np.float32)
-    sx = ((-1.0) ** (np.arange(nka) - hx)).astype(np.float32)
-    Z = np.empty((Ny2, nka), np.complex64)
-    rb = int(max(1, (1 << 18) // nka))
+    sx = np.ascontiguousarray((-1.0) ** (np.arange(nka) - hx), np.float32)
+    Z = np.empty((nka, Ny2), np.complex64)
+    rb = int(max(1, (1 << 18) // Ny2))
 
     def fill(sl):
-        if sl.stop <= nkr - hy:
-            np.multiply(B[hy + sl.start:hy + sl.stop], sy[hy + sl.start:hy + sl.stop, None], out=Z[sl])
-        elif sl.start >= Ny2 - hy:
-            a_ = sl.start - (Ny2 - hy)
-            np.multiply(B[a_:a_ + sl.stop - sl.start], sy[a_:a_ + sl.stop - sl.start, None], out=Z[sl])
-        else:
-            Z[sl] = 0
-    edges = sorted({0, nkr - hy, Ny2 - hy, Ny2})
-    for a_, b_ in zip(edges, edges[1:]):
-        _blocks(lambda sl: fill(slice(a_ + sl.start, a_ + sl.stop)), b_ - a_, rb)
+        np.multiply(B[sl, hy:], sy[hy:], out=Z[sl, :nkr - hy])
+        Z[sl, nkr - hy:Ny2 - hy] = 0
+        np.multiply(B[sl, :hy], sy[:hy], out=Z[sl, Ny2 - hy:])
+    _blocks(fill, nka, rb)
     del B
-    F1 = sf.ifft(Z, axis=0, workers=W, overwrite_x=True)                   # [Ny2, nka]: range done
+    F1 = sf.ifft(Z, axis=1, workers=W, overwrite_x=True)                   # [nka, Ny2]: range done
     del Z
     timing['range transform'] = timing.get('range transform', 0.0) + time.perf_counter() - t0
     ltab = _polyphase('lanczos', LANCZOS, PHASES)
@@ -622,14 +634,14 @@ def _pfa_cpu(S, g, window, correct, complex_image, timing):
         rb0 = max(0, Ny2 // 2 + ov * (jb - ny // 2) - msy)
         span = min(Ny2, Ny2 // 2 + ov * (jb + n - ny // 2) + msy) - rb0
         t1 = time.perf_counter()
+        # the block's range rows, turned to range-major about index 0 of the padded azimuth transform
         Z = np.empty((span, Nx2), np.complex64)
+        lib.ql_transpose(at(F1, hx, rb0), Ny2, nka - hx, span, ptr(Z), Nx2, at(sx, hx))
+        lib.ql_transpose(at(F1, 0, rb0), Ny2, hx, span, at(Z, 0, Nx2 - hx), Nx2, ptr(sx))
 
-        def place(sl, Z=Z, rb0=rb0):
-            src = F1[rb0 + sl.start:rb0 + sl.stop]
-            np.multiply(src[:, hx:], sx[hx:], out=Z[sl, :nka - hx])
+        def pad(sl, Z=Z):
             Z[sl, nka - hx:Nx2 - hx] = 0
-            np.multiply(src[:, :hx], sx[:hx], out=Z[sl, Nx2 - hx:])
-        _blocks(place, span, rb)
+        _blocks(pad, span, rb)
         base = np.ascontiguousarray(sf.fft(Z, axis=1, workers=W, overwrite_x=True))
         del Z
         t2 = time.perf_counter()

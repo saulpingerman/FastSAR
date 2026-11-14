@@ -14,6 +14,11 @@ the ellipsoid normal, with its origin at the (mid-aperture) scene reference poin
 - a moving scene reference point, re-referenced to mid-aperture when the range change is small, else left for
   `backproject` with `ref=meta['ref']`
 - channels by index, identifier or polarization
+- a part of the file: `pulses=(first, last + 1)` and `samples=(first, last + 1)` read those vectors and those
+  samples of each alone, with `pread` on all cores, and only those vectors' parameters. For a collection with one
+  scene reference point and one frequency grid the result equals the rows and columns of the whole read, value
+  for value; `fmin` is the frequency of the first sample kept, and the local frame is that of the pulses read.
+  `fastsar.quicklook` reads this way
 - invalid positions (trimmed at the ends, interpolated inside), empty or flagged pulses (reported in `notes`)
 - a vendor SICD's grid: the image is the SICD array (transposed when range runs along rows); non-planar SICD grids
   need `io.sicd_points` and `backproject` ([processing-chain.md](processing-chain.md#2-form))

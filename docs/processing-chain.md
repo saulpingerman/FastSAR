@@ -98,3 +98,37 @@ products.write_sicd('out.nitf', img, 'scene_SICD.nitf')    # image on the templa
 ```
 
 The SICD metadata is described in [products.md](products.md#sicd-output).
+
+## Quick look
+
+When only a look at the data is wanted, `quicklook` forms a reduced-resolution picture of a spotlight collection
+from the part of the file that resolution needs:
+
+```python
+out = fastsar.quicklook('scene_CPHD.cphd', 'look.png')                    # 2048 pixels on the longer side
+out = fastsar.quicklook('scene_CPHD.cphd', size=4096, correct=False)      # the fastest picture of that size
+out = fastsar.quicklook('scene_CPHD.cphd', 'look.nitf', resolution=1.0)   # 1 m, the complex image as a SICD
+out['display'], out['corners'], out['cut'], out['notes'], out['timing']
+```
+
+The header and a few hundred per-pulse parameters decide the cut: the central run of frequency samples and the
+central run of pulses whose bands give the pixel asked for, never more than the collection holds. Only those are
+read (`read_cphd(pulses=, samples=)`). The cut history is formed by polar format on a slant-plane grid along the
+mid-aperture line of sight, detected, remapped (`remap='nrl'`, as a SIDD from `process_cphd`) and laid out shadows
+down. The pixel is 0.96 of the reciprocal of the band on each axis and has one size on the ground across and along
+the ground range direction, so `size` pixels span the longer side of the tasked area's bounding rectangle. The
+picture stays on the slant plane: it is the ground sheared by the plane's twist, which the product gives with the
+latitude and longitude of the corner pixels.
+
+`correct=True` (the default) removes polar format's displacement of scatterers; `correct=False` skips that step.
+`resolution=` sets the ground resolution in meters instead of `size`, and `'full'` asks for the finest the
+collection holds on both axes. `looks=n` averages the power of n by n images of the same pixels, formed from
+sub-apertures and sub-bands side by side, for less speckle at n by n times the bytes and the formation time.
+`output` is a `.png` file, written with the standard library alone, or a `.nitf` file, the complex image as a
+slant-plane SICD. `backend='cpu'` and `'cuda'` run polar format; `'jax'` and `'tpu'` form the same cut history on
+the same grid by the factorized former, since polar format's resampling steps are gathers that a TPU runs slowly.
+
+A moving-beam collection (stripmap, sliding spotlight) is refused with a `ValueError` that names `process_cphd`:
+polar format assumes one scene reference point, and a moving beam's azimuth resolution is set per pixel by the
+processed Doppler band, not by a run of pulses. Times, bytes read and accuracy are in
+[performance.md](performance.md#quick-look) and [algorithms.md](algorithms.md#quick-look).

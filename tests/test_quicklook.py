@@ -18,6 +18,12 @@ LAT, LON = 35.0, -106.0
 TARGETS = np.array([[0.0, 0.0, 0.0], [50.0, 40.0, 0.0], [-50.0, 40.0, 0.0], [50.0, -40.0, 0.0], [-50.0, -40.0, 0.0]])
 
 
+def look(*args, **kw):
+    """fastsar.quicklook on the cpu backend unless a test names another ('auto' is cuda where CuPy has a GPU)."""
+    kw.setdefault('backend', 'cpu')
+    return fastsar.quicklook(*args, **kw)
+
+
 def rel_db(a, b):
     a, b = a.astype(np.complex128).ravel(), b.astype(np.complex128).ravel()
     g = np.vdot(a, b) / np.vdot(a, a)
@@ -123,8 +129,20 @@ def test_selection_cphd03(spot, tmp_path):
     assert mf['cphd_version'].startswith('0.3')
     assert np.array_equal(part['S'], full['S'][20:300, 48:500])
     assert mp['pulses'] == (20, 300) and mp['samples'] == (48, 500)
-    out = fastsar.quicklook(path, size=128)
+    out = look(path, size=128)
     assert out['display'].shape == (128, 128) and out['cut']['of_samples'] == full['S'].shape[1]
+
+
+def test_selection_through_form_cphd(spot):
+    """form_cphd's reader_options carry the selection: the image of a part of the band and of the aperture."""
+    P, K = spot['S'].shape
+    out = fastsar.form_cphd(spot['path'], backend='cpu', reader_options=dict(pulses=(200, P - 200), samples=(304, K - 300)))
+    col = spot['col']
+    assert out['meta']['pulses'] == (200, P - 200) and out['meta']['samples'] == (304, K - 300)
+    assert out['band'][0] == pytest.approx(col.fmin + 304 * col.df, rel=1e-12)
+    assert out['band'][1] == pytest.approx(col.fmin + (K - 301) * col.df, rel=1e-12)
+    whole = fastsar.form_cphd(spot['path'], backend='cpu')
+    assert out['spy'] == pytest.approx(whole['spy'] * K / (K - 604), rel=1e-6)   # the spacing follows the band
 
 
 # ------------------------------------------------------------------------------------------------------- the cut
@@ -133,7 +151,7 @@ def test_cut_is_the_central_band_and_pulses(spot):
     """The cut is the central run of samples and pulses whose bands are 0.96 over the pixel spacings, read alone."""
     P, K = spot['S'].shape
     col = spot['col']
-    out = fastsar.quicklook(spot['path'], size=256)
+    out = look(spot['path'], size=256)
     cut = out['cut']
     (pa, pb), (k0, k1) = cut['pulses'], cut['samples']
     assert cut['of_pulses'] == P and cut['of_samples'] == K and out['pulses'] == (0, pb - pa)
@@ -152,7 +170,7 @@ def test_cut_is_the_central_band_and_pulses(spot):
     assert out['pixel'] == pytest.approx(out['spy'] / np.cos(out['graze']), rel=1e-3)      # broadside: no twist
     assert abs(out['twist']) < 1e-3 and out['graze'] == pytest.approx(np.radians(35.0), abs=1e-3)
     # half the pixels: half the band on both axes
-    small = fastsar.quicklook(spot['path'], size=128)
+    small = look(spot['path'], size=128)
     assert small['cut']['samples'][1] - small['cut']['samples'][0] == pytest.approx((k1 - k0) / 2, abs=2)
     assert small['cut']['pulses'][1] - small['cut']['pulses'][0] == pytest.approx((pb - pa) / 2, abs=3)
     assert small['pixel'] == pytest.approx(2 * out['pixel'], rel=1e-6)
@@ -162,21 +180,21 @@ def test_never_more_than_the_collection_holds(spot):
     """resolution='full' uses the whole of the axis that limits the resolution; a finer request gets that, with a
     note; a resolution in meters sets the pixel."""
     P, K = spot['S'].shape
-    full = fastsar.quicklook(spot['path'], resolution='full')
+    full = look(spot['path'], resolution='full')
     assert full['cut']['samples'] == (0, K) and full['cut']['pulses'][1] - full['cut']['pulses'][0] <= P
     assert full['resolution'] == pytest.approx(full['finest'])
     assert full['finest'] == pytest.approx(C / (2 * K * spot['col'].df) / np.cos(np.radians(35.0)), rel=1e-3)
-    fine = fastsar.quicklook(spot['path'], resolution=0.01)
+    fine = look(spot['path'], resolution=0.01)
     assert fine['cut'] == full['cut'] and fine['display'].shape == full['display'].shape
     assert any('the collection holds a resolution' in n for n in fine['notes'])
-    one = fastsar.quicklook(spot['path'], resolution=1.0, weighting='uniform')
+    one = look(spot['path'], resolution=1.0, weighting='uniform')
     assert one['pixel'] == pytest.approx(0.96) and one['window'] is None
     assert one['display'].shape == tuple(2 * int(np.ceil(75.0 / 0.96 - 1e-6)) for _ in range(2))
 
 
 def test_extent(spot):
     """extent=(across, along) the line of sight on the ground replaces the file's image area."""
-    out = fastsar.quicklook(spot['path'], size=128, extent=(120.0, 60.0))
+    out = look(spot['path'], size=128, extent=(120.0, 60.0))
     assert out['display'].shape == (64, 128)                                   # rows along range
     assert out['pixel'] == pytest.approx(120.0 / 128)
 
@@ -198,7 +216,7 @@ def _expected_pixels(out):
 def test_points_where_they_should_be(spot, correct):
     """Five point targets appear at the pixels the product's geometry gives, the picture is laid out shadows down
     and seen from above, and its corners lie on the scene."""
-    out = fastsar.quicklook(spot['path'], size=256, correct=correct)
+    out = look(spot['path'], size=256, correct=correct)
     d = out['display']
     assert d.dtype == np.uint8 and d.shape == (256, 256) and d.flags.c_contiguous
     rows, cols = _expected_pixels(out)
@@ -247,10 +265,10 @@ def test_complex_image_against_exact_backprojection(spot):
     # unweighted, against the unweighted exact image
     ex0 = fastsar.ExactFormer(ant, f0, df, S.shape[1], *grid, backend='cpu', window=False)(S)
     assert rel_db(quick._pfa(S, ant, f0, df, *grid, correct=True, window=False), ex0) < -25
-    out = fastsar.quicklook(spot['path'], size=256, complex_image=True)
+    out = look(spot['path'], size=256, complex_image=True)
     assert out['image'].shape == grid[:2] and out['image'].dtype == np.complex64 and out['image'].flags.c_contiguous
-    assert rel_db(out['image'], img) < -100
-    assert fastsar.quicklook(spot['path'], size=256)['image'] is None
+    assert np.abs(out['image'] - img).max() <= 1e-5 * np.abs(img).max()
+    assert look(spot['path'], size=256)['image'] is None
 
 
 def test_taylor_window_is_scipys():
@@ -317,16 +335,16 @@ def test_png_read_by_pillow(tmp_path):
 def test_output_files(spot, tmp_path):
     """.png: the display; .nitf: the complex image as a slant-plane SICD that the library's reader takes."""
     png = str(tmp_path / 'look.png')
-    out = fastsar.quicklook(spot['path'], png, size=128)
+    out = look(spot['path'], png, size=128)
     assert out['path'] == png and np.array_equal(quick.read_png(png), out['display']) and 'write' in out['timing']
     ntf = str(tmp_path / 'look.nitf')
-    out = fastsar.quicklook(spot['path'], ntf, size=128)
+    out = look(spot['path'], ntf, size=128)
     pix, sm = io.read_sicd(ntf, native=True)
     assert out['image'] is None and out['metadata'].Grid.ImagePlane == 'SLANT'
     assert pix.shape == (128, 128) and sm.Grid.ImagePlane == 'SLANT' and sm.Grid.Type == 'PLANE'
     assert sm.Grid.Row.SS == pytest.approx(out['spy']) and sm.Grid.Col.SS == pytest.approx(out['spx'])
     # the SICD's rows run along range as the display's do: the same picture, detected
-    full = fastsar.quicklook(spot['path'], size=128, complex_image=True)
+    full = look(spot['path'], size=128, complex_image=True)
     lay = full['transform']
     a = np.abs(full['image']).T
     a = a[::-1] if lay['flip_rows'] else a
@@ -347,7 +365,7 @@ def test_moving_beam_is_refused(spot, tmp_path):
     path = str(tmp_path / 'moving.cphd')
     sim.write_cphd(path, col, spot['S'], LAT, LON, srp=srp, scene=150.0)
     with pytest.raises(ValueError, match=r'moving beam.*process_cphd'):
-        fastsar.quicklook(path)
+        look(path)
     assert not os.path.exists(tmp_path / 'x.png')
 
 
@@ -359,23 +377,23 @@ def test_arguments_are_checked_before_the_file_is_read(spot, tmp_path, monkeypat
                       (dict(extent=(10.0, -1.0)), 'extent'), (dict(backend='gpu'), 'backend'),
                       (dict(output=str(tmp_path / 'x.tif')), r'\.png'), (dict(reader_options=dict(sicd='x')), 'reader_options')):
         with pytest.raises(ValueError, match=match):
-            fastsar.quicklook(spot['path'], **kw)
+            look(spot['path'], **kw)
     with pytest.raises(OSError):
-        fastsar.quicklook(str(tmp_path / 'absent.cphd'))
+        look(str(tmp_path / 'absent.cphd'))
 
 
 def test_too_few_pulses(spot):
     with pytest.raises(ValueError, match='pulses'):
-        fastsar.quicklook(spot['path'], resolution=40.0)
+        look(spot['path'], resolution=40.0)
 
 
 # ----------------------------------------------------------------------------------------------------- devices
 
 def test_remap_and_function(spot):
-    a = fastsar.quicklook(spot['path'], size=128, remap='density')['display']
-    b = fastsar.quicklook(spot['path'], size=128)['display']
+    a = look(spot['path'], size=128, remap='density')['display']
+    b = look(spot['path'], size=128)['display']
     assert a.shape == b.shape and not np.array_equal(a, b)
-    c = fastsar.quicklook(spot['path'], size=128, remap=lambda x, valid=None: np.full(x.shape, 7, np.uint8))['display']
+    c = look(spot['path'], size=128, remap=lambda x, valid=None: np.full(x.shape, 7, np.uint8))['display']
     assert (c == 7).all()
 
 
@@ -391,14 +409,14 @@ def test_looks(tmp_path):
     power, mean = {}, {}
     for looks in (1, 2, (3, 1), (1, 3), 8):
         got = []
-        out = fastsar.quicklook(path, size=128, looks=looks, remap=lambda x, valid=None: (got.append(np.array(x)), np.zeros(x.shape, np.uint8))[1])
+        out = look(path, size=128, looks=looks, remap=lambda x, valid=None: (got.append(np.array(x)), np.zeros(x.shape, np.uint8))[1])
         la, lr = out['looks']
         pw = got[0].astype(np.float64) ** 2
         power[looks], mean[looks] = pw.std() / pw.mean(), pw.mean()
         print(f'looks {looks}: {la} by {lr}, contrast of the power {power[looks]:.3f}, expected {1 / np.sqrt(la * lr):.3f}')
         assert power[looks] == pytest.approx(1 / np.sqrt(la * lr), rel=0.05)
         assert mean[looks] == pytest.approx(mean[1], rel=0.03) and out['display'].shape == (128, 128)
-        one = fastsar.quicklook(path, size=128)['cut']
+        one = look(path, size=128)['cut']
         n = lambda c, k: c[k][1] - c[k][0]
         assert n(out['cut'], 'pulses') == pytest.approx(la * n(one, 'pulses'), abs=2 * la)
         assert n(out['cut'], 'samples') == lr * n(one, 'samples')
@@ -406,17 +424,17 @@ def test_looks(tmp_path):
     assert out['looks'] == (4, 3)                                               # 8 by 8 asked for
     for bad in (0, (2, 0), 'two', (1, 2, 3)):
         with pytest.raises(ValueError, match='looks'):
-            fastsar.quicklook(path, looks=bad)
+            look(path, looks=bad)
     with pytest.raises(ValueError, match='one look'):
-        fastsar.quicklook(path, looks=2, complex_image=True)
+        look(path, looks=2, complex_image=True)
 
 
 def test_factorized_former_on_jax(spot, request):
     """backend='jax': the same cut history on the same grid by the factorized former, with a note; the picture
     agrees with polar format's."""
     request.getfixturevalue('jax_cpu')
-    ref = fastsar.quicklook(spot['path'], size=128, complex_image=True)
-    out = fastsar.quicklook(spot['path'], size=128, backend='jax', complex_image=True)
+    ref = look(spot['path'], size=128, complex_image=True)
+    out = look(spot['path'], size=128, backend='jax', complex_image=True)
     assert out['algorithm'] == 'ffbp' and out['backend'] == 'jax' and out['displacement_px'] is None
     assert out['cut'] == ref['cut'] and out['display'].shape == ref['display'].shape
     assert any('factorized backprojection' in n for n in out['notes'])
@@ -461,8 +479,19 @@ def test_cuda(spot):
             e = rel_db(cp.asnumpy(d).astype(np.complex64), h.astype(np.complex64))
             print(f'cuda against the host, correct {correct}, complex {cplx}: {e:.1f} dB')
             assert e < -60
-    a = fastsar.quicklook(spot['path'], size=256, backend='cuda')
-    b = fastsar.quicklook(spot['path'], size=256, backend='cpu')
+    a = look(spot['path'], size=256, backend='cuda')
+    b = look(spot['path'], size=256, backend='cpu')
     assert a['backend'] == 'cuda' and isinstance(a['display'], np.ndarray) and a['display'].shape == b['display'].shape
     assert np.mean(np.abs(a['display'].astype(int) - b['display'].astype(int)) <= 1) > 0.999
-    assert a['cut'] == b['cut']
+    assert a['cut'] == b['cut'] and 'range gate' in a['timing']
+    assert fastsar.quicklook(spot['path'], size=64)['backend'] == 'cuda'       # 'auto' on a machine with a GPU
+    c = look(spot['path'], size=256, backend='cuda', complex_image=True)
+    d = look(spot['path'], size=256, backend='cpu', complex_image=True)
+    assert isinstance(c['image'], np.ndarray) and c['image'].flags.c_contiguous and rel_db(c['image'], d['image']) < -60
+    # looks on the device: the remap is given a CuPy image
+    got = []
+    out = look(spot['path'], size=128, looks=2, backend='cuda', remap=lambda x, valid=None: (got.append(x), cp.zeros(x.shape, cp.uint8))[1])
+    ref = []
+    look(spot['path'], size=128, looks=2, remap=lambda x, valid=None: (ref.append(np.array(x)), np.zeros(x.shape, np.uint8))[1])
+    assert out['looks'] == (2, 2) and isinstance(got[0], cp.ndarray)
+    assert rel_db(cp.asnumpy(got[0]).astype(np.complex64), ref[0].astype(np.complex64)) < -60

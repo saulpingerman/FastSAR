@@ -1,5 +1,6 @@
 // The quick look's polar format on the CPU (quick.py): the range resampling, the azimuth resampling for pulses that
-// are not evenly spaced in the tangent of the look angle, and the final resampling at the apparent positions.
+// are not evenly spaced in the tangent of the look angle, the final resampling at the apparent positions, and the
+// passes that prepare the arrays for the transforms.
 //
 // Each kernel reads its interpolation weights from a polyphase table: row q of [Q + 1, taps] holds the kernel's
 // taps, normalised to unit sum, for the fractional position q / Q (quick.py's _polyphase), and a position takes the
@@ -49,72 +50,71 @@ extern "C" void ql_resample_rows(const float* x, long R, long n, const double* p
   });
 }
 
-// out[m, j] = column m of A [R, M] (complex) at the row position q(t) for t = (ka0 + j dka) inv_kr[m], j < n_out:
-// q by linear interpolation in qtab [nt], the row position at t = t0 + i / inv_dt (the pulses' own, uneven, spacing in
-// t), formed in double. Zero where t lies outside the table or the position outside (-0.5, R - 0.5). The columns are
-// taken 64 at a time: where their taps start at one row and lie inside the array, each tap is a product of 64
-// consecutive samples of a row with the columns' weights, added across the columns at once.
-extern "C" void ql_resample_cols(const float* A, long R, long M, const double* inv_kr, double ka0, double dka,
-                                 const double* qtab, long nt, double t0, double inv_dt, long n_out,
-                                 const float* ptab, int Q, float* out) {
+// out[j, m] = row m of A [M, R] (complex: the pulses of one range wavenumber, end to end) at the position q(t) for
+// t = (ka0 + j dka) inv_kr[m], j < n_out: q by linear interpolation in qtab [nt], the position at t = t0 + i / inv_dt
+// (the pulses' own, uneven, spacing in t), formed in double. Zero where t lies outside the table or the position
+// outside (-0.5, R - 0.5). The output is azimuth-wavenumber major, [n_out, M], so that the range transform that
+// follows runs along its rows; the rows of A are taken 64 at a time, each thread writing 64 consecutive values of
+// an output row at once.
+extern "C" void ql_resample_az(const float* A, long M, long R, const double* inv_kr, double ka0, double dka,
+                               const double* qtab, long nt, double t0, double inv_dt, long n_out,
+                               const float* ptab, int Q, float* out) {
   const int half = T / 2, MB = 64;
   par::for_dynamic((M + MB - 1) / MB, 1, [&](long mb) {
     const long m0 = mb * MB;
     const int nm = (int)(std::min(M, m0 + MB) - m0);
-    float wb[T][MB], acc[2 * MB];
-    double pos[MB];
-    long first[MB];
-    bool in[MB];
     for (long j = 0; j < n_out; ++j) {
       const double ka = ka0 + j * dka;
-      bool together = true;
+      float* o = out + 2 * (j * M + m0);
       for (int c = 0; c < nm; ++c) {
+        float re = 0.f, im = 0.f;
         const double u = (ka * inv_kr[m0 + c] - t0) * inv_dt;
-        double p = -1.0;
         if (u >= 0.0 && u < nt - 1) {
           const long k = (long)u;
-          p = qtab[k] + (u - k) * (qtab[k + 1] - qtab[k]);
-        }
-        in[c] = p > -0.5 && p < R - 0.5;
-        pos[c] = p;
-        first[c] = in[c] ? (long)std::floor(p) - half + 1 : 0;
-        together = together && in[c] && first[c] == first[0];
-      }
-      if (together && first[0] >= 0 && first[0] + T <= R) {
-        for (int c = 0; c < nm; ++c) {
-          const float* w = ptab + (long)((pos[c] - std::floor(pos[c])) * Q + 0.5) * T;
-          for (int t = 0; t < T; ++t) wb[t][c] = w[t];
-        }
-        std::fill(acc, acc + 2 * nm, 0.f);
-        for (int t = 0; t < T; ++t) {
-          const float* v = A + 2 * ((first[0] + t) * M + m0);
-          const float* w = wb[t];
-          #pragma omp simd
-          for (int c = 0; c < nm; ++c) { acc[2 * c] += w[c] * v[2 * c]; acc[2 * c + 1] += w[c] * v[2 * c + 1]; }
-        }
-        for (int c = 0; c < nm; ++c) {
-          float* o = out + 2 * ((m0 + c) * n_out + j);
-          o[0] = acc[2 * c]; o[1] = acc[2 * c + 1];
-        }
-        continue;
-      }
-      for (int c = 0; c < nm; ++c) {                 // an edge of the aperture, or columns whose taps start apart
-        float re = 0.f, im = 0.f;
-        if (in[c]) {
-          const float* w = ptab + (long)((pos[c] - std::floor(pos[c])) * Q + 0.5) * T;
-          float tot = 0.f;
-          for (int t = 0; t < T; ++t) {
-            const long i = first[c] + t;
-            if (i >= 0 && i < R) {
-              const float* v = A + 2 * (i * M + m0 + c);
-              re += w[t] * v[0]; im += w[t] * v[1]; tot += w[t];
+          const double pos = qtab[k] + (u - k) * (qtab[k + 1] - qtab[k]);
+          if (pos > -0.5 && pos < R - 0.5) {
+            const double fl = std::floor(pos);
+            const long i0 = (long)fl - half + 1;
+            const float* w = ptab + (long)((pos - fl) * Q + 0.5) * T;
+            const float* row = A + 2 * (m0 + c) * R;
+            if (i0 >= 0 && i0 + T <= R) {
+              const float* v = row + 2 * i0;
+              #pragma omp simd reduction(+:re, im)
+              for (int t = 0; t < T; ++t) { re += w[t] * v[2 * t]; im += w[t] * v[2 * t + 1]; }
+            } else {
+              float tot = 0.f;
+              for (int t = 0; t < T; ++t) {
+                const long i = i0 + t;
+                if (i >= 0 && i < R) { re += w[t] * row[2 * i]; im += w[t] * row[2 * i + 1]; tot += w[t]; }
+              }
+              const float inv = 1.f / std::max(tot, 1e-12f);
+              re *= inv; im *= inv;
             }
           }
-          const float inv = 1.f / std::max(tot, 1e-12f);
-          re *= inv; im *= inv;
         }
-        float* o = out + 2 * ((m0 + c) * n_out + j);
-        o[0] = re; o[1] = im;
+        o[2 * c] = re; o[2 * c + 1] = im;
+      }
+    }
+  });
+}
+
+// dst[c, r] = src[r, c] s[r] for r < R, c < C (complex): a transpose in tiles that fit the first-level cache, on all
+// cores. src's rows are sstride and dst's rows dstride complex values apart; s: a real factor per source row, or
+// null. The transforms of the quick look all run along rows, the way that is three times faster than along
+// columns, and the arrays are turned between them.
+extern "C" void ql_transpose(const float* src, long sstride, long R, long C, float* dst, long dstride, const float* s) {
+  const long TB = 32;
+  par::for_dynamic((C + TB - 1) / TB, 1, [&](long cb) {
+    const long c0 = cb * TB, c1 = std::min(C, c0 + TB);
+    for (long r0 = 0; r0 < R; r0 += TB) {
+      const long r1 = std::min(R, r0 + TB);
+      for (long r = r0; r < r1; ++r) {
+        const float g = s ? s[r] : 1.f;
+        const float* p = src + 2 * (r * sstride + c0);
+        for (long c = c0; c < c1; ++c, p += 2) {
+          float* q = dst + 2 * (c * dstride + r);
+          q[0] = p[0] * g; q[1] = p[1] * g;
+        }
       }
     }
   });
