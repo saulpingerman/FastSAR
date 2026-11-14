@@ -8,11 +8,14 @@ that resolution needs.
 
 Resolution first. The header and a few hundred of the per-pulse parameters give the collection geometry, the band
 and the tasked area; no sample is read for it. The picture is the tasked area's bounding rectangle on a slant-plane
-grid whose range axis is the mid-aperture line of sight, with pixels that are square on the ground at the scene
-center: size pixels along its longer side, or pixels of 0.96 times the resolution asked for. That pixel is 0.96 of
-the reciprocal of the band on each axis, the library's sampling of a complex image, so the cut is the central run of
-frequency samples and the central run of pulses with those bands, never more than the collection holds. Contiguous
-runs keep the sample and pulse spacings, and with them the unambiguous extents.
+grid whose range axis is the mid-aperture line of sight, with pixels of one size on the ground along the ground
+range direction and across it: size pixels along its longer side, or pixels of 0.96 times the resolution asked for.
+That pixel is 0.96 of the reciprocal of the band on each axis, the library's sampling of a complex image, so the cut
+is the central run of frequency samples and the central run of pulses with those bands, never more than the
+collection holds. Contiguous runs keep the sample and pulse spacings, and with them the unambiguous extents; a
+picture is cut to 0.92 of those extents where the tasked area is larger. The picture stays on the slant plane: it is
+the ground sheared by the plane's twist (zero at broadside, tens of degrees for a squinted look at a steep grazing
+angle), and the product gives that angle.
 
 Only those pulses and samples are read (io.read_cphd's pulses= and samples=), and the cut history is formed by polar
 format in four stages, each a pass whose cost follows the picture, not the collection:
@@ -71,7 +74,7 @@ def _lib():
         L.ql_resample_cols.argtypes = [p, i, i, p, d, d, p, i, d, d, i, i, p, i, p]
         L.ql_gather.argtypes = [p, n, n, n, n, n, n, i, i, i, i, i, i, d, d, d, d, d, p, p, p, i, i, d, d, i, fl, i, p, i,
                                 i, p, n]
-        L.ql_weight_pad.argtypes = [p, n, n, p, n, n, p]
+        L.ql_weight_pad.argtypes = [p, n, n, p, p, n, n, p]
         L.ql_resample_cols.restype = L.ql_gather.restype = L.ql_weight_pad.restype = None
         _LIB.append(L)
     return _LIB[0]
@@ -200,19 +203,31 @@ def _plan(r, cphd, channel, size, resolution, extent, ref_freq, notes):
     c = c - ((c - (c if refpt is None else refpt)) @ up) * up          # on the plane through the reference point
     # the slant plane at the mid-aperture pulse: e2 the line of sight (away from the radar), e1 across it in the
     # plane of the line of sight and the velocity, their normal on the upward side
-    e2 = _unit(c - apc[mid])
-    n = _unit(np.cross(e2, np.gradient(apc, idx, axis=0)[mid]))
+    r0 = float(np.linalg.norm(c - apc[mid]))
+    e2 = (c - apc[mid]) / r0
+    vel = np.gradient(apc, idx, axis=0)[mid]
+    n = _unit(np.cross(e2, vel))
     if n @ up < 0:
         n = -n
-    if n @ up < 0.05:
-        raise ValueError('the slant plane is within 3 degrees of vertical (a look near the nadir): its picture has no '
+    if n @ up < 0.02:
+        raise ValueError('the slant plane is within a degree of vertical (a look at the nadir): its picture has no '
                          'ground scale in range. Use fastsar.process_cphd')
     e1 = np.cross(e2, n)
-    # a meter along e1 or e2, carried to the ground along the plane's normal, is s1 or s2 meters there
-    s1, s2 = (float(np.linalg.norm(e - n * (e @ up) / (n @ up))) for e in (e1, e2))
+    # the ground under the plane. Carried to the ground along the plane's normal, a meter along e2 is s2 meters along
+    # the ground range direction, and a meter along e1 is s1 meters across that direction and tan(twist) s1 along
+    # it: the picture is the ground sheared by the twist (none at broadside)
+    g1, g2 = (e - n * (e @ up) / (n @ up) for e in (e1, e2))
+    s2 = float(np.linalg.norm(g2))
+    s1 = float(np.linalg.norm(g1 - (g1 @ g2) / s2 ** 2 * g2))
+    twist = float(np.degrees(np.arctan2((g1 @ g2) / s2, s1)))
     if extent is None:
-        d = corners - c
-        Hx, Hy = float(np.abs(d @ e1).max()), float(np.abs(d @ e2).max())
+        # the corners where the picture shows them: the points of the plane with their range and range rate
+        vh = _unit(vel - (vel @ n) * n)
+        v1, v2 = float(vh @ e1), float(vh @ e2)
+        w = corners - apc[mid]
+        al = w @ vh
+        pe = np.sqrt(np.maximum(np.sum(w * w, 1) - al * al, 0.0)) * np.sign(v1)
+        Hx, Hy = float(np.abs(al * v1 - pe * v2).max()), float(np.abs(al * v2 + pe * v1 - r0).max())
     else:
         Hx, Hy = 0.5 * float(extent[0]) / s1, 0.5 * float(extent[1]) / s2
     u = apc - c
@@ -230,9 +245,8 @@ def _plan(r, cphd, channel, size, resolution, extent, ref_freq, notes):
     for name, H, X, what in (('azimuth', Hx, Xa, 'pulse rate'), ('range', Hy, Xr, 'frequency step')):
         lim = 0.46 * X
         if H > lim:
-            notes.append(f'the area ({2 * H * (s1 if name == "azimuth" else s2):.0f} m on the ground in {name}) '
-                         f'exceeds the unambiguous {name} extent of the {what} ({X:.0f} m in the slant plane): the '
-                         f'picture is cut to {2 * lim:.0f} m of it')
+            notes.append(f'the area spans {2 * H:.0f} m in {name} on the slant plane, more than the unambiguous {name} '
+                         f'extent of the {what} ({X:.0f} m): the picture is cut to the central {2 * lim:.0f} m')
             Hx, Hy = (lim, Hy) if name == 'azimuth' else (Hx, lim)
     # the pixel on the ground, and the finest one the collection holds on both axes
     bx_max, by_max = 2 * fcv / C * float(abs(t[-1] - t[0])), 2 * Kv * df / C
@@ -265,7 +279,7 @@ def _plan(r, cphd, channel, size, resolution, extent, ref_freq, notes):
     graze = float(np.degrees(np.arcsin(np.clip(-(e2 @ up), -1, 1))))
     return dict(channel=channel, pulses=(pa, pb), samples=(k0, k0 + Kc), P=P, K=K, valid=(k_lo, k_hi), center=c, e1=e1,
                 e2=e2, normal=n, up=up, Hx=Hx, Hy=Hy, spx=spx, spy=spy, nx=nx, ny=ny, pixel=p, s=(s1, s2),
-                resolution=p / 0.96, finest=p_min / 0.96, extents=(Xa, Xr), graze=graze, f0=f0, df=df)
+                resolution=p / 0.96, finest=p_min / 0.96, extents=(Xa, Xr), graze=graze, twist=twist, f0=f0, df=df)
 
 
 # --------------------------------------------------------------------------------------------- the cut collection
@@ -436,7 +450,9 @@ def _wrap_cut(x, n, axis):
 
 def _pfa_cpu(S, g, window, correct, complex_image, timing):
     """The quick look's polar format on the host -> the image, range-major [ny, nx]: complex64 with backprojection's
-    phase (complex_image) or the amplitude (float32)."""
+    phase (complex_image) or the amplitude (float32). The passes over the arrays are fused and run on all cores:
+    NumPy's products in row blocks on the pool, scipy's transforms with its workers, the kernels with their own
+    threads."""
     import ctypes
     import scipy.fft as sf
     from . import pfa2
@@ -447,25 +463,26 @@ def _pfa_cpu(S, g, window, correct, complex_image, timing):
     tab = pfa2.kernel_table(TAPS, KAISER)
     ptr = lambda a: a.ctypes.data_as(ctypes.c_void_p)
     t0 = time.perf_counter()
-    wk = (g['wk'] * (_taylor(K) if window else 1.0)).astype(np.float32)
-    wp = (g['wp'] * (_taylor(P) if window else 1.0)).astype(np.float32)
-    # 1. range gate, in blocks of pulses on the pool: weighted and padded, to range profiles, the gate, and back
+    wk = np.ascontiguousarray(g['wk'] * (_taylor(K) if window else 1.0), np.float32)
+    wp = np.ascontiguousarray(g['wp'] * (_taylor(P) if window else 1.0), np.float32)
+    # 1. range gate, in blocks of pulses on the pool: weighted and padded (one pass), to range profiles, the gate,
+    # and back to the spectrum on Nr samples
     tap_r = _taper(Nr, g['Er'], g['gy'], g['bin_r'])
     keep = min(Nr, Kf)
     pos, neg = keep - keep // 2, keep // 2
     G = np.empty((P, Nr), np.complex64)
-    chunk = int(max(1, min(64, (1 << 21) // (8 * Kf))))
 
     def rows(sl):
-        buf = np.zeros((sl.stop - sl.start, Kf), np.complex64)
-        np.multiply(S[sl], wk, out=buf[:, k0:k0 + K])
+        n = sl.stop - sl.start
+        buf = np.empty((n, Kf), np.complex64)
+        lib.ql_weight_pad(ctypes.c_void_p(S.ctypes.data + sl.start * S.strides[0]), n, K, ptr(wk),
+                          ctypes.c_void_p(wp.ctypes.data + 4 * sl.start), k0, Kf, ptr(buf))
         prof = sf.ifft(buf, axis=1, overwrite_x=True)
-        gate = np.empty((sl.stop - sl.start, Nr), np.complex64) if Nr <= Kf else np.zeros((sl.stop - sl.start, Nr), np.complex64)
+        gate = np.empty((n, Nr), np.complex64) if Nr <= Kf else np.zeros((n, Nr), np.complex64)
         np.multiply(prof[:, :pos], tap_r[:pos], out=gate[:, :pos])
         np.multiply(prof[:, Kf - neg:], tap_r[Nr - neg:], out=gate[:, Nr - neg:])
-        gate *= wp[sl, None]
         G[sl] = sf.fft(gate, axis=1, overwrite_x=True)
-    _blocks(rows, P, chunk)
+    _blocks(rows, P, int(max(1, min(64, (1 << 21) // (8 * Kf)))))
     timing['range gate'] = time.perf_counter() - t0
     t0 = time.perf_counter()
     A = np.empty((P, nkr), np.complex64)
@@ -475,22 +492,35 @@ def _pfa_cpu(S, g, window, correct, complex_image, timing):
     del G
     timing['range resampling'] = time.perf_counter() - t0
     t0 = time.perf_counter()
-    # 2. azimuth gate: the pulses of every range wavenumber transformed, cut, and back on Na pulses
+    # 2. azimuth gate: the pulses of every range wavenumber transformed (padded to Pf), cut to Na bins, and back on
+    # Na pulses. The gate carries the image's scale and the phase that sets the pulses p0 rows into the Na
     Pf, Na, p0 = g['Pf'], g['Na'], g['p0']
-    pad = np.zeros((Pf, nkr), np.complex64)
-    pad[p0:p0 + P] = A
+    ov = g['ov']
+    Nfft = ov * nfy if correct else nfy
+    k = np.arange(Na)
+    k = np.where(k < Na - Na // 2, k, k - Na)
+    tap_a = (_taper(Na, g['Ex'], g['gx'], g['bin_a']) * (g['gain'] * Nfft * Na / Pf)
+             * np.exp(-2j * np.pi * (k * p0 % Pf) / Pf)).astype(np.complex64)
+    prof = sf.fft(A, n=Pf, axis=0, workers=W)
     del A
-    prof = sf.fft(pad, axis=0, workers=W, overwrite_x=True)
-    del pad
-    tap_a = _taper(Na, g['Ex'], g['gx'], g['bin_a']) * np.float32(Na / Pf)
-    gate = _wrap_cut(prof, Na, 0)
-    if gate is prof:
-        gate = prof
+    keep = min(Na, Pf)
+    pos, neg = keep - keep // 2, keep // 2
+    gate = np.empty((Na, nkr), np.complex64)
+    rb = int(max(1, (1 << 18) // nkr))
+
+    def cut(sl):
+        if sl.stop <= pos:                                             # the bins from 0 on
+            np.multiply(prof[sl], tap_a[sl, None], out=gate[sl])
+        elif sl.start >= Na - neg:                                     # the bins before 0, from the transform's end
+            np.multiply(prof[sl.start - Na + Pf:sl.stop - Na + Pf], tap_a[sl, None], out=gate[sl])
+        else:
+            gate[sl] = 0                                               # a longer array than the transform: zeros
+    edges = sorted({0, pos, Na - neg, Na})
+    for a_, b_ in zip(edges, edges[1:]):
+        _blocks(lambda sl: cut(slice(a_ + sl.start, a_ + sl.stop)), b_ - a_, rb)
     del prof
-    gate *= tap_a[:, None]
-    A2 = sf.ifft(gate, axis=0, workers=W, overwrite_x=True)
+    A2 = np.ascontiguousarray(sf.ifft(gate, axis=0, workers=W, overwrite_x=True))
     del gate
-    A2 = np.ascontiguousarray(A2)
     timing['azimuth gate'] = time.perf_counter() - t0
     t0 = time.perf_counter()
     B = np.empty((nkr, nka), np.complex64)
@@ -501,57 +531,86 @@ def _pfa_cpu(S, g, window, correct, complex_image, timing):
     del A2
     timing['azimuth resampling'] = time.perf_counter() - t0
     t0 = time.perf_counter()
+    out = np.empty((ny, nx), np.complex64 if complex_image else np.float32)
+    cb = int(max(1, (1 << 18) // nx))
     if not correct:
-        # 3. the raster's transform, cut to the picture: range (the first ny / 2 and the last ny / 2 outputs are
-        # the pixels from the center on and those before it), then azimuth
-        F = _wrap_shift(sf.ifft(B, n=nfy, axis=0, workers=W), ny, 0)
+        # 3. the raster's transform, cut to the picture: of the range transform, the last ny / 2 outputs are the
+        # pixels before the center and the first ny / 2 those from it on; likewise the azimuth transform's
+        F = sf.ifft(B, n=nfy, axis=0, workers=W)
         del B
-        img = _wrap_shift(sf.fft(F, n=nfx, axis=1, workers=W), nx, 1)
-        del F
-        scale = np.float32(g['gain'] * nfy)
         if complex_image:
             y, x = (np.arange(ny) - ny / 2.0) * g['spy'], (np.arange(nx) - nx / 2.0) * g['spx']
-            img *= (scale * np.exp(1j * g['kr_min'] * y)).astype(np.complex64)[:, None]
-            img *= np.exp(-1j * g['ka_lo'] * x).astype(np.complex64)[None, :]
-        else:
-            img = _abs(img, scale)
+            cy, cx = np.exp(1j * g['kr_min'] * y).astype(np.complex64), np.exp(-1j * g['ka_lo'] * x).astype(np.complex64)
+        for r_out, r_in in ((0, nfy - ny // 2), (ny // 2, 0)):
+            T = sf.fft(F[r_in:r_in + ny // 2], n=nfx, axis=1, workers=W)
+
+            def put(sl, T=T, r_out=r_out):
+                o = out[r_out + sl.start:r_out + sl.stop]
+                for c_out, c_in in ((0, nfx - nx // 2), (nx // 2, 0)):
+                    if complex_image:
+                        np.multiply(T[sl, c_in:c_in + nx // 2], cx[c_out:c_out + nx // 2], out=o[:, c_out:c_out + nx // 2])
+                    else:
+                        np.abs(T[sl, c_in:c_in + nx // 2], out=o[:, c_out:c_out + nx // 2])
+                if complex_image:
+                    o *= cy[r_out + sl.start:r_out + sl.stop, None]
+            _blocks(put, ny // 2, cb)
+            del T
         timing['image'] = time.perf_counter() - t0
-        return img
-    # 4. the same on a raster padded by ov, at baseband, in blocks of range pixels read at the apparent positions
-    ov, dist = g['ov'], g['dist']
+        return out
+    # 4. the same on a raster padded by ov, at baseband, in blocks of range pixels read at the apparent positions.
+    # The spectrum is set about index 0 of the padded transforms with alternating signs, so that their outputs
+    # count from the image's center
+    dist = g['dist']
     Ny2, Nx2 = ov * nfy, ov * nfx
     hy, hx = nkr // 2, nka // 2
-    B *= ((-1.0) ** (np.arange(nkr) - hy)).astype(np.float32)[:, None]     # the outputs then count from the center
-    B *= ((-1.0) ** (np.arange(nka) - hx)).astype(np.float32)[None, :]
-    Z = np.zeros((Ny2, nka), np.complex64)
-    Z[:nkr - hy], Z[Ny2 - hy:] = B[hy:], B[:hy]
+    sy = ((-1.0) ** (np.arange(nkr) - hy)).astype(np.float32)
+    sx = ((-1.0) ** (np.arange(nka) - hx)).astype(np.float32)
+    Z = np.empty((Ny2, nka), np.complex64)
+    rb = int(max(1, (1 << 18) // nka))
+
+    def fill(sl):
+        if sl.stop <= nkr - hy:
+            np.multiply(B[hy + sl.start:hy + sl.stop], sy[hy + sl.start:hy + sl.stop, None], out=Z[sl])
+        elif sl.start >= Ny2 - hy:
+            a_ = sl.start - (Ny2 - hy)
+            np.multiply(B[a_:a_ + sl.stop - sl.start], sy[a_:a_ + sl.stop - sl.start, None], out=Z[sl])
+        else:
+            Z[sl] = 0
+    edges = sorted({0, nkr - hy, Ny2 - hy, Ny2})
+    for a_, b_ in zip(edges, edges[1:]):
+        _blocks(lambda sl: fill(slice(a_ + sl.start, a_ + sl.stop)), b_ - a_, rb)
     del B
     F1 = sf.ifft(Z, axis=0, workers=W, overwrite_x=True)                   # [Ny2, nka]: range done
     del Z
     timing['range transform'] = time.perf_counter() - t0
-    out = np.empty((ny, nx), np.complex64 if complex_image else np.float32)
     ltab = _lanczos_table(LANCZOS)
     cx, cy = np.ascontiguousarray(dist['cx'], np.float64), np.ascontiguousarray(dist['cy'], np.float64)
     pw = np.ascontiguousarray(np.asarray(dist['powers'], np.int32).ravel())
     deg = max(a + b for a, b in dist['powers'])
     kr_c, ka_c = g['kr_min'] + hy * g['dkr'], g['ka_lo'] + hx * g['dka']
-    gain = float(g['gain'] * Ny2)
     msy = int(math.ceil(g['shift'][1] / g['spy'])) * ov + LANCZOS + 2
     bw = int(max(16, min(ny, (128 << 20) // (8 * Nx2 * ov))))               # range pixels per block
+    rb = int(max(1, (1 << 18) // Nx2))
     tt = [0.0, 0.0]
     for jb in range(0, ny, bw):
         n = min(bw, ny - jb)
         rb0 = max(0, Ny2 // 2 + ov * (jb - ny // 2) - msy)
         span = min(Ny2, Ny2 // 2 + ov * (jb + n - ny // 2) + msy) - rb0
         t1 = time.perf_counter()
-        Z = np.zeros((span, Nx2), np.complex64)
-        Z[:, :nka - hx], Z[:, Nx2 - hx:] = F1[rb0:rb0 + span, hx:], F1[rb0:rb0 + span, :hx]
+        Z = np.empty((span, Nx2), np.complex64)
+
+        def place(sl, Z=Z, rb0=rb0):
+            src = F1[rb0 + sl.start:rb0 + sl.stop]
+            np.multiply(src[:, hx:], sx[hx:], out=Z[sl, :nka - hx])
+            Z[sl, nka - hx:Nx2 - hx] = 0
+            np.multiply(src[:, :hx], sx[:hx], out=Z[sl, Nx2 - hx:])
+        _blocks(place, span, rb)
         base = np.ascontiguousarray(sf.fft(Z, axis=1, workers=W, overwrite_x=True))
         del Z
         t2 = time.perf_counter()
         lib.ql_gather(ptr(base), span, Nx2, Nx2, Ny2, rb0, 0, nx, n, 0, jb, nx, ny, float(g['spx']),
                       float(g['spy']), float(ov), float(dist['sx']), float(dist['sy']), ptr(cx), ptr(cy), ptr(pw),
-                      len(cx), deg, float(kr_c), float(ka_c), 1, gain, LANCZOS, ptr(ltab), 1024,
+                      len(cx), deg, float(kr_c), float(ka_c), 1, 1.0, LANCZOS, ptr(ltab), 1024,
                       0 if complex_image else 1, ctypes.c_void_p(out.ctypes.data + jb * out.strides[0]), nx)
         del base
         tt[0] += t2 - t1
@@ -716,7 +775,7 @@ def _pfa_cuda(S, g, window, correct, complex_image, timing):
     del A
     gate = _wrap_cut(cf.fft(pad, axis=0, overwrite_x=True), Na, 0)
     del pad
-    gate *= cp.asarray(_taper(Na, g['Ex'], g['gx'], g['bin_a']) * np.float32(Na / Pf))[:, None]
+    gate *= cp.asarray((_taper(Na, g['Ex'], g['gx'], g['bin_a']) * (g['gain'] * (g['ov'] * nfy if correct else nfy) * Na / Pf)).astype(np.float32))[:, None]
     A2 = cp.ascontiguousarray(cf.ifft(gate, axis=0, overwrite_x=True))
     del gate
     t0 = lap('azimuth gate', t0)
@@ -731,14 +790,12 @@ def _pfa_cuda(S, g, window, correct, complex_image, timing):
         del B
         img = _wrap_shift(cf.fft(F, n=nfx, axis=1), nx, 1)
         del F
-        scale = np.float32(g['gain'] * nfy)
         if complex_image:
             y, x = (np.arange(ny) - ny / 2.0) * g['spy'], (np.arange(nx) - nx / 2.0) * g['spx']
-            img *= cp.asarray((scale * np.exp(1j * g['kr_min'] * y)).astype(np.complex64))[:, None]
+            img *= cp.asarray(np.exp(1j * g['kr_min'] * y).astype(np.complex64))[:, None]
             img *= cp.asarray(np.exp(-1j * g['ka_lo'] * x).astype(np.complex64))[None, :]
         else:
             img = cp.abs(img)
-            img *= scale
         lap('image', t0)
         return img
     ov, dist = g['ov'], g['dist']
@@ -757,7 +814,7 @@ def _pfa_cuda(S, g, window, correct, complex_image, timing):
     d_cx, d_cy = cp.asarray(np.asarray(dist['cx'], np.float64)), cp.asarray(np.asarray(dist['cy'], np.float64))
     d_pw = cp.asarray(np.asarray(powers, np.int32).ravel())
     kr_c, ka_c = g['kr_min'] + hy * g['dkr'], g['ka_lo'] + hx * g['dka']
-    gain = cp.asarray(np.array([g['gain'] * Ny2], np.float32))
+    gain = cp.ones((1,), cp.float32)
     msy = int(math.ceil(g['shift'][1] / g['spy'])) * ov + LANCZOS + 2
     out = cp.empty((nx, ny), cp.complex64)                           # the kernel writes azimuth-major
     bw = int(max(16, min(ny, _xp.cuda_block() // (16 * Nx2 * ov))))
@@ -950,7 +1007,8 @@ def quicklook(cphd, output=None, *, size=2048, resolution=None, correct=True, re
     display_origin + r row_ss row + c col_ss col (sidd.shadows_down's entries); corners: latitude and longitude
     [4, 2] of the display's corner pixels on the scene's plane, from the first row and column clockwise; pixel, the
     pixel on the ground (m), resolution (m) and finest, the finest resolution the collection holds; band (first
-    and last frequency used, Hz), bandwidth (cycles/m along e1 and e2), window, pulses (of those read) and cut:
+    and last frequency used, Hz), bandwidth (cycles/m along e1 and e2), window, graze and twist (rad: the grazing
+    angle, and the angle by which the slant plane shears the ground in the picture), pulses (of those read) and cut:
     dict(pulses, of_pulses, samples, of_samples: the file's vectors and samples read; signal_bytes, of_bytes: their
     size and the signal array's); algorithm ('pfa' or 'ffbp'), backend, correct, displacement_px (polar format's
     largest displacement along e1 and e2 over the picture, in pixels; removed when correct), remap, meta
@@ -993,8 +1051,9 @@ def quicklook(cphd, output=None, *, size=2048, resolution=None, correct=True, re
                  f"{pb - pa} of {plan['P']} pulses and {k1 - k0} of {plan['K']} samples "
                  f"({cut['signal_bytes'] / 1e6:.1f} MB of the {cut['of_bytes'] / 1e9:.2f} GB signal array)")
     notes.append(f'slant-plane grid along the mid-aperture line of sight, {nx} by {ny} pixels of {spx:.3f} by {spy:.3f} m '
-                 '(0.96 of the reciprocal of the band on each axis), square on the ground at the scene center; the '
-                 'picture is not projected to the ground')
+                 f"(0.96 of the reciprocal of the band on each axis), which are {plan['pixel']:.3f} m across and along "
+                 f"the ground range direction (grazing angle {plan['graze']:.1f} degrees). The picture is not projected "
+                 f"to the ground: it is the ground sheared by the slant plane's twist, {plan['twist']:.1f} degrees")
     info, shift = {}, None
     if backend in ('jax', 'tpu'):
         img = _ffbp(col, backend, window, timing)[0]
@@ -1050,7 +1109,8 @@ def quicklook(cphd, output=None, *, size=2048, resolution=None, correct=True, re
         pixel=float(plan['pixel']), resolution=float(plan['resolution']), finest=float(plan['finest']),
         band=(f0, f0 + (K - 1) * df), bandwidth=(2 * fc / C * float(abs(tt[-1] - tt[0])), 2 * K * df / C),
         window=('taylor', 'taylor') if window else None, pulses=(0, P), cut=cut, algorithm=algorithm, backend=backend,
-        correct=corrected, displacement_px=shift, remap=remap, graze=float(np.radians(plan['graze'])), meta=meta,
+        correct=corrected, displacement_px=shift, remap=remap, graze=float(np.radians(plan['graze'])),
+        twist=float(np.radians(plan['twist'])), meta=meta,
         notes=notes, timing=timing)
     if kind is not None:
         t0 = time.perf_counter()

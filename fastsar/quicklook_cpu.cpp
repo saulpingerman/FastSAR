@@ -137,15 +137,21 @@ extern "C" void ql_gather(const float* base, long span, long width, long Nx2, lo
   });
 }
 
-// out[r, k0 + k] = S[r, k] wk[k] for k < K and 0 in the rest of the row of Kf: the weighted, zero-padded rows that the
-// range transforms take (one pass, in place of a product and two fills)
-extern "C" void ql_weight_pad(const float* S, long R, long K, const float* wk, long k0, long Kf, float* out) {
-  par::for_dynamic(R, 4, [&](long r) {
+// out[r, k0 + k] = S[r, k] wk[k] wp[r] for k < K and 0 in the rest of the row of Kf: the weighted, zero-padded rows
+// that the range transforms take, in one pass. On the calling thread: quick.py calls it from its own pool, a block of
+// rows per thread.
+extern "C" void ql_weight_pad(const float* S, long R, long K, const float* wk, const float* wp, long k0, long Kf,
+                              float* out) {
+  for (long r = 0; r < R; ++r) {
     const float* s = S + 2 * r * K;
     float* o = out + 2 * r * Kf;
+    const float g = wp[r];
     std::fill(o, o + 2 * k0, 0.f);
     #pragma omp simd
-    for (long k = 0; k < K; ++k) { o[2 * (k0 + k)] = s[2 * k] * wk[k]; o[2 * (k0 + k) + 1] = s[2 * k + 1] * wk[k]; }
+    for (long k = 0; k < K; ++k) {
+      const float w = wk[k] * g;
+      o[2 * (k0 + k)] = s[2 * k] * w; o[2 * (k0 + k) + 1] = s[2 * k + 1] * w;
+    }
     std::fill(o + 2 * (k0 + K), o + 2 * Kf, 0.f);
-  });
+  }
 }
