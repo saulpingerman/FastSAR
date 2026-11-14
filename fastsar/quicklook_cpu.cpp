@@ -158,6 +158,23 @@ extern "C" void ql_transpose(const float* src, long sstride, long R, long C, flo
   });
 }
 
+// dst[c, r] = src[r, J0 + c - jlo[r]] where that column lies in [0, W), else 0, for c < C and r < R (complex): the
+// rows J0 .. of the raster's range wavenumbers out of a history whose pulses each hold their own W rows, from row
+// jlo[r] on (a picture on the ground under a twisted slant plane: the band of a pulse drifts along the aperture,
+// and each pulse is resampled on the rows it reaches). src's rows are W and dst's rows dstride complex values
+// apart. On the calling thread.
+extern "C" void ql_unshear(const float* src, long W, long R, const int* jlo, long J0, long C, float* dst, long dstride) {
+  for (long c = 0; c < C; ++c) std::fill(dst + 2 * c * dstride, dst + 2 * (c * dstride + R), 0.f);
+  for (long r = 0; r < R; ++r) {
+    const long c0 = std::max(0L, (long)jlo[r] - J0), c1 = std::min(C, (long)jlo[r] + W - J0);
+    const float* p = src + 2 * (r * W + (J0 + c0 - jlo[r]));
+    for (long c = c0; c < c1; ++c, p += 2) {
+      float* q = dst + 2 * (c * dstride + r);
+      q[0] = p[0]; q[1] = p[1];
+    }
+  }
+}
+
 // The image at the apparent positions, range-major: for the range pixel jb + c (c < n) and the azimuth pixel i0 + i
 // (i < h) of an nx by ny grid, the apparent position (Xa, Ya) of the pixel's own (x, y) from the distortion
 // polynomial in float64 (pfa2.distortion: Xa = x + sum cx[k] xn^a yn^b over the powers (a, b), xn = x / dsx,
@@ -168,12 +185,15 @@ extern "C" void ql_transpose(const float* src, long sstride, long R, long C, flo
 // [span, width] holds the rows rb0 .. and the columns cb0 .. of the oversampled image, whose index (fy, fx) lies at
 // ((fy - Ny2 / 2) spy / ov, (fx - Nx2 / 2) spx / ov). carrier: the result is multiplied by exp(j (kr_c Ya - ka_c Xa)),
 // the phase backprojection gives the pixel. detect: the amplitude is written (float [n, h]) in place of the complex
-// value (float pairs [n, h]); out's rows are ostride values apart.
+// value (float pairs [n, h]); out's rows are ostride values apart. shear: where the band's center moves with the
+// azimuth wavenumber (a picture on the ground under a twisted slant plane), the baseband image is smooth along
+// lines that cross `shear` columns per row, not along its columns; each row of taps is then read at the column
+// where such a line through the position meets it, fx + shear (row - fy), with its own weights.
 extern "C" void ql_gather(const float* base, long span, long width, long Nx2, long Ny2, long rb0, long cb0,
                           int h, int n, int i0, int jb, int nx, int ny, double spx, double spy, double ov,
                           double dsx, double dsy, const double* cx, const double* cy, const int* pw, int npow, int deg,
                           double kr_c, double ka_c, int carrier, float gain, int taps, const float* ptab,
-                          const float* ptab16, int Q, int detect, float* out, long ostride) {
+                          const float* ptab16, int Q, int detect, float* out, long ostride, double shear) {
   const int half = taps / 2;
   const double ux = ov / spx, uy = ov / spy;
   par::for_dynamic(n, 2, [&](long c) {
@@ -195,7 +215,30 @@ extern "C" void ql_gather(const float* base, long span, long width, long Nx2, lo
       const float* wx = ptab + qx * taps;
       const float* wy = ptab + (long)((fy - fiy) * Q + 0.5) * taps;
       float ar = 0.f, ai = 0.f;
-      if (ix >= 0 && ix + 8 <= width && iy >= 0 && iy + taps <= span) {          // every tap inside the block
+      if (shear != 0.0) {
+        for (int a = 0; a < taps; ++a) {
+          const long yy = std::min(std::max(iy + a, 0L), span - 1);
+          const double fxa = fx + shear * ((double)(iy + a + rb0) - fy), fl = std::floor(fxa);
+          const long ixa = (long)fl - cb0 - half + 1, qa = (long)((fxa - fl) * Q + 0.5);
+          float re = 0.f, im = 0.f;
+          if (ixa >= 0 && ixa + 8 <= width) {
+            const float* wx16 = ptab16 + qa * 16;
+            const float* row = base + 2 * (yy * width + ixa);
+            float acc[16];
+            #pragma omp simd
+            for (int u = 0; u < 16; ++u) acc[u] = wx16[u] * row[u];
+            for (int u = 0; u < 16; u += 2) { re += acc[u]; im += acc[u + 1]; }
+          } else {
+            const float* wxa = ptab + qa * taps;
+            for (int b = 0; b < taps; ++b) {
+              const long xx = std::min(std::max(ixa + b, 0L), width - 1);
+              const float* v = base + 2 * (yy * width + xx);
+              re += wxa[b] * v[0]; im += wxa[b] * v[1];
+            }
+          }
+          ar += wy[a] * re; ai += wy[a] * im;
+        }
+      } else if (ix >= 0 && ix + 8 <= width && iy >= 0 && iy + taps <= span) {   // every tap inside the block
         const float* wx16 = ptab16 + qx * 16;
         float acc[16] = {0.f};
         for (int a = 0; a < taps; ++a) {

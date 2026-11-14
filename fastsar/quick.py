@@ -44,7 +44,7 @@ same stages in CuPy with the CUDA kernels of polar format (pfa2.py: the range re
 one more for the uneven pulse spacing; the history is windowed and gated on the device in blocks of pulses. 'jax'
 and 'tpu': polar format's resampling steps are gathers, slow on a TPU's vector unit, so the same cut history is
 formed on the same grid by the factorized former (ImageFormer; precision 'single-pass' on a TPU), and a note says
-so. 'auto': tpu, else cuda, else cpu.
+so. 'auto': the device that forms the cut soonest, by its size (the AUTO_ thresholds below).
 
 A moving-beam collection (stripmap, sliding spotlight) is refused: polar format assumes one scene reference point,
 and a moving beam's azimuth resolution is set per pixel by the processed Doppler band, not by a run of pulses, so
@@ -66,6 +66,18 @@ TAPS, KAISER = 16, 8.0        # the resampling kernel of the range and azimuth s
 PASS = 0.65                   # the part of a gated transform's period that the kernel reads to its accuracy
 OVERSAMPLE, LANCZOS = 2, 6    # the corrected image: the raster's padding and the taps of the final kernel
 PHASES = 2048                 # fractional positions per sample in the host kernels' weight tables
+# backend='auto' takes the device that forms a cut history soonest, by the history's size in samples (pulses times
+# frequency samples). Measured from the file to the PNG on 16 threads of a Threadripper PRO 7965WX against an RTX
+# PRO 6000 that another job kept busy, second call of a process, CPU / CUDA seconds: 7e6 samples 0.061 / 0.149,
+# 28e6 0.166 / 0.192, 49e6 0.130 / 0.175, 112e6 0.527 / 0.402, 132e6 0.309 / 0.281, 449e6 2.02 / 1.13: the GPU is
+# the faster from about 1e8 samples. The first CUDA quick look of a process also makes the context, compiles the
+# kernels and plans the transforms, 1.6 s here, which the 1.9 ns a sample the device saves repays from 8e8 samples.
+AUTO_CUDA_SAMPLES = 100_000_000
+AUTO_CUDA_FIRST_SAMPLES = 800_000_000
+# On a TPU host the C++ polar format on the host's cores is taken below this size and the device from it on. Not
+# measured: no TPU was at hand (tests/bench_tpu_blocks.py times both sides on one); set above the collections of
+# this class until it is, since the device's program is compiled for each cut.
+AUTO_TPU_SAMPLES = 4_000_000_000
 _LIB = []
 _POOL = []
 _LOCK = threading.Lock()
@@ -88,10 +100,11 @@ def _lib():
         L.ql_azimuth_gate.argtypes = [p, n, n, n, p, p, d, d, p]
         L.ql_azimuth_gate.restype = None
         L.ql_gather.argtypes = [p, n, n, n, n, n, n, i, i, i, i, i, i, d, d, d, d, d, p, p, p, i, i, d, d, i, fl, i, p, p,
-                                i, i, p, n]
+                                i, i, p, n, d]
         L.ql_weight_pad.argtypes = [p, n, n, p, p, n, n, p]
+        L.ql_unshear.argtypes = [p, n, n, p, n, n, p, n]
         L.ql_resample_rows.restype = L.ql_resample_az.restype = L.ql_gather.restype = L.ql_weight_pad.restype = None
-        L.ql_transpose.restype = None
+        L.ql_transpose.restype = L.ql_unshear.restype = None
         _LIB.append(L)
     return _LIB[0]
 
@@ -169,9 +182,8 @@ def _polyphase(kind, taps, q):
 
 def _plan(r, cphd, channel, size, resolution, extent, ref_freq, looks, notes):
     """The cut and the grid, from the header and a few hundred per-pulse parameters (no sample is read): dict of the
-    pulses and samples to read, the picture's center, slant-plane axes and plane normal (ECF), its half extents and
-    spacings along the axes (m), its pixel on the ground, and the collection's facts the notes and the product
-    quote."""
+    pulses and samples to read, the picture's center and its axes on the ground (ECF), its half extents and its
+    pixel (m), and the collection's facts the notes and the product quote."""
     from .cphd import _image_area
     m = r.cphd_meta
     v03 = str(getattr(r, 'cphd_version', '') or '').startswith('0.3')
@@ -229,80 +241,71 @@ def _plan(r, cphd, channel, size, resolution, extent, ref_freq, looks, notes):
                          'meters on the ground')
     c = (s0 if refpt is None else refpt) if extent is not None else corners.mean(0)
     c = c - ((c - (c if refpt is None else refpt)) @ up) * up          # on the plane through the reference point
-    # the slant plane at the mid-aperture pulse: e2 the line of sight (away from the radar), e1 across it in the
-    # plane of the line of sight and the velocity, their normal on the upward side
+    # the picture's axes, on the ground (form_cphd's axes='los'): e2 the mid-aperture line of sight projected on the
+    # plane, away from the radar, e1 = e2 x up across it. Range then runs down a column of the picture whatever the
+    # squint, and a tasked area that the collection states along these axes is the picture's rectangle
     r0 = float(np.linalg.norm(c - apc[mid]))
-    e2 = (c - apc[mid]) / r0
-    vel = np.gradient(apc, idx, axis=0)[mid]
-    n = _unit(np.cross(e2, vel))
-    if n @ up < 0:
-        n = -n
-    if n @ up < 0.02:
-        raise ValueError('the slant plane is within a degree of vertical (a look at the nadir): its picture has no '
-                         'ground scale in range. Use fastsar.process_cphd')
-    e1 = np.cross(e2, n)
-    # the ground under the plane. Carried to the ground along the plane's normal, a meter along e2 is s2 meters along
-    # the ground range direction, and a meter along e1 is s1 meters across that direction and tan(twist) s1 along
-    # it: the picture is the ground sheared by the twist (none at broadside)
-    g1, g2 = (e - n * (e @ up) / (n @ up) for e in (e1, e2))
-    s2 = float(np.linalg.norm(g2))
-    s1 = float(np.linalg.norm(g1 - (g1 @ g2) / s2 ** 2 * g2))
-    twist = float(np.degrees(np.arctan2((g1 @ g2) / s2, s1)))
+    los = (c - apc[mid]) / r0
+    graze = float(np.degrees(np.arcsin(np.clip(-(los @ up), -1, 1))))
+    if 1 - (los @ up) ** 2 < 0.02 ** 2:
+        raise ValueError('the line of sight is within a degree of the vertical (a look at the nadir): its picture has '
+                         'no ground scale in range. Use fastsar.process_cphd')
+    e2 = _unit(los - (los @ up) * up)
+    e1 = np.cross(e2, up)
     if extent is None:
-        # the corners where the picture shows them: the points of the plane with their range and range rate
-        vh = _unit(vel - (vel @ n) * n)
-        v1, v2 = float(vh @ e1), float(vh @ e2)
-        w = corners - apc[mid]
-        al = w @ vh
-        pe = np.sqrt(np.maximum(np.sum(w * w, 1) - al * al, 0.0)) * np.sign(v1)
-        Hx, Hy = float(np.abs(al * v1 - pe * v2).max()), float(np.abs(al * v2 + pe * v1 - r0).max())
+        w = corners - c
+        Hx, Hy = float(np.abs(w @ e1).max()), float(np.abs(w @ e2).max())
     else:
-        Hx, Hy = 0.5 * float(extent[0]) / s1, 0.5 * float(extent[1]) / s2
+        Hx, Hy = 0.5 * float(extent[0]), 0.5 * float(extent[1])
     u = apc - c
     u /= np.linalg.norm(u, axis=1, keepdims=True)
-    t = (u @ e1) / -(u @ e2)                         # the tangent of the look angle in the plane
+    ur = -(u @ e2)                                   # a meter along e2 is ur meters of range (cos of the grazing angle)
+    t = (u @ e1) / ur                                # the tangent of the look angle on the ground
     sgn = 1.0 if t[-1] > t[0] else -1.0
-    if not np.all(np.diff(t) * sgn > 0):
+    if ur.min() <= 0 or not np.all(np.diff(t) * sgn > 0):
         raise ValueError('the look angle does not change monotonically along the pulses, which polar format needs; '
                          'use fastsar.process_cphd')
-    dt = float(np.abs(np.gradient(t, idx)).max())    # per pulse
     f_hi = f0 + (k_hi - 1) * df
     fcv = f0 + 0.5 * (k_lo + k_hi - 1) * df
-    # the unambiguous extents (m, in the plane): a picture keeps inside them, with room for the gates' edges
-    Xr, Xa = C / (2 * df), C / (2 * f_hi * dt)
-    for name, H, X, what in (('azimuth', Hx, Xa, 'pulse rate'), ('range', Hy, Xr, 'frequency step')):
+    # the unambiguous extents (m, on the ground): a picture keeps inside them, with room for the gates' edges
+    Xr = C / (2 * df * float(ur.max()))
+    Xa = C / (2 * f_hi * float(np.abs(ur * np.gradient(t, idx)).max()))
+    for name, H, X, what in (('across', Hx, Xa, 'pulse rate'), ('along', Hy, Xr, 'frequency step')):
         lim = 0.46 * X
         if H > lim:
-            notes.append(f'the area spans {2 * H:.0f} m in {name} on the slant plane, and the {what} leaves '
+            notes.append(f'the area spans {2 * H:.0f} m {name} the ground range direction, and the {what} leaves '
                          f'{X:.0f} m unambiguous: the picture is cut to the central {2 * lim:.0f} m (0.92 of that)')
-            Hx, Hy = (lim, Hy) if name == 'azimuth' else (Hx, lim)
-    # the pixel on the ground, and the finest one the collection holds on both axes
-    bx_max, by_max = 2 * fcv / C * float(abs(t[-1] - t[0])), 2 * Kv * df / C
-    p_min = 0.96 * max(s1 / bx_max, s2 / by_max)
+            Hx, Hy = (lim, Hy) if name == 'across' else (Hx, lim)
+    # the pixel, one size on both ground axes, and the finest one the collection holds on both: the band across the
+    # ground range is that of the pulses' directions along e1, the band along it that of the samples times ur
+    ux = u @ e1
+    urm = float(ur[mid])
+    bx_max, by_max = 2 * fcv / C * float(abs(ux[-1] - ux[0])), 2 * Kv * df / C * urm
+    p_min = 0.96 / min(bx_max, by_max)
     if resolution == 'full':
         p = p_min
     elif resolution is not None:
         p = 0.96 * float(resolution)
     else:
-        p = max(2 * Hx * s1, 2 * Hy * s2) / int(size)
+        p = max(2 * Hx, 2 * Hy) / int(size)
     if p < p_min * (1 - 1e-9):
         notes.append(f'the collection holds a resolution of {p_min / 0.96:.3f} m on both ground axes; the picture has '
                      f'that, not the {p / 0.96:.3f} m asked for')
         p = p_min
-    spx, spy = p / s1, p / s2
-    nx, ny = (2 * int(np.ceil(H / sp - 1e-6)) for H, sp in ((Hx, spx), (Hy, spy)))
+    spx = spy = p
+    nx, ny = (2 * int(np.ceil(H / p - 1e-6)) for H in (Hx, Hy))
     # the cut: the central samples and pulses whose bands are 0.96 / spacing; for several looks, as many such runs
     # side by side as were asked for and the collection holds
-    Kc = int(min(Kv, max(2, round(0.96 / spy * C / (2 * df)))))
+    Kc = int(min(Kv, max(2, round(0.96 / spy * C / (2 * df * urm)))))
     lr = int(max(1, min(looks[1], Kv // Kc)))
     k0 = (k_lo + (Kv - lr * Kc) // 2) // 16 * 16      # from a multiple of 16: the reader's rows as they are read
     k0 += 16 if k0 < k_lo else 0
     Kc = min(Kc, (k_hi - k0) // lr)                   # (the whole band: up to 15 samples short of it)
     fc = f0 + (k0 + 0.5 * (lr * Kc - 1)) * df
-    need = 0.96 / spx * C / (2 * fc)                  # the span of t of one look
-    la = int(max(1, min(looks[0], np.floor(abs(t[-1] - t[0]) / need + 1e-9))))
-    order = np.argsort(t)
-    ends = np.interp([t[mid] - la * need / 2, t[mid] + la * need / 2], t[order], idx[order].astype(np.float64))
+    need = 0.96 / spx * C / (2 * fc)                  # the span of the directions along e1 of one look
+    la = int(max(1, min(looks[0], np.floor(abs(ux[-1] - ux[0]) / need + 1e-9))))
+    order = np.argsort(ux)
+    ends = np.interp([ux[mid] - la * need / 2, ux[mid] + la * need / 2], ux[order], idx[order].astype(np.float64))
     pa, pb = int(max(idx[0], np.floor(ends.min()))), int(min(idx[-1], np.ceil(ends.max()))) + 1
     if (pb - pa) // la < 2 * TAPS:
         raise ValueError(f'the picture asked for needs {(pb - pa) // la} pulses, fewer than the {2 * TAPS} polar '
@@ -310,11 +313,9 @@ def _plan(r, cphd, channel, size, resolution, extent, ref_freq, looks, notes):
     if (la, lr) != tuple(looks):
         notes.append(f'{la} by {lr} looks (sub-apertures by sub-bands), not the {looks[0]} by {looks[1]} asked for: '
                      'the collection holds no more at this resolution')
-    graze = float(np.degrees(np.arcsin(np.clip(-(e2 @ up), -1, 1))))
     return dict(channel=channel, pulses=(pa, pb), samples=(k0, k0 + lr * Kc), looks=(la, lr), P=P, K=K,
-                valid=(k_lo, k_hi), center=c, e1=e1,
-                e2=e2, normal=n, up=up, Hx=Hx, Hy=Hy, spx=spx, spy=spy, nx=nx, ny=ny, pixel=p, s=(s1, s2),
-                resolution=p / 0.96, finest=p_min / 0.96, extents=(Xa, Xr), graze=graze, twist=twist, f0=f0, df=df)
+                valid=(k_lo, k_hi), center=c, e1=e1, e2=e2, up=up, Hx=Hx, Hy=Hy, spx=spx, spy=spy, nx=nx, ny=ny, pixel=p,
+                resolution=p / 0.96, finest=p_min / 0.96, extents=(Xa, Xr), graze=graze, f0=f0, df=df)
 
 
 # --------------------------------------------------------------------------------------------- the cut collection
@@ -366,11 +367,40 @@ def _collection(cphd, size=2048, resolution=None, extent=None, channel=0, reader
 
 # ------------------------------------------------------------------------------------------------ polar format
 
-def _geometry(ant, fmin, df, K, nx, ny, spx, spy, e1, e2, correct, ov=OVERSAMPLE):
+def _distortion(ant, nx, ny, spx, spy, e1, e2, weights=None, n=21, deg=3):
+    """Where polar format puts a scatterer, for any pair of grid axes (a slant plane, the ground plane). With
+    ur = -u . e2 and t = (u . e1) / ur of each pulse, the raster's wavenumbers are kr = 4 pi f ur / c and ka = kr t,
+    and a scatterer at x e1 + y e2 whose range history is dR has the phase kr (-dR / ur): the weighted
+    least-squares line -dR / ur = t X - Y over the aperture gives its apparent position (X, Y), the peak of its
+    response, and leaves no mean phase there (weights: the pulses' window, so that the corrected image has
+    backprojection's phase). The mapping is fitted by 2-D polynomials of degree deg on an n by n grid over the
+    picture -> the dict of pfa2.distortion (which takes e2 along the line of sight, where ur is 1 at mid-aperture)."""
+    ant = np.asarray(ant, np.float64)
+    r0 = np.linalg.norm(ant, axis=1)
+    u = ant / r0[:, None]
+    ur = -(u @ e2)
+    w = np.sqrt(np.ones(len(ant)) if weights is None else np.asarray(weights, np.float64))
+    pinv = np.linalg.pinv(np.stack([(u @ e1) / ur, -np.ones(len(ant))], 1) * w[:, None]) * w        # [2, P]
+    xs, ys = np.linspace(-nx / 2.0, nx / 2.0, n) * spx, np.linspace(-ny / 2.0, ny / 2.0, n) * spy
+    X, Y = (v.ravel() for v in np.meshgrid(xs, ys, indexing='ij'))
+    pts = X[:, None] * e1 + Y[:, None] * e2
+    dR = np.linalg.norm(pts[:, None, :] - ant[None, :, :], axis=2) - r0[None, :]
+    g = -dR / ur[None, :]
+    xa, ya = g @ pinv[0], g @ pinv[1]
+    powers = [(a, b) for a in range(deg + 1) for b in range(deg + 1 - a)]
+    sx, sy = nx / 2.0 * spx, ny / 2.0 * spy
+    B = np.stack([(X / sx) ** a * (Y / sy) ** b for a, b in powers], 1)
+    cx, cy = np.linalg.lstsq(B, xa - X, rcond=None)[0], np.linalg.lstsq(B, ya - Y, rcond=None)[0]
+    rms = (float(np.sqrt(np.mean((B @ cx - (xa - X)) ** 2)) / spx), float(np.sqrt(np.mean((B @ cy - (ya - Y)) ** 2)) / spy))
+    return dict(cx=cx, cy=cy, powers=powers, sx=sx, sy=sy, rms_px=rms,
+                max_shift_px=(float(np.abs(xa - X).max() / spx), float(np.abs(ya - Y).max() / spy)))
+
+
+def _geometry(ant, fmin, df, K, nx, ny, spx, spy, e1, e2, correct, ov=OVERSAMPLE, window=True):
     """The float64 setup of the quick look's polar format for a cut history: the raster, the two gates, the
-    resampling positions and the distortion model."""
-    from .pfa2 import distortion
-    from .sim import Collect
+    resampling positions and the distortion model. e1, e2: the picture's axes, any pair that spans its plane with
+    e2 away from the radar (a slant plane along the line of sight, the ground plane along the ground range): the
+    raster's wavenumbers are the components of the samples' along them."""
     P = len(ant)
     r0 = np.linalg.norm(ant, axis=1)
     u = ant / r0[:, None]
@@ -389,29 +419,55 @@ def _geometry(ant, fmin, df, K, nx, ny, spx, spy, e1, e2, correct, ov=OVERSAMPLE
     Hx, Hy = 0.5 * nx * spx, 0.5 * ny * spy
     # where polar format puts the scatterers (a few hundred pulses give the fit)
     sub = np.unique(np.round(np.linspace(0, P - 1, min(P, 257))).astype(int))
-    dist = distortion(Collect(fmin=fmin, df=df, K=K, ant=ant[sub], res=0.5), nx, ny, spx, spy, e1, e2)
+    dist = _distortion(ant[sub], nx, ny, spx, spy, e1, e2, _taylor(P)[sub] if window else None)
     shx, shy = (float(v) for v in (dist['max_shift_px'][0] * spx, dist['max_shift_px'][1] * spy))
     # the gates. Range: the slant delays of the picture's points, exactly, over the aperture, with the displacement
     # (an uncorrected picture shows points from that far outside) and a pixel; azimuth: the picture's extent with
-    # the displacement and the spread of a point's azimuth bins that the uneven pulse spacing makes
-    gx, gy = max(8 * spx, 0.03 * Hx), max(8 * spy, 0.03 * Hy)
+    # the displacement and the spread of a point's azimuth bins that the uneven pulse spacing makes. A meter along
+    # e2 is ur meters of delay (1 on a slant plane along the line of sight, the cosine of the grazing angle on the
+    # ground), so the range gate, which is set in delay, takes its guard and its pixel times ur
+    ur_lo, ur_hi = float(ur.min()), float(ur.max())
+    gx, gy = max(8 * spx, 0.03 * Hx), max(8 * spy, 0.03 * Hy) * ur_lo
     xs, ys = (Hx + shx) * np.array([-1, 0, 1]), (Hy + shy) * np.array([-1, 0, 1])
     pts = (xs[:, None, None] * e1 + ys[None, :, None] * e2).reshape(-1, 3)
     dR = np.linalg.norm(pts[:, None] - ant[sub][None], axis=2) - r0[sub][None]
-    Er = float(np.abs(dR).max()) + 2 * spy
+    Er = float(np.abs(dR).max()) + 2 * spy * ur_hi
     Ex = (Hx + shx) * float(1 + np.abs(dtp / dts - 1).max()) + 2 * spx
     # the raster: its periods hold the picture, the displacement and a gate's far edge
-    nfy = _fft_size(int(np.ceil((Hy + shy + Er + gy) / spy)) + 2)
+    nfy = _fft_size(int(np.ceil((Hy + shy + (Er + gy) / ur_lo) / spy)) + 2)
     nfx = _fft_size(int(np.ceil((Hx + shx + Ex + gx) / spx)) + 2)
     dkr, dka = 2 * math.pi / (nfy * spy), 2 * math.pi / (nfx * spx)
-    kr_min, kr_max = 4 * math.pi * f[0] / C * ur.min(), 4 * math.pi * f[-1] / C * ur.max()
-    nkr = int((kr_max - kr_min) / dkr) + 1
-    if nkr > nfy:                                   # a band wider than the spacing resolves: its center
+    kr_lo, kr_hi = 4 * math.pi * f[0] / C * ur, 4 * math.pi * f[-1] / C * ur     # each pulse's band
+    kr_min, kr_max = float(kr_lo.min()), float(kr_hi.max())
+    nkr = int((kr_max - kr_min) / dkr) + 1                                        # the rows the bands reach together
+    nwin = int(float((kr_hi - kr_lo).max()) / dkr) + 1                           # and those of one pulse
+    jlo, hy, shear = None, None, 0.0
+    if nkr - nwin > max(8, 0.05 * nwin):
+        # The band drifts along the aperture: e2 is not the line of sight (a picture on the ground under a slant
+        # plane twisted about it), ur changes from pulse to pulse and the samples fill a sheared parallelogram of
+        # the raster. Each pulse is resampled on its own nwin rows, from row jlo; the rows are then taken across
+        # the pulses that reach them, and they fold into the transform's period, which holds a pulse's band and
+        # need not hold their union. shear: rows of drift per unit of azimuth wavenumber
+        mid = 0.5 * (kr_lo + kr_hi)
+        if nwin > nfy:                              # a band wider than the spacing resolves: each pulse's center
+            nwin = nfy
+            jlo = np.round((mid - kr_min) / dkr).astype(np.int64) - nwin // 2
+        else:
+            jlo = np.ceil((kr_lo - kr_min) / dkr - 1e-9).astype(np.int64)
+        jlo = np.maximum(jlo, 0).astype(np.int32)
+        nkr = int(jlo.max()) + nwin
+        hy = int(jlo[P // 2]) + nwin // 2
+        shear = float(np.polyfit(mid * t, mid, 1)[0])
+        first, last = kr_min + dkr * jlo, kr_min + dkr * (jlo + nwin - 1)
+        ka_lo, ka_hi = float(min((first * t).min(), (last * t).min())), float(max((first * t).max(), (last * t).max()))
+    elif nkr > nfy:                                 # a band wider than the spacing resolves: its center
         kr_min += ((nkr - nfy) // 2) * dkr
         nkr = nfy
     kr = kr_min + dkr * np.arange(nkr)
     kr_max = kr[-1]
-    ka_lo, ka_hi = kr_max * t.min(), kr_max * t.max()
+    if jlo is None:
+        nwin, hy = nkr, nkr // 2
+        ka_lo, ka_hi = kr_max * t.min(), kr_max * t.max()
     nka = int((ka_hi - ka_lo) / dka) + 1
     if nka > nfx:
         ka_lo += ((nka - nfx) // 2) * dka
@@ -427,6 +483,8 @@ def _geometry(ant, fmin, df, K, nx, ny, spx, spy, e1, e2, correct, ov=OVERSAMPLE
     scale = C / (4 * math.pi * ur * df)             # frequency samples per unit of kr, per pulse
     alpha = ((kr_min * scale - fmin / df) + k0) * (Nr / Kf)
     beta = dkr * scale * (Nr / Kf)
+    if jlo is not None:
+        alpha = alpha + jlo * beta
     # azimuth gate: P pulses at p0 of Pf, the bins of row kr 2 pi / (kr |dts| Pf), Na kept, the pulses back on Na
     Xa = 2 * math.pi / (kr_max * abs(dts))          # the shortest period, the highest wavenumber's
     rho_a = 2 * (Ex + gx) / PASS / Xa
@@ -456,7 +514,8 @@ def _geometry(ant, fmin, df, K, nx, ny, spx, spy, e1, e2, correct, ov=OVERSAMPLE
     return dict(P=P, K=K, nx=nx, ny=ny, spx=spx, spy=spy, nfx=nfx, nfy=nfy, dkr=dkr, dka=dka, kr_min=kr_min, nkr=nkr,
                 ka_lo=ka_lo, nka=nka, kr=kr, k0=k0, Kf=Kf, Nr=Nr, bin_r=bin_r, Er=Er, gy=gy, alpha=alpha, beta=beta,
                 p0=p0, Pf=Pf, Na=Na, bin_a=bin_a, bins_a=bins_a, Ex=Ex, gx=gx, qtab=qtab, tg0=float(tg[0]), tg_inv=float(4 / dts),
-                wk=wk, wp=wp, gain=gain, dist=dist, shift=(shx, shy), ov=ov, t=t, dts=dts)
+                wk=wk, wp=wp, gain=gain, dist=dist, shift=(shx, shy), ov=ov, t=t, dts=dts, nwin=nwin, jlo=jlo, hy=hy,
+                shear=shear)
 
 
 def _corner_error(ant, fmin, df, K, nx, ny, spx, spy, e1, e2, window=True):
@@ -517,6 +576,24 @@ def _wrap_cut(x, n, axis):
     return out
 
 
+def _fold(B, n, origin):
+    """The rows of a raster (the columns J of B [m, nkr]) summed into the n bins of a transform's period: column J
+    into bin (J - origin) mod n. A transform of n points takes its samples at multiples of its period's reciprocal,
+    where rows n apart are the same, so the fold changes nothing at the pixels."""
+    nkr = B.shape[1]
+    Z = np.zeros((B.shape[0], n), np.complex64)
+    J = 0
+    while J < nkr:
+        c = (J - origin) % n
+        w = min(nkr - J, n - c)
+
+        def add(sl, J=J, c=c, w=w):
+            Z[sl, c:c + w] += B[sl, J:J + w]
+        _blocks(add, B.shape[0], int(max(1, (1 << 18) // max(w, 1))))
+        J += w
+    return Z
+
+
 def _pfa_cpu(S, g, window, correct, complex_image, timing):
     """The quick look's polar format on the host -> the image, range-major [ny, nx]: complex64 with backprojection's
     phase (complex_image) or the amplitude (float32). The passes over the arrays are fused and run on all cores:
@@ -542,7 +619,8 @@ def _pfa_cpu(S, g, window, correct, complex_image, timing):
     keep = min(Nr, Kf)
     pos, neg = keep - keep // 2, keep // 2
     alpha, beta = np.ascontiguousarray(g['alpha'], np.float64), np.ascontiguousarray(g['beta'], np.float64)
-    A = np.empty((P, nkr), np.complex64)
+    nwin, jlo = g['nwin'], g['jlo']                       # a pulse's rows of the raster (all of them, or its own)
+    A = np.empty((P, nwin), np.complex64)
 
     def rows(sl):
         n = sl.stop - sl.start
@@ -553,7 +631,7 @@ def _pfa_cpu(S, g, window, correct, complex_image, timing):
         np.multiply(prof[:, :pos], tap_r[:pos], out=gate[:, :pos])
         np.multiply(prof[:, Kf - neg:], tap_r[Nr - neg:], out=gate[:, Nr - neg:])
         G = np.ascontiguousarray(sf.fft(gate, axis=1, overwrite_x=True))
-        lib.ql_resample_rows(ptr(G), n, Nr, at(alpha, sl.start), at(beta, sl.start), nkr, ptr(tab), PHASES,
+        lib.ql_resample_rows(ptr(G), n, Nr, at(alpha, sl.start), at(beta, sl.start), nwin, ptr(tab), PHASES,
                              at(A, sl.start), 1)
     _blocks(rows, P, int(max(1, min(64, (1 << 21) // (8 * max(Kf, Nr))))))
     S = None
@@ -578,7 +656,10 @@ def _pfa_cpu(S, g, window, correct, complex_image, timing):
     def cols(sl):
         n = sl.stop - sl.start
         buf = np.empty((n, Pf), np.complex64)
-        lib.ql_transpose(at(A, 0, sl.start), nkr, P, n, ptr(buf), Pf, None, 1)
+        if jlo is None:
+            lib.ql_transpose(at(A, 0, sl.start), nkr, P, n, ptr(buf), Pf, None, 1)
+        else:
+            lib.ql_unshear(ptr(A), nwin, P, ptr(jlo), sl.start, n, ptr(buf), Pf)
         buf[:, P:] = 0
         prof = np.ascontiguousarray(sf.fft(buf, axis=1, overwrite_x=True))
         gate = np.empty((n, Na), np.complex64)
@@ -596,6 +677,8 @@ def _pfa_cpu(S, g, window, correct, complex_image, timing):
         # 3. the raster's transform, cut to the picture: the range transform along the rows, whose last ny / 2
         # outputs are the pixels before the center and whose first ny / 2 are those from it on, turned to
         # range-major with those in their places; then the azimuth transform along the rows, cut likewise
+        if nkr > nfy:                                                   # the rows fold into the transform's period
+            B = _fold(B, nfy, 0)
         F = sf.ifft(B, n=nfy, axis=1, workers=W)                        # [nka, nfy]
         del B
         Z = np.empty((ny, nfx), np.complex64)
@@ -631,17 +714,21 @@ def _pfa_cpu(S, g, window, correct, complex_image, timing):
     # count from the image's center
     dist = g['dist']
     Ny2, Nx2 = ov * nfy, ov * nfx
-    hy, hx = nkr // 2, nka // 2
+    hy, hx = g['hy'], nka // 2
     sy = ((-1.0) ** (np.arange(nkr) - hy)).astype(np.float32)
     sx = np.ascontiguousarray((-1.0) ** (np.arange(nka) - hx), np.float32)
-    Z = np.empty((nka, Ny2), np.complex64)
     rb = int(max(1, (1 << 18) // Ny2))
+    if nkr > Ny2:                                                          # the rows fold into the padded period
+        B *= sy
+        Z = _fold(B, Ny2, hy)
+    else:
+        Z = np.empty((nka, Ny2), np.complex64)
 
-    def fill(sl):
-        np.multiply(B[sl, hy:], sy[hy:], out=Z[sl, :nkr - hy])
-        Z[sl, nkr - hy:Ny2 - hy] = 0
-        np.multiply(B[sl, :hy], sy[:hy], out=Z[sl, Ny2 - hy:])
-    _blocks(fill, nka, rb)
+        def fill(sl):
+            np.multiply(B[sl, hy:], sy[hy:], out=Z[sl, :nkr - hy])
+            Z[sl, nkr - hy:Ny2 - hy] = 0
+            np.multiply(B[sl, :hy], sy[:hy], out=Z[sl, Ny2 - hy:])
+        _blocks(fill, nka, rb)
     del B
     F1 = sf.ifft(Z, axis=1, workers=W, overwrite_x=True)                   # [nka, Ny2]: range done
     del Z
@@ -677,7 +764,8 @@ def _pfa_cpu(S, g, window, correct, complex_image, timing):
         lib.ql_gather(ptr(base), span, Nx2, Nx2, Ny2, rb0, 0, nx, n, 0, jb, nx, ny, float(g['spx']),
                       float(g['spy']), float(ov), float(dist['sx']), float(dist['sy']), ptr(cx), ptr(cy), ptr(pw),
                       len(cx), deg, float(kr_c), float(ka_c), 1, 1.0, LANCZOS, ptr(ltab), ptr(ltab16), PHASES,
-                      0 if complex_image else 1, ctypes.c_void_p(out.ctypes.data + jb * out.strides[0]), nx)
+                      0 if complex_image else 1, ctypes.c_void_p(out.ctypes.data + jb * out.strides[0]), nx,
+                      float(g['shear'] * g['spy'] / g['spx']))
         del base
         tt[0] += t2 - t1
         tt[1] += time.perf_counter() - t2
@@ -724,7 +812,8 @@ def _pfa(S, ant, fmin, df, nx, ny, spx, spy, e1, e2, *, correct=True, window=Tru
         raise ValueError(f'the quick look takes even pixel counts, got {nx} by {ny}')
     box = S if isinstance(S, list) else [S]            # a one-element list hands the history over: it is freed
     del S                                              # as soon as the range stage has read it
-    g = _geometry(ant, float(fmin), float(df), box[0].shape[1], int(nx), int(ny), float(spx), float(spy), e1, e2, correct)
+    g = _geometry(ant, float(fmin), float(df), box[0].shape[1], int(nx), int(ny), float(spx), float(spy), e1, e2, correct,
+                  window=bool(window))
     timing['geometry'] = timing.get('geometry', 0.0) + time.perf_counter() - t0
     info = {} if info is None else info
     info.update(shift_px=g['dist']['max_shift_px'], fit_rms_px=g['dist']['rms_px'], raster=(g['nkr'], g['nka']),
@@ -801,6 +890,59 @@ extern "C" __global__ void ql_resample_cols(const float2* A, int R, int M, const
   out[(long)m * n_out + j] = acc;
 }
 """
+_CUDA_GATHER_SRC = r"""
+#define HALF_L (LTAPS / 2)
+// quicklook_cpu.cpp's ql_gather on the device: one thread per pixel, i along azimuth (fastest), c the range pixel of
+// the block. The apparent position from the distortion polynomial in float64, the baseband image (the block's rows
+// rb0 .. of [Ny2, Nx2], oversampled by ov) read there with LTAPS x LTAPS taps whose weights come from the polyphase
+// table tab [Q + 1, LTAPS]; each row of taps at the column fx + shear (row - fy). The result times exp(j (kr_c Ya -
+// ka_c Xa)), or its amplitude (detect), written range-major: out[c, i].
+extern "C" __global__ void ql_gather(const float2* base, int span, int Nx2, int Ny2, int rb0, int n, int jb, int nx,
+                                     int ny, double spx, double spy, double ov, double dsx, double dsy,
+                                     const double* cx, const double* cy, const int* pw, double kr_c, double ka_c,
+                                     double shear, const float* tab, int detect, float gain, float* out) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x, c = blockIdx.y;
+  if (i >= nx || c >= n) return;
+  const double x = (i - nx / 2.0) * spx, y = (jb + c - ny / 2.0) * spy;
+  const double xn = x / dsx, yn = y / dsy;
+  double Xa = x, Ya = y, px[DEG + 1], py[DEG + 1];
+  px[0] = 1.0; py[0] = 1.0;
+  #pragma unroll
+  for (int k = 1; k <= DEG; ++k) { px[k] = px[k-1] * xn; py[k] = py[k-1] * yn; }
+  #pragma unroll
+  for (int k = 0; k < NPOW; ++k) {
+    const double t = px[pw[2*k]] * py[pw[2*k+1]];
+    Xa += cx[k] * t; Ya += cy[k] * t;
+  }
+  const double fx = Xa * (ov / spx) + Nx2 / 2.0, fy = Ya * (ov / spy) + Ny2 / 2.0;
+  const double fiy = floor(fy);
+  const int iy0 = (int)fiy - HALF_L + 1;
+  const float* wy = tab + (int)((fy - fiy) * QTAB + 0.5) * LTAPS;
+  float ar = 0.f, ai = 0.f;
+  #pragma unroll
+  for (int a = 0; a < LTAPS; ++a) {
+    const int row = iy0 + a;
+    const double fxa = fx + shear * ((double)row - fy), fl = floor(fxa);
+    const int ix0 = (int)fl - HALF_L + 1;
+    const float* wx = tab + (int)((fxa - fl) * QTAB + 0.5) * LTAPS;
+    const float2* r = base + (long)min(max(row - rb0, 0), span - 1) * Nx2;
+    float re = 0.f, im = 0.f;
+    #pragma unroll
+    for (int b = 0; b < LTAPS; ++b) {
+      const float2 v = r[min(max(ix0 + b, 0), Nx2 - 1)];
+      re = fmaf(wx[b], v.x, re); im = fmaf(wx[b], v.y, im);
+    }
+    ar = fmaf(wy[a], re, ar); ai = fmaf(wy[a], im, ai);
+  }
+  ar *= gain; ai *= gain;
+  const long o = (long)c * nx + i;
+  if (detect) { out[o] = sqrtf(ar * ar + ai * ai); return; }
+  double sn, cs;
+  sincos(kr_c * Ya - ka_c * Xa, &sn, &cs);
+  const float cr = (float)cs, ci = (float)sn;
+  out[2 * o] = ar * cr - ai * ci; out[2 * o + 1] = ar * ci + ai * cr;
+}
+"""
 _CUDA = {}
 
 
@@ -812,6 +954,41 @@ def _cuda_cols():
         _CUDA['cols'] = cp.RawModule(code=_CUDA_COLS_SRC, options=(f'-DTAPS={TAPS}', f'-DTABN={TABN}')).get_function(
             'ql_resample_cols')
     return _CUDA['cols']
+
+
+def _cuda_gather(npow, deg):
+    """The CUDA kernel of the final read at the apparent positions, compiled once per polynomial."""
+    key = ('gather', npow, deg)
+    if key not in _CUDA:
+        import cupy as cp
+        _CUDA[key] = cp.RawModule(code=_CUDA_GATHER_SRC, options=(f'-DLTAPS={LANCZOS}', f'-DNPOW={npow}', f'-DDEG={deg}',
+                                                                  f'-DQTAB={PHASES}')).get_function('ql_gather')
+    return _CUDA[key]
+
+
+def _cuda_unshear():
+    """pad[p, J] = A[p, J - jlo[p]] where that column exists, else 0: the rows of the raster out of a history whose
+    pulses hold their own rows (quicklook_cpu.cpp's ql_unshear)."""
+    if 'unshear' not in _CUDA:
+        import cupy as cp
+        _CUDA['unshear'] = cp.ElementwiseKernel(
+            'raw complex64 A, raw int32 jlo, int32 W, int32 nkr', 'complex64 out',
+            'const long long p = i / nkr; const int c = (int)(i - p * nkr) - jlo[p]; '
+            'out = (c >= 0 && c < W) ? A[p * W + c] : complex<float>(0.f, 0.f);', 'fastsar_ql_unshear')
+    return _CUDA['unshear']
+
+
+def _fold_dev(B, n, origin):
+    """_fold on the device, for a raster whose range wavenumbers are its rows: row J into bin (J - origin) mod n."""
+    import cupy as cp
+    Z = cp.zeros((n,) + B.shape[1:], cp.complex64)
+    J = 0
+    while J < B.shape[0]:
+        c = (J - origin) % n
+        w = min(B.shape[0] - J, n - c)
+        Z[c:c + w] += B[J:J + w]
+        J += w
+    return Z
 
 
 def _pfa_cuda(S, g, window, correct, complex_image, timing):
@@ -840,7 +1017,8 @@ def _pfa_cuda(S, g, window, correct, complex_image, timing):
     alpha, beta = cp.asarray(g['alpha'].astype(np.float32)), cp.asarray(g['beta'].astype(np.float32))
     t0 = lap('kernels', t0)
     # 1. range gate and range resampling, a block of pulses at a time (three arrays of the padded block at once)
-    A = cp.empty((P, nkr), cp.complex64)
+    nwin, jlo = g['nwin'], g['jlo']
+    A = cp.empty((P, nwin), cp.complex64)
     nb = int(max(1, min(P, 1024, _xp.cuda_block() // (24 * max(Kf, Nr)))))
     for r in range(0, P, nb):
         x = cp.asarray(S[r:r + nb])
@@ -854,14 +1032,17 @@ def _pfa_cuda(S, g, window, correct, complex_image, timing):
         gate *= wp[r:r + n, None]
         G = cp.ascontiguousarray(cf.fft(gate, axis=1, overwrite_x=True))
         del gate
-        k_rows((-(-nkr // 128), n), (128,), (G, i32(n), i32(Nr), alpha[r:r + n], beta[r:r + n], i32(nkr), tab, A[r:r + n]))
+        k_rows((-(-nwin // 128), n), (128,), (G, i32(n), i32(Nr), alpha[r:r + n], beta[r:r + n], i32(nwin), tab, A[r:r + n]))
         del G
     S = None
     t0 = lap('range', t0)
     # 2. azimuth gate and azimuth resampling
     Pf, Na, p0 = g['Pf'], g['Na'], g['p0']
     pad = cp.zeros((Pf, nkr), cp.complex64)
-    pad[p0:p0 + P] = A
+    if jlo is None:
+        pad[p0:p0 + P] = A
+    else:
+        _cuda_unshear()(A, cp.asarray(jlo), i32(nwin), i32(nkr), pad[p0:p0 + P])
     del A
     gate = _wrap_cut(cf.fft(pad, axis=0, overwrite_x=True), Na, 0)
     del pad
@@ -882,6 +1063,8 @@ def _pfa_cuda(S, g, window, correct, complex_image, timing):
     del A2
     t0 = lap('azimuth', t0)
     if not correct:
+        if nkr > nfy:
+            B = _fold_dev(B, nfy, 0)
         F = _wrap_shift(cf.ifft(B, n=nfy, axis=0), ny, 0)
         del B
         img = _wrap_shift(cf.fft(F, n=nfx, axis=1), nx, 1)
@@ -896,23 +1079,27 @@ def _pfa_cuda(S, g, window, correct, complex_image, timing):
         return img
     ov, dist = g['ov'], g['dist']
     Ny2, Nx2 = ov * nfy, ov * nfx
-    hy, hx = nkr // 2, nka // 2
+    hy, hx = g['hy'], nka // 2
     B *= cp.asarray(((-1.0) ** (np.arange(nkr) - hy)).astype(np.float32))[:, None]
     B *= cp.asarray(((-1.0) ** (np.arange(nka) - hx)).astype(np.float32))[None, :]
-    Z = cp.zeros((Ny2, nka), cp.complex64)
-    Z[:nkr - hy], Z[Ny2 - hy:] = B[hy:], B[:hy]
+    if nkr > Ny2:
+        Z = _fold_dev(B, Ny2, hy)
+    else:
+        Z = cp.zeros((Ny2, nka), cp.complex64)
+        Z[:nkr - hy], Z[Ny2 - hy:] = B[hy:], B[:hy]
     del B
     F1 = cf.ifft(Z, axis=0, overwrite_x=True)
     del Z
     t0 = lap('range transform', t0)
     powers = dist['powers']
-    kern = pfa2._gather_kernel(LANCZOS, len(powers), max(a + b for a, b in powers))
+    kern = _cuda_gather(len(powers), max(a + b for a, b in powers))
     d_cx, d_cy = cp.asarray(np.asarray(dist['cx'], np.float64)), cp.asarray(np.asarray(dist['cy'], np.float64))
     d_pw = cp.asarray(np.asarray(powers, np.int32).ravel())
+    ltab = cp.asarray(_polyphase('lanczos', LANCZOS, PHASES))
     kr_c, ka_c = g['kr_min'] + hy * g['dkr'], g['ka_lo'] + hx * g['dka']
-    gain = cp.ones((1,), cp.float32)
+    shear = float(g['shear'] * g['spy'] / g['spx'])
     msy = int(math.ceil(g['shift'][1] / g['spy'])) * ov + LANCZOS + 2
-    out = cp.empty((nx, ny), cp.complex64)                           # the kernel writes azimuth-major
+    out = cp.empty((ny, nx), cp.complex64 if complex_image else cp.float32)      # range-major
     bw = int(max(16, min(ny, _xp.cuda_block() // (16 * Nx2 * ov))))
     for jb in range(0, ny, bw):
         n = min(bw, ny - jb)
@@ -923,15 +1110,14 @@ def _pfa_cuda(S, g, window, correct, complex_image, timing):
         base = cp.ascontiguousarray(cf.fft(Z, axis=1, overwrite_x=True))
         del Z
         kern((-(-nx // 128), n), (128,),
-             (base, i32(span), i32(Nx2), i32(Ny2), i32(rb0), i32(nx), i32(n), i32(0), i32(jb), i32(nx), i32(ny),
-              f64(g['spx']), f64(g['spy']), f64(0.0), f64(0.0), f64(ov), f64(dist['sx']), f64(dist['sy']), d_cx, d_cy, d_pw,
-              f64(kr_c), f64(ka_c), i32(1), i32(-1), np.float32(1.0), gain, out[:, jb:], np.int64(ny)))
+             (base, i32(span), i32(Nx2), i32(Ny2), i32(rb0), i32(n), i32(jb), i32(nx), i32(ny), f64(g['spx']),
+              f64(g['spy']), f64(ov), f64(dist['sx']), f64(dist['sy']), d_cx, d_cy, d_pw, f64(kr_c), f64(ka_c),
+              f64(shear), ltab, i32(0 if complex_image else 1), np.float32(1.0), out[jb:]))
         cp.cuda.get_current_stream().synchronize()
         del base
     del F1
-    img = cp.ascontiguousarray(out.T) if complex_image else cp.ascontiguousarray(cp.abs(out).T)
     lap('correction', t0)
-    return img
+    return out
 
 
 # ------------------------------------------------------------------------------------------- factorized former
@@ -1065,22 +1251,35 @@ def read_png(path):
 # ------------------------------------------------------------------------------------------------- the quick look
 
 def _backend(backend):
-    """backend checked against this machine, 'auto' resolved (tpu, else cuda, else cpu). JAX is asked for a TPU only
-    where one may be present (JAX already imported, the libtpu package installed, or TPU_LIBRARY_PATH set): importing
-    it takes longer than a quick look."""
+    """A backend named by the caller, checked against this machine ('auto' is resolved by _auto, once the cut is
+    known)."""
+    from . import api
+    b = api._backend(backend)
+    return 'cpu' if b == 'metal' else b
+
+
+def _auto(samples):
+    """backend='auto' for a cut history of `samples` samples: the device that forms its picture soonest, by the
+    AUTO_ thresholds above. No device is asked for below them: importing CuPy or JAX takes longer than a small
+    quick look. JAX is asked for a TPU only where one may be present (JAX already imported, the libtpu package
+    installed, or TPU_LIBRARY_PATH set)."""
     import importlib.util
     import sys
-    from . import api
-    if backend != 'auto' or 'jax' in sys.modules or os.environ.get('TPU_LIBRARY_PATH') \
-            or importlib.util.find_spec('libtpu') is not None:
-        b = api._backend(backend)
-        return 'cpu' if b == 'metal' else b
-    try:
-        import cupy
-        if cupy.cuda.runtime.getDeviceCount() > 0:
-            return 'cuda'
-    except Exception:
-        pass
+    if samples >= AUTO_TPU_SAMPLES and ('jax' in sys.modules or os.environ.get('TPU_LIBRARY_PATH')
+                                        or importlib.util.find_spec('libtpu') is not None):
+        from . import api
+        try:
+            if 'tpu' in api.available_backends():
+                return 'tpu'
+        except Exception:
+            pass
+    if samples >= (AUTO_CUDA_SAMPLES if _CUDA else AUTO_CUDA_FIRST_SAMPLES):
+        try:
+            import cupy
+            if cupy.cuda.runtime.getDeviceCount() > 0:
+                return 'cuda'
+        except Exception:
+            pass
     return 'cpu'
 
 
@@ -1093,18 +1292,20 @@ def quicklook(cphd, output=None, *, size=2048, resolution=None, correct=True, re
     resolution needs (see the module docstring).
 
     cphd: path (CPHD 1.0.1, 1.1.0 or 0.3, frequency domain). output: a file to write, by its extension: .png, the
-        8-bit picture (standard library only); .nitf or .ntf, the complex image as a slant-plane SICD
+        8-bit picture (standard library only); .nitf or .ntf, the complex image as a ground-plane SICD
         (products.write_sicd). None: nothing is written.
-    size: pixels along the longer side of the picture, which is the tasked area's bounding rectangle on the
-        slant-plane grid (default 2048). resolution: the ground resolution in meters in place of size (the
-        reciprocal of the band used on both axes; the pixel is 0.96 of it), or 'full' for the finest the collection
-        holds on both axes. A request finer than that gets that, with a note.
+    size: pixels along the longer side of the picture, which is the tasked area's bounding rectangle along and
+        across the ground range direction (default 2048). resolution: the ground resolution in meters in place of
+        size (the reciprocal of the band used on both axes; the pixel is 0.96 of it), or 'full' for the finest the
+        collection holds on both axes. A request finer than that gets that, with a note.
     correct: remove polar format's displacement of scatterers (the default). False is the fastest picture: the
         displacement, a smooth field that grows with the square of the distance from the center, stays, and
         displacement_px says how large it is at the corners.
     remap: the display remap, a name of fastsar.remap.REMAPS other than 'linear' or a function (sidd.to_display's).
     backend: 'auto', 'cpu', 'cuda', 'jax' or 'tpu'. cpu and cuda form by polar format; jax and tpu form the same
-        cut history on the same grid by the factorized former (ImageFormer), where correct does not apply.
+        cut history on the same grid by the factorized former (ImageFormer), where correct does not apply. 'auto'
+        takes the device that forms the cut soonest, by its size: the CPU for a small one (no device is started),
+        a GPU or a TPU from the sizes of AUTO_CUDA_SAMPLES, AUTO_CUDA_FIRST_SAMPLES and AUTO_TPU_SAMPLES on.
     weighting: 'taylor' (nbar 4, 35 dB, along frequency and along pulses: the default) or 'uniform'.
     looks: n, or (sub-apertures, sub-bands): the picture is the mean power of that many images of the same pixels
         and resolution, formed from runs of pulses and of samples side by side (n by n for one number), for less
@@ -1118,13 +1319,14 @@ def quicklook(cphd, output=None, *, size=2048, resolution=None, correct=True, re
 
     -> dict(display: uint8 [rows, cols], laid out shadows down (range away from the radar down the rows, seen from
     above); image: the complex image or None; origin, e1, e2, spx, spy: the grid of image [nx, ny], pixel (i, j) at
-    origin + i spx e1 + j spy e2 in the local frame of meta (as form_cphd's products); plane 'slant', axes 'los',
+    origin + i spx e1 + j spy e2 in the local frame of meta (the grid of form_cphd(axes='los')); plane 'ground', axes
+    'los',
     mode 'spotlight', center; display_origin, row, col, row_ss, col_ss, transform: the display's pixel (r, c) at
     display_origin + r row_ss row + c col_ss col (sidd.shadows_down's entries); corners: latitude and longitude
     [4, 2] of the display's corner pixels on the scene's plane, from the first row and column clockwise; pixel, the
     pixel on the ground (m), resolution (m) and finest, the finest resolution the collection holds; band (first
-    and last frequency used, Hz), bandwidth (cycles/m along e1 and e2), window, graze and twist (rad: the grazing
-    angle, and the angle by which the slant plane shears the ground in the picture), pulses (of those read) and cut:
+    and last frequency used, Hz), bandwidth (cycles/m along e1 and e2), window, graze (rad), pulses (of those read)
+    and cut:
     dict(pulses, of_pulses, samples, of_samples: the file's vectors and samples read; signal_bytes, of_bytes: their
     size and the signal array's); algorithm ('pfa' or 'ffbp'), backend, correct, displacement_px (polar format's
     largest displacement along e1 and e2 over the picture, in pixels; removed when correct), corner_error (polar
@@ -1133,7 +1335,7 @@ def quicklook(cphd, output=None, *, size=2048, resolution=None, correct=True, re
     sub-bands), remap, meta
     (read_cphd's), notes, timing (seconds by stage, and total), and path when a file was written). A moving-beam
     collection raises ValueError; process_cphd forms those."""
-    from . import _xp, planes, sidd
+    from . import _xp, sidd
     from . import remap as _remap
     t_start = time.perf_counter()
     if resolution is None:
@@ -1163,13 +1365,15 @@ def quicklook(cphd, output=None, *, size=2048, resolution=None, correct=True, re
     want = bool(complex_image) or kind == 'sicd'
     if want and looks != (1, 1):
         raise ValueError('the complex image (complex_image=True, a .nitf output) is of one look: leave looks=1')
-    backend = _backend(backend)
+    backend = backend if backend == 'auto' else _backend(backend)
     window = weighting == 'taylor'
     col = _collection(cphd, size, resolution, extent, channel, reader_options, looks)
     timing, notes, plan, meta = col['timing'], col['notes'], col['plan'], col['meta']
     nx, ny, spx, spy, e1, e2, c = col['nx'], col['ny'], col['spx'], col['spy'], col['e1'], col['e2'], col['center']
     S, ant, f0, df = col['S'], col['ant'], col['fmin'], col['df']
     P, K = S.shape
+    if backend == 'auto':
+        backend = _auto(P * K)
     (pa, pb), (k0, k1) = meta['pulses'], meta['samples']
     isz = meta['signal_bytes'] // (P * K) if P * K else 0
     cut = dict(pulses=(pa, pb), of_pulses=plan['P'], samples=(k0, k1), of_samples=plan['K'],
@@ -1177,10 +1381,8 @@ def quicklook(cphd, output=None, *, size=2048, resolution=None, correct=True, re
     notes.append(f"quick look: a ground resolution of {plan['resolution']:.3f} m in pixels of {plan['pixel']:.3f} m, from "
                  f"{pb - pa} of {plan['P']} pulses and {k1 - k0} of {plan['K']} samples "
                  f"({cut['signal_bytes'] / 1e6:.1f} MB of the {cut['of_bytes'] / 1e9:.2f} GB signal array)")
-    notes.append(f'slant-plane grid along the mid-aperture line of sight, {nx} by {ny} pixels of {spx:.3f} by {spy:.3f} m '
-                 f"(0.96 of the reciprocal of the band on each axis), which are {plan['pixel']:.3f} m across and along "
-                 f"the ground range direction (grazing angle {plan['graze']:.1f} degrees). The picture is not projected "
-                 f"to the ground: it is the ground sheared by the slant plane's twist, {plan['twist']:.1f} degrees")
+    notes.append(f'ground-plane grid along the mid-aperture line of sight, {nx} by {ny} pixels of {spx:.3f} m (0.96 of '
+                 f"the reciprocal of the band on each axis; grazing angle {plan['graze']:.1f} degrees)")
     la, lr = plan['looks']
     Pl, Kl = P // la, K // lr                                            # pulses and samples of a look
 
@@ -1261,23 +1463,21 @@ def quicklook(cphd, output=None, *, size=2048, resolution=None, correct=True, re
     rows, cols = display.shape
     rc = np.array([[0, 0], [0, cols - 1], [rows - 1, cols - 1], [rows - 1, 0]], np.float64)
     q = lay['origin'] + rc[:, :1] * lay['row_ss'] * lay['row'] + rc[:, 1:] * lay['col_ss'] * lay['col']
-    fr = planes.slant_frame(meta, c)
-    ground = planes.slant_to_ground(fr, *planes.ground_to_slant(fr, q), c[2])
-    lat, lon, _ = io.ecf_to_geodetic(io.local_to_ecf(ground, meta))
+    lat, lon, _ = io.ecf_to_geodetic(io.local_to_ecf(q, meta))
     timing['display'] = time.perf_counter() - t0
     u = ant / np.linalg.norm(ant, axis=1, keepdims=True)
-    tt = (u @ e1) / -(u @ e2)
+    ux, urm = u @ e1, float(-(u[P // 2] @ e2))
     fc = f0 + 0.5 * (K - 1) * df
     product = dict(
-        display=display, image=cimg, origin=origin, e1=e1, e2=e2, spx=float(spx), spy=float(spy), plane='slant',
+        display=display, image=cimg, origin=origin, e1=e1, e2=e2, spx=float(spx), spy=float(spy), plane='ground',
         axes='los', mode='spotlight', center=c, display_origin=lay['origin'], row=lay['row'], col=lay['col'],
         row_ss=lay['row_ss'], col_ss=lay['col_ss'], transform=tr, corners=np.stack([lat, lon], 1),
         pixel=float(plan['pixel']), resolution=float(plan['resolution']), finest=float(plan['finest']),
-        band=(f0, f0 + (K - 1) * df), bandwidth=(2 * fc / C * float(abs(tt[-1] - tt[0])), 2 * K * df / C),
+        band=(f0, f0 + (K - 1) * df), bandwidth=(2 * fc / C * float(abs(ux[-1] - ux[0])) / la, 2 * K * df / C * urm / lr),
         window=('taylor', 'taylor') if window else None, pulses=(0, P), cut=cut, algorithm=algorithm, backend=backend,
         correct=corrected, displacement_px=shift, corner_error=defocus, looks=(la, lr), remap=remap,
         graze=float(np.radians(plan['graze'])),
-        twist=float(np.radians(plan['twist'])), meta=meta,
+        meta=meta,
         notes=notes, timing=timing)
     if kind is not None:
         t0 = time.perf_counter()

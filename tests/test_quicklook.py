@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 
 import fastsar
-from fastsar import io, planes, quick, sim
+from fastsar import io, quick, sim
 
 C = 299792458.0
 LAT, LON = 35.0, -106.0
@@ -158,7 +158,7 @@ def test_cut_is_the_central_band_and_pulses(spot):
     assert cut['signal_bytes'] == (pb - pa) * (k1 - k0) * 8 and cut['of_bytes'] == P * K * 8
     assert max(out['display'].shape) == 256 and out['algorithm'] == 'pfa' and out['correct'] is True
     # the band of the samples kept is 0.96 / spy, that of the pulses 0.96 / spx (to a sample and a pulse or two)
-    assert (k1 - k0) * col.df * 2 / C == pytest.approx(0.96 / out['spy'], rel=2 / (k1 - k0))
+    assert (k1 - k0) * col.df * 2 / C * np.cos(out['graze']) == pytest.approx(0.96 / out['spy'], rel=2 / (k1 - k0))
     assert out['bandwidth'][0] == pytest.approx(0.96 / out['spx'], rel=3 / (pb - pa))
     assert out['bandwidth'][1] == pytest.approx(0.96 / out['spy'], rel=2 / (k1 - k0))
     # central: within the 16 samples the reader's alignment may move the band, and a pulse
@@ -167,8 +167,8 @@ def test_cut_is_the_central_band_and_pulses(spot):
     assert out['band'][1] == pytest.approx(col.fmin + (k1 - 1) * col.df, rel=1e-12)
     # the pixel is 0.96 of the resolution, the same on the ground along both axes
     assert out['pixel'] == pytest.approx(0.96 * out['resolution']) and out['resolution'] > out['finest']
-    assert out['pixel'] == pytest.approx(out['spy'] / np.cos(out['graze']), rel=1e-3)      # broadside: no twist
-    assert abs(out['twist']) < 1e-3 and out['graze'] == pytest.approx(np.radians(35.0), abs=1e-3)
+    assert out['pixel'] == out['spx'] == out['spy'] and out['graze'] == pytest.approx(np.radians(35.0), abs=1e-3)
+    assert out['plane'] == 'ground' and out['axes'] == 'los'
     # half the pixels: half the band on both axes
     small = look(spot['path'], size=128)
     assert small['cut']['samples'][1] - small['cut']['samples'][0] == pytest.approx((k1 - k0) / 2, abs=2)
@@ -202,13 +202,9 @@ def test_extent(spot):
 # ------------------------------------------------------------------------------------------------- the picture
 
 def _expected_pixels(out):
-    """Where the product's own geometry puts the simulated targets in the display: the slant-plane point with each
-    target's range and range rate (fastsar.planes), in rows and columns."""
-    meta = out['meta']
-    g = io.ecf_to_local(sim.to_ecf(TARGETS, LAT, LON), meta)
-    fr = planes.slant_frame(meta, out['center'])
-    a, r = planes.ground_to_slant(fr, g)
-    q = out['center'] + a[:, None] * fr['e1'] + r[:, None] * fr['e2'] - out['display_origin']
+    """Where the product's own geometry puts the simulated targets, which lie on the picture's plane, in the
+    display: rows and columns."""
+    q = io.ecf_to_local(sim.to_ecf(TARGETS, LAT, LON), out['meta']) - out['display_origin']
     return q @ out['row'] / out['row_ss'], q @ out['col'] / out['col_ss']
 
 
@@ -229,9 +225,9 @@ def test_points_where_they_should_be(spot, correct):
     # shadows down, from above: rows along the ground range away from the radar, row x col upward
     meta = out['meta']
     ant = 0.5 * (meta['tx'] + meta['rcv'])
-    los = out['center'] - ant[len(ant) // 2]
-    assert out['row'] @ los > 0.99 * np.linalg.norm(los) and np.cross(out['row'], out['col'])[2] > 0
-    assert out['transform']['transpose'] and out['plane'] == 'slant'
+    los = (out['center'] - ant[len(ant) // 2]) * np.array([1.0, 1.0, 0.0])
+    assert out['row'] @ los > 0.999 * np.linalg.norm(los) and np.cross(out['row'], out['col'])[2] > 0.999
+    assert out['plane'] == 'ground' and abs(out['e2'] @ out['row']) > 0.999
     # the corner pixels on the ground: the 150 m area about the scene center (their centers' mean lies half a
     # pixel from it: pixel i of n sits at (i - n / 2) spacings)
     lat, lon = out['corners'].T
@@ -271,6 +267,77 @@ def test_complex_image_against_exact_backprojection(spot):
     assert look(spot['path'], size=256)['image'] is None
     # a picture polar format holds: its own error at the corners is far below the kernels', and no note speaks of it
     assert out['corner_error'][1] < -40 and not any('defocused' in n for n in out['notes'])
+
+
+@pytest.fixture(scope='module')
+def squinted(tmp_path_factory):
+    """A 0.5 m spotlight at 60 degrees of grazing whose track passes 18 km to the side of broadside: the slant plane
+    is twisted 42 degrees about the line of sight, so that on the ground the lines of equal range and of equal
+    Doppler meet at an angle and the band of a pulse drifts along the aperture."""
+    col = sim.make_collect(res=0.5, scene=160.0, r0=30e3, graze_deg=60.0, offset=(0.0, 18e3, 0.0))
+    S = sim.simulate_brute(col, TARGETS, np.ones(len(TARGETS)) + 0j).astype(np.complex64)
+    path = str(tmp_path_factory.mktemp('squinted') / 'squinted.cphd')
+    sim.write_cphd(path, col, S, LAT, LON, scene=120.0)
+    return dict(path=path, col=col, S=S)
+
+
+def test_whole_scene_under_a_twisted_slant_plane(squinted):
+    """The picture is the tasked area on the ground along the line of sight, whatever the twist of the slant plane:
+    its points are where the product's geometry puts them, and the complex image is exact backprojection's of the
+    same cut on the same grid, corrected and windowed or not. The raster is then sheared: each pulse holds its own
+    rows of range wavenumbers, and they fold into the transform's period."""
+    out = look(squinted['path'], size=128, complex_image=True)
+    d = out['display']
+    assert out['plane'] == 'ground' and max(d.shape) == 128 and not any('cut to the central' in n for n in out['notes'])
+    rows, cols = _expected_pixels(out)
+    for r, c in zip(rows, cols):
+        i, j = int(round(r)), int(round(c))
+        box = d[i - 4:i + 5, j - 4:j + 5].astype(int)
+        pi, pj = np.unravel_index(box.argmax(), box.shape)
+        assert box.max() >= 250 and abs(pi - 4) <= 1 and abs(pj - 4) <= 1, (r, c, pi, pj, box.max())
+    # the tasked square, 120 m, seen along a line of sight 31 degrees from its sides
+    lat, lon = out['corners'].T
+    ecf = io.geodetic_to_ecf(lat, lon, np.zeros(4))
+    side = np.linalg.norm(ecf - np.roll(ecf, 1, axis=0), axis=1)
+    rot = np.arctan2(18e3, 30e3 * np.cos(np.radians(60.0)))
+    assert side == pytest.approx(120.0 * (np.cos(rot) + np.sin(rot)) * 127 / 128, rel=0.02)
+    col = quick._collection(squinted['path'], size=128)
+    S, ant, f0, df = col['S'], col['ant'], col['fmin'], col['df']
+    grid = tuple(col[k] for k in ('nx', 'ny', 'spx', 'spy', 'e1', 'e2'))
+    g = quick._geometry(ant, f0, df, S.shape[1], *grid, True)
+    assert g['jlo'] is not None and g['nkr'] > 1.2 * g['nwin'] and abs(g['shear']) > 0.3
+    for window, limit in ((True, -35), (False, -25)):
+        ex = fastsar.ExactFormer(ant, f0, df, S.shape[1], *grid, backend='cpu', window=window)(S)
+        e = rel_db(quick._pfa(S, ant, f0, df, *grid, window=window), ex)
+        ea = rel_db(quick._pfa(S, ant, f0, df, *grid, window=window, correct=False, complex_image=False), np.abs(ex))
+        print(f'twisted slant plane, window {window}: {e:.1f} dB against exact backprojection, uncorrected amplitude {ea:.1f} dB')
+        assert e < limit and ea < -15
+    assert rel_db(out['image'], fastsar.ExactFormer(ant, f0, df, S.shape[1], *grid, backend='cpu', window=True)(S)) < -35
+
+
+def test_distortion_on_any_axes():
+    """The apparent position is the weighted least-squares line of -dR / ur over the tangent of the look angle: on a
+    slant plane along the line of sight it is pfa2.distortion's to a fraction of a pixel, and on the ground, where a
+    meter of range is not a meter along the axis, the corrected image has backprojection's phase."""
+    from fastsar import pfa2
+    col = sim.make_collect(res=0.3, scene=200.0, r0=30e3, graze_deg=35.0)
+    P = col.Np
+    a = col.ant[P // 2]
+    e2 = -a / np.linalg.norm(a)
+    n = np.cross(e2, col.ant[P // 2 + 1] - col.ant[P // 2 - 1])
+    n *= np.sign(n[2]) / np.linalg.norm(n)
+    e1 = np.cross(e2, n)
+    own = quick._distortion(col.ant[::8], 256, 256, 0.5, 0.5, e1, e2)
+    rel = pfa2.distortion(sim.Collect(fmin=col.fmin, df=col.df, K=col.K, ant=col.ant[::8], res=0.3), 256, 256, 0.5, 0.5, e1, e2)
+    assert np.abs(np.array(own['cx']) - rel['cx']).max() < 0.01 and np.abs(np.array(own['cy']) - rel['cy']).max() < 0.01
+    rng = np.random.default_rng(2)
+    tg = np.stack([rng.uniform(-40, 40, 30), rng.uniform(-40, 40, 30), np.zeros(30)], 1)
+    S = sim.simulate_brute(col, tg, rng.standard_normal(30) + 1j * rng.standard_normal(30)).astype(np.complex64)
+    grid = (360, 290, 0.28, 0.35, np.array([0.0, 1.0, 0.0]), np.array([1.0, 0.0, 0.0]))      # the ground
+    ex = fastsar.ExactFormer(col.ant, col.fmin, col.df, col.K, *grid, backend='cpu', window=True)(S)
+    img = quick._pfa(S, col.ant, col.fmin, col.df, *grid, window=True)
+    g = np.vdot(img.ravel(), ex.ravel()) / np.vdot(img.ravel(), img.ravel())
+    assert rel_db(img, ex) < -35 and abs(np.angle(g)) < 0.01 and abs(g) == pytest.approx(1.0, abs=0.01)
 
 
 def test_taylor_window_is_scipys():
@@ -403,15 +470,15 @@ def test_png_read_by_pillow(tmp_path):
 
 
 def test_output_files(spot, tmp_path):
-    """.png: the display; .nitf: the complex image as a slant-plane SICD that the library's reader takes."""
+    """.png: the display; .nitf: the complex image as a ground-plane SICD that the library's reader takes."""
     png = str(tmp_path / 'look.png')
     out = look(spot['path'], png, size=128)
     assert out['path'] == png and np.array_equal(quick.read_png(png), out['display']) and 'write' in out['timing']
     ntf = str(tmp_path / 'look.nitf')
     out = look(spot['path'], ntf, size=128)
     pix, sm = io.read_sicd(ntf, native=True)
-    assert out['image'] is None and out['metadata'].Grid.ImagePlane == 'SLANT'
-    assert pix.shape == (128, 128) and sm.Grid.ImagePlane == 'SLANT' and sm.Grid.Type == 'PLANE'
+    assert out['image'] is None and out['metadata'].Grid.ImagePlane == 'GROUND'
+    assert pix.shape == (128, 128) and sm.Grid.ImagePlane == 'GROUND' and sm.Grid.Type == 'PLANE'
     assert sm.Grid.Row.SS == pytest.approx(out['spy']) and sm.Grid.Col.SS == pytest.approx(out['spx'])
     # the SICD's rows run along range as the display's do: the same picture, detected
     full = look(spot['path'], size=128, complex_image=True)
@@ -517,27 +584,45 @@ def test_factorized_former_on_jax(spot, request):
         assert out['display'][int(round(r)) - 2:int(round(r)) + 3, int(round(c)) - 2:int(round(c)) + 3].max() >= 250
 
 
-def test_auto_backend_without_importing_jax(monkeypatch):
-    """'auto' asks JAX for a TPU only where one may be present."""
+def test_auto_backend_by_the_size_of_the_cut(spot, monkeypatch):
+    """'auto' takes the CPU for a small cut without asking for a device; from the thresholds on it takes a GPU where
+    CuPy has one (a first look of a process from a larger size, which repays the start of the device), and it asks
+    JAX for a TPU only where one may be present."""
     import importlib.util
     import sys
+    import types
+    from fastsar import api
     real = importlib.util.find_spec
     monkeypatch.setattr(importlib.util, 'find_spec', lambda name, *a: None if name == 'libtpu' else real(name, *a))
     monkeypatch.delenv('TPU_LIBRARY_PATH', raising=False)
-    monkeypatch.setattr(fastsar.api, 'available_backends', lambda: pytest.fail('the device probe ran'))
+    monkeypatch.setattr(api, 'available_backends', lambda: pytest.fail('the device probe ran'))
+    asked = []
+    rt = types.SimpleNamespace(getDeviceCount=lambda: asked.append(1) or 1)
+    monkeypatch.setitem(sys.modules, 'cupy', types.SimpleNamespace(cuda=types.SimpleNamespace(runtime=rt)))
     saved = sys.modules.pop('jax', None)
     try:
-        assert quick._backend('auto') in ('cuda', 'cpu') and quick._backend('cpu') == 'cpu'
+        monkeypatch.setattr(quick, '_CUDA', {'cols': None})                     # the device has formed a look here
+        assert quick._auto(quick.AUTO_CUDA_SAMPLES - 1) == 'cpu' and not asked
+        assert quick._auto(quick.AUTO_CUDA_SAMPLES) == 'cuda' and asked
+        monkeypatch.setattr(quick, '_CUDA', {})                                 # a first look: the start is not repaid
+        assert quick._auto(quick.AUTO_CUDA_FIRST_SAMPLES - 1) == 'cpu' and quick._auto(quick.AUTO_CUDA_FIRST_SAMPLES) == 'cuda'
+        assert quick._auto(10 ** 12) == 'cuda'                                  # no TPU here: JAX is not asked
     finally:
         if saved is not None:
             sys.modules['jax'] = saved
+    assert quick.AUTO_CUDA_SAMPLES <= quick.AUTO_CUDA_FIRST_SAMPLES
+    out = fastsar.quicklook(spot['path'], size=64)                              # a few hundred thousand samples
+    assert out['backend'] == 'cpu'
+    with pytest.raises(ValueError):
+        fastsar.quicklook(spot['path'], size=64, backend='gpu')
 
 
 @pytest.mark.tpu
-def test_tpu(spot):
+def test_tpu(spot, monkeypatch):
     """On a TPU: 'auto' picks it, the cut history is formed by the factorized former at precision 'single-pass',
     and the picture agrees with polar format's on the host."""
     ref = look(spot['path'], size=128, complex_image=True)
+    monkeypatch.setattr(quick, 'AUTO_TPU_SAMPLES', 0)
     out = fastsar.quicklook(spot['path'], size=128, complex_image=True)
     assert out['backend'] == 'tpu' and out['algorithm'] == 'ffbp' and out['corner_error'] is None
     assert any('single-pass' in n for n in out['notes']) and out['cut'] == ref['cut']
@@ -554,6 +639,23 @@ def test_cuda_without_room_forms_on_the_host(spot, monkeypatch):
     out = look(spot['path'], size=256, backend='cuda')
     assert out['backend'] == 'cpu' and any('formed on the host' in n for n in out['notes'])
     assert np.array_equal(out['display'], look(spot['path'], size=256, backend='cpu')['display'])
+
+
+@pytest.mark.cuda
+def test_cuda_sheared_raster(squinted):
+    """The CUDA path on a ground grid under a twisted slant plane: the host's image."""
+    import cupy as cp
+    col = quick._collection(squinted['path'], size=128)
+    S, ant, f0, df = col['S'], col['ant'], col['fmin'], col['df']
+    grid = tuple(col[k] for k in ('nx', 'ny', 'spx', 'spy', 'e1', 'e2'))
+    assert quick._geometry(ant, f0, df, S.shape[1], *grid, True)['jlo'] is not None
+    for correct in (True, False):
+        for cplx in (True, False):
+            h = quick._pfa(S, ant, f0, df, *grid, correct=correct, complex_image=cplx)
+            d = quick._pfa(S, ant, f0, df, *grid, correct=correct, complex_image=cplx, backend='cuda')
+            e = rel_db(cp.asnumpy(d).astype(np.complex64), h.astype(np.complex64))
+            print(f'cuda against the host on a sheared raster, correct {correct}, complex {cplx}: {e:.1f} dB')
+            assert d.shape == h.shape and e < -60
 
 
 @pytest.mark.cuda
@@ -577,7 +679,6 @@ def test_cuda(spot):
     assert a['backend'] == 'cuda' and isinstance(a['display'], np.ndarray) and a['display'].shape == b['display'].shape
     assert np.mean(np.abs(a['display'].astype(int) - b['display'].astype(int)) <= 1) > 0.999
     assert a['cut'] == b['cut'] and {'range', 'azimuth', 'correction'} <= set(a['timing'])
-    assert fastsar.quicklook(spot['path'], size=64)['backend'] == 'cuda'       # 'auto' on a machine with a GPU
     c = look(spot['path'], size=256, backend='cuda', complex_image=True)
     d = look(spot['path'], size=256, backend='cpu', complex_image=True)
     assert isinstance(c['image'], np.ndarray) and c['image'].flags.c_contiguous and rel_db(c['image'], d['image']) < -60
