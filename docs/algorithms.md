@@ -76,6 +76,60 @@ the inner to the outer ring around the scene center; the factorized image's erro
 *Error relative to the float64 reference in four rings around the scene center, for polar format and the float32
 factorized image on the L4.*
 
+### Quick look
+
+`fastsar.quicklook` runs polar format on a cut of the collection, in a form whose cost follows the picture and not
+the collection ([processing-chain.md](processing-chain.md#quick-look)). The cut is the central run of frequency
+samples and the central run of pulses whose bands are 0.96 over the pixel spacings. Contiguous runs keep the sample
+and pulse spacings, so the unambiguous extents stay those of the collection. The grid lies in the slant plane with
+its range axis along the mid-aperture line of sight. The stages:
+
+1. Range. Each pulse is weighted, transformed to a range profile, cut to the bins the picture spans (a raised-cosine
+   edge beyond them) and transformed back, to a spectrum sampled 1.5 times finer than the gate needs. A 16-tap
+   Kaiser-windowed sinc reads it at the range wavenumbers of the raster. A file whose frequency step leaves 34 km
+   unambiguous for a 2 km swath (the Umbra collection below) is cut to the swath here.
+2. Azimuth. The pulses of each range wavenumber are transformed, cut to the picture's azimuth extent and
+   transformed back at the pulse spacing that extent needs. The cut is set in meters for each range wavenumber:
+   the bins of that transform scale with the wavenumber, by 5% and more across a wide band, and a cut set in bins
+   lets the low end of the band wrap content from beyond the picture into its far edge. The same kernel reads the
+   result at the raster's azimuth wavenumbers, at positions taken from the pulses' own spacing in the tangent of
+   the look angle, which is uneven by 1.4% on Panama. The pulses are not resampled separately.
+3. The raster's two-dimensional transform, cut to the picture. With `correct=False` this is the image.
+4. With `correct=True` the transform is taken on a raster padded to twice the sampling and read at each pixel's
+   apparent position with a 6-tap Lanczos kernel, as `algorithm='pfa'` does.
+
+The gates leave the picture inside 0.65 of each transform's period, the part the kernel reads to -58 dB, and a
+picture is cut to 0.92 of an unambiguous extent that the tasked area exceeds. On the CPU each of the first two
+stages is one pass per block of rows on a thread pool, every transform runs along the rows of its array, and the
+kernels read their weights from polyphase tables of 2048 positions per sample. Nothing is compiled per geometry.
+
+Against exact backprojection of the same cut history on the same grid (`ExactFormer`, the same Taylor window; the
+rms of the complex difference over that of the exact image, with one complex gain fitted), the corrected image
+measures -42.1, -43.0 and -43.1 dB at 1024, 2048 and 4096 pixels on the Umbra collection of the table in
+[performance.md](performance.md#quick-look), -41.0, -42.3 and -41.0 dB on the first Capella collection, -41.6 and
+-44.0 dB at 1024 and 2048 pixels on the second, and -41.6, -42.7 and -42.2 dB on the Panama history. The fitted
+gain is 0.997 to 0.998, so the image also has backprojection's scale.
+
+At full resolution over several kilometers the corners show polar format's own limit, a defocus that the
+displacement correction does not remove. On the Panama grid of 12,206 by 8,808 pixels, patches of 256 by 256
+pixels measure -61.3 dB at the center and -22.9, -40.8, -41.1 and -22.4 dB at the corners, where
+`algorithm='pfa'` measures -35.8 dB and -22.8, -37.2, -34.9 and -22.4 dB. On the 211 megapixel picture of the
+first Capella collection (0.41 m pixels over 6.0 by 3.8 km) the center measures -68.1 dB and the corners -13.0,
+-27.5, -28.8 and -13.0 dB. The phase that planar wavefronts leave over the aperture and the band for a scatterer
+at those places, once its linear part (the displacement) is taken out, predicts -13.0, -28.3, -29.2 and -13.1 dB
+there (1.3 rad at most) and -22.6 dB at the two worse Panama corners (0.42 rad): the error is the algorithm's and
+not the resampling's. `quicklook` computes that estimate for each picture (`corner_error`) and adds a note when it
+passes -30 dB; `form_cphd` forms such corners exactly. The estimate is of the defocus, and it gives the complex
+error where the scene is a small part of the range, as from orbit (0.6% here). On a simulated scene 358 m deep at
+2 km the amplitudes at the corners follow it (-20 to -23 dB for -19 dB) and the complex error is -6 to -10 dB,
+the same for `algorithm='pfa'`: the phase of the corrected image is not held there.
+
+Left uncorrected (`correct=False`), the image carries a phase that varies over the scene and the scatterers are
+displaced: by up to 4.6 by 3.3 pixels at the corners of the 2048-pixel picture of the first Capella collection
+(2.1 by 1.5 pixels measured on boxes of 512 pixels at the corners), 4.1 pixels in range on the Umbra picture, and
+21 pixels in range on the picture at 84 degrees of grazing, whose slant-range pixel is 0.29 m. The amplitude image
+then agrees with the exact one to -4 to -8 dB over the whole picture, which is the displacement.
+
 ## Wide-angle and circular apertures
 
 Factorized backprojection makes no small-angle assumption and forms wide-angle and circular collections. Test

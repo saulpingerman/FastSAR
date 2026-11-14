@@ -52,8 +52,9 @@
   (`display_origin`, `row`, `col`, `row_ss`, `col_ss`, `transform`), `corners` (latitude and longitude of the
   display's corner pixels), `pixel`, `resolution` and `finest` (m on the ground), `graze` and `twist` (rad),
   `cut` (the file's pulses and samples read, and their bytes), `algorithm`, `backend`, `correct`,
-  `displacement_px`, `looks`, `notes` and `timing` (seconds per stage). A moving-beam collection raises
-  `ValueError`; `process_cphd` forms those.
+  `displacement_px`, `corner_error` (polar format's own defocus at the worst corner: the phase left there in rad
+  and the error against exact backprojection in dB), `looks`, `notes` and `timing` (seconds per stage). A
+  moving-beam collection raises `ValueError`; `process_cphd` forms those.
 - `process_stack(cphds, output=None, *, product='mean', grid=None, reference=0, spacing=None, extent=None,
   register='fourier', equalize='mean', weights=None, window=7, weighting='taylor', aperture='auto', dem=None,
   remap='nrl', remap_args=None, shadows_down=True, backend='auto', precision='float32', max_shift=64,

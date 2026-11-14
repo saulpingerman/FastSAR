@@ -122,7 +122,9 @@ latitude and longitude of the corner pixels.
 
 `correct=True` (the default) removes polar format's displacement of scatterers; `correct=False` skips that step.
 `resolution=` sets the ground resolution in meters instead of `size`, and `'full'` asks for the finest the
-collection holds on both axes. `looks=n` averages the power of n by n images of the same pixels, formed from
+collection holds on both axes. At a resolution finer than about a meter over several kilometers polar format
+defocuses the corners of the picture; the product estimates by how much (`corner_error`), a note says so, and
+`form_cphd` is the tool for that image. `looks=n` averages the power of n by n images of the same pixels, formed from
 sub-apertures and sub-bands side by side, for less speckle at n by n times the bytes and the formation time.
 `output` is a `.png` file, written with the standard library alone, or a `.nitf` file, the complex image as a
 slant-plane SICD. `backend='cpu'` and `'cuda'` run polar format; `'jax'` and `'tpu'` form the same cut history on

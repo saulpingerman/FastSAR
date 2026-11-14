@@ -3,6 +3,44 @@
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The date of a version is the day it
 was published on PyPI.
 
+## [Unreleased]
+
+### Added
+
+- `fastsar.quicklook(cphd, output=None, *, size=2048, resolution=None, correct=True, remap='nrl', backend='auto',
+  weighting='taylor', looks=1, complex_image=False, channel=0, extent=None, reader_options=None)`: a
+  reduced-resolution picture of a spotlight collection for a look at the data
+  ([docs/processing-chain.md](docs/processing-chain.md#quick-look)). The header and a few hundred per-pulse
+  parameters decide the cut, the central run of frequency samples and of pulses whose bands give the pixel asked
+  for; only those are read from the file; the cut history is formed by polar format on a slant-plane grid along
+  the mid-aperture line of sight, detected, remapped and laid out shadows down. `size` is the pixel count along
+  the longer side, `resolution` the ground resolution in meters or `'full'`. The output is a `.png` file, written
+  with the standard library, or a `.nitf` file, the complex image as a slant-plane SICD. `correct=False` leaves
+  polar format's displacement of scatterers in. `looks=n` averages the power of n by n images from sub-apertures
+  and sub-bands side by side. On 16 CPU threads, with the file in the page cache, a 2048-pixel picture of a 9.1 GB
+  Capella spotlight takes 0.10 s and reads 65 MB of samples, one of an 8.7 GB Umbra spotlight 0.11 s and 348 MB,
+  and 4096-pixel pictures 0.33 and 0.36 s; `form_cphd` takes 365 s and 31 s on those files. The complex image is
+  within -41 to -44 dB of exact backprojection of the same cut history on the same grid; at full resolution over
+  several kilometers polar format defocuses the corners, and the product says by how much (`corner_error`, and a
+  note). The formation step on the
+  Panama history takes 0.94 s on the published grid of 12,206 by 8,808 pixels (0.53 s uncorrected), where
+  `form_image(algorithm='pfa')` takes 9.8 s ([docs/performance.md](docs/performance.md#quick-look)).
+  The cpu and cuda backends form by polar format (CuPy alone on the GPU); the jax and tpu backends form the same
+  cut history on the same grid by the factorized former. A moving-beam collection is refused with a `ValueError`
+  that names `process_cphd`.
+- `io.read_cphd(..., pulses=(first, last + 1), samples=(first, last + 1))` reads a part of a collection: those
+  vectors' parameters and those samples of each alone, with `pread` on all cores, for CPHD 1.0.1, 1.1.0 and 0.3.
+  For a collection with one scene reference point and one frequency grid the result equals the rows and columns of
+  the whole read, value for value. `form_cphd` takes the selection through `reader_options`.
+- `fastsar.quick.write_png` and `read_png`: 8-bit PNG files with the standard library alone, the rows deflated in
+  blocks on all cores.
+- `examples/quicklook.py`: a quick look from the command line, with the time of each stage.
+
+### Changed
+
+- `fastsar.pfa2` imports JAX when a polar-format program is built, not when the module is imported. The images of
+  `form_image(algorithm='pfa')`, `form_cphd` and `process_cphd` are bit for bit those of 0.3.0 on the CPU.
+
 ## [0.3.0] - 2026-11-14
 
 ### Added

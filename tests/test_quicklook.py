@@ -269,6 +269,8 @@ def test_complex_image_against_exact_backprojection(spot):
     assert out['image'].shape == grid[:2] and out['image'].dtype == np.complex64 and out['image'].flags.c_contiguous
     assert np.abs(out['image'] - img).max() <= 1e-5 * np.abs(img).max()
     assert look(spot['path'], size=256)['image'] is None
+    # a picture polar format holds: its own error at the corners is far below the kernels', and no note speaks of it
+    assert out['corner_error'][1] < -40 and not any('defocused' in n for n in out['notes'])
 
 
 def test_taylor_window_is_scipys():
@@ -296,6 +298,44 @@ def test_uneven_pulse_spacing():
     e = rel_db(quick._pfa(S, col.ant, col.fmin, col.df, *grid, window=True), ex)
     print(f'uneven pulses: {e:.1f} dB')
     assert e < -30
+
+
+def test_corner_error_is_polar_formats_own():
+    """Fine resolution over a picture 880 m wide at 20 km: polar format defocuses its ends, by the phase its planar
+    wavefronts leave beyond the displacement. The estimate the product carries (corner_error) is the error measured
+    against exact backprojection on patches at the corners, and it is small on a picture polar format holds."""
+    rng = np.random.default_rng(4)
+    r0, wide, deep, res, fc, psi = 20e3, 880.0, 100.0, 0.3, 9.6e9, np.radians(30.0)
+    df = C / (2 * 1.6 * deep)
+    K = int(C / (2 * res) / df) // 2 * 2
+    dy = (C / fc) * r0 / (2 * 1.6 * wide)
+    P = int(r0 * (C / fc) / (2 * res) / dy) // 2 * 2
+    ant = np.stack([np.full(P, -r0 * np.cos(psi)), (np.arange(P) - (P - 1) / 2.0) * dy, np.full(P, r0 * np.sin(psi))], 1)
+    col = sim.Collect(fmin=fc - (K // 2) * df, df=df, K=K, ant=ant, res=res)
+    a = ant[P // 2]
+    e2 = -a / np.linalg.norm(a)
+    n = np.cross(e2, ant[P // 2 + 1] - ant[P // 2 - 1])
+    n *= np.sign(n[2]) / np.linalg.norm(n)
+    e1 = np.cross(e2, n)
+    sp, h = 0.28, 32
+    nx, ny = int(wide / sp) // 2 * 2, int(deep / sp) // 2 * 2
+    grid = (nx, ny, sp, sp, e1, e2)
+    phase, db = quick._corner_error(ant, col.fmin, df, K, *grid)
+    assert phase > 0.8 and -16 < db < -12
+    cens = [((i + h - nx / 2) * sp, (j + h - ny / 2) * sp) for i in (0, nx - 2 * h) for j in (0, ny - 2 * h)]
+    tg = np.concatenate([(np.array([cx, cy]) + rng.uniform(-6, 6, (6, 2))) @ np.stack([e1, e2]) for cx, cy in cens])
+    amp = rng.standard_normal(len(tg)) + 1j * rng.standard_normal(len(tg))
+    S = sim.simulate_brute(col, tg, amp).astype(np.complex64)
+    img = quick._pfa(S, ant, col.fmin, df, *grid, window=True)
+    worst = -200.0
+    for cx, cy in cens:
+        ex = fastsar.ExactFormer(ant, col.fmin, df, K, 2 * h, 2 * h, sp, sp, e1, e2, backend='cpu', window=True,
+                                 center=cx * e1 + cy * e2)(S)
+        i, j = int(round(cx / sp + nx / 2 - h)), int(round(cy / sp + ny / 2 - h))
+        worst = max(worst, rel_db(img[i:i + 2 * h, j:j + 2 * h], ex))
+    print(f'corner error: estimated {db:.1f} dB ({phase:.2f} rad), measured {worst:.1f} dB')
+    assert abs(worst - db) < 1.5
+    assert quick._corner_error(ant, col.fmin, df, K, 256, 256, sp, sp, e1, e2)[1] < -50
 
 
 def test_wide_band_keeps_the_far_edge_clean():

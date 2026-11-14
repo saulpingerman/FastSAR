@@ -361,3 +361,56 @@ the two meet between 1024 and 2048 pixels on a side. On the c4d-highmem-16 facto
 2.6 s at 1024 pixels, 269 against 7.2 s at 8192; the CPU's exact kernel has since become faster, 433 s to 366 s on
 the full Panama image). On the three Panama regions exact backprojection is 19 to 21 dB more
 accurate against the 64 times truth. Records: `results/fastsar/crossover` in sar-accel-study.
+
+## Quick look
+
+`fastsar.quicklook` ([processing-chain.md](processing-chain.md#quick-look)) from the file to the PNG on an AMD Ryzen
+Threadripper PRO 7965WX held to 16 threads (a 16-CPU quota and `OMP_NUM_THREADS=16`), with the files in the page
+cache, as the second call of a process. Seconds with polar format's displacement corrected and left in, and the
+megabytes of samples read from the file:
+
+| Collection | `size=1024` | `size=2048` | `size=4096` | `resolution='full'` |
+|---|---|---|---|---|
+| Umbra spotlight, 8.73 GB (9,038 pulses of 120,736 samples) | 0.058 / 0.045 s, 87 MB | 0.108 / 0.101 s, 348 MB | 0.362 / 0.320 s, 1,392 MB | 0.70 / 0.66 s, 3,014 MB (2,748 by 6,028 pixels of 1.45 m) |
+| Capella spotlight, 9.13 GB (78,269 pulses of 29,162 samples) | 0.044 / 0.041 s, 16 MB | 0.105 / 0.097 s, 65 MB | 0.334 / 0.268 s, 258 MB | 5.8 to 10.5 / 4.7 to 7.9 s, 3,904 MB (15,942 by 13,262 pixels of 0.41 m) |
+| Capella spotlight at 84 degrees of grazing, 10.90 GB (212,858 pulses of 12,802 samples) | 0.059 / 0.056 s, 67 MB | 0.131 / 0.112 s, 197 MB | as 2048 | as 2048 |
+
+The first call of a process takes 0.1 to 0.2 s longer: the kernels are loaded and the thread pools started, and
+nothing is compiled per geometry. The third collection holds a ground resolution of 3.06 m, which `size=2048`
+already asks for, so its larger pictures are that picture (1,718 by 1,758 pixels). The 211 megapixel
+full-resolution picture of the second holds 20 GB of arrays, and its time followed the machine's free memory over
+the runs. On the same machine `form_cphd` takes 30.9 s, 365 s and 43.5 s on the three files, and
+`form_image(algorithm='pfa')` on the full-resolution cut and grid takes 8.3 s, 36.4 s and 1.0 s once the whole
+file is read (0.7 to 12.8 s): neither falls with the size of the picture.
+
+Bytes. The samples are read with `pread`, a block of pulses per thread, with the per-pulse parameters of those
+pulses alone, so the process asks the file for the megabytes above and the header. Read cold, the 2048-pixel cut of
+the 9.13 GB file took 77 MB from storage for 59 MB of samples, in 0.04 s. The Umbra file needs the most because
+its frequency step leaves 34 km unambiguous for a 2 km swath: a contiguous cut keeps that step, and the range gate
+removes the rest after the read.
+
+Stages at `size=2048` on the 9.13 GB file (0.105 s): the plan and the geometry 0.007 s, the read 0.010 s, the
+phase reference 0.002 s, the range stage 0.015 s, the azimuth stage 0.014 s, the padded transforms 0.017 s, the
+gather at the apparent positions 0.007 s, the remap and the layout 0.020 s, the PNG 0.012 s. The correction (the
+padded transforms and the gather in place of the plain transform) costs 0.003 to 0.013 s at `size=1024`, 0.007 to
+0.019 s at 2048 and 0.04 to 0.07 s at 4096, which is 5 to 22% of the call. Of the formation step alone it is
+more, and more than a quarter at full resolution: on Panama 10% at 1024 pixels, 26% at 2048, 24% at 4096 and 44%
+on the published grid (0.41 s of 0.94 s).
+
+Formation alone on the Panama history (15,186 pulses of 14,399 samples), corrected and uncorrected: 0.021 and
+0.019 s at 1024 pixels, 0.043 and 0.032 s at 2048, 0.126 and 0.096 s at 4096, and 0.94 and 0.53 s on the published
+grid (12,206 by 8,808 pixels), where `form_image(algorithm='pfa')` takes 9.8 s. The difference is in the passes:
+the pulses are not resampled separately, the gates cut the arrays before they are resampled, each stage is one
+pass per block of rows, every transform runs along rows, the weights come from tables, and no program is compiled
+for the geometry.
+
+On a GPU the same stages run in CuPy. An RTX PRO 6000 that another job kept busy took 0.16 to 0.18 s at
+`size=2048` (0.13 to 0.15 s uncorrected), 0.29 s at 4096 on the 9.13 GB file and 2.7 s for its full-resolution
+picture, and the Panama formation takes 0.54 s corrected and 0.32 s uncorrected on the published grid. The first
+call of a process pays for the CUDA context, the kernels and an FFT plan per array size: 1.7 s at `size=2048`. For
+one picture of 4096 pixels or fewer the CPU path is therefore the faster one on this machine; `backend='auto'`
+still picks the GPU where there is one, as the rest of the library does. Where the device has less free memory
+than the stages hold there, the picture is formed on the host and a note says so.
+
+`looks` costs its count. At `size=2048` on the 9.13 GB file one look takes 0.107 s and 65 MB, 2 by 2 looks 0.41 s
+and 258 MB, 3 by 3 looks 0.89 s and 580 MB.

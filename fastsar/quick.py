@@ -35,8 +35,8 @@ format in stages whose cost follows the picture, not the collection:
 
 What the correction does not remove is polar format's defocus far from the center at fine resolution: the complex
 image is within -40 dB of exact backprojection of the same history at the sizes a quick look is for, and at full
-resolution on a scene of several kilometers it falls to -15 to -25 dB at the corners, as form_image(algorithm='pfa')
-does.
+resolution on a scene of several kilometers it falls to -13 to -23 dB at the corners, as form_image(algorithm='pfa')
+does. _corner_error estimates that from the geometry; the product carries it and a note says so past -30 dB.
 
 Devices. 'cpu': scipy's FFTs on all cores, every one along the rows of its array (the arrays are turned between
 the stages), and the C++ kernels of quicklook_cpu.cpp, which read their weights from polyphase tables. 'cuda': the
@@ -457,6 +457,38 @@ def _geometry(ant, fmin, df, K, nx, ny, spx, spy, e1, e2, correct, ov=OVERSAMPLE
                 ka_lo=ka_lo, nka=nka, kr=kr, k0=k0, Kf=Kf, Nr=Nr, bin_r=bin_r, Er=Er, gy=gy, alpha=alpha, beta=beta,
                 p0=p0, Pf=Pf, Na=Na, bin_a=bin_a, bins_a=bins_a, Ex=Ex, gx=gx, qtab=qtab, tg0=float(tg[0]), tg_inv=float(4 / dts),
                 wk=wk, wp=wp, gain=gain, dist=dist, shift=(shx, shy), ov=ov, t=t, dts=dts)
+
+
+def _corner_error(ant, fmin, df, K, nx, ny, spx, spy, e1, e2, window=True):
+    """Polar format's own error at the picture's corners, as (phase, dB). Its planar wavefronts leave a phase over
+    the aperture and the band for a scatterer away from the center; the part of it that is linear in the two
+    wavenumbers is the displacement, which the correction removes, and the rest defocuses the scatterer. phase is the
+    most of that rest in radians, and dB the relative energy of the difference it makes to the weighted point
+    response with one complex gain fitted, at the worst of the four corners. The phase is smooth, so 65 pulses by 9
+    frequencies carry it."""
+    P = len(ant)
+    ip = np.unique(np.linspace(0, P - 1, min(P, 65)).round().astype(np.int64))
+    ik = np.unique(np.linspace(0, K - 1, min(K, 9)).round().astype(np.int64))
+    a = np.asarray(ant, np.float64)[ip]
+    R = np.linalg.norm(a, axis=1)
+    u = a / R[:, None]
+    k = 4 * np.pi * (fmin + df * ik) / C
+    w = np.ones((len(ip), len(ik)))
+    if window:
+        w = (_taylor(len(ip))[:, None] * _taylor(len(ik))[None, :]) ** 2
+    w = (w / w.sum()).ravel()
+    kx, ky = ((u @ e1)[:, None] * k).ravel(), ((u @ e2)[:, None] * k).ravel()
+    A = np.stack([np.ones(w.size), (kx - w @ kx) / np.ptp(kx), (ky - w @ ky) / np.ptp(ky)], 1)
+    fit = np.linalg.pinv(A * np.sqrt(w)[:, None]) * np.sqrt(w)          # the weighted least-squares linear part
+    worst = (0.0, -120.0)
+    for sx in (-0.5, 0.5):
+        for sy in (-0.5, 0.5):
+            r = sx * nx * spx * e1 + sy * ny * spy * e2
+            phi = ((np.linalg.norm(a - r, axis=1) - R + u @ r)[:, None] * k).ravel()
+            left = phi - A @ (fit @ phi)
+            err = 1.0 - abs(np.sum(w * np.exp(1j * left))) ** 2
+            worst = max(worst, (float(np.abs(left).max()), float(10 * np.log10(max(err, 1e-12)))), key=lambda v: v[1])
+    return worst
 
 
 def _taper(n, edge, guard, binsize):
@@ -1095,7 +1127,9 @@ def quicklook(cphd, output=None, *, size=2048, resolution=None, correct=True, re
     angle, and the angle by which the slant plane shears the ground in the picture), pulses (of those read) and cut:
     dict(pulses, of_pulses, samples, of_samples: the file's vectors and samples read; signal_bytes, of_bytes: their
     size and the signal array's); algorithm ('pfa' or 'ffbp'), backend, correct, displacement_px (polar format's
-    largest displacement along e1 and e2 over the picture, in pixels; removed when correct), looks (sub-apertures,
+    largest displacement along e1 and e2 over the picture, in pixels; removed when correct), corner_error (polar
+    format's own defocus at the worst corner: the phase its planar wavefronts leave there beyond the displacement,
+    rad, and the error that makes against exact backprojection, dB; None for ffbp), looks (sub-apertures,
     sub-bands), remap, meta
     (read_cphd's), notes, timing (seconds by stage, and total), and path when a file was written). A moving-beam
     collection raises ValueError; process_cphd forms those."""
@@ -1156,7 +1190,7 @@ def quicklook(cphd, output=None, *, size=2048, resolution=None, correct=True, re
             return col
         rows, cols = slice(i * Pl, (i + 1) * Pl), slice(j * Kl, (j + 1) * Kl)
         return dict(col, S=np.ascontiguousarray(S[rows, cols]), ant=ant[rows], fmin=f0 + j * Kl * df)
-    info, shift, acc, cimg = {}, None, None, None
+    info, shift, acc, cimg, defocus = {}, None, None, None, None
     xp = np
     for i in range(la):
         for j in range(lr):
@@ -1205,6 +1239,12 @@ def quicklook(cphd, output=None, *, size=2048, resolution=None, correct=True, re
         algorithm, corrected, shift = 'pfa', bool(correct), tuple(float(v) for v in info['shift_px'])
         notes.append(f'polar format: its displacement of scatterers, up to {shift[0]:.1f} by {shift[1]:.1f} pixels '
                      '(azimuth by range) over the picture, ' + ('removed' if corrected else 'left in (correct=False)'))
+        defocus = _corner_error(ant[:Pl], f0, df, Kl, nx, ny, spx, spy, e1, e2, window)
+        if defocus[1] > -30.0:
+            notes.append(f"polar format's planar wavefronts leave up to {defocus[0]:.2f} rad of phase over the aperture "
+                         f"at the picture's corners, beyond the displacement: at this resolution the corners are "
+                         f'defocused, about {defocus[1]:.0f} dB from exact backprojection there. form_cphd forms the '
+                         'whole area exactly')
     del S, col
     # the picture: remapped where the image is, laid out shadows down
     t0 = time.perf_counter()
@@ -1235,7 +1275,8 @@ def quicklook(cphd, output=None, *, size=2048, resolution=None, correct=True, re
         pixel=float(plan['pixel']), resolution=float(plan['resolution']), finest=float(plan['finest']),
         band=(f0, f0 + (K - 1) * df), bandwidth=(2 * fc / C * float(abs(tt[-1] - tt[0])), 2 * K * df / C),
         window=('taylor', 'taylor') if window else None, pulses=(0, P), cut=cut, algorithm=algorithm, backend=backend,
-        correct=corrected, displacement_px=shift, looks=(la, lr), remap=remap, graze=float(np.radians(plan['graze'])),
+        correct=corrected, displacement_px=shift, corner_error=defocus, looks=(la, lr), remap=remap,
+        graze=float(np.radians(plan['graze'])),
         twist=float(np.radians(plan['twist'])), meta=meta,
         notes=notes, timing=timing)
     if kind is not None:
