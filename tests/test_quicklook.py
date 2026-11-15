@@ -1173,11 +1173,13 @@ def test_cuda_gives_the_device_back():
             need = next(b for b in range(1 << 20, 1 << 30, 1 << 16)
                         if not quick._cuda_plan(g, correct, False, b, b // 4)['kept'])
             pool.free_all_blocks()
-            pool.set_limit(size=pool.used_bytes() + int(1.03 * need / 0.9))
+            pool.set_limit(size=pool.used_bytes() + int(1.08 * need / 0.9))   # 8%: the pool's rounding and cuFFT's
+                                                                               # work areas differ by GPU (an L4 took 4%)
             seen = []
             for call in range(3):
                 if call == 2:                                                  # another caller's plan, with its work area
-                    cp.fft.fft(cp.zeros((8, 13500), cp.complex64), axis=1)
+                    rows = max(8, int(0.15 * need / (13500 * 8)) + 1)          # a work area of 15% of the need,
+                    cp.fft.fft(cp.zeros((rows, 13500), cp.complex64), axis=1)  # past the 8% the limit leaves
                     assert cache.get_curr_memsize() > 0.05 * need                # beyond the 3% the limit leaves
                 info = {}
                 img = quick._pfa(S, ant, col.fmin, col.df, *grid, correct=correct, complex_image=False, backend='cuda', info=info)

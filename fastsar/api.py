@@ -833,7 +833,7 @@ def _pfa(S, col, nx, ny, spx, spy, e1, e2, guard=300.0, window=True, support='un
     out = fn(re, im, W, alpha, eps_r, shift, eps_a, scale)               # scaled on the device
     if type(out).__module__.startswith('cupy'):                          # the CUDA gather wrote a CuPy image
         return _to_host(out)                                             # through pinned memory, as ImageFormer returns
-    if jax.default_backend() == 'gpu':
-        import cupy as cp
-        return _to_host(cp.from_dlpack(out))
+    if any(d.platform == 'gpu' for d in getattr(out, 'devices', lambda: ())()):    # by the image's own device: a
+        import cupy as cp                                                        # process that moved JAX to its CPU
+        return _to_host(cp.from_dlpack(out))                                     # still reports the GPU as default
     return np.asarray(out)
