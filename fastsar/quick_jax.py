@@ -36,6 +36,14 @@ slower than blocks of 2 GB. So:
   different sizes share the programs that take long to compile; 'fused' compiles a chain as one program. COMPILED
   lists what this process compiled and how long each first call took.
 
+  Compile time. A TPU's compiler takes long over two forms, and the stages avoid both. Positions fused with the
+  weights of a read: the azimuth stage's parabolas compiled for 15 s, the final read's displacement polynomial
+  for 53 s; an optimization barrier keeps the positions apart (2 to 3 s, the same run time). Transforms of many
+  rows: the time grows with the rows (at 18,432 samples, 8 rows 0.5 s, 128 rows 8.6 s), so a stage transforms in
+  a loop over chunks of CHUNK rows, and reads in chunks of DENSE_ROWS. The Panama image's 23 programs compiled
+  in 17 s on a v6e, 107 s before. JAX's persistent compilation cache (_xp.jax_cache) keeps them for the next
+  process, which loads them in 0.7 s.
+
 Positions. A resampling position reaches tens of thousands of samples and must hold to a small part of a sample,
 more than float32 carries, and a TPU has no fast float64. Along a row the range positions are linear and the
 azimuth positions smooth: the host forms them in float64 at the first, middle and last outputs of blocks of BLOCK
@@ -520,14 +528,16 @@ def _plan(sizes, budget, block):
     """Where the three large arrays live for a device with `budget` bytes to give (None: no limit known) and
     `block` bytes for a stage's own arrays: dict(A, B, F: True on the device; kept: the names of those on the
     host). A stage holds the array it reads, the one it writes with one more piece of it while that is joined,
-    and three blocks; the largest go to the host first until what is left fits."""
+    and the temporaries of its programs, counted as four blocks; the largest go to the host first until what is
+    left fits. (The 252-megapixel Capella image peaked at 11.1 GB on a TPU v5e, blocks of 1.06 GB, and at 14.7 GB on
+    a v6e, blocks of 2.1 GB: the largest stage's arrays, 7.2 GB, and 3.7 and 3.6 blocks.)"""
     names = dict(A="the range stage's output", B='the raster', F="the raster's range transform")
     on = dict.fromkeys(sizes, True)
     if budget is not None:
         def peak():
             s = {k: sizes[k] if on[k] else 0 for k in sizes}
             g = 1.0 + 1.0 / GROUP
-            return max(g * s['A'], s['A'] + g * s['B'], s['B'] + g * s['F'], s['F']) + 3 * block
+            return max(g * s['A'], s['A'] + g * s['B'], s['B'] + g * s['F'], s['F']) + 4 * block
         for k in sorted(sizes, key=lambda k: -sizes[k]):
             if peak() <= budget:
                 break

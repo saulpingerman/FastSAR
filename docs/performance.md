@@ -78,6 +78,16 @@ JAX. Range gates are planned the same way, and gates and pulse counts outside th
 Each patch's history is checked, scaled and uploaded on a worker thread (`ImageFormer.stage`). Without the program
 cache, the 2021 Capella stripmap mosaic on a v6e spent 19 s of 52 s rebuilding plan arrays.
 
+FastSAR's JAX programs are kept in JAX's persistent compilation cache, so a second process loads them from disk
+instead of compiling them. The cache is a directory `jax` beside the compiled CPU kernels (`FASTSAR_CACHE_DIR`,
+else `$XDG_CACHE_HOME/fastsar`, else `~/.cache/fastsar`). `FASTSAR_JAX_CACHE` moves it, and `FASTSAR_JAX_CACHE=off`
+leaves JAX's settings alone. A cache the user configured (`JAX_COMPILATION_CACHE_DIR` or
+`jax.config.update('jax_compilation_cache_dir', ...)` before FastSAR's first JAX program) is used as it is. It is
+settled at FastSAR's first JAX program in a process and then holds every program the process compiles in more
+than a second (`jax_persistent_cache_min_compile_time_secs`), and the polar format stages' programs whatever their
+compile time. On a TPU v6e the 23 programs of the Panama image take 11 MB there, and a second process loads them in
+0.7 s: its first image takes 2.8 s, against 19.3 s with an empty cache. The directory may be deleted at any time.
+
 In a mosaic the range profiles are computed once and stay in GPU memory on `cuda` when they fit, with the range gate
 on the GPU. While one patch forms, worker threads prepare the next ones. The CPU uses one thread, since its
 formation already uses every core; a GPU or TPU uses up to four, which would otherwise wait about 0.5 s per patch
@@ -229,6 +239,7 @@ megapixel from 35 to 1,155 Mpx.
 | `FASTSAR_RESAMPLE_JAX` | `blocks` on a TPU, `gather` on JAX's other devices | how `resample` interpolates a JAX image on a knot map (`planes.to_slant`, `planes.to_ground`): `gather` reads every tap with an indexed load, as the CPU and CUDA kernels do; `blocks` reads one window per block of output samples as a row of a table and moves the taps by selects, which a TPU does some fifty times faster |
 | `FASTSAR_REMAP_JAX` | `count` on a TPU, `histogram` on JAX's other devices | how the order statistics of a JAX image are found (`remap.nrl`, `remap.percentile`): from two histograms, or from counts of the pixels below thresholds; the same statistics either way |
 | `FASTSAR_CUDA_BLOCK_MB` | nine tenths of the free device memory, counting the unused blocks of CuPy's pool | megabytes of device memory the stages after formation count on, on the cuda backend: their blocks take a quarter of it at a time (at most 2048 MB), and `process_cphd` keeps on the host the images of a product that do not fit in it (see [Memory](#the-stages-after-formation-on-a-small-gpu)) |
+| `FASTSAR_JAX_CACHE` | `jax` in the kernel cache directory (`FASTSAR_CACHE_DIR`) | the directory of JAX's persistent compilation cache for FastSAR's programs, or `off`; a cache the user configured for JAX is kept (see [Compiled programs](#compiled-programs)) |
 | `FASTSAR_JAX_BLOCK_MB` | nine tenths of the device memory not in use, where the device reports it (a TPU; JAX on a CPU does not, and holds every image) | megabytes of JAX's device the stages after formation count on, on the jax and tpu backends: `process_cphd` keeps on the host the images of a product that do not fit (an image written on the device is there twice while its blocks are joined) and passes them through the device in blocks, with a note; a stage's own blocks take a quarter of it, at most 2048 (by default a sixteenth of the device's memory) |
 | `FASTSAR_FINAL` | `tc3` | `fp32` keeps the cuda float32 final stage on the CUDA cores instead of three bfloat16 tensor-core passes |
 

@@ -856,8 +856,8 @@ def test_device_streams_what_does_not_fit(spot, steep, request, monkeypatch, meg
     assert quick_jax.plan(g)['kept'] == [] and not any('kept on the host' in n for n in look(spot['path'], size=128, backend='jax')['notes'])
     sizes = dict(A=4 << 30, B=2 << 30, F=5 << 30)
     assert quick_jax._plan(sizes, None, 1 << 30)['kept'] == [] and quick_jax._plan(sizes, 16 << 30, 2 << 30)['kept'] == []
-    assert quick_jax._plan(sizes, 13 << 30, 2 << 30)['kept'] == ["the raster's range transform"]
-    assert quick_jax._plan(sizes, 12 << 30, 2 << 30)['kept'] == ["the range stage's output", "the raster's range transform"]
+    assert quick_jax._plan(sizes, 15 << 30, 2 << 30)['kept'] == ["the raster's range transform"]
+    assert quick_jax._plan(sizes, 13 << 30, 2 << 30)['kept'] == ["the range stage's output", "the raster's range transform"]
     assert len(quick_jax._plan(sizes, 1 << 30, 1 << 28)['kept']) == 3
 
 
