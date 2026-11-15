@@ -362,7 +362,8 @@ def test_pinned_size():
 
 def test_pinned_reused(monkeypatch):
     """Blocks of one kind of crossing: a size within a factor of two of the largest asked for so far takes the
-    largest's block (the pool hands one back only at its own size), a smaller one its own class; kinds are apart."""
+    largest's block (the pool hands one back only at its own size), a smaller one its own class, but for the
+    staging buffers, which take the largest; kinds are apart."""
     from fastsar import memory
     asked = []
     monkeypatch.setattr(memory, '_pinned', lambda n: asked.append(n) or bytearray(0))
@@ -370,7 +371,9 @@ def test_pinned_reused(monkeypatch):
     for n in (64 << 20, 40 << 20, 33 << 20, 30 << 20, 96 << 20, 64 << 20):
         memory._pinned_reused(n, 'test')
     memory._pinned_reused(1 << 20, 'other')
-    assert asked == [64 << 20, 64 << 20, 64 << 20, 30 << 20, 96 << 20, 96 << 20, 1 << 20]
+    memory._pinned_reused(64 << 20, 'staging')
+    memory._pinned_reused(1 << 20, 'staging')                                   # staging takes the largest
+    assert asked == [64 << 20, 64 << 20, 64 << 20, 30 << 20, 96 << 20, 96 << 20, 1 << 20, 64 << 20, 64 << 20]
 
 
 def test_cuda_plan_places_the_images_of_a_product():

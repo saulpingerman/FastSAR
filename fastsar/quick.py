@@ -1734,9 +1734,10 @@ def _pfa_cuda(S, g, window, correct, complex_image, timing, phase=None, info=Non
     if isinstance(S, np.ndarray):
         S = np.ascontiguousarray(S, c64)
     kind, rowb = (S.kind, K * S.itemsize) if raw else (0, 8 * K)
-    # the staging buffers: a power of two that holds a block of the history, 64 MB for a large one
+    # the staging buffers: a power of two that holds a block of the history (at most 1,024 pulses), 64 MB for a
+    # large one
     size = 1 << 20
-    while size < (64 << 20) and size < (P * rowb if staged else 64 << 20):
+    while size < (64 << 20) and size < (min(P, 1024) * rowb if staged else 64 << 20):
         size <<= 1
     while size < rowb and staged:
         size <<= 1

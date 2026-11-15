@@ -79,11 +79,12 @@ def _pinned_reused(n, kind='image'):
     is at least half of it, else of n's own class. The pool hands a block back only at the size it was made, and
     locking memory takes about a second per gigabyte (an L4's host): so a new size of picture within a factor of two
     of the largest takes the block an earlier one left, instead of locking one of its own; a much smaller one does
-    not hold a block twice its size."""
+    not hold a block twice its size. Staging buffers (kind 'staging'), which go back to the pool when their call
+    ends, always take the largest."""
     size = _pinned_size(n)
     with _REUSED_LOCK:
         top = _REUSED.get(kind, 0)
-        if size <= top and 2 * size >= top:
+        if size <= top and (2 * size >= top or kind == 'staging'):
             size = top
         _REUSED[kind] = max(top, size)
     return _pinned(size)

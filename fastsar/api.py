@@ -96,6 +96,13 @@ def _backend(backend):
         raise ValueError(f'unknown backend {backend!r}: one of {", ".join(map(repr, BACKENDS))}')
     if backend in ('cpu', 'jax'):            # no device probe (a mosaic builds a former per patch)
         return backend
+    if backend == 'cuda':                    # CuPy's probe alone: available_backends imports JAX to look for a TPU,
+        try:                                 # a third of a second of a process's first call
+            import cupy
+            if cupy.cuda.runtime.getDeviceCount() > 0:
+                return backend
+        except Exception:
+            pass
     have = available_backends()
     if backend == 'auto':
         return have[0]
