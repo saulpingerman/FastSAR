@@ -1,8 +1,9 @@
-"""Polar format on a simulated scene. The JAX program's device paths (FASTSAR_PFA_PROGRAM=jax, the jax and tpu
-backends): the kernel gather of the final resampling (C++ on the CPU, CUDA on a GPU) against the JAX gather, and
-the direct Kaiser-sinc resampling (FASTSAR_PFA_CZT=0) against the chirp-z transforms. The stages that form on the
-cpu and cuda backends against that program and against exact backprojection. ExactFormer's float16 profiles against
-its float32 ones on cuda."""
+"""Polar format on a simulated scene. The JAX program of 0.3.0 (FASTSAR_PFA_PROGRAM=jax): the kernel gather of the
+final resampling (C++ on the CPU, CUDA on a GPU) against the JAX gather, and the direct Kaiser-sinc resampling
+(FASTSAR_PFA_CZT=0) against the chirp-z transforms. The stages that form on every backend against that program and
+against exact backprojection; the stages on a JAX device against the C++ stages, with the device's memory held
+small; what keeps a scatterer outside the grid out of the image. ExactFormer's float16 profiles against its float32
+ones on cuda."""
 import os
 
 import numpy as np
@@ -102,22 +103,147 @@ def test_stages_against_the_program_and_exact_backprojection(grid):
         assert e_pair < -30 and abs(gain) == pytest.approx(1.0, abs=0.02) and abs(np.angle(gain)) < 0.01
 
 
-def test_program_choice(scene, monkeypatch):
-    """FASTSAR_PFA_PROGRAM: 'jax' keeps the JAX program on every backend; the jax backend keeps it too."""
+def test_program_choice(scene, monkeypatch, request):
+    """form_image(algorithm='pfa') forms by the stages on every backend; FASTSAR_PFA_PROGRAM=jax takes the JAX
+    program of 0.3.0 on every backend."""
+    request.getfixturevalue('jax_cpu')
     from fastsar import api
-    assert api._pfa_stages('cpu', 'union') == 'cpu' and api._pfa_stages('cpu', 'inscribed') == 'cpu'
-    assert api._pfa_stages('jax', 'union') is None
+    for b in ('cpu', 'jax'):
+        assert api._pfa_stages(b, 'union') == b and api._pfa_stages(b, 'inscribed') == b
     monkeypatch.setenv('FASTSAR_PFA_PROGRAM', 'stages')
     assert api._pfa_stages('jax', 'union') == 'jax' and api._pfa_stages('cpu', 'union') == 'cpu'
-    col, S = scene
-    a = fastsar.form_image(S, col.ant, col.fmin, col.df, **GRID, algorithm='pfa', pfa_guard=10.0, backend='jax')
-    b = fastsar.form_image(S, col.ant, col.fmin, col.df, **GRID, algorithm='pfa', pfa_guard=10.0, backend='cpu')
-    assert a.shape == b.shape and a.dtype == np.complex64 and rel_db(a, b) < -70
     monkeypatch.setenv('FASTSAR_PFA_PROGRAM', 'jax')
-    assert api._pfa_stages('cpu', 'union') is None
+    assert api._pfa_stages('cpu', 'union') is None and api._pfa_stages('jax', 'union') is None
+    col, S = scene
+    called = []
+    real = api._pfa
+    monkeypatch.setattr(api, '_pfa', lambda *a, **k: called.append(1) or real(*a, **k))
+    old = fastsar.form_image(S, col.ant, col.fmin, col.df, **GRID, algorithm='pfa', pfa_guard=10.0, backend='jax')
+    assert len(called) == 1 and np.array_equal(old, _pfa(scene))          # the released program, value for value
+    monkeypatch.delenv('FASTSAR_PFA_PROGRAM')
+    del called[:]
+    new = fastsar.form_image(S, col.ant, col.fmin, col.df, **GRID, algorithm='pfa', pfa_guard=10.0, backend='jax')
+    assert not called and new.shape == old.shape and new.dtype == np.complex64 and new.flags.c_contiguous
+    e = rel_db(np.abs(new).astype(np.complex64), np.abs(old).astype(np.complex64))
+    print(f'the stages on jax against the program, amplitudes (a ground grid): {e:.1f} dB')
+    assert e < -20 and not np.array_equal(new, old)                       # the stages: the program's picture
+    cpu = fastsar.form_image(S, col.ant, col.fmin, col.df, **GRID, algorithm='pfa', pfa_guard=10.0, backend='cpu')
+    assert rel_db(new, cpu) < -65
     monkeypatch.setenv('FASTSAR_PFA_PROGRAM', 'fast')
     with pytest.raises(ValueError, match='FASTSAR_PFA_PROGRAM'):
         api._pfa_stages('cpu', 'union')
+
+
+@pytest.mark.parametrize('grid', ['slant', 'ground', 'odd'])
+def test_stages_on_a_jax_device(grid, request, monkeypatch):
+    """backend='jax' (and 'tpu'): the stages as a TPU runs them, on JAX's CPU device. The image is the cpu
+    backend's, at its scale, on a slant-plane grid, on a ground grid and for an odd pixel count; with
+    pfa_support='inscribed'; and with the device's memory held to a megabyte, where the arrays live on the host and
+    cross in blocks."""
+    request.getfixturevalue('jax_cpu')
+    rng = np.random.default_rng(5)
+    col = sim.make_collect(res=0.5, scene=560.0, r0=200e3)
+    g = dict(slant=_slant_grid(col), ground=dict(GRID, nx=120, ny=100, spy=0.55), odd=_slant_grid(col, 121, 99))[grid]
+    e1, e2 = np.array(g['e1']), np.array(g['e2'])
+    tg = rng.uniform(-24, 24, (30, 1)) * e1 + rng.uniform(-20, 20, (30, 1)) * e2
+    S = sim.simulate_brute(col, tg, rng.standard_normal(30) + 1j * rng.standard_normal(30)).astype(np.complex64)
+    form = lambda backend, **kw: fastsar.form_image(S, col.ant, col.fmin, col.df, **g, algorithm='pfa', pfa_guard=40.0,
+                                                    backend=backend, **kw)
+    cpu, dev = form('cpu'), form('jax')
+    gain = np.vdot(dev.ravel(), cpu.ravel()) / np.vdot(dev.ravel(), dev.ravel())
+    e = rel_db(dev, cpu)
+    print(f'{grid}: the stages on jax against cpu {e:.1f} dB, gain {abs(gain):.5f}')
+    assert dev.shape == cpu.shape == (g['nx'], g['ny']) and dev.dtype == np.complex64 and dev.flags.c_contiguous
+    assert e < -55 and abs(gain) == pytest.approx(1.0, abs=1e-3) and abs(np.angle(gain)) < 1e-3
+    if grid == 'slant':
+        assert rel_db(form('jax', pfa_support='inscribed'), form('cpu', pfa_support='inscribed')) < -55
+        assert rel_db(form('jax', window=False), form('cpu', window=False)) < -55
+        cal = np.linalg.norm(col.ant, axis=1) + 3.0                         # a reference range that is not |ant|
+        assert rel_db(form('jax', ref=cal), form('cpu', ref=cal)) < -55
+    monkeypatch.setenv('FASTSAR_JAX_BLOCK_MB', '1')
+    small = form('jax')
+    assert rel_db(small, dev) < -90
+
+
+def test_scatterer_outside_the_grid_stays_out():
+    """What keeps wrap-around out of the stages' image is their two gates, not pfa_guard. Each pulse's range profile
+    is cut to the picture's delays and each range wavenumber's azimuth profile to the picture's extent (a raised
+    cosine beyond each, of the larger of 8 pixels and 3% of the half extent, in meters), and the raster's periods
+    hold the picture, its displacement and a gate's far edge, so what a gate's edge passes wraps to beyond the
+    opposite edge of the picture. A scatterer outside the grid, from 3 pixels beyond its edge to where an ungated
+    raster would fold it onto the picture's middle, in azimuth and in range: what it adds to the picture, as a
+    part of its own peak, is its sidelobes as exact backprojection has them (to 3 dB), and beyond the gates no
+    more than -50 dB anywhere, where a fold would add 0 dB. Within the gate's edge its near sidelobes wrap into the
+    far half of the picture at -50 dB (Taylor weights). pfa_guard changes the image's scale and nothing else."""
+    rng = np.random.default_rng(12)
+    col = sim.make_collect(res=0.3, scene=220.0, r0=30e3)
+    g = _slant_grid(col, 256, 256, 0.28)
+    e1, e2 = np.array(g['e1']), np.array(g['e2'])
+    geo = fastsar.quick._geometry(col.ant, col.fmin, col.df, col.K, g['nx'], g['ny'], g['spx'], g['spy'], e1, e2, True)
+    half = (0.5 * g['nx'] * g['spx'], 0.5 * g['ny'] * g['spy'])
+    period = (geo['nfx'] * g['spx'], geo['nfy'] * g['spy'])
+    shift = geo['shift']
+    assert period[0] >= half[0] + shift[0] + geo['Ex'] + geo['gx'] and period[1] >= half[1] + shift[1] + geo['Er'] + geo['gy']
+    assert geo['gx'] == pytest.approx(8 * g['spx']) and geo['Ex'] < half[0] + 1.0
+    scene = rng.uniform(-30, 30, (30, 1)) * e1 + rng.uniform(-30, 30, (30, 1)) * e2
+    S0 = sim.simulate_brute(col, scene, rng.standard_normal(30) + 1j * rng.standard_normal(30)).astype(np.complex64)
+    form = lambda S, guard=30.0: fastsar.form_image(S, col.ant, col.fmin, col.df, **g, algorithm='pfa', pfa_guard=guard,
+                                                    backend='cpu')
+    exact = lambda S: fastsar.ExactFormer(col.ant, col.fmin, col.df, col.K, **g, backend='cpu', window=True)(S)
+    one = sim.simulate_brute(col, np.zeros((1, 3)), np.array([1.0 + 0j])).astype(np.complex64)
+    img0, ex0, peak, peak_ex = form(S0), exact(S0), np.abs(form(one)).max(), np.abs(exact(one)).max()
+    db = lambda v: 20 * np.log10(max(float(v), 1e-30))
+    for axis, e, edge, guard in ((0, e1, geo['Ex'], geo['gx']), (1, e2, geo['Er'], geo['gy'])):
+        for name, d, limit in (('3 pixels beyond the edge', half[axis] + 3 * g['spx'], None),
+                               ("in the gate's edge", edge + 0.5 * guard, None), ('beyond the gate', edge + 1.5 * guard, -50),
+                               ('half a period out', 0.5 * period[axis] + 5.0, -50), ('a period out', period[axis] - 10.0, -60)):
+            for sign in ((1.0, -1.0) if limit is None else (1.0,)):
+                Sx = 1000.0 * sim.simulate_brute(col, (sign * d * e)[None], np.array([1.0 + 0j])).astype(np.complex64)
+                leak = np.abs(form(S0 + Sx) - img0) / (1000.0 * peak)
+                far = leak[:128] if axis == 0 else leak[:, :128]
+                far = far if sign > 0 else (leak[128:] if axis == 0 else leak[:, 128:])
+                line = f"{'azimuth' if axis == 0 else 'range'}, {name} ({sign * d:+.1f} m): at most {db(leak.max()):.1f} dB of its peak, {db(far.max()):.1f} dB in the far half"
+                if limit is None:                              # in the gate: its sidelobes, as exact backprojection's
+                    true = db((np.abs(exact(S0 + Sx) - ex0) / (1000.0 * peak_ex)).max())
+                    print(line + f'; exact backprojection {true:.1f} dB')
+                    assert db(leak.max()) < true + 3.0 and db(far.max()) < -48
+                else:                                          # beyond it: gated out
+                    print(line)
+                    assert db(leak.max()) < limit and db(far.max()) < -55
+    # pfa_guard: the scale alone (the size of the JAX program's azimuth transform, which it set)
+    S = S0 + 1000.0 * sim.simulate_brute(col, ((geo['Ex'] + 1.5 * geo['gx']) * e1)[None], np.array([1.0 + 0j])).astype(np.complex64)
+    a, b = form(S, 10.0), form(S, 300.0)
+    k = np.vdot(a.ravel(), b.ravel()) / np.vdot(a.ravel(), a.ravel())
+    assert rel_db(a, b) < -100 and abs(k.imag) < 1e-6 * abs(k) and k.real == pytest.approx(
+        fastsar.pfa2._fft_size(g['nx'] + int(600 / g['spx'])) / fastsar.pfa2._fft_size(g['nx'] + int(20 / g['spx'])), rel=1e-5)
+
+
+@pytest.mark.cuda
+def test_scatterer_outside_the_grid_stays_out_on_cuda():
+    """The cuda stages take the gates of the same geometry: a scatterer beyond the gate, in azimuth and in range."""
+    rng = np.random.default_rng(12)
+    col = sim.make_collect(res=0.3, scene=220.0, r0=30e3)
+    g = _slant_grid(col, 256, 256, 0.28)
+    e1, e2 = np.array(g['e1']), np.array(g['e2'])
+    geo = fastsar.quick._geometry(col.ant, col.fmin, col.df, col.K, g['nx'], g['ny'], g['spx'], g['spy'], e1, e2, True)
+    scene = rng.uniform(-30, 30, (30, 1)) * e1 + rng.uniform(-30, 30, (30, 1)) * e2
+    S0 = sim.simulate_brute(col, scene, rng.standard_normal(30) + 1j * rng.standard_normal(30)).astype(np.complex64)
+    for e, d in ((e1, geo['Ex'] + 1.5 * geo['gx']), (e2, geo['Er'] + 1.5 * geo['gy']), (e1, geo['nfx'] * g['spx'] - 10.0)):
+        S = S0 + sim.simulate_brute(col, (d * e)[None], np.array([1000.0 + 0j])).astype(np.complex64)
+        a = fastsar.form_image(S, col.ant, col.fmin, col.df, **g, algorithm='pfa', backend='cuda')
+        b = fastsar.form_image(S, col.ant, col.fmin, col.df, **g, algorithm='pfa', backend='cpu')
+        assert rel_db(a, b) < -50
+
+
+@pytest.mark.tpu
+def test_stages_on_a_tpu(scene):
+    """On a TPU the stages are form_image's polar format, and its image is the cpu backend's."""
+    col, S = scene
+    a = fastsar.form_image(S, col.ant, col.fmin, col.df, **GRID, algorithm='pfa', pfa_guard=10.0, backend='tpu')
+    b = fastsar.form_image(S, col.ant, col.fmin, col.df, **GRID, algorithm='pfa', pfa_guard=10.0, backend='cpu')
+    e = rel_db(a, b)
+    print(f'polar format, tpu against cpu: {e:.1f} dB')
+    assert isinstance(a, np.ndarray) and a.dtype == np.complex64 and e < -55
 
 
 @pytest.mark.cuda

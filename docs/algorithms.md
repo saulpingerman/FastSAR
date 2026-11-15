@@ -57,22 +57,31 @@ reference at 4 km (`tests/test_accuracy.py`) the error falls by 12 dB per doubli
 
 ## Polar format
 
-`algorithm='pfa'` resamples the data onto a rectangular wavenumber grid and applies a 2-D FFT. On the `cpu` and
-`cuda` backends it runs the stages of the quick look below (each pulse gated to the scene's range bins and read at
-the raster's range wavenumbers, each range wavenumber gated to the scene's azimuth extent and read at the raster's
-azimuth wavenumbers at the pulses' own spacing, with no separate pulse resampling); on the `jax` and `tpu`
-backends it runs the JAX program of `fastsar.pfa2`, which resamples the pulses, then the two axes by chirp-z
-transforms. `FASTSAR_PFA_PROGRAM=jax` takes that program on every backend, `FASTSAR_PFA_PROGRAM=stages` the
-stages on every backend. The stages give the program's image at the program's scale, and are the closer of the
-two to exact backprojection ([performance.md](performance.md#polar-format-by-stages)); on a ground-plane grid,
-where a meter of range is not a meter along the range axis, the program's image carries a phase that
-backprojection's does not, and the stages' image has backprojection's phase.
+`algorithm='pfa'` resamples the data onto a rectangular wavenumber grid and applies a 2-D FFT. On every backend it
+runs the stages of the quick look below (each pulse gated to the scene's range bins and read at the raster's range
+wavenumbers, each range wavenumber gated to the scene's azimuth extent and read at the raster's azimuth
+wavenumbers at the pulses' own spacing, with no separate pulse resampling): in C++ on the `cpu` backend, in CUDA
+kernels on `cuda`, in compiled float32 programs on `jax` and `tpu`. `FASTSAR_PFA_PROGRAM=jax` takes the JAX program
+of `fastsar.pfa2` on every backend, the polar format of 0.3.0, which resamples the pulses, then the two axes by
+chirp-z transforms. The stages give the program's image at the program's scale, and are the closer of the two to
+exact backprojection ([performance.md](performance.md#polar-format-by-stages)); on a ground-plane grid, where a
+meter of range is not a meter along the range axis, the program's image carries a phase that backprojection's does
+not, and the stages' image has backprojection's phase.
 `pfa_support` chooses the raster's spectral support: `'union'` (default) keeps every pulse's band, the trapezoid
 backprojection sees, with zeros where a pulse has no sample; `'inscribed'` keeps the rectangle common to all pulses,
 a clean window at the cost of the bandwidth outside it (about half the range bandwidth in the ground plane of a
 squinted orbital spotlight, little in the slant plane).
-`pfa_guard` (default 300 m, for orbital scenes) is the margin kept free of wrap-around; small simulated scenes need
-less. The polar raster is taken about the grid's range axis `e2`, which must point along the mid-aperture line of
+`pfa_guard` (default 300 m) is the margin around the scene that the JAX program keeps free of wrap-around; small
+simulated scenes need less there. The stages do not use it for that. Two gates of their own keep echoes from
+beyond the image out of it: each pulse's range profile is cut to the picture's delays and each range wavenumber's
+azimuth profile to the picture's extent, with a raised-cosine edge of the larger of 8 pixels and 3% of the half
+extent beyond the picture and its displacement, and the raster's periods hold the picture, the displacement and a
+gate's far edge, so what an edge passes wraps to beyond the picture's opposite edge. A scatterer placed from
+3 pixels beyond the grid to a raster period beyond it, in azimuth and in range, adds to the picture what exact
+backprojection shows of it, its sidelobes, to 3 dB; beyond the gates that is less than -50 dB of its peak, where a
+fold would add 0 dB. A scatterer inside a gate's edge leaves its near sidelobes in the far half of the picture,
+50 dB below its peak with the Taylor window (`tests/test_pfa_paths.py`). In the stages `pfa_guard` sets the
+image's scale, as it set the program's, and nothing else. The polar raster is taken about the grid's range axis `e2`, which must point along the mid-aperture line of
 sight in the image plane (the vendors' image grids do, whatever the squint of the collection); a grid rotated from it
 degrades quickly (15 degrees on a squinted Umbra spotlight gave -5 dB against backprojection where the aligned grid
 gave -27 dB) and FastSAR warns beyond 2 degrees. Backprojection takes any grid. The planar-wavefront assumption displaces scatterers away from the center: on Panama by up to 18 pixels in

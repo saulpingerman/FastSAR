@@ -25,8 +25,12 @@ half path, a vendor's reference point); both algorithms honor it (polar format r
 pfa_support: 'union' (default) keeps every pulse's band on the polar-format raster, the trapezoidal support of
 backprojection; 'inscribed' keeps the rectangle common to all pulses, a clean window at the cost of the bandwidth
 outside it (half the range bandwidth in the ground plane of a squinted orbital spotlight, little in the slant plane).
-pfa_guard: margin (m) around the scene that polar format keeps free of wrap-around; 300 m suits orbital scenes of a
-few kilometers and must be smaller for small simulated scenes.
+pfa_guard: polar format's stages (the default on every backend) keep wrap-around out of the image with two gates of
+their own, in range and in azimuth, whose edges lie the larger of 8 pixels and 3% of the half extent beyond the
+picture and its displacement; pfa_guard sets the image's scale there (the size of the azimuth transform it gave the
+JAX program) and nothing else. For the JAX program of 0.3.0 (FASTSAR_PFA_PROGRAM=jax) it is the margin (m) around
+the scene kept free of wrap-around: 300 m suits orbital scenes of a few kilometers and must be smaller for small
+simulated scenes.
 
 Precision: 'float32' (default), 'float16' (CUDA: float16 storage throughout with float32 accumulation; JAX: float16
 throughout), 'single-pass' (TPU: one bfloat16 pass per product, what the matrix unit does by itself), 'three-pass'
@@ -700,17 +704,17 @@ _PFA_LOCK = threading.Lock()
 
 
 def _pfa_stages(backend, support):
-    """Which polar format forms on `backend`: 'cpu' or 'cuda' for the stages of fastsar.quick (C++ on the host's
-    cores, CuPy on a GPU), or None for the JAX program of fastsar.pfa2, which the jax and tpu backends and
-    FASTSAR_PFA_PROGRAM=jax keep. FASTSAR_PFA_PROGRAM=stages takes the stages on the jax and tpu backends too
-    (fastsar.quick_jax)."""
+    """Which polar format forms on `backend`: 'cpu', 'cuda', 'jax' or 'tpu' for the stages of fastsar.quick (C++ on
+    the host's cores, CuPy on a GPU, fastsar.quick_jax on a JAX device or a TPU), or None for the JAX program of
+    fastsar.pfa2, the polar format of 0.3.0, which FASTSAR_PFA_PROGRAM=jax keeps on every backend
+    (FASTSAR_PFA_PROGRAM=stages, the default, is accepted)."""
     v = os.environ.get('FASTSAR_PFA_PROGRAM', '').strip().lower() or 'auto'
     if v not in ('auto', 'jax', 'stages'):
         raise ValueError(f"FASTSAR_PFA_PROGRAM must be 'jax', 'stages' or 'auto', got {v!r}")
     b = _backend(backend)
     if support not in ('union', 'inscribed'):
         raise ValueError(f"support must be 'union' or 'inscribed', not {support!r}")
-    if v == 'jax' or (b in ('jax', 'tpu') and v != 'stages'):
+    if v == 'jax':
         return None
     return b if b in ('cuda', 'jax', 'tpu') else 'cpu'
 
@@ -721,7 +725,12 @@ def _pfa_staged(S, col, nx, ny, spx, spy, e1, e2, guard, window, support, backen
     azimuth wavenumbers at the pulses' own spacing, the padded transforms, the read at the apparent positions): the
     image of the JAX program to its accuracy, at its scale, which is the raster's sum over the transform's range
     period and not backprojection's sum over the samples. guard sets that scale as it did (the size of the
-    program's azimuth transform) and nothing else: the stages set their own gate edges."""
+    program's azimuth transform) and nothing else. What it did for the program, keep echoes from beyond the image
+    from wrapping into it, the two gates do here at any distance: their edges (quick._geometry's gx, gy: the larger
+    of 8 pixels and 3% of the half extent, a raised cosine) lie beyond the picture and its displacement, and the
+    raster's periods hold the picture, the displacement and a gate's far edge, so what an edge passes wraps to
+    beyond the picture's opposite edge. A scatterer inside a gate's edge leaves its near sidelobes in the far
+    half of the picture, 50 dB below its peak with the Taylor window (tests/test_pfa_paths.py)."""
     from . import pfa2, quick
     P, K = S.shape
     bad = []

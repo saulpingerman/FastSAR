@@ -62,7 +62,7 @@ def missing(need):
             why = 'no TPU'
             try:
                 import jax
-                if any(d.platform == 'tpu' for d in jax.devices()):
+                if jax.devices('tpu'):                      # by name: a module may have made the CPU the default
                     why = None
             except Exception:
                 pass
