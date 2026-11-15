@@ -58,6 +58,7 @@ COMPILED = []                 # (name, key, seconds of the first call) of each p
 _KAISER = {}
 SHEAR_TAPS, SHEAR_KAISER = 10, 7.2   # the kernel of the read at the apparent positions on a sheared raster
 AT_ONCE = 1 << 19             # values of rows a program transforms at once; beyond, in a loop over chunks (_by_rows)
+CHUNK = 16                    # rows of a chunk
 
 
 def _mode():
@@ -208,7 +209,10 @@ def _dense(jnp, lax, xr, xi, ib, fr, Rw, taps, wpoly):
     parity), times the Kaiser window as a polynomial (wpoly, 16 taps) or the sinc window (None: its sine follows
     from the angle sum with constants of w). A tap outside the row counts as zero and the rest are normalised
     again; zero where the position lies outside (-0.5, n - 0.5): quicklook_cpu.cpp's ql_resample_rows, with the
-    weights at the position itself and not at the nearest of 2048 phases."""
+    weights at the position itself and not at the nearest of 2048 phases. The positions are formed apart from the
+    weights (an optimization barrier): a TPU compiles the two fused for 15 s (the azimuth stage's parabolas) to
+    53 s (the final read's displacement polynomial), apart for 2 to 3 s, and runs both alike."""
+    ib, fr = lax.optimization_barrier((ib, fr))
     R, n = xr.shape
     nblk, h = ib.shape[1] // BLOCK, taps // 2
     N = max(-(-n // STRIDE) * STRIDE, Rw)
@@ -243,17 +247,17 @@ def _dense(jnp, lax, xr, xi, ib, fr, Rw, taps, wpoly):
 
 
 def _by_rows(jnp, lax, fn, xs, width):
-    """fn applied to the rows of the arrays xs ([R, ...] each) in chunks of 8 or 16 rows, a loop (lax.map) over
-    them, where the rows hold more than 2^19 values of `width` samples: fn's outputs ([R, ...] each). A TPU compiles
-    a transform along the rows in a time that grows with their count until a few hundred (a v6e: 18,432 samples, 8
-    rows 0.5 s, 16 rows 0.9 s, 128 rows 8.6 s, 2,688 rows 7.3 s), and runs the loop over chunks of 16 rows within
-    5% of the whole (5.1 ms against 4.9 ms at 2,688 rows; 8 rows 6.0 ms)."""
+    """fn applied to the rows of the arrays xs ([R, ...] each) in chunks of CHUNK rows (the last padded), a loop
+    (lax.map) over them, where the rows hold more than AT_ONCE values of `width` samples: fn's outputs ([R, ...]
+    each). A TPU compiles a transform along the rows in a time that grows with their count until a few hundred, and
+    not evenly (a v6e at 18,432 samples: 8 rows 0.5 s, 16 rows 0.9 s, 128 rows 8.6 s, 2,688 rows 7.3 s; at 40,960
+    samples 1,536 rows 11.1 s, chunks of 8, 16 and 32 rows 4.0, 2.6 and 5.9 s). The loop over chunks of 16 rows
+    runs at 18,432 samples within 4% of the whole (5.1 ms against 4.9 ms at 2,688 rows), at 40,960 samples 1.5
+    times as long (17.5 ms against 11.9 ms at 1,536 rows); chunks of 8 rows run 1.2 and 3.3 times as long."""
     R = int(xs[0].shape[0])
-    if R * width <= AT_ONCE or R <= 16:
+    c = CHUNK
+    if R * width <= AT_ONCE or R <= c:
         return fn(*xs)
-    c = 16 if width <= 20000 else 8
-    if R % c:
-        c = 8 if R % 8 == 0 and width <= 20000 else c
     m = -(-R // c)
     pad = m * c - R
     if pad:
@@ -952,7 +956,7 @@ def pfa(S, g, window, correct, complex_image, timing, phase=None, info=None, on_
         X = X0
         for _ in range(2):                           # the picture's column that lies on this column of H at this row
             X = X0 + (sig * uy * _poly(jnp, cy, powers, X, Y) - ux * _poly(jnp, cx, powers, X, Y)) * inv
-        ib, fr = lax.optimization_barrier(_split(jnp, iyr[None, :], _poly(jnp, cy, powers, X, Y) * uy + half))
+        ib, fr = _split(jnp, iyr[None, :], _poly(jnp, cy, powers, X, Y) * uy + half)
         return _dense(jnp, lax, zr, zi, ib, fr, RwY, taps, wfin)
 
     def to_columns(zr, zi, xn, yn, ixm, qi, qf, cx, cy, sig, ux, uy, half, cxx, cyy, krc, kac):
