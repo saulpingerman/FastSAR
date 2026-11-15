@@ -1221,6 +1221,7 @@ def _pfa_cuda(S, g, window, correct, complex_image, timing, phase=None, info=Non
         _blocks(copy, hb.shape[0], int(max(1, (1 << 18) // hb.shape[1])))
         d = cp.empty(hb.shape, hb.dtype)
         d.set(pin)
+        sync()                                        # the copy has left the page-locked block before it is reused
         return d
     ptr = lambda a: a.ctypes.data_as(ctypes.c_void_p)
     at = lambda a, row=0, col=0: ctypes.c_void_p(a.ctypes.data + row * a.strides[0] + col * a.strides[1])
