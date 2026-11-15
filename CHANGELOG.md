@@ -5,6 +5,10 @@ was published on PyPI.
 
 ## [0.3.1] - 2026-11-15
 
+The README and the docs carry the 0.3.1 release records: the three Umbra collections on the six devices,
+re-recorded at the tag (the Capella records are those of 0.3.0, whose products this release leaves bit for bit
+unchanged).
+
 ### Added
 
 - `fastsar.quicklook(cphd, output=None, *, size=2048, resolution=None, correct=True, remap='nrl', backend='auto',
@@ -50,10 +54,12 @@ was published on PyPI.
 
 ### Changed
 
-- `form_image(algorithm='pfa')` forms by the quick look's stages on every backend: the image of the JAX program
-  to its accuracy and at its scale, in a tenth of the time or less (the Panama image, 12,207 by 8,808 pixels from
-  15,186 pulses of 14,399 samples: 1.2 s on 16 CPU threads, 0.3 s on a GPU and 1.4 s on a TPU v6e, where the
-  program takes 9.6 s on the CPU and 110 s on the v6e). Over whole images the stages are the closer of the two to exact backprojection
+- `form_image(algorithm='pfa')` forms by the quick look's stages on every backend, 2 to 74 times faster
+  than 0.3.0 and closer to exact backprojection. The Panama image (12,207 by 8,808 pixels from 15,186 pulses of
+  14,399 samples), host memory to host memory, in the release records: 1.9 s on a c4d-highmem-16 (0.3.0: 9.0 s),
+  0.73 s on an L4 (1.43 s), 0.35 s on an A100 (0.93 s), 0.18 s on an H100 (0.56 s), 1.5 s on a TPU v6e (110 s) and
+  2.2 s on a v5e (103 s); its error against the float64 reference falls from -32.1 to -33.7 dB on every device, and
+  its 5 by 5 coherence at the 0.1 percentile rises from 0.986 to 0.995
   ([docs/performance.md](docs/performance.md#polar-format-by-stages)). On a ground-plane grid the stages' image
   has backprojection's phase, which the program's does not; the amplitudes agree. A collection that lacks pulses
   of its evenly timed sequence is formed with each pulse at its place. `backend` now chooses where polar format
@@ -84,13 +90,18 @@ was published on PyPI.
 - Images and quick looks come back from a GPU into page-locked blocks that the next one takes when its size is
   within a factor of two, instead of locking memory of their own size each time (about a second per gigabyte).
 
-### Fixed
+### Known issues
 
-- The full-resolution quick look of a ground grid under a twisted slant plane (a sheared raster) on a TPU. Each
-  block of the raster's rows was cut out of the range stage's output by a gather that laid the whole array out
-  anew on the device for every block, 22 ms a block of a 4.4 GB array. A block is now one slice of each piece of
-  the array, the pulses of a piece written from a common first row. On a TPU v6e the 13,216 by 13,216 Capella
-  picture takes 6.0 s instead of 15.6 s, its cuts 0.3 s instead of 9.0 s (the host's 44 cores take 4.8 s).
+- On a machine whose JAX is built for CUDA, a process that starts JAX on the GPU and then makes the CPU JAX's
+  default device cannot run 0.3.0's polar-format program (`FASTSAR_PFA_PROGRAM=jax`): its CUDA gather is handed
+  arrays that lie on the CPU, and CuPy raises a `TypeError`. `tests/test_pfa_paths.py::test_program_choice` fails
+  that way on GPU instances when it runs after `tests/test_api.py`. The default polar format is not affected.
+- `tests/test_quicklook.py::test_cuda_gives_the_device_back` fails in the full suite on an Nvidia L4, A100 and
+  H100 (with its own module it passes on an L4 and on an RTX PRO 6000). The test limits CuPy's memory
+  pool to a few megabytes, sized from cuFFT's work areas as it measures them: on the L4 and the H100 a formation
+  then runs out of the pool (by 0.5 MB on the L4), and on the A100 the competing transform the test sets up needs
+  no work area, so its premise does not hold. Formation at ordinary device memory is not concerned: every record
+  image of this release formed on these devices.
 
 ## [0.3.0] - 2026-11-14
 

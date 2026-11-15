@@ -86,7 +86,7 @@ sight in the image plane (the vendors' image grids do, whatever the squint of th
 degrades quickly (15 degrees on a squinted Umbra spotlight gave -5 dB against backprojection where the aligned grid
 gave -27 dB) and FastSAR warns beyond 2 degrees. Backprojection takes any grid. The planar-wavefront assumption displaces scatterers away from the center: on Panama by up to 18 pixels in
 azimuth and 12 in range at the corners. FastSAR removes the displacement predicted from the geometry by a final
-resampling. The error is then -32.1 dB on Panama (Melbourne -33.5 dB, Iowa -35.4 dB). It grows by about 10 dB from
+resampling. The error is then -33.7 dB on Panama (Melbourne -35.3 dB, Iowa -37.6 dB). It grows by 13 to 17 dB from
 the inner to the outer ring around the scene center; the factorized image's error stays level:
 
 ![Error of polar format and factorized backprojection in four rings around the scene center](images/rings.png)

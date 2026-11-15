@@ -20,7 +20,7 @@ min against 369 s measured.
 | ISCE3 `backproject`, 16 threads | -31.5 to -54.9 | 4.8 h (est.) |
 | GRDL, factorized | no image | 77.5 s |
 | FastSAR, exact backprojection, cubic, 8x | -77.5 to -81.7 (truth) | 369 s |
-| FastSAR, factorized, float32 | -57.2 to -62.6 (truth) | 11.2 s |
+| FastSAR, factorized, float32 | -57.2 to -62.6 (truth) | 11.3 s |
 
 | GPU (Nvidia L4) | Error (dB) | Time |
 |---|---|---|
@@ -31,7 +31,7 @@ min against 369 s measured.
 | MatX `sar_bp`, `taylor_fast`, float64 pixel coordinates, 8x | -54.9 to -58.6 | 11.6 s |
 | FastSAR, exact backprojection, linear, 8x | -54.9 to -58.7 | 10.8 s |
 | FastSAR, exact backprojection, cubic, 8x | -77.5 to -81.7 (truth) | 16.9 s |
-| FastSAR, factorized, float32 | -57.1 to -62.6 (truth) | 2.8 s |
+| FastSAR, factorized, float32 | -57.1 to -62.6 (truth) | 3.0 s |
 | FastSAR, factorized, float16 throughout | -55.6 to -61.6 (truth) | 2.5 s |
 
 - RITSAR: a `linspace` range axis too coarse by one part in N_fft - 1, and a frequency axis that assumes an even
@@ -58,7 +58,7 @@ from day to day. The factorized algorithm cuts the time by a further factor of 6
 
 On the same CPU, the AFRL toolbox's `pfa_mem` (Octave) forms a polar-format image in 44.5 s and GRDL's polar format in 24.5 s.
 Neither corrects the planar-wavefront displacement. Their log-amplitude correlations with the reference are 0.80 to
-0.89 and 0.78 to 0.93, against 0.996 to 0.999 for FastSAR's corrected polar format (9.0 s on the CPU, 1.4 s on the L4).
+0.89 and 0.78 to 0.93, against 0.9995 to 0.9999 for FastSAR's corrected polar format (1.9 s on the CPU, 0.73 s on the L4).
 
 Scripts and records: [sar-accel-study](https://github.com/saulpingerman/sar-accel-study), directories `oss` and
 `results/comparison`.

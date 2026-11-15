@@ -131,7 +131,9 @@ At a resolution finer than about a meter over several kilometers polar format de
 picture; the product estimates by how much (`corner_error`), a note says so, and `form_cphd` is the tool for that
 image. `looks=n` averages the power of n by n images of the same pixels, formed from sub-apertures and sub-bands
 side by side, for less speckle at n by n times the bytes and the formation time. `output` is a `.png` file,
-written with the standard library alone, or a `.nitf` file, the complex image as a ground-plane SICD.
+written with the standard library alone, or a `.nitf` file, the complex image as a ground-plane SICD. A
+full-resolution picture of a large spotlight can pass 179 megapixels, the size above which Pillow refuses to open
+an image unless `PIL.Image.MAX_IMAGE_PIXELS` is raised (or set to `None`); `fastsar.quick.read_png` reads any size.
 
 Every backend runs polar format's stages written for it: `'cpu'` in C++ on all cores, `'cuda'` in CUDA kernels
 and cuFFT, `'jax'` and `'tpu'` in float32 planes on JAX's device. The device paths work in blocks sized from the

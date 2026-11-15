@@ -26,15 +26,15 @@ of the difference over the whole image.
 | TPU v5e, three-pass | -57.9 |
 | TPU v6e, three-pass | -57.8 |
 | TPU v5e and v6e, single-pass | -46.2 |
-| Polar format with the displacement correction (all devices) | -32.1 |
+| Polar format with the displacement correction (all devices) | -33.7 |
 
 - Float32-class images (float32 on CPU and L4, three-pass on TPU) leave the amplitude visually unchanged; their 5
   by 5 coherence with the reference exceeds 0.999 even at its 0.1 percentile. The TPU kernels compute the last
   level's geometry in float32, the probable cause of their error being up to 2.2 dB larger.
 - The single-pass TPU setting adds 12 dB. The amplitude is unchanged, but the phase deviates by up to 106 degrees beside
   bright returns (99th percentile 1.1 degrees). Use three-pass for interferometry.
-- Polar format shows striped coherence below 0.99; its residual grows from -40 dB at the scene center to -30 dB in
-  the outer quarter ([algorithms.md](algorithms.md#polar-format)).
+- Polar format keeps its 5 by 5 coherence with the reference at 0.995 or more at the 0.1 percentile, with coherence
+  loss beside bright returns; its residual grows from -45 dB at the scene center to -31 dB in the outer quarter ([algorithms.md](algorithms.md#polar-format)).
 - The reference limits the measured error of exact backprojection with its default cubic interpolation at 8 times:
   against a float64 backprojection oversampled 64 times on the lock, port and ship regions, the reference is -67.3
   to -68.8 dB, the cubic image -77.5 to -81.7 dB and the float32 factorized images -57.1 to -62.6 dB, a margin of 19 to 21 dB for

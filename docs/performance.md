@@ -15,13 +15,13 @@ The Umbra Panama image ([real-data.md](real-data.md#umbra-spotlight)) at float32
 
 | Device | Dollars per hour | Seconds per image | Dollars per 1000 images |
 |---|---|---|---|
-| TPU v6e (three-pass) | 2.70 | 2.9 | 1.56 |
-| TPU v5e (three-pass) | 1.20 | 5.0 | 1.31 |
-| L4 (float32) | 0.707 | 2.8 | 0.57 |
-| L4 (float16 throughout, float32 accumulation) | 0.707 | 2.5 | 0.49 |
-| A100 (float32) | 5.02 | 1.2 | 1.65 |
+| TPU v6e (three-pass) | 2.70 | 2.9 | 1.55 |
+| TPU v5e (three-pass) | 1.20 | 5.1 | 1.32 |
+| L4 (float32) | 0.707 | 3.0 | 0.59 |
+| L4 (float16 throughout, float32 accumulation) | 0.707 | 2.5 | 0.51 |
+| A100 (float32) | 5.02 | 1.2 | 1.63 |
 | H100 (float32) | 10.97 | 0.6 | 1.84 |
-| c4d-highmem-16 | 0.964 | 11.2 | 3.01 |
+| c4d-highmem-16 | 0.964 | 11.3 | 3.02 |
 
 Cost is the hourly price divided by the throughput of back-to-back images (on the TPUs the next history is staged
 while one forms). The H100 forms the image fastest; the L4, whose hourly price is about a quarter of the v6e's and
@@ -30,14 +30,27 @@ on the Melbourne and Iowa collections as well.
 
 ![Cost per 1000 Panama images against error for every FastSAR configuration and the open-source implementations](images/teaser.png)
 
-Single-pass on the TPUs takes 2.6 s (v6e) and 3.5 s (v5e) at -46.2 dB, $1.19 and $0.82 per 1000 images. Float16
-on the L4 and single-pass on the TPUs lower each device's cost by 13 to 37%. Polar format takes 1.4 s on the L4
-($0.28 per 1000, the lowest cost of any configuration) and 9.0 s on the c4d-highmem-16, at -32.1 dB. On the TPUs its resampling steps are gathers on the vector unit and take 103 s (v5e) and 110 s (v6e) per image. The L4 draws 0.05 kWh per 1000 float32 images (mean
-`nvidia-smi` power, host excluded).
+Single-pass on the TPUs takes 2.5 s (v6e) and 3.6 s (v5e) at -46.2 dB, $1.19 and $0.83 per 1000 images. Float16
+on the L4 and single-pass on the TPUs lower each device's cost by 15 to 37%. Polar format takes 0.73 s on the L4
+($0.14 per 1000, the lowest cost of any configuration), 0.35 s on the A100, 0.18 s on the H100, 1.9 s on the
+c4d-highmem-16, 1.5 s on the v6e and 2.2 s on the v5e, at -33.7 dB (0.3.0: 1.4, 0.93, 0.56, 9.0, 110 and 103 s at
+-32.1 dB). On a TPU VM the host's own cores form it faster than the TPU: about 1.3 s on the v6e's 44 vCPUs and 1.9 s
+on the v5e's 24, measured outside the records; `form_image(..., algorithm='pfa', backend='cpu')` takes them, while
+`backend='auto'` takes the TPU. The L4 draws 0.05 kWh per 1000 float32 images (mean `nvidia-smi` power, host
+excluded).
 
-These are the release records of the study (FastSAR 0.3.0; public API only, the CPU kernels compiled on each
-instance). Every image is bitwise that of the 0.2.0 records: 81 images of the three Umbra collections on the six
-devices and 75 region images of the five Capella collections on the five devices that form them. On the Umbra
+These are the release records of the study (FastSAR 0.3.1; public API only, the CPU kernels compiled on each
+instance). 0.3.1 re-recorded the three Umbra collections on the six devices; every image is bitwise that of the
+0.3.0 records except the polar format's, which forms by new stages. The median change in time of the unchanged
+configurations against 0.3.0 is +0.6% on the L4, -0.1% on the A100, +0.1% on the H100, +0.6% on the c4d-highmem-16,
++2.0% on the v5e and -0.5% on the v6e; the largest increases are 6.8, 0.2, 0.7, 2.2, 3.5 and 0.2%. The 6.8% is the
+L4's float32 Panama image (3.01 against 2.81 s); on a second L4 instance, alternating the two versions, 0.3.0
+took 2.84 and 2.92 s and 0.3.1 2.92 and 2.91 s, so the record instance is the slower machine. The Capella
+collections were not re-recorded: their products are those of 0.3.0, bit for bit, and their times are the 0.3.0
+records.
+
+The 0.3.0 records against 0.2.0: every image is bitwise that of the 0.2.0 records, 81 images of the three Umbra
+collections on the six devices and 75 region images of the five Capella collections on the five devices that form them. On the Umbra
 collections the median change in time against 0.2.0 is -0.5% on the L4, 0.0% on the A100, +0.1% on the H100,
 +0.6% on the c4d-highmem-16, -0.1% on the v5e and +0.3% on the v6e; the largest increases are 2.6, 6.2, 3.2, 1.2,
 0.1 and 2.3%. On the Capella collections the median is -0.1, -0.4, +0.1, -1.3 and 0.0% on the L4, A100, H100,
@@ -45,8 +58,8 @@ c4d-highmem-16 and v6e, and the largest increases are 1.7, 1.6, 2.2, 0.1 and 10.
 format on Melbourne (single call, 1.01 against 0.95 s). On a second A100 instance, run alternately, 0.2.0 took 0.98
 and 0.97 s and 0.3.0 0.98 and 0.96 s, so the record instance is the outlier, as for polar format on the A100 at
 0.2.0. On the v6e the 2024 Capella spotlight took 6.2% longer on the record VM and 0.4% longer on a second one.
-The 2025 Capella stripmap took 164.9 s on the record VM and 164.1 s on a second one, against
-149.2 s in the 0.2.0 records; on a third VM, alternating the two versions, 0.2.0 took 163.8 and 166.1 s and 0.3.0
+The 2025 Capella stripmap took 164.9 s on the record VM and 164.1 s on a second one, against 149.2 s in the 0.2.0
+records; on a third VM, alternating the two versions, 0.2.0 took 163.8 and 166.1 s and 0.3.0
 166.1 and 164.4 s, so the VM of the 0.2.0 record was the faster machine. The L4 record is the first of two fresh
 instances, which agreed within 2.9% on every configuration with bitwise identical images (Panama float32 single
 call 2.81 and 2.86 s; the two instances of the 0.2.0 records had 2.91 and 2.84 s).
@@ -299,7 +312,7 @@ with `-march=haswell` and run on the same machine, the factorized former takes 4
 
 ## Kernel times and stage profile
 
-On the c4d-highmem-16 the float32 Panama image takes 221 s as a single JAX program (`backend='jax'`) and 11.2 s
+On the c4d-highmem-16 the float32 Panama image takes 221 s as a single JAX program (`backend='jax'`) and 11.3 s
 with the C++ kernels. On the accelerators, in development and on the device, the JAX program took 4.6, 9.3 and
 13.7 s (v6e, v5e, L4) and the kernels 2.4, 4.6 and 3.5 s. In the profiled builds every kernel stage ran within 1.0
 to 2.5 times a lower bound set by its limiting hardware unit, measured by microbenchmarks on the same device.
@@ -329,32 +342,32 @@ The automatic tile choice takes 16 pixels on ARM. macOS builds the kernels with 
 
 On the Umbra Panama collection (15,186 pulses by 14,399 samples, 12,207 by 8,808 pixels) a c4a-highmem-16
 (Google Axion, Neoverse V2, 16 cores) forms the factorized float32 image in 20.3 s with these kernels, from 43.7 s
-with the 16-lane vectors of 0.1.1 (the c4d-highmem-16 of record: 11.2 s). Record: `results/fastsar/logs/arm2` in
+with the 16-lane vectors of 0.1.1 (the c4d-highmem-16 of record: 11.3 s). Record: `results/fastsar/logs/arm2` in
 sar-accel-study.
 
 ## Exact backprojection
 
 `ExactFormer` on the Umbra Panama collection (12,207 by 8,808 pixels, 15,186 pulses), host memory to host memory,
-warm former, against the float64 reference (release 0.3.0 records; 0.1.4's GPU times in brackets):
+warm former, against the float64 reference (release 0.3.1 records; 0.1.4's GPU times in brackets):
 
 | Device | Cubic, `upsample=8` (default) | Linear, `upsample=8` |
 |---|---|---|
-| L4 (g2-standard-4) | 16.9 s (23.9 s), -67.4 dB | 10.8 s (19.4 s), -56.8 dB |
+| L4 (g2-standard-4) | 16.8 s (23.9 s), -67.4 dB | 10.8 s (19.4 s), -56.8 dB |
 | A100 80GB (a2-ultragpu-1g) | 8.28 s (9.3 s), -67.4 dB | 5.17 s (6.9 s), -56.8 dB |
-| H100 80GB (a3-highgpu-1g) | 4.50 s (5.3 s), -67.4 dB | 2.89 s (4.2 s), -56.8 dB |
-| c4d-highmem-16 | 369 s, -67.4 dB | 227 s, -56.9 dB |
+| H100 80GB (a3-highgpu-1g) | 4.53 s (5.3 s), -67.4 dB | 2.91 s (4.2 s), -56.8 dB |
+| c4d-highmem-16 | 374 s, -67.4 dB | 232 s, -56.9 dB |
 
 At 0.1.7 the cuda former keeps its cropped range profiles in float16 for linear interpolation on grids of 2^25
 pixels or more (`profiles='auto'`; float32 below, and for cubic), which took the L4's linear time from 12.1 to 10.9 s
-at -56.8 against -56.9 dB; the cubic path is unchanged. The exact images of the 0.3.0 records are bitwise those of
-0.2.0, at 0.99 to 1.01 times its times. The exact kernels did not change between 0.1.5 and 0.1.6;
+at -56.8 against -56.9 dB; the cubic path is unchanged. The exact images of the 0.3.1 records are bitwise those of
+0.3.0, at 0.99 to 1.02 times its times. The exact kernels did not change between 0.1.5 and 0.1.6;
 the two L4 instances of the 0.1.6 records ran them 3 to 6% slower than the 0.1.5 record instance (16.3 s cubic,
 11.7 s linear). The 0.1.5 images are bitwise those of 0.1.4
 on all three GPUs and the three Umbra scenes. Two changes made the
 difference: the CUDA kernel's thread blocks take their tiles along the grid axis closer to constant range, so that
 the blocks resident together read the same range bins from the L2 cache instead of the image's whole range window,
 and the image comes back through pinned memory (0.25 s or more for the 860 MB image through pageable memory).
-Records: the bucket prefix `v13` of sar-accel-study (`cloud/r030/queue_gpu_v030.sh`).
+Records: the bucket prefix `v14` of sar-accel-study (`cloud/r031/queue_gpu_v031.sh`).
 
 The cubic error is the reference's own: against a float64 backprojection oversampled 64 times, the reference is
 -67.3 to -68.8 dB on the lock, port and ship regions and the cubic image -77.5 to -81.7 dB (the float32 factorized
