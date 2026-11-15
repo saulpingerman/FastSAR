@@ -1085,6 +1085,52 @@ def test_tpu(spot, squinted, steep, monkeypatch):
     assert rel_db(out['image'], ref['image']) < -20
 
 
+_BUDGET_SCRIPT = '''
+import json, math, sys
+import numpy as np
+import jax
+from fastsar import _xp, quick, sim
+n, out = int(sys.argv[1]), sys.argv[2]
+res, r0 = 0.5, 600e3
+col = sim.make_collect(res=res, scene=0.96 * res * n / (1.25 * math.sqrt(2.0)) * 1.2, r0=r0, graze_deg=45.0)
+P, K = col.Np, col.K
+mid = col.ant[P // 2]
+e2 = -mid / np.linalg.norm(mid)
+nrm = np.cross(e2, col.ant[P // 2 + 1] - col.ant[P // 2 - 1])
+nrm *= np.sign(nrm[2]) / np.linalg.norm(nrm)
+S = np.random.default_rng(0).standard_normal((P, K, 2), np.float32).view(np.complex64)[..., 0]
+grid = (n, n, 0.96 * res, 0.96 * res, np.cross(e2, nrm), e2)
+before = jax.devices()[0].memory_stats()
+info = {}
+img = quick._pfa(S.copy(), col.ant, col.fmin, col.df, *grid, backend='tpu', info=info, layout='formed')
+st = jax.devices()[0].memory_stats()
+ref = quick._pfa(S, col.ant, col.fmin, col.df, *grid, layout='formed')
+a, b = img.ravel().astype(np.complex128), ref.ravel().astype(np.complex128)
+g = np.vdot(a, b) / np.vdot(a, a)
+err = 10 * np.log10(np.sum(np.abs(g * a - b) ** 2) / np.sum(np.abs(b) ** 2))
+print(json.dumps(dict(peak=st['peak_bytes_in_use'], before=before['bytes_in_use'], budget=_xp.jax_budget(), stream=info.get('stream'), err=err)))
+'''
+
+
+@pytest.mark.tpu
+def test_tpu_holds_to_its_budget(tmp_path):
+    """On a TPU held to less memory than a formation's arrays take (FASTSAR_JAX_BLOCK_MB), the device's peak stays
+    within it: the arrays that do not fit are kept on the host and cross in blocks, a note says so, and the image is
+    the C++ stages'. (A TPU v5e, 16 GB, formed the 252-megapixel Capella image within its own budget this way.)"""
+    import json
+    import subprocess
+    import sys
+    script = tmp_path / 'budget.py'
+    script.write_text(_BUDGET_SCRIPT)
+    for mb, kept in (('120', True), ('4000', False)):
+        env = dict(os.environ, FASTSAR_JAX_BLOCK_MB=mb)
+        out = subprocess.run([sys.executable, str(script), '2048', str(tmp_path / 'img.npy')], env=env, capture_output=True, text=True, timeout=900)
+        assert out.returncode == 0, out.stderr[-3000:]
+        d = json.loads(out.stdout.strip().splitlines()[-1])
+        print(f"{mb} MB: peak {d['peak'] / 1e6:.0f} MB of the device, {d['err']:.1f} dB against C++; {d['stream']}")
+        assert d['peak'] - d['before'] <= d['budget'] and d['err'] < -60 and bool(d['stream']) == kept
+
+
 @pytest.mark.cuda
 @pytest.mark.parametrize('megabytes', ['0.4', '2'])
 def test_cuda_streams_what_does_not_fit(spot, squinted, monkeypatch, megabytes):
