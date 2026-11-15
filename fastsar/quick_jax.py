@@ -24,10 +24,10 @@ slower than blocks of 2 GB. So:
   bytes.
 
   Memory. The history is never on the device whole. Of the three large arrays (the range stage's output, the
-  raster, its range transform) those that fit stay on the device, in a few pieces that are joined as their blocks
-  come (never there twice); the others live on the host and their blocks cross (_plan). The read at the apparent
-  positions works in strips of the picture's rows, and the picture comes down strip by strip. Every block is sized
-  from _xp.jax_block() (at most 2 GB).
+  raster, its range transform) those that fit stay on the device, in a few pieces that their blocks are written
+  into as they come (never there twice); the others live on the host and their blocks cross (_plan). The read at
+  the apparent positions works in strips of the picture's rows, and the picture comes down strip by strip. Every
+  block is sized from _xp.jax_block() (at most 2 GB).
 
   Programs. A stage is a chain of three functions: the cut of a block out of the array before it (specific to
   that array's size), the block's layout for the stage (padding, signs, the fold), and the stage's work on a block
@@ -80,7 +80,7 @@ def _mode():
     return v
 
 
-def _program(name, key, make, detail=None):
+def _program(name, key, make, detail=None, donate=()):
     """The compiled program `name` for its static sizes `key`, kept between calls (the newest 256). Its first call
     is brought to completion and timed (COMPILED); with detail (a dict) every call is, and the seconds are added
     to detail[name]."""
@@ -92,7 +92,7 @@ def _program(name, key, make, detail=None):
         _xp.jax_cache()
         if len(_PROGRAMS) >= 256:
             _PROGRAMS.pop(next(iter(_PROGRAMS)))
-        p = _PROGRAMS[k] = [jax.jit(make()), False]
+        p = _PROGRAMS[k] = [jax.jit(make(), donate_argnums=donate), False]
     if p[1] and detail is None:
         return p[0]
 
@@ -306,8 +306,8 @@ class _Run:
             self._lib = Q._lib()
         return self._lib
 
-    def program(self, name, key, make):
-        return _program(name, key, make, self.detail)
+    def program(self, name, key, make, donate=()):
+        return _program(name, key, make, self.detail, donate)
 
     def chain(self, parts):
         """parts: (name, key, fn, args) in order; each fn takes the outputs of the one before it, then its own
@@ -372,44 +372,39 @@ def _unpack(x):
 
 class _Device:
     """A large complex array [rows, width] on the device as two float32 planes, kept in at most GROUP pieces of
-    rows: its blocks (`per` rows each, the last moved back to end at the last row) are joined as they come, a
-    piece at a time, so the array is never on the device twice."""
+    rows (_pieces): its blocks (`per` rows each, the last moved back to end at the last row) are written into
+    their piece as they come, in place (a donated buffer), so the array is never on the device twice. (A join of a
+    piece's blocks by one concatenation compiled for 3 s on a TPU v5e where a piece held 109 blocks.)"""
     host = False
 
     def __init__(self, run, total, per, starts, width):
         self.run, self.total, self.per, self.width = run, total, per, width
         self.group = max(1, -(-len(starts) // GROUP))
-        self.pieces, self.waiting, self.done = [], [], 0
+        self.spans = _pieces(starts, per)
+        self.pieces, self.count = [], 0
 
     def put(self, r0, re, im):
-        self.waiting.append((r0, re, im))
-        if len(self.waiting) == self.group:
-            self._join()
+        import jax.numpy as jnp
+        from jax import lax
+        k, self.count = self.count // self.group, self.count + 1
+        first, end = self.spans[k]
+        rows, W, per = end - first, self.width, self.per
+        trim = max(0, first - r0)                     # rows of a block moved back that the piece before holds
+        if trim == 0 and r0 == first and rows == per:
+            self.pieces.append((re, im))
+            return
+        if len(self.pieces) == k:
+            new = self.run.program('piece', (rows, W), lambda: lambda: (jnp.zeros((rows, W), jnp.float32), jnp.zeros((rows, W), jnp.float32)))
+            self.pieces.append(new())
 
-    def _join(self):
-        trims = []
-        for r0, _, _ in self.waiting:
-            trims.append(self.done - r0)             # rows of a block moved back that the one before it holds
-            self.done = r0 + self.per
-        if len(self.waiting) == 1 and trims[0] == 0:
-            self.pieces.append(self.waiting[0][1:])
-        else:
-            n = len(trims)
-
-            def make(trims=tuple(trims)):
-                import jax.numpy as jnp
-
-                def run(*a):
-                    return (jnp.concatenate([x[t:] for x, t in zip(a[:n], trims)], 0),
-                            jnp.concatenate([x[t:] for x, t in zip(a[n:], trims)], 0))
-                return run
-            join = self.run.program('join', (self.per, self.width, tuple(trims)), make)
-            self.pieces.append(join(*(w[1] for w in self.waiting), *(w[2] for w in self.waiting)))
-        self.waiting = []
+        def make():
+            def run(br, bi, re, im, at):
+                return lax.dynamic_update_slice(br, re[trim:], (at, 0)), lax.dynamic_update_slice(bi, im[trim:], (at, 0))
+            return run
+        place = self.run.program('place', (rows, W, per, trim), make, donate=(0, 1))
+        self.pieces[k] = place(*self.pieces[k], re, im, np.int32(r0 + trim - first))
 
     def close(self):
-        if self.waiting:
-            self._join()
         self.rows = sum(int(p[0].shape[0]) for p in self.pieces)
         return self
 
@@ -527,7 +522,7 @@ def _origins(g, b1):
 def _plan(sizes, budget, block):
     """Where the three large arrays live for a device with `budget` bytes to give (None: no limit known) and
     `block` bytes for a stage's own arrays: dict(A, B, F: True on the device; kept: the names of those on the
-    host). A stage holds the array it reads, the one it writes with one more piece of it while that is joined,
+    host). A stage holds the array it reads, the one it writes and an eighth more (a piece and its block),
     and the temporaries of its programs, counted as four blocks; the largest go to the host first until what is
     left fits. (The 252-megapixel Capella image peaked at 11.1 GB on a TPU v5e, blocks of 1.06 GB, and at 14.7 GB on
     a v6e, blocks of 2.1 GB: the largest stage's arrays, 7.2 GB, and 3.7 and 3.6 blocks.)"""
