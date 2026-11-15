@@ -90,6 +90,7 @@ AUTO_CUDA_FIRST_SAMPLES = 250_000_000
 # 1.72 s on the device (quick_jax._resident) after a first call of 106 s. No larger collection was measured there:
 # the threshold stays above the collections of this class.
 AUTO_TPU_SAMPLES = 4_000_000_000
+JAX_DISPLAY = 'host'          # where a quick look on a JAX device is remapped (_jax_display)
 _LIB = []
 _POOL = []
 _LOCK = threading.Lock()
@@ -856,7 +857,7 @@ def _abs(img, scale):
 
 
 def _pfa(S, ant, fmin, df, nx, ny, spx, spy, e1, e2, *, correct=True, window=True, backend='cpu', complex_image=True,
-         timing=None, info=None, warn=False, support='union', scale=None, layout='range', phase=None):
+         timing=None, info=None, warn=False, support='union', scale=None, layout='range', phase=None, keep=False):
     """The quick look's polar format of a history S [P, K] referenced to |ant| on the grid of form_image (e2 along
     the mid-aperture line of sight, away from the radar) -> the image [nx, ny]: complex64 as backprojection gives
     it, or its amplitude (float32, complex_image False); a NumPy array, or a CuPy array for backend 'cuda'.
@@ -864,9 +865,10 @@ def _pfa(S, ant, fmin, df, nx, ny, spx, spy, e1, e2, *, correct=True, window=Tru
     geometry's facts (the displacement, the raster and gate sizes). scale: a factor for the image, or a function of
     the geometry that gives one (form_image's polar format keeps its JAX program's scale). layout: 'range' returns
     the image as it is formed, range-major, as the transposed view [nx, ny]; 'azimuth' returns a contiguous
-    [nx, ny] array (form_image's). phase: (ph0, ph1) [P] float64 in cycles, a phase exp(2 pi j (ph0 + k ph1)) still to
+    [nx, ny] array (form_image's); 'formed' the range-major array itself, [ny, nx]. phase: (ph0, ph1) [P] float64 in cycles, a phase exp(2 pi j (ph0 + k ph1)) still to
     be given to sample k of each pulse (the quick look's reference to the grid center): the device applies it with
-    the weights, the host in a pass of its own."""
+    the weights, the host in a pass of its own. keep: on the jax and tpu backends the amplitude image stays on the
+    device and is returned as a JAX array (the complex image always comes to the host)."""
     timing = {} if timing is None else timing
     t0 = time.perf_counter()
     e1, e2 = np.asarray(e1, np.float64), np.asarray(e2, np.float64)
@@ -893,17 +895,17 @@ def _pfa(S, ant, fmin, df, nx, ny, spx, spy, e1, e2, *, correct=True, window=Tru
         img = _pfa_cuda(box, g, window, correct, complex_image, timing, phase, info)
     elif backend in ('jax', 'tpu'):
         from . import quick_jax
-        img = quick_jax.pfa(box, g, window, correct, complex_image, timing, phase, info)
+        img = quick_jax.pfa(box, g, window, correct, complex_image, timing, phase, info, keep)
     else:
         box[0] = np.ascontiguousarray(box[0], np.complex64)
         if phase is not None:
             _apply_phase(box[0], *phase)
         img = _pfa_cpu(box, g, window, correct, complex_image, timing)
+    if layout == 'formed':
+        return img
     if layout == 'range':
         return img.T
     t0 = time.perf_counter()
-    if isinstance(img, np.ndarray) and img.T.flags.c_contiguous:     # formed azimuth-major (the resident JAX path)
-        return img.T
     if type(img).__module__.startswith('cupy'):
         out = __import__('cupy').ascontiguousarray(img.T)
     elif img.dtype == np.complex64:                    # turned in tiles on all cores
@@ -1629,6 +1631,17 @@ def _jax_algorithm():
     return v
 
 
+def _jax_display():
+    """Where a quick look on the jax and tpu backends is remapped and laid out once it is detected: 'host' (the
+    amplitude comes down and the host's cores remap it) or 'device' (the amplitude stays on the device, fastsar.remap
+    works there in blocks and the 8-bit picture comes down). FASTSAR_QUICKLOOK_DISPLAY chooses; the default is
+    JAX_DISPLAY."""
+    v = os.environ.get('FASTSAR_QUICKLOOK_DISPLAY', '').strip().lower() or JAX_DISPLAY
+    if v not in ('host', 'device'):
+        raise ValueError(f"FASTSAR_QUICKLOOK_DISPLAY must be 'host' or 'device', got {v!r}")
+    return v
+
+
 def _backend(backend):
     """A backend named by the caller, checked against this machine ('auto' is resolved by _auto, once the cut is
     known)."""
@@ -1785,6 +1798,7 @@ def quicklook(cphd, output=None, *, size=2048, resolution=None, correct=True, re
         return dict(col, S=np.ascontiguousarray(S[rows, cols]), ant=ant[rows], fmin=f0 + j * Kl * df, phase=ph)
     info, shift, acc, cimg, defocus = {}, None, None, None, None
     xp = np
+    keep = backend in ('jax', 'tpu') and not want and _jax_display() == 'device'
     for i in range(la):
         for j in range(lr):
             sub = look(i, j)
@@ -1797,10 +1811,9 @@ def quicklook(cphd, output=None, *, size=2048, resolution=None, correct=True, re
                 box = [sub.pop('S')]                                     # handed over: freed once it is gated
                 if (la, lr) == (1, 1):
                     S = None
-                out = _pfa(box, sub['ant'], sub['fmin'], df, nx, ny, spx, spy, e1, e2, correct=bool(correct),
-                           window=window, backend=backend, complex_image=want, timing=timing, info=info,
-                           phase=sub['phase'])
-                rm = out.T                                               # range-major, where it was formed
+                rm = _pfa(box, sub['ant'], sub['fmin'], df, nx, ny, spx, spy, e1, e2, correct=bool(correct),
+                          window=window, backend=backend, complex_image=want, timing=timing, info=info,
+                          phase=sub['phase'], layout='formed', keep=keep)    # range-major, where it was formed
                 xp = _xp.module(rm)
                 complex_rm = want
                 if want:

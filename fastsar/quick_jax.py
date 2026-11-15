@@ -439,13 +439,22 @@ def _plan(sizes, budget, block):
     return dict(on, kept=[names[k] for k in sizes if not on[k]])
 
 
-def plan(g, K=None):
-    """The sizes of a formation on the JAX device and where its arrays live, for a geometry of quick._geometry:
-    dict(bytes: of A, B and F; A, B, F: on the device; kept; budget, block). What pfa takes."""
+def _block():
+    """Bytes of a stage's own arrays for one block: _xp.jax_block() (a sixteenth of the device's memory, at most
+    2 GB), or FASTSAR_JAX_PFA_BLOCK_MB megabytes, for measurements."""
     from . import _xp
-    lay = _layout(g, _xp.jax_block())
-    return dict(_plan(lay['bytes'], _xp.jax_budget(), _xp.jax_block()), bytes=lay['bytes'], budget=_xp.jax_budget(),
-                block=_xp.jax_block())
+    mb = os.environ.get('FASTSAR_JAX_PFA_BLOCK_MB', '').strip()
+    return int(float(mb) * (1 << 20)) if mb else _xp.jax_block()
+
+
+def plan(g, correct=True):
+    """The sizes of a formation on the JAX device and where its arrays live, for a geometry of quick._geometry:
+    dict(bytes: of the range stage's output A, the raster B and its range transform F; A, B, F: True on the device;
+    kept: the names of those on the host; budget, block: the device's bytes they were planned for). What pfa
+    takes."""
+    from . import _xp
+    lay = _layout(g, _block(), correct)
+    return dict(_plan(lay['bytes'], _xp.jax_budget(), _block()), bytes=lay['bytes'], budget=_xp.jax_budget(), block=_block())
 
 
 def _layout(g, blk, correct=True):
@@ -519,12 +528,12 @@ def _split(jnp, index, frac):
     return index + fl.astype(jnp.int32), frac - fl
 
 
-def pfa(S, g, window, correct, complex_image, timing, phase=None, info=None):
+def pfa(S, g, window, correct, complex_image, timing, phase=None, info=None, keep=False):
     """fastsar.quick's polar format on JAX's device -> the image on the host, range-major [ny, nx] (complex64, or
     its amplitude, float32). S [P, K] complex64 on the host (or a one-element list that hands it over); g:
     quick._geometry's; phase: (ph0, ph1) [P] in cycles, a reference phase exp(2 pi j (ph0 + k ph1)) of sample k
     that the device applies with the weights. info['stream']: what was kept on the host, where the device had no
-    room. timing: the stages' seconds; with timing['detail'] a dict, every program's call is brought to completion
+    room. keep: the amplitude is left on the device and returned as a JAX array (for a remap there). timing: the stages' seconds; with timing['detail'] a dict, every program's call is brought to completion
     and its seconds are added there by name."""
     import jax
     import jax.numpy as jnp
@@ -537,7 +546,7 @@ def pfa(S, g, window, correct, complex_image, timing, phase=None, info=None):
     P, K, Kf, Nr, k0 = g['P'], g['K'], g['Kf'], g['Nr'], g['k0']
     nkr, nka, nfy, nfx, nx, ny = g['nkr'], g['nka'], g['nfy'], g['nfx'], g['nx'], g['ny']
     nwin, jlo, Pf, Na, p0, Pp, place = g['nwin'], g['jlo'], g['Pf'], g['Na'], g['p0'], g['Pp'], g['place']
-    blk, budget = _xp.jax_block(), _xp.jax_budget()
+    blk, budget = _block(), _xp.jax_budget()
     L = _layout(g, blk, correct)
     where = _plan(L['bytes'], budget, blk)
     if where['kept'] and info is not None:
@@ -721,7 +730,30 @@ def pfa(S, g, window, correct, complex_image, timing, phase=None, info=None):
     jax.block_until_ready(o)
     timing['range transform'] = timing.get('range transform', 0.0) + time.perf_counter() - t0
     t0 = time.perf_counter()
-    out = np.empty((ny, nx), c64 if complex_image else np.float32)
+    keep = bool(keep) and not complex_image
+    out = None if keep else np.empty((ny, nx), c64 if complex_image else np.float32)
+    kept = []
+
+    def deliver(o, j, n):
+        """Rows j .. j + n of the picture: the leading rows of the device block o, to the host or kept."""
+        if keep:
+            kept.append((j, n, o))
+        else:
+            run.fetch(o, out[j:j + n])
+
+    def finished():
+        if not keep:
+            run.flush()
+            return out
+        rows, done = [], 0
+        for j, n, o in sorted(kept, key=lambda v: v[0]):       # (a block moved back repeats rows of the one before it)
+            if j + n > done:
+                rows.append((done - j, n))
+                done = j + n
+        blocks = [o for _, _, o in sorted(kept, key=lambda v: v[0])][:len(rows)]
+        join = run.program('picture rows', (tuple(rows), tuple(b.shape for b in blocks), nx),
+                           lambda: lambda *a: jnp.concatenate([x[lo:hi, :nx] for x, (lo, hi) in zip(a, rows)], 0))
+        return join(*blocks)
     Nx = ov * nfx
     if not correct:
         # 4. the azimuth transform of the picture's range bins, cut to its columns, with the carriers. The bins
@@ -749,8 +781,8 @@ def pfa(S, g, window, correct, complex_image, timing, phase=None, info=None):
                 o = run.chain([F.cut(nv, (nfy - ny // 2 + jb) % nfy), ('columns', (nv, bw, F.rows, nka, Nx), columns, ()),
                                ('picture', (bw, Nx, nx, bool(complex_image)), picture,
                                 (cxd, rows_of(cyh, slice(jb, jb + nv), bw, np.uint32)))])
-                run.fetch(o[0], out[jb:jb + nv])
-        run.flush()
+                deliver(o[0], jb, nv)
+        out = finished()
         timing['image'] = timing.get('image', 0.0) + time.perf_counter() - t0
         return out
     # 4. the read at the apparent positions, in strips of the picture's rows (range pixels). A strip's rows of the
@@ -868,8 +900,10 @@ def pfa(S, g, window, correct, complex_image, timing, phase=None, info=None):
                             (xn, rows_of(yn, sl, njc, f32), ixm, rows_of(qi, sl, njc, i32), rows_of(qf, sl, njc, f32), cx, cy,
                              scal(sig), scal(ux), scal(uy), scal(half_x), cxx, rows_of(cyy, sl, njc, f32), krc, kac))])
             n = min(nvc, ny - (j0 + c0))
-            run.fetch(o[0], out[j0 + c0:j0 + c0 + n])
+            deliver(o[0], j0 + c0, n)
         del G
-    run.flush()
+    out = finished()
+    if keep:
+        jax.block_until_ready(out)
     timing['correction'] = timing.get('correction', 0.0) + time.perf_counter() - t0
     return out

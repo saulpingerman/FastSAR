@@ -796,9 +796,10 @@ def test_device_programs_are_shared(spot, squinted, request, monkeypatch):
         quick._pfa(S, ant, f0, df, *grid, backend='jax')
 
 
-def test_quicklook_on_jax(spot, squinted, request):
+def test_quicklook_on_jax(spot, squinted, request, monkeypatch):
     """quicklook(backend='jax'): the cut referenced to the grid center on the device (a phase in 32-bit integer
-    arithmetic), the picture and the complex image of the cpu backend, on a plain and on a sheared raster; looks."""
+    arithmetic), the picture and the complex image of the cpu backend, on a plain and on a sheared raster; looks;
+    and the picture remapped on the device (FASTSAR_QUICKLOOK_DISPLAY=device), where only its 8 bits come down."""
     request.getfixturevalue('jax_cpu')
     for f, limit in ((spot, -70), (squinted, -45)):
         ref = look(f['path'], size=128, complex_image=True)
@@ -812,6 +813,17 @@ def test_quicklook_on_jax(spot, squinted, request):
         assert np.mean(np.abs(raw['display'].astype(int) - look(f['path'], size=128, correct=False)['display'].astype(int)) <= 1) > 0.999
     lk = look(spot['path'], size=64, backend='jax', looks=2)
     assert lk['looks'] == (2, 2) and np.mean(np.abs(lk['display'].astype(int) - look(spot['path'], size=64, looks=2)['display'].astype(int)) <= 1) > 0.99
+    host = {c: look(squinted['path'], size=128, backend='jax', correct=c)['display'] for c in (True, False)}
+    assert quick._jax_display() == quick.JAX_DISPLAY
+    monkeypatch.setenv('FASTSAR_QUICKLOOK_DISPLAY', 'device')
+    for c in (True, False):
+        dev = look(squinted['path'], size=128, backend='jax', correct=c)
+        assert isinstance(dev['display'], np.ndarray) and np.abs(dev['display'].astype(int) - host[c].astype(int)).max() <= 1
+    two = look(spot['path'], size=64, backend='jax', looks=2)
+    assert np.abs(two['display'].astype(int) - lk['display'].astype(int)).max() <= 1
+    monkeypatch.setenv('FASTSAR_QUICKLOOK_DISPLAY', 'gpu')
+    with pytest.raises(ValueError, match='FASTSAR_QUICKLOOK_DISPLAY'):
+        look(spot['path'], size=64, backend='jax')
 
 
 def test_factorized_former_on_jax(spot, request, monkeypatch):
