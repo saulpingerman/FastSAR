@@ -11,6 +11,7 @@ streams the history from host memory through the first level, and a CUDA mosaic 
 profiles on the device. Each fallback that FastSAR chooses raises a MemoryWarning naming it; filter it with
 warnings.simplefilter('ignore', fastsar.MemoryWarning)."""
 import os
+import threading
 import warnings
 
 
@@ -66,6 +67,26 @@ def _pinned(n):
     """A block of at least n bytes from CuPy's pinned pool, its size rounded to a class (_pinned_size)."""
     import cupy as cp
     return cp.cuda.alloc_pinned_memory(_pinned_size(n))
+
+
+_REUSED = {}
+_REUSED_LOCK = threading.Lock()
+
+
+def _pinned_reused(n, kind='image'):
+    """A block of at least n bytes from CuPy's pinned pool for the crossings of one kind (an image coming back from
+    the device, the CUDA quick look's staging buffers), of the largest size this process asked for that kind when n
+    is at least half of it, else of n's own class. The pool hands a block back only at the size it was made, and
+    locking memory takes about a second per gigabyte (an L4's host): so a new size of picture within a factor of two
+    of the largest takes the block an earlier one left, instead of locking one of its own; a much smaller one does
+    not hold a block twice its size."""
+    size = _pinned_size(n)
+    with _REUSED_LOCK:
+        top = _REUSED.get(kind, 0)
+        if size <= top and 2 * size >= top:
+            size = top
+        _REUSED[kind] = max(top, size)
+    return _pinned(size)
 
 
 def _cgroup_file_cache(stat):

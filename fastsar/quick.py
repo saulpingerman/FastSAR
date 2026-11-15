@@ -989,11 +989,12 @@ def _pfa(S, ant, fmin, df, nx, ny, spx, spy, e1, e2, *, correct=True, window=Tru
 
 def _host(d):
     """A CuPy array on the host; a large one through page-locked memory, several times faster than into pageable
-    memory (the array returned then lies in that memory, which CuPy's pool takes back when it is released)."""
+    memory (the array returned then lies in that memory, which CuPy's pool takes back when it is released; a block
+    an earlier picture left there serves a new size within a factor of two: memory._pinned_reused)."""
     from . import memory
     if d.nbytes < (16 << 20):
         return d.get()
-    host = np.frombuffer(memory._pinned(d.nbytes), d.dtype, d.size).reshape(d.shape)
+    host = np.frombuffer(memory._pinned_reused(d.nbytes, 'display'), d.dtype, d.size).reshape(d.shape)
     d.get(out=host)
     return host
 
@@ -1298,38 +1299,147 @@ extern "C" __global__ void ql_cut(const float2* T, const float2* cy, const float
 }
 """
 _CUDA = {}
-_PLANS = threading.local()    # .kept: {(n, batch): plan}, the calling thread's cuFFT plans that take no work area
+_PLANS = threading.local()    # .kept: {(n, batch): plan}, the calling thread's cuFFT plans
+_CUFFT = []
+
+
+def _cufft():
+    """cuFFT's own functions, by ctypes from the library CuPy loaded (found in the process's memory map), or None
+    where it cannot be found."""
+    if not _CUFFT:
+        lib = None
+        try:
+            import ctypes
+            from cupy.cuda import cufft
+            cufft.getVersion()                        # the library, loaded
+            with open('/proc/self/maps') as fh:
+                paths = {line.split()[-1] for line in fh if '/libcufft.so' in line}
+            if len(paths) == 1:
+                lib = ctypes.CDLL(paths.pop())
+                h, p = ctypes.c_int, ctypes.c_void_p
+                lib.cufftCreate.argtypes = [ctypes.POINTER(h)]
+                lib.cufftSetAutoAllocation.argtypes = [h, ctypes.c_int]
+                lib.cufftMakePlan1d.argtypes = [h, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_size_t)]
+                lib.cufftSetWorkArea.argtypes = [h, p]
+                lib.cufftSetStream.argtypes = [h, p]
+                lib.cufftExecC2C.argtypes = [h, p, p, ctypes.c_int]
+                lib.cufftDestroy.argtypes = [h]
+        except Exception:
+            lib = None
+        _CUFFT.append(lib)
+    return _CUFFT[0]
+
+
+def _cufft_ok(result, what):
+    if result:
+        raise RuntimeError(f'cuFFT: {what} returned {result}')
+
+
+class _Plan:
+    """A cuFFT plan of `batch` C2C transforms of n points (cuFFT's own API, _cufft) that keeps between calls without
+    its work area: attach() takes one from CuPy's pool for a stage, release() gives it back at the stage's end."""
+
+    def __init__(self, n, batch):
+        import ctypes
+        import cupy as cp
+        L, h = _cufft(), ctypes.c_int()
+        _cufft_ok(L.cufftCreate(ctypes.byref(h)), 'cufftCreate')
+        self.handle, self.n, self.batch, self.mem, self.L = h.value, int(n), int(batch), None, L
+        try:
+            _cufft_ok(L.cufftSetAutoAllocation(self.handle, 0), 'cufftSetAutoAllocation')
+            size = ctypes.c_size_t()
+            r = L.cufftMakePlan1d(self.handle, self.n, 0x29, self.batch, ctypes.byref(size))      # CUFFT_C2C
+            if r == 2:                                # CUFFT_ALLOC_FAILED: the pool's unused blocks back, and again
+                cp.get_default_memory_pool().free_all_blocks()
+                r = L.cufftMakePlan1d(self.handle, self.n, 0x29, self.batch, ctypes.byref(size))
+            _cufft_ok(r, f'cufftMakePlan1d({self.n}, batch {self.batch})')
+        except BaseException:
+            L.cufftDestroy(self.handle)
+            raise
+        self.work = int(size.value)
+
+    def attach(self):
+        if self.work and self.mem is None:
+            import cupy as cp
+            mem = cp.cuda.alloc(self.work)
+            _cufft_ok(self.L.cufftSetWorkArea(self.handle, mem.ptr), 'cufftSetWorkArea')
+            self.mem = mem
+
+    def release(self):
+        self.mem = None
+
+    def run(self, x, inverse):
+        import cupy as cp
+        _cufft_ok(self.L.cufftSetStream(self.handle, cp.cuda.get_current_stream().ptr), 'cufftSetStream')
+        _cufft_ok(self.L.cufftExecC2C(self.handle, x.data.ptr, x.data.ptr, 1 if inverse else -1), 'cufftExecC2C')
+
+    def __del__(self):
+        try:
+            self.L.cufftDestroy(self.handle)
+        except Exception:
+            pass
+
+
+class _CupyPlan:
+    """CuPy's Plan1d where cuFFT's own API is not found (_cufft): its work area is its own for its life, so one with
+    a work area serves its stage only (it is not kept)."""
+
+    def __init__(self, n, batch):
+        from cupy.cuda import cufft
+        self.p, self.batch, self.cufft = cufft.Plan1d(n, cufft.CUFFT_C2C, batch), int(batch), cufft
+        self.work = int(getattr(getattr(self.p.work_area, 'mem', None), 'size', 0))
+
+    def attach(self):
+        pass
+
+    def release(self):
+        pass
+
+    def run(self, x, inverse):
+        self.p.fft(x, x, self.cufft.CUFFT_INVERSE if inverse else self.cufft.CUFFT_FORWARD)
 
 
 def _cuda_fft(x, inverse, plans, sync):
     """The transform of each row of x [batch, n] (complex64, C-contiguous), in place, by a cuFFT plan of this path's
     own; the inverse comes without its 1 / n (the stages fold it into a factor they apply anyway, which saves a pass
-    over the array). plans: the dict of the stage's plans by n, which the stage empties when it ends.
+    over the array). plans: the dict of the stage's plans by n, whose work areas the stage gives back when it ends
+    (_cuda_release).
 
     CuPy's own plan cache is not used. It keeps the last 16 plans of a thread for the life of the process, each with
     a work area the size of its batch (cuFFT asks for one for most lengths above a few thousand), taken from CuPy's
     pool and counted there as in use: after one full image and its uncorrected twin on an L4, 15 plans held 8 of the
-    device's 23 GB, the next call planned with 14.7 GB in place of 20.7 and kept an array on the host. A plan is
-    made in a quarter of a millisecond, so the plans with a work area live for their stage (one batch size at a
-    time: the last block's plan replaces the others'), and only those without one are kept between calls."""
-    from cupy.cuda import cufft
+    device's 23 GB, the next call planned with 14.7 GB in place of 20.7 and kept an array on the host. The plans
+    here are kept between calls by length and batch (_Plan), their work areas taken for a stage (one batch size at a
+    time: the last block's plan takes the area the others' gave back) and given back at its end: a plan with a work
+    area takes 1 to 4 ms to make, a dozen of them a call."""
     b, n = x.shape
     p = plans.get(n)
     if p is None or p.batch != b:
+        if p is not None and p.work:                  # the stage's last block: the other blocks' work area goes back
+            sync()                                    # first, once nothing runs in it
+            p.release()
+            del plans[n]
         kept = _PLANS.__dict__.setdefault('kept', {})
         p = kept.get((n, b))
         if p is None:
-            if n in plans:                            # the stage's last block: the work area of the other blocks' plan
-                sync()                                # is released first, once nothing runs in it
-                del plans[n]
-            p = cufft.Plan1d(n, cufft.CUFFT_C2C, b)
-            if not getattr(getattr(p.work_area, 'mem', None), 'size', 0):
+            p = (_Plan if _cufft() is not None else _CupyPlan)(n, b)
+            if isinstance(p, _Plan) or not p.work:
                 if len(kept) >= 64:
                     kept.clear()
                 kept[(n, b)] = p
+        p.attach()
         plans[n] = p
-    p.fft(x, x, cufft.CUFFT_INVERSE if inverse else cufft.CUFFT_FORWARD)
+    p.run(x, inverse)
     return x
+
+
+def _cuda_release(plans=None):
+    """The work areas of a stage's plans (or of every kept plan of the calling thread: a call that ended early may
+    have left some), back to CuPy's pool; the caller has brought the device to completion."""
+    for p in (plans.values() if plans is not None else _PLANS.__dict__.get('kept', {}).values()):
+        p.release()
+    if plans is not None:
+        plans.clear()
 
 
 def _cuda_room(g, correct, complex_image):
@@ -1422,7 +1532,8 @@ class _Link:
     piece arrives. The orders that matter are set by events: a copy up waits for the kernel that still reads the
     device block it overwrites, a kernel for the copy that brings its input, a copy down for the kernel that writes
     what it takes. The buffers come from CuPy's pinned pool in sizes that are powers of two up to 64 MB and stay
-    there between calls: locking memory takes a second per gigabyte, far more than using it.
+    there between calls, a smaller call taking the larger buffers an earlier one left (memory._pinned_reused):
+    locking memory takes a second per gigabyte, far more than using it.
 
     timed: every copy is waited for where it is made, and its seconds counted (stats['up_link'], ['down_link']):
     the link's own rate, which a detailed call reports; otherwise the copies overlap the work and only the host's
@@ -1442,7 +1553,7 @@ class _Link:
         i = at[0] % count
         at[0] += 1
         if len(bufs) <= i:
-            bufs.append(np.frombuffer(memory._pinned(self.size), np.uint8, self.size))
+            bufs.append(np.frombuffer(memory._pinned_reused(self.size, 'staging'), np.uint8, self.size))
             last.append(None)
         if last[i] is not None:
             last[i].synchronize()
@@ -1608,6 +1719,7 @@ def _pfa_cuda(S, g, window, correct, complex_image, timing, phase=None, info=Non
     main = cp.cuda.get_current_stream()
     sync = main.synchronize
     sync()                                            # nothing of the caller's still runs in memory the pool gives out
+    _cuda_release()                                   # (work areas a call that raised left attached)
     budget, blk, plan = _cuda_room(g, correct, complex_image)
     if info is not None:
         info['device'] = dict(budget=int(budget), block=int(blk),
@@ -1644,7 +1756,7 @@ def _pfa_cuda(S, g, window, correct, complex_image, timing, phase=None, info=Non
 
     def lap(name, t0):
         sync()
-        plans.clear()                                 # the stage's plans and their work areas, back to the pool
+        _cuda_release(plans)                          # the stage's plans' work areas, back to the pool
         timing[name] = timing.get(name, 0.0) + time.perf_counter() - t0
         return time.perf_counter()
 
