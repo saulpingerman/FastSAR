@@ -34,25 +34,52 @@ was published on PyPI.
   the whole read, value for value. `form_cphd` takes the selection through `reader_options`.
 - `fastsar.quick.write_png` and `read_png`: 8-bit PNG files with the standard library alone, the rows deflated in
   blocks on all cores.
+- JAX's persistent compilation cache for FastSAR's programs: a directory `jax` beside the compiled CPU kernels
+  (`FASTSAR_CACHE_DIR`), `FASTSAR_JAX_CACHE` to move it or `FASTSAR_JAX_CACHE=off`; a cache the user configured
+  for JAX is kept. A second process loads the programs instead of compiling them: on a TPU v6e its first Panama
+  image takes 2.8 s instead of 19 s, its first Capella image 7.4 s instead of 34 s
+  ([docs/performance.md](docs/performance.md#compiled-programs)).
 - `examples/quicklook.py`: a quick look from the command line, with the time of each stage.
   `tests/bench_quicklook.py`: the times of full images and quick looks by backend and stage, as JSON.
   `tests/bench_tpu_blocks.py`: the device times of the building blocks of a polar format on a JAX device.
 
 ### Changed
 
-- `form_image(algorithm='pfa')` forms by the quick look's stages on the `cpu` and `cuda` backends: the image of
-  the JAX program to its accuracy and at its scale, in a tenth of the time or less (the Panama image, 12,207 by
-  8,808 pixels from 15,186 pulses of 14,399 samples: 1.2 s on 16 CPU threads and 0.3 s on a GPU, where the
-  program takes 9.6 s). Over whole images the stages are the closer of the two to exact backprojection
+- `form_image(algorithm='pfa')` forms by the quick look's stages on every backend: the image of the JAX program
+  to its accuracy and at its scale, in a tenth of the time or less (the Panama image, 12,207 by 8,808 pixels from
+  15,186 pulses of 14,399 samples: 1.2 s on 16 CPU threads, 0.3 s on a GPU and 1.4 s on a TPU v6e, where the
+  program takes 9.6 s on the CPU and 110 s on the v6e). Over whole images the stages are the closer of the two to exact backprojection
   ([docs/performance.md](docs/performance.md#polar-format-by-stages)). On a ground-plane grid the stages' image
   has backprojection's phase, which the program's does not; the amplitudes agree. A collection that lacks pulses
   of its evenly timed sequence is formed with each pulse at its place. `backend` now chooses where polar format
-  runs. `FASTSAR_PFA_PROGRAM=jax` takes the JAX program on every backend, bit for bit that of 0.3.0 on the CPU;
-  the `jax` and `tpu` backends keep it (`FASTSAR_PFA_PROGRAM=stages` takes the stages there). `pfa_guard` sets the
+  runs. `FASTSAR_PFA_PROGRAM=jax` takes the JAX program on every backend, bit for bit that of 0.3.0 on the CPU.
+  `pfa_guard` sets the
   image's scale as before; the stages set their own gate edges, and form a grid that with its guard exceeds the
   unambiguous extent.
 - `fastsar.pfa2` imports JAX when a polar-format program is built, not when the module is imported. The images of
   `form_cphd` and `process_cphd` are bit for bit those of 0.3.0 on the CPU.
+- Polar format's stages on a TPU (`quicklook` and `form_image(algorithm='pfa')` on the `tpu` and `jax` backends)
+  compile in a sixth of the time, and a process's first image no longer waits two minutes. On a TPU v6e the
+  Panama image's first call takes 19 s instead of 120 s, and a 252-megapixel Capella image's 34 s instead of
+  133 s. Two forms took the TPU's compiler long. The positions of a read fused with its weights: the final
+  read along the columns compiled for 53 to 67 s and the azimuth stage for 15 s; the positions are now formed
+  apart (2 to 4 s). Transforms of many rows: a transform's compile time grows with its rows (7 s for 2,688 rows
+  of 18,432 samples, 0.8 s for 16), so the stages transform in a loop over chunks of 16 rows and read in chunks
+  of at most 128 rows. A large array's blocks are written into their piece in place, not joined by a
+  concatenation (3 s to compile on a TPU v5e). Later images are faster too: 1.36 s instead of 1.61 s (Panama)
+  and 6.0 s instead of 6.6 s (Capella). The images are unchanged: -68.9 and -69.1 dB from the C++ stages.
+- The memory plan of the stages on a JAX device counts four blocks of temporaries beside the arrays, not three:
+  the Capella image peaked at the arrays and 3.7 blocks on a TPU v5e. On the v5e's 16 GB the Panama and Capella
+  images keep every array on the device (peaks of 4.6 and 11.1 GB of a 15.2 GB budget); a 587-megapixel image
+  keeps two arrays on the host, with a note, and peaks at 6.6 GB.
+
+### Fixed
+
+- The full-resolution quick look of a ground grid under a twisted slant plane (a sheared raster) on a TPU. Each
+  block of the raster's rows was cut out of the range stage's output by a gather that laid the whole array out
+  anew on the device for every block, 22 ms a block of a 4.4 GB array. A block is now one slice of each piece of
+  the array, the pulses of a piece written from a common first row. On a TPU v6e the 13,216 by 13,216 Capella
+  picture takes 6.2 s instead of 15.6 s (the host's 44 cores take 6.2 s), its cuts 0.3 s instead of 9.0 s.
 
 ## [0.3.0] - 2026-11-14
 

@@ -87,9 +87,10 @@ PHASES = 2048                 # fractional positions per sample in the host kern
 AUTO_CUDA_SAMPLES = 10_000_000
 AUTO_CUDA_FIRST_SAMPLES = 250_000_000
 # On a TPU host the C++ polar format on the host's cores is taken below this size and the device from it on.
-# Measured on a v6e VM (44 vCPUs) at 2.2e8 samples, the Panama image from the arrays in memory: 1.27 s on the cores,
-# 1.72 s on the device (quick_jax._resident) after a first call of 106 s. No larger collection was measured there:
-# the threshold stays above the collections of this class.
+# Measured on a v6e VM (44 vCPUs) at 2.2e8 samples, the Panama image from the arrays in memory: 1.28 s on the cores,
+# 1.36 s on the device after a first call of 19 s (2.8 s with the programs in the persistent compilation cache).
+# Full quick looks at 1.1e9 samples: Capella 6.2 s on either, Umbra 2.4 s on the cores and 1.8 s on the device,
+# first calls of 26 to 30 s there. A process's first look is the host's: the threshold stays above these.
 AUTO_TPU_SAMPLES = 4_000_000_000
 JAX_DISPLAY = 'host'          # where a quick look on a JAX device is remapped (_jax_display)
 _LIB = []
