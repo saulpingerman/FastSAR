@@ -334,6 +334,54 @@ def _hist_jax(xp, amp, x, valid, lut):
     return xp.zeros(nb + 1, xp.int32).at[idx].add(1)[:nb]
 
 
+_HOST = []
+
+
+def _host_lib():
+    """The compiled passes of the host (quicklook_cpu.cpp's ql_hist), or None where there is no compiler or
+    FASTSAR_REMAP_KERNEL=0: NumPy then counts."""
+    if not _HOST:
+        import os
+        L = None
+        if os.environ.get('FASTSAR_REMAP_KERNEL', '1') != '0':
+            try:
+                from .quick import _lib
+                L = _lib()
+            except (RuntimeError, OSError, AttributeError):
+                L = None
+        _HOST.append(L)
+    return _HOST[0]
+
+
+def _hist_host(lib, x, valid, lut, amp, nb):
+    """_hist's counts of a host image by the compiled pass, on all cores. NumPy's steps (the amplitude, the key, the
+    bins, the count) hand Python's lock from thread to thread between them: on 67 million pixels the two passes
+    took 0.17 s on 4 cores and 0.30 s on 16, and 3 s of a 275-megapixel picture on 32. A float32 image is counted
+    in one call, each thread in a table of its own; an image of another type (a complex one, whose amplitude NumPy
+    takes) in row blocks on the pool, each thread's blocks into its own table."""
+    import threading
+    lutp = None if lut is None else np.ascontiguousarray(lut, np.int32)
+    at = lambda a: None if a is None else a.ctypes.data
+    if x.dtype == np.float32 and x.flags.c_contiguous and (valid is None or valid.shape == x.shape):
+        v = None if valid is None else np.ascontiguousarray(valid, bool)
+        h = np.zeros(nb, np.int64)
+        lib.ql_hist(x.ctypes.data, x.size, at(v), at(lutp), int(bool(amp)), 0, h.ctypes.data)
+        return h
+    tables, local, lock = [], threading.local(), threading.Lock()
+
+    def work(sl):
+        h = getattr(local, 'h', None)
+        if h is None:
+            h = local.h = np.zeros(nb, np.int64)
+            with lock:
+                tables.append(h)
+        a = np.ascontiguousarray(_amp(np, x[sl]) if amp else x[sl].astype(np.float32))
+        v = None if valid is None else np.ascontiguousarray(valid[sl], bool)
+        lib.ql_hist(a.ctypes.data, a.size, at(v), at(lutp), int(bool(amp)), 1, h.ctypes.data)
+    _each(x, work)
+    return np.sum(tables, axis=0) if tables else np.zeros(nb, np.int64)
+
+
 def _hist(x, valid, lut, amp=True):
     """Counts (int64, on the host) of the float32 amplitudes of x (amp False: of its real values) over the valid
     pixels, by key (_key): by the 2^16 values of the key's high half; or, given lut [2^16] (int32: a slot
@@ -361,6 +409,9 @@ def _hist(x, valid, lut, amp=True):
         return h.get().astype(np.int64)
     import threading
     x, valid = np.atleast_1d(x), (None if valid is None else np.atleast_1d(valid))
+    lib = _host_lib()
+    if lib is not None:
+        return _hist_host(lib, x, valid, lut, amp, nb)
     h, lock = np.zeros(nb, np.int64), threading.Lock()
 
     def work(sl):
@@ -661,7 +712,32 @@ def nrl(x, a=1.0, c=220.0, valid=None):
     knee = thr - amin
     with np.errstate(divide='ignore', invalid='ignore'):
         b = f(255 - c) / np.log10((amax - amin) / knee)
+    if _xp.kind(x) == 'numpy' and not _VIA and x.dtype == np.float32 and x.ndim and x.flags.c_contiguous:
+        out = _nrl_host(x, valid, amin, thr, knee, b, f(c))
+        if out is not None:
+            return out
     return _apply(_nrl_u8, np.uint8, x, valid, amin, thr, knee, b, f(c))
+
+
+def _nrl_host(x, valid, amin, thr, knee, b, c):
+    """_nrl_u8 of a float32 host image with its linear part, 99 pixels in 100, by the compiled pass on all cores
+    (quicklook_cpu.cpp's ql_nrl8: the same single-precision operations, so the same values), and the logarithm of
+    the rest by NumPy as _nrl_u8 takes it. None where there is no compiled pass, or where more than a sixteenth of
+    the pixels lie above the threshold (a scale a well below 1): NumPy's steps then run."""
+    lib = _host_lib()
+    if lib is None or not hasattr(lib, 'ql_nrl8'):
+        return None
+    v = None if valid is None else np.ascontiguousarray(valid, bool)
+    out, rest = np.empty(x.shape, np.uint8), np.empty(x.size // 16 + 1024, np.int64)
+    k = lib.ql_nrl8(x.ctypes.data, x.size, None if v is None else v.ctypes.data, amin, thr, knee, c, out.ctypes.data,
+                    rest.ctypes.data, rest.size)
+    if k < 0:
+        return None
+    if k:
+        idx = rest[:k]
+        with np.errstate(divide='ignore', invalid='ignore'):
+            out.reshape(-1)[idx] = _uint8(b * np.log10((np.abs(x.reshape(-1)[idx]) - amin) / knee) + c)
+    return out
 
 
 REMAPS = dict(density=density, brighter=brighter, darker=darker, highcontrast=highcontrast, pedf=pedf, nrl=nrl,

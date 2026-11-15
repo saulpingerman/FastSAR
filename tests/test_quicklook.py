@@ -524,6 +524,80 @@ def test_png_read_by_pillow(tmp_path):
     assert np.array_equal(quick.read_png(str(tmp_path / 'b.png')), a[:64, :48])
 
 
+def test_png_blocks_join_into_one_stream(tmp_path):
+    """The blocks, deflated apart on all cores, make one zlib stream in several IDAT chunks that another decoder
+    reads (Pillow where it is installed, else zlib and the filter bytes), at the levels 0 (stored), 1 (run lengths
+    and Huffman codes) and 6 (zlib's search), for speckle with a black border."""
+    rng = np.random.default_rng(2)
+    a = np.minimum(40 * rng.rayleigh(1.0, (1900, 2300)), 255).astype(np.uint8)
+    a[:300] = 0
+    a[:, -200:] = 0
+    sizes = {}
+    for level in (0, 1, 6):
+        p = str(tmp_path / f'level{level}.png')
+        quick.write_png(p, a, level=level)
+        with open(p, 'rb') as fh:
+            b = fh.read()
+        sizes[level] = len(b)
+        at, data, chunks = 33, [], 0
+        while b[at + 4:at + 8] == b'IDAT':
+            n = int.from_bytes(b[at:at + 4], 'big')
+            assert zlib.crc32(b[at + 4:at + 8 + n]) == int.from_bytes(b[at + 8 + n:at + 12 + n], 'big')
+            data.append(b[at + 8:at + 8 + n])
+            at, chunks = at + 12 + n, chunks + 1
+        assert chunks > 4 and b[at:] == b'\x00\x00\x00\x00IEND\xaeB`\x82'
+        try:
+            from PIL import Image
+            got = np.asarray(Image.open(p))
+        except ImportError:
+            raw = np.frombuffer(zlib.decompress(b''.join(data)), np.uint8).reshape(a.shape[0], 1 + a.shape[1])
+            assert not raw[:, 0].any()                                         # filter type 0 on every row
+            got = raw[:, 1:]
+        assert np.array_equal(got, a) and np.array_equal(quick.read_png(p), a)
+    assert sizes[1] < 0.9 * sizes[0] and sizes[1] < 1.02 * sizes[6]            # as small as the search makes it
+    with pytest.raises(ValueError, match='level'):
+        quick.write_png(str(tmp_path / 'bad.png'), a, level=12)
+
+
+def test_display_passes_on_all_cores(spot, monkeypatch):
+    """The host's display passes by the compiled kernels (the histograms of the remap's order statistics, the
+    linear part of nrl, the layout) give NumPy's values, value for value."""
+    from fastsar import remap
+    if remap._host_lib() is None:
+        pytest.skip('needs the compiled kernels')
+    rng = np.random.default_rng(4)
+    x = rng.rayleigh(1.0, (301, 517)).astype(np.float32)
+    x[::37, ::41] *= 200
+    x[5, 7], x[9, 3] = np.nan, 0.0
+    z = (x * np.exp(1j * rng.uniform(0, 6.3, x.shape))).astype(np.complex64)
+    mask = rng.random(x.shape) > 0.2
+    lut = np.full(1 << 16, -1, np.int32)
+    lut[np.argsort(remap._hist(x, None, None))[-3:]] = [0, 1, 2]
+    cases = [(x, None, None, True), (x, mask, None, True), (x, None, lut, True), (x, mask, lut, True), (-x, None, None, False),
+             (-x, mask, lut, False), (z, None, None, True), (z, mask, lut, True), (x[:, ::2], mask[:, ::2], None, True),
+             (x.astype(np.float64), None, lut, True)]
+    got = [remap._hist(*c) for c in cases]
+    maps = [remap.nrl(x[:, :400]), remap.nrl(x[10:], valid=mask[10:]), remap.nrl(x, a=0.2), remap.nrl(np.full((4, 5), 2.0, np.float32)),
+            remap.nrl(z), remap.density(x)]
+    look_c = look(spot['path'], size=128)['display']
+    monkeypatch.setattr(remap, '_HOST', [None])                                # NumPy's steps
+    for c, h in zip(cases, got):
+        assert h.dtype == np.int64 and np.array_equal(h, remap._hist(*c)), c[1:]
+    ref = [remap.nrl(x[:, :400]), remap.nrl(x[10:], valid=mask[10:]), remap.nrl(x, a=0.2), remap.nrl(np.full((4, 5), 2.0, np.float32)),
+           remap.nrl(z), remap.density(x)]
+    assert all(m.dtype == np.uint8 and np.array_equal(m, r) for m, r in zip(maps, ref))
+    monkeypatch.setattr(quick, '_oriented', lambda d, t, fr, fc: np.ascontiguousarray((d.T if t else d)[::-1 if fr else 1, ::-1 if fc else 1]))
+    assert np.array_equal(look(spot['path'], size=128)['display'], look_c)
+    monkeypatch.undo()
+    d = rng.integers(0, 256, (133, 517), dtype=np.uint8)
+    for turn in (False, True):
+        for fr in (False, True):
+            for fc in (False, True):
+                o = quick._oriented(d, turn, fr, fc)
+                assert o.flags.c_contiguous and np.array_equal(o, (d.T if turn else d)[::-1 if fr else 1, ::-1 if fc else 1])
+    assert quick._oriented(d[:, ::2], True, True, False).shape == (259, 133)   # a view: NumPy's copy
+
+
 def test_output_files(spot, tmp_path):
     """.png: the display; .nitf: the complex image as a ground-plane SICD that the library's reader takes."""
     png = str(tmp_path / 'look.png')
@@ -750,6 +824,50 @@ def test_cuda_streams_what_does_not_fit(spot, squinted, monkeypatch, megabytes):
     g = quick._geometry(col['ant'], col['fmin'], col['df'], col['S'].shape[1], *(col[k] for k in ('nx', 'ny', 'spx', 'spy', 'e1', 'e2')), True)
     assert quick._cuda_plan(g, True, False, 1 << 40, 1 << 20)['kept'] == []
     assert len(quick._cuda_plan(g, True, False, 1 << 10, 1 << 8)['kept']) == 4
+
+
+@pytest.mark.cuda
+def test_cuda_gives_the_device_back():
+    """A second formation in a process plans with the memory the first one had. On a device that just holds the
+    arrays (CuPy's pool limited to that, with transforms long enough for cuFFT to ask for work areas), both calls
+    keep everything on the device and the pool holds no more after the second than after the first; work areas
+    another caller left in CuPy's plan cache are released before an array would be kept on the host."""
+    import cupy as cp
+    rng = np.random.default_rng(11)
+    col = sim.make_collect(res=0.3, scene=3600.0, r0=30e3)
+    ant = np.ascontiguousarray(col.ant[::128])
+    P, K = len(ant), col.K
+    S = (rng.standard_normal((P, K), np.float32) + 1j * rng.standard_normal((P, K), np.float32)).astype(np.complex64)
+    grid = (128, 1024, 0.3, 0.3, np.array([0.0, 1.0, 0.0]), np.array([1.0, 0.0, 0.0]))
+    g = quick._geometry(ant, col.fmin, col.df, K, *grid, True)
+    assert g['Kf'] > 20000                                                     # a length with a work area
+    pool, cache = cp.get_default_memory_pool(), cp.fft.config.get_plan_cache()
+    quick._cuda()                                                              # the kernels and tables, loaded
+    cache.clear()
+    limit = pool.get_limit()
+    try:
+        for correct in (True, False):
+            need = next(b for b in range(1 << 20, 1 << 30, 1 << 16)
+                        if not quick._cuda_plan(g, correct, False, b, b // 4)['kept'])
+            pool.free_all_blocks()
+            pool.set_limit(size=pool.used_bytes() + int(1.03 * need / 0.9))
+            seen = []
+            for call in range(3):
+                if call == 2:                                                  # another caller's plan, with its work area
+                    cp.fft.fft(cp.zeros((8, 13500), cp.complex64), axis=1)
+                    assert cache.get_curr_memsize() > 0.1 * need
+                info = {}
+                img = quick._pfa(S, ant, col.fmin, col.df, *grid, correct=correct, complex_image=False, backend='cuda', info=info)
+                cp.cuda.get_current_stream().synchronize()
+                assert isinstance(img, cp.ndarray)
+                del img
+                seen.append((info.get('stream'), info['device'], pool.used_bytes(), cache.get_curr_memsize()))
+            assert [s[0] for s in seen] == [None] * 3, seen                    # nothing kept on the host, any call
+            assert seen[0][1]['on_host'] == [] and seen[1][1] == seen[0][1] and seen[2][1] == seen[0][1], seen
+            assert seen[2][2] <= seen[1][2] <= seen[0][2], seen                # the pool holds no more
+            assert [s[3] for s in seen] == [0] * 3                             # and CuPy's plan cache nothing
+    finally:
+        pool.set_limit(size=limit)
 
 
 @pytest.mark.cuda

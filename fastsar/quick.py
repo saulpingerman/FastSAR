@@ -48,10 +48,11 @@ formed with each pulse at its place (_places).
 
 Devices, each with the stages written for it. 'cpu': scipy's FFTs on all cores, every one along the rows of its
 array (the arrays are turned between the stages), and the C++ kernels of quicklook_cpu.cpp, which read their
-weights from polyphase tables. 'cuda' (_pfa_cuda): the history goes up in blocks of pulses through page-locked
-buffers while the device works on the block before, each pass that is not a transform is one CUDA kernel, and
-every stage works in blocks sized from the device's free memory; the arrays that do not fit stay on the host and
-cross in blocks. 'jax' and 'tpu' (quick_jax.py): compiled programs over blocks of one shape, in float32 with every
+weights from polyphase tables. 'cuda' (_pfa_cuda): the samples go up as the file holds them (16-bit integers at
+half the bytes of complex64) in blocks of pulses through page-locked buffers, on a stream of their own, while a
+thread reads the next block from the file and the device converts and forms the one before; each pass that is not
+a transform is one CUDA kernel, and every stage works in blocks sized from the device's free memory; the arrays
+that do not fit stay on the host and cross in blocks by the same link. 'jax' and 'tpu' (quick_jax.py): compiled programs over blocks of one shape, in float32 with every
 complex array as two planes. 'auto': the device that forms the cut soonest, by its size (the AUTO_ thresholds
 below).
 
@@ -117,6 +118,11 @@ def _lib():
         L.ql_unshear.argtypes = [p, n, n, p, p, n, n, n, p, n]
         L.ql_resample_rows.restype = L.ql_resample_az.restype = L.ql_gather.restype = L.ql_weight_pad.restype = None
         L.ql_transpose.restype = L.ql_unshear.restype = None
+        L.ql_hist.argtypes = [p, n, p, p, i, i, p]
+        L.ql_orient8.argtypes = [p, n, n, i, i, i, p]
+        L.ql_hist.restype = L.ql_orient8.restype = None
+        L.ql_nrl8.argtypes = [p, n, p, fl, fl, fl, fl, p, p, n]
+        L.ql_nrl8.restype = n
         _LIB.append(L)
     return _LIB[0]
 
@@ -146,6 +152,21 @@ def _blocks(fn, n, chunk):
             _POOL[:] = [(w, ThreadPoolExecutor(w, thread_name_prefix='fastsar-quicklook'))]
         pool = _POOL[0][1]
     list(pool.map(fn, sl))
+
+
+def _ordered(fn, n):
+    """fn(0), fn(1), ... fn(n - 1), each as soon as it and those before it are done, computed on the pool."""
+    w = _workers()
+    if n == 1 or w == 1:
+        for i in range(n):
+            yield fn(i)
+        return
+    with _LOCK:
+        if not _POOL or _POOL[0][0] != w:
+            from concurrent.futures import ThreadPoolExecutor
+            _POOL[:] = [(w, ThreadPoolExecutor(w, thread_name_prefix='fastsar-quicklook'))]
+        pool = _POOL[0][1]
+    yield from pool.map(fn, range(n))
 
 
 def _unit(v):
@@ -369,7 +390,8 @@ def _collection(cphd, size=2048, resolution=None, extent=None, channel=0, reader
         t0 = time.perf_counter()
         col, meta = io._read_cphd(cphd, None, plan['channel'], True, opts.get('regrid_tol', 1e-3),
                                   opts.get('drop_flagged', False), opts.get('troposphere'), opts.get('phase_sign'),
-                                  opts.get('ref_freq'), plan['pulses'], plan['samples'], reader=r)
+                                  opts.get('ref_freq'), plan['pulses'], plan['samples'], reader=r,
+                                  device=backend == 'cuda')
     timing['read'] = time.perf_counter() - t0
     t0 = time.perf_counter()
     if not meta['fixed_ref']:
@@ -928,6 +950,22 @@ def _host(d):
     return host
 
 
+def _oriented(d, turn, flip_rows, flip_cols):
+    """The picture d [rows, cols] laid out for display, a new contiguous array: turned (its transpose) when turn,
+    then with its rows and its columns reversed when flip_rows and flip_cols. A uint8 picture is laid out in tiles on
+    all cores (quicklook_cpu.cpp's ql_orient8): NumPy's copy of a turned view runs on one core, down the columns of
+    its source, 1.5 s of a 275-megapixel picture."""
+    d = np.asarray(d)
+    if d.dtype != np.uint8 or d.ndim != 2 or not d.flags.c_contiguous or not d.size:
+        d = d.T if turn else d
+        d = d[::-1] if flip_rows else d
+        return np.ascontiguousarray(d[:, ::-1] if flip_cols else d)
+    out = np.empty(d.shape[::-1] if turn else d.shape, np.uint8)
+    _lib().ql_orient8(d.ctypes.data, d.shape[0], d.shape[1], int(bool(turn)), int(bool(flip_rows)), int(bool(flip_cols)),
+                      out.ctypes.data)
+    return out
+
+
 def _apply_phase(S, ph0, ph1):
     """S[p, k] *= exp(2 pi j (ph0[p] + k ph1[p])) in place, in blocks of pulses on the pool."""
     k = np.arange(S.shape[1])
@@ -939,12 +977,13 @@ def _apply_phase(S, ph0, ph1):
 
 
 # ------------------------------------------------------------------------------------------------------- CUDA
-# The stages on a GPU, written for it: the history goes up in blocks of pulses through two page-locked buffers while
-# the device works on the block before; each pass over an array that is not a transform is one kernel (the weights,
-# the padding and the reference phase; the range gate and its cut; the azimuth gate, its cut and the scale; the
+# The stages on a GPU, written for it: the history goes up in blocks of pulses through page-locked buffers, as the
+# file holds it where it comes from a file, while a thread fetches the next block and the device works on the one
+# before (_Link); each pass over an array that is not a transform is one kernel (the conversion of the file's
+# samples, the weights, the padding and the phases; the range gate and its cut; the azimuth gate, its cut and the scale; the
 # raster's place in the padded transforms with its signs; the read at the apparent positions with the detection);
-# the transforms keep their plans between calls (CuPy's plan cache) and the kernels and tables stay compiled and
-# loaded (_CUDA).
+# the transforms run on plans of the path's own, whose work areas go back to the pool when their stage ends
+# (_cuda_fft), and the kernels and tables stay compiled and loaded (_CUDA).
 
 _CUDA_SRC = r"""
 #define HALF_T (TAPS / 2)
@@ -1009,15 +1048,39 @@ extern "C" __global__ void ql_gather(const float2* base, int span, int Nx2, int 
 // The passes that are not transforms, one kernel each: a thread per output value, x along a row, y the row of a
 // block of at most 32,768 rows, whose first row is row r0 of the whole array (the arrays that hold a value per row
 // are given from that row on).
-// out [n, Kf] = S[r, k - k0] wk wp[r] exp(2 pi j (ph0[r] + (k - k0) ph1[r])) inside the band, 0 in the padding
-extern "C" __global__ void ql_weight(const float2* S, const float* wk, const float* wp, const double* ph0,
-                                     const double* ph1, int K, int k0, int Kf, int ref, int r0, int nr, float2* out) {
+// A sample of a block of pulses as it came up: complex64 (kind 0), or the pair of big-endian parts the file holds,
+// `kind` bytes each (1 and 2: integers, 4: floats), times the pulse's scale g, conjugated when conj, a pair with a
+// part that is not finite counting as 0: io_cpu.cpp's cphd_load, value for value.
+__device__ __forceinline__ float2 ql_sample(const void* S, int kind, long i, float g, int conj) {
+  if (kind == 0) return ((const float2*)S)[i];
+  float re, im;
+  if (kind == 2) {
+    const unsigned short* w = (const unsigned short*)S + 2 * i;
+    re = (float)(short)((w[0] >> 8) | (w[0] << 8)); im = (float)(short)((w[1] >> 8) | (w[1] << 8));
+  } else if (kind == 1) {
+    const signed char* w = (const signed char*)S + 2 * i;
+    re = (float)w[0]; im = (float)w[1];
+  } else {
+    const unsigned int* w = (const unsigned int*)S + 2 * i;
+    const unsigned int a = w[0], b = w[1];
+    re = __uint_as_float((a >> 24) | ((a >> 8) & 0xff00u) | ((a << 8) & 0xff0000u) | (a << 24));
+    im = __uint_as_float((b >> 24) | ((b >> 8) & 0xff00u) | ((b << 8) & 0xff0000u) | (b << 24));
+  }
+  re *= g; im *= conj ? -g : g;
+  if (!(isfinite(re) && isfinite(im))) { re = 0.f; im = 0.f; }
+  return make_float2(re, im);
+}
+// out [n, Kf] = S[r, k - k0] wk wp[r] exp(2 pi j (ph0[r] + (k - k0) ph1[r])) inside the band, 0 in the padding; S the
+// block as it came up (ql_sample; amp: the pulses' scales when has_amp)
+extern "C" __global__ void ql_weight(const void* S, const float* amp, const float* wk, const float* wp, const double* ph0,
+                                     const double* ph1, int kind, int has_amp, int conj, int K, int k0, int Kf, int ref,
+                                     int r0, int nr, float2* out) {
   const int kk = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y;
   if (kk >= Kf || r >= nr) return;
   const int k = kk - k0;
   float2 v = make_float2(0.f, 0.f);
   if (k >= 0 && k < K) {
-    const float2 s = S[(long)r * K + k];
+    const float2 s = ql_sample(S, kind, (long)r * K + k, has_amp ? amp[r] : 1.f, conj);
     const float w = wk[k] * wp[r];
     if (ref) {
       double c = ph0[r] + k * ph1[r];
@@ -1028,6 +1091,22 @@ extern "C" __global__ void ql_weight(const float2* S, const float* wk, const flo
     } else v = make_float2(w * s.x, w * s.y);
   }
   out[(long)r * Kf + kk] = v;
+}
+// An array [R, C] of the stages that is kept on the host, as a stage reads it on the device. The stage that makes it
+// sends it down in blocks of nb rows, each turned (ql_turn: [C, rows of the block]), and the next stage, which
+// takes it by columns, brings up the columns lo[b] .. hi[b] - 1 of every block b, end to end from off[b] on: runs of
+// the host's memory as they lie. -> the value at (r, c), 0 for a column that was not brought.
+__device__ __forceinline__ float2 ql_kept(const float2* T, const long long* off, const int* lo, const int* hi, int nb,
+                                          int R, int r, int c) {
+  const int b = r / nb;
+  if (c < lo[b] || c >= hi[b]) return make_float2(0.f, 0.f);
+  return T[off[b] + (long long)(c - lo[b]) * min(nb, R - b * nb) + (r - b * nb)];
+}
+// out [C, nr] = in [nr, C] turned: a block of rows on its way to the host
+extern "C" __global__ void ql_turn(const float2* in, int C, int r0, int nr, float2* out) {
+  const int c = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y;
+  if (c >= C || r >= nr) return;
+  out[(long)c * nr + r] = in[(long)r * C + c];
 }
 // out [n, Nr] = the profile's bins about bin 0 (cut out of Kf, or set among zeros), times the taper
 extern "C" __global__ void ql_rgate(const float2* prof, const float* tap, int Kf, int Nr, int r0, int nr, float2* out) {
@@ -1045,8 +1124,10 @@ extern "C" __global__ void ql_rgate(const float2* prof, const float* tap, int Kf
 // for the pulse p at place q - p0 (src[q - p0], or q - p0 itself; none where src is negative), where the pulse's own
 // W rows hold that wavenumber (all of them, from 0, or its rows from jlo[p] on), and 0 elsewhere
 // (quicklook_cpu.cpp's ql_transpose and ql_unshear)
+// kept: A is on the host and came up by columns (ql_kept)
 extern "C" __global__ void ql_pulses(const float2* A, const int* jlo, const int* src, int has_jlo, int has_src, int W,
-                                     int P, int Pp, int p0, int Pf, int r0, int nr, float2* out) {
+                                     int P, int Pp, int p0, int Pf, const long long* off, const int* lo, const int* hi,
+                                     int nb, int kept, int r0, int nr, float2* out) {
   const int q = blockIdx.x * blockDim.x + threadIdx.x, J = r0 + blockIdx.y;
   if (q >= Pf || blockIdx.y >= nr) return;
   float2 v = make_float2(0.f, 0.f);
@@ -1055,7 +1136,7 @@ extern "C" __global__ void ql_pulses(const float2* A, const int* jlo, const int*
     const int p = has_src ? src[pl] : pl;
     if (p >= 0 && p < P) {
       const int c = J - (has_jlo ? jlo[p] : 0);
-      if (c >= 0 && c < W) v = A[(long)p * W + c];
+      if (c >= 0 && c < W) v = kept ? ql_kept(A, off, lo, hi, nb, P, p, c) : A[(long)p * W + c];
     }
   }
   out[(long)blockIdx.y * Pf + q] = v;
@@ -1118,25 +1199,28 @@ extern "C" __global__ void ql_resample_az(const float2* A, int R, const double* 
 // transform of Ny takes: out[a, c] = the sum of B[J, a] over the rows J = (c + hy) mod Ny, + Ny, ... (the rows of a
 // sheared raster that meet in one bin), times (-1)^(J - hy + a - sx0) when signs (the padded transforms' outputs
 // then count from the image's center)
-extern "C" __global__ void ql_place(const float2* B, int nkr, int nka, int hy, int Ny, int signs, int sx0, int r0,
+extern "C" __global__ void ql_place(const float2* B, int nkr, int nka, int hy, int Ny, int signs, int sx0,
+                                    const long long* off, const int* lo, const int* hi, int nb, int kept, int r0,
                                     int nr, float2* out) {
   const int c = blockIdx.x * blockDim.x + threadIdx.x, a = r0 + blockIdx.y;
   if (c >= Ny || blockIdx.y >= nr) return;
   float2 v = make_float2(0.f, 0.f);
   for (int J = (c + hy) % Ny; J < nkr; J += Ny) {
-    const float2 b = B[(long)J * nka + a];
+    const float2 b = kept ? ql_kept(B, off, lo, hi, nb, nkr, J, a) : B[(long)J * nka + a];
     if (signs && ((J - hy + a - sx0) & 1)) { v.x -= b.x; v.y -= b.y; } else { v.x += b.x; v.y += b.y; }
   }
   out[(long)blockIdx.y * Ny + c] = v;
 }
 // out [rows, Nx] = range bins (rb0 + r) mod Ny of F [nka, Ny] (the range transform done), each along a row with
 // azimuth wavenumber a at (a - hx) mod Nx and zeros between: what the azimuth transform of those range bins takes
-extern "C" __global__ void ql_aplace(const float2* F, int nka, int Ny, int hx, int Nx, int rb0, int r0, int nr,
-                                     float2* out) {
+extern "C" __global__ void ql_aplace(const float2* F, int nka, int Ny, int hx, int Nx, int rb0, const long long* off,
+                                     const int* lo, const int* hi, int nb, int kept, int r0, int nr, float2* out) {
   const int x = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y;
   if (x >= Nx || r >= nr) return;
-  const int a = (x + hx) % Nx;
-  out[(long)r * Nx + x] = a < nka ? F[(long)a * Ny + (rb0 + r) % Ny] : make_float2(0.f, 0.f);
+  const int a = (x + hx) % Nx, bin = (rb0 + r) % Ny;
+  float2 v = make_float2(0.f, 0.f);
+  if (a < nka) v = kept ? ql_kept(F, off, lo, hi, nb, nka, a, bin) : F[(long)a * Ny + bin];
+  out[(long)r * Nx + x] = v;
 }
 // the uncorrected picture [ny, nx] out of its rows' azimuth transforms T [ny, nfx]: pixel x from output
 // (x - nx / 2) mod nfx, with its carriers, or its amplitude (detect)
@@ -1153,6 +1237,61 @@ extern "C" __global__ void ql_cut(const float2* T, const float2* cy, const float
 }
 """
 _CUDA = {}
+_PLANS = threading.local()    # .kept: {(n, batch): plan}, the calling thread's cuFFT plans that take no work area
+
+
+def _cuda_fft(x, inverse, plans, sync):
+    """The transform of each row of x [batch, n] (complex64, C-contiguous), in place, by a cuFFT plan of this path's
+    own; the inverse comes without its 1 / n (the stages fold it into a factor they apply anyway, which saves a pass
+    over the array). plans: the dict of the stage's plans by n, which the stage empties when it ends.
+
+    CuPy's own plan cache is not used. It keeps the last 16 plans of a thread for the life of the process, each with
+    a work area the size of its batch (cuFFT asks for one for most lengths above a few thousand), taken from CuPy's
+    pool and counted there as in use: after one full image and its uncorrected twin on an L4, 15 plans held 8 of the
+    device's 23 GB, the next call planned with 14.7 GB in place of 20.7 and kept an array on the host. A plan is
+    made in a quarter of a millisecond, so the plans with a work area live for their stage (one batch size at a
+    time: the last block's plan replaces the others'), and only those without one are kept between calls."""
+    from cupy.cuda import cufft
+    b, n = x.shape
+    p = plans.get(n)
+    if p is None or p.batch != b:
+        kept = _PLANS.__dict__.setdefault('kept', {})
+        p = kept.get((n, b))
+        if p is None:
+            if n in plans:                            # the stage's last block: the work area of the other blocks' plan
+                sync()                                # is released first, once nothing runs in it
+                del plans[n]
+            p = cufft.Plan1d(n, cufft.CUFFT_C2C, b)
+            if not getattr(getattr(p.work_area, 'mem', None), 'size', 0):
+                if len(kept) >= 64:
+                    kept.clear()
+                kept[(n, b)] = p
+        plans[n] = p
+    p.fft(x, x, cufft.CUFFT_INVERSE if inverse else cufft.CUFFT_FORWARD)
+    return x
+
+
+def _cuda_room(g, correct, complex_image):
+    """(budget, block, plan) of the CUDA path for a geometry: the device bytes it may take now, those of a stage's
+    temporaries, and where the arrays live (_cuda_plan). Where the free memory would leave an array on the host and
+    CuPy's plan cache holds work areas (another stage of the library, or the caller's own transforms, left them
+    there), the cache is emptied and the plan made again: streaming costs seconds, a plan a fraction of a
+    millisecond."""
+    import cupy as cp
+    from . import _xp
+    for attempt in (0, 1):
+        budget, blk = _xp.cuda_budget(), _xp.cuda_block()
+        plan = _cuda_plan(g, correct, complex_image, budget, blk)
+        try:
+            cache = cp.fft.config.get_plan_cache()
+            held = cache.get_curr_memsize()
+        except Exception:                             # a CuPy without the cache
+            break
+        if not plan['kept'] or not held or attempt:
+            break
+        cp.cuda.get_current_stream().synchronize()
+        cache.clear()
+    return budget, blk, plan
 
 
 def _cuda(npow=10, deg=3):
@@ -1166,7 +1305,7 @@ def _cuda(npow=10, deg=3):
         mod = cp.RawModule(code=_CUDA_SRC, options=(f'-DTAPS={TAPS}', f'-DTABN={pfa2.TABN}', f'-DLTAPS={LANCZOS}',
                                                     f'-DNPOW={npow}', f'-DDEG={deg}', f'-DQTAB={PHASES}'))
         k = {n: mod.get_function('ql_' + n) for n in ('weight', 'rgate', 'pulses', 'agate', 'resample_az', 'place',
-                                                       'aplace', 'cut', 'gather')}
+                                                       'aplace', 'cut', 'gather', 'turn')}
         if 'kaiser' not in _CUDA:
             _CUDA['kaiser'] = cp.asarray(pfa2.kernel_table(TAPS, KAISER))
             _CUDA['lanczos'] = cp.asarray(_polyphase('lanczos', LANCZOS, PHASES))
@@ -1181,7 +1320,8 @@ def _cuda_plan(g, correct, complex_image, budget, block):
     stage's temporaries: dict(A, B, F, out: True on the device, False on the host, from where blocks go up and
     come down; kept: the names of those on the host). The stages hold at most two of the four at a time (the
     range stage's output A [P, nwin] and the raster B [nkr, nka]; B and its range transform F [nka, Ny]; F and the
-    picture), so the largest go to the host first until what is left fits."""
+    picture), so the largest go to the host first until what is left fits. Beside them a stage takes up to two
+    blocks: its temporaries, its plans' work areas and the device ends of its crossings."""
     P, nwin, nkr, nka, nx, ny = g['P'], g['nwin'], g['nkr'], g['nka'], g['nx'], g['ny']
     Ny = (g['ov'] if correct else 1) * g['nfy']
     size = dict(A=8 * P * nwin, B=8 * nkr * nka, F=8 * nka * Ny, out=(8 if complex_image else 4) * nx * ny)
@@ -1198,21 +1338,205 @@ def _cuda_plan(g, correct, complex_image, budget, block):
     return dict(on, kept=[names[k] for k in size if not on[k]])
 
 
+def _copy_parts(dst, parts):
+    """The byte arrays `parts`, end to end, into dst (bytes), on the pool in pieces of four megabytes."""
+    tasks, at = [], 0
+    for p in parts:
+        for a in range(0, p.size, 4 << 20):
+            tasks.append((at + a, p[a:a + (4 << 20)]))
+        at += p.size
+
+    def copy(sl):
+        for o, v in tasks[sl]:
+            np.copyto(dst[o:o + v.size], v)
+    _blocks(copy, len(tasks), 1)
+
+
+class _Link:
+    """The crossings of the CUDA path between host and device. Every one goes through page-locked staging buffers
+    (the link copies from and to page-locked memory several times faster than pageable memory, and only such a copy
+    can be left running) and on a stream of its own, so that it runs beside the kernels of the stream the caller
+    works on: up, three buffers filled in turn on the host (from the file, from a host array) while the one before
+    is on its way; down, two buffers emptied in turn into the host's array on the pool's threads while the next
+    piece arrives. The orders that matter are set by events: a copy up waits for the kernel that still reads the
+    device block it overwrites, a kernel for the copy that brings its input, a copy down for the kernel that writes
+    what it takes. The buffers come from CuPy's pinned pool in sizes that are powers of two up to 64 MB and stay
+    there between calls: locking memory takes a second per gigabyte, far more than using it.
+
+    timed: every copy is waited for where it is made, and its seconds counted (stats['up_link'], ['down_link']):
+    the link's own rate, which a detailed call reports; otherwise the copies overlap the work and only the host's
+    parts are counted."""
+
+    def __init__(self, size, timed):
+        import cupy as cp
+        self.cp, self.size, self.timed = cp, int(size), timed
+        self.up, self.down = cp.cuda.Stream(non_blocking=True), cp.cuda.Stream(non_blocking=True)
+        self.rings = dict(up=([], [], [0], 3), down=([], [], [0], 2))      # buffers, their last copies, next, count
+        self.stats = dict(up_bytes=0, up_host=0.0, up_link=0.0, up_wait=0.0, down_bytes=0, down_host=0.0, down_link=0.0)
+
+    def _stage(self, way):
+        """A staging buffer (bytes) of the ring `way` that its last copy has left, and its place in the ring."""
+        from . import memory
+        bufs, last, at, count = self.rings[way]
+        i = at[0] % count
+        at[0] += 1
+        if len(bufs) <= i:
+            bufs.append(np.frombuffer(memory._pinned(self.size), np.uint8, self.size))
+            last.append(None)
+        if last[i] is not None:
+            last[i].synchronize()
+            last[i] = None
+        return i, bufs[i]
+
+    def send(self, nbytes, fill, dst, after=None):
+        """fill(buffer) writes nbytes into a staging buffer; they are then copied to the device memory dst (a
+        MemoryPointer), once the event `after` (the last reader of what dst held) is done -> the copy's event."""
+        import ctypes
+        t0 = time.perf_counter()
+        i, buf = self._stage('up')
+        t1 = time.perf_counter()
+        fill(buf[:nbytes])
+        t2 = time.perf_counter()
+        if after is not None:
+            self.up.wait_event(after)
+        dst.copy_from_host_async(ctypes.c_void_p(buf.ctypes.data), nbytes, self.up)
+        ev = self.cp.cuda.Event()
+        ev.record(self.up)
+        self.rings['up'][1][i] = ev
+        if self.timed:
+            ev.synchronize()
+            self.stats['up_link'] += time.perf_counter() - t2
+        self.stats['up_bytes'] += nbytes
+        self.stats['up_host'] += t2 - t1
+        self.stats['up_wait'] += t1 - t0
+        return ev
+
+    def sendv(self, parts, dst, after=None):
+        """The host arrays `parts` (contiguous), end to end, to the device array dst -> the last copy's event."""
+        loads, cur, room = [], [], self.size
+        for p in parts:
+            b = p.reshape(-1).view(np.uint8)
+            while b.size:
+                n = min(room, b.size)
+                cur.append(b[:n])
+                b, room = b[n:], room - n
+                if not room:
+                    loads.append(cur)
+                    cur, room = [], self.size
+        if cur:
+            loads.append(cur)
+        at, ev = 0, None
+        for load in loads:
+            n = sum(v.size for v in load)
+            ev = self.send(n, lambda buf, load=load: _copy_parts(buf, load), dst.data + at, after if not at else None)
+            at += n
+        return ev
+
+    def fetch(self, src, host, after=None):
+        """The device array src (contiguous) into the host array `host` (contiguous, as many bytes), once the event
+        `after` (the kernel that writes src) is done; returns when the bytes are in the host's array."""
+        import ctypes
+        hv = host.reshape(-1).view(np.uint8)
+        n, pending = hv.size, None
+
+        def land(buf, at, m, ev):
+            t = time.perf_counter()
+            ev.synchronize()
+            t1 = time.perf_counter()
+            _copy_parts(hv[at:at + m], [buf[:m]])
+            self.stats['down_host'] += time.perf_counter() - t1
+            if self.timed:
+                self.stats['down_link'] += t1 - t
+        for at in range(0, n, self.size):
+            m = min(self.size, n - at)
+            i, buf = self._stage('down')
+            if after is not None and not at:
+                self.down.wait_event(after)
+            (src.data + at).copy_to_host_async(ctypes.c_void_p(buf.ctypes.data), m, self.down)
+            ev = self.cp.cuda.Event()
+            ev.record(self.down)
+            if self.timed:
+                t = time.perf_counter()
+                ev.synchronize()
+                self.stats['down_link'] += time.perf_counter() - t
+            if pending is not None:
+                land(*pending)                        # the piece before, while this one arrives
+            pending = (buf, at, m, ev)
+        if pending is not None:
+            land(*pending)
+        self.stats['down_bytes'] += n
+
+    def report(self, history=None):
+        """What crossed, for info['crossings']: for the history (the link's counts when its last block had gone up:
+        `history`), for the blocks of the kept arrays that went up after it (to_device) and for those that came
+        down (to_host): bytes, the host's seconds on them (reading the file or filling the staging buffers, emptying
+        them) and, from a timed link, the link's seconds and the rates in GB/s, of the link alone and with the host's
+        part."""
+        st, out = self.stats, {}
+        h = history or dict.fromkeys(st, 0)
+        for name, n, host, wire in (('history', h['up_bytes'], h['up_host'], h['up_link']),
+                                    ('to_device', st['up_bytes'] - h['up_bytes'], st['up_host'] - h['up_host'], st['up_link'] - h['up_link']),
+                                    ('to_host', st['down_bytes'], st['down_host'], st['down_link'])):
+            if n:
+                d = dict(bytes=int(n), host_seconds=round(host, 4))
+                if self.timed:
+                    d.update(link_seconds=round(wire, 4), link_gb_s=round(n / 1e9 / max(wire, 1e-9), 2),
+                             gb_s=round(n / 1e9 / max(wire + host, 1e-9), 2))
+                out[name] = d
+        return out
+
+
+class _Kept:
+    """An array [R, C] of the CUDA stages that the device has no room for (_cuda_plan), on the host in the layout
+    its two stages cross it in. The stage that makes it works in blocks of nb rows, and the one that reads it in
+    blocks of columns: so each block goes down turned on the device ([C, rows of the block], ql_turn), into pageable
+    memory of its own, and a block of columns c0 .. c1 - 1 is then the rows c0 .. c1 - 1 of every stored block,
+    runs of memory that go up as they lie; the reading kernel finds a value by ql_kept. Nothing is turned on the
+    host: turning the range stage's output of a 9 GB full image there, a column block at a time, ran at 1 GB/s on an
+    L4's host, eight times under the link."""
+
+    def __init__(self, R, C, nb):
+        self.R, self.C, self.nb = int(R), int(C), int(nb)
+        self.blocks = [None] * (-(-self.R // self.nb))
+
+    def rows(self, b):
+        return min(self.nb, self.R - b * self.nb)
+
+    def block(self, b):
+        if self.blocks[b] is None:
+            self.blocks[b] = np.empty((self.C, self.rows(b)), np.complex64)
+        return self.blocks[b]
+
+    def columns(self, lo, hi):
+        """The columns lo[b] .. hi[b] - 1 of each stored block b (int arrays, or two numbers for the same columns of
+        every block) -> (the host arrays to send, end to end; off, lo, hi: ql_kept's tables; the values sent)."""
+        nB = len(self.blocks)
+        lo = np.clip(np.broadcast_to(np.asarray(lo, np.int64), (nB,)), 0, self.C)
+        hi = np.maximum(np.clip(np.broadcast_to(np.asarray(hi, np.int64), (nB,)), 0, self.C), lo)
+        n = (hi - lo) * np.array([self.rows(b) for b in range(nB)], np.int64)
+        off = np.concatenate([[0], np.cumsum(n)[:-1]]).astype(np.int64)
+        return ([self.blocks[b][lo[b]:hi[b]] for b in range(nB) if hi[b] > lo[b]], off, lo.astype(np.int32),
+                hi.astype(np.int32), int(n.sum()))
+
+
 def _pfa_cuda(S, g, window, correct, complex_image, timing, phase=None, info=None):
     """The quick look's polar format on a GPU -> the image, range-major [ny, nx]: a CuPy array, or a NumPy array
-    where the picture does not fit on the device beside the arrays that form it. S: the host history (it goes up in
-    blocks of pulses through two page-locked buffers, each block weighted, gated and resampled while the next is
-    copied) or a CuPy array. Every stage works in blocks sized from the device's free memory (_xp.cuda_budget), and
-    of the four large arrays (_cuda_plan) those that do not fit there stay on the host, their blocks going up and
-    coming down as the stages need them; info['stream'] then says which. phase: (ph0, ph1) [P] float64, a
-    reference phase exp(2 pi j (ph0 + k ph1)) of pulse p's sample k that the device applies with the weights (the
-    history is then as the reader left it). timing: the stages' seconds; with timing['detail'] a dict, the device
-    is brought to completion after every step and the steps' seconds are added to it (the steps then do not overlap,
-    so their sum is longer than the call)."""
-    import ctypes
+    where the picture does not fit on the device beside the arrays that form it. S: the history, a host array, a
+    CuPy array, or the samples left in the file (io.RawSignal: they go up as the file holds them, half the bytes of
+    complex64 for 16-bit samples, and the device converts them with the weights: byte order, the pulses' scales,
+    the conjugation, the reader's phase ramps). A host history or a file goes up in blocks of pulses through
+    page-locked buffers (_Link) on a stream of its own: a thread reads or copies the next block while the block
+    before is on the link and the one before that in the kernels, so the read, the upload and the range stage take
+    about the time of the slowest of the three, not their sum. Every stage works in blocks sized from the device's
+    free memory (_cuda_room), and of the four large arrays (_cuda_plan) those that do not fit there stay on the
+    host (_Kept), their blocks crossing by the same link as the stages need them; info['stream'] then says which.
+    phase: (ph0, ph1) [P] float64, a reference phase exp(2 pi j (ph0 + k ph1)) of pulse p's sample k that the
+    device applies with the weights. timing: the stages' seconds; with timing['detail'] a dict, the device is
+    brought to completion after every step and the steps' seconds are added to it (the steps then do not overlap,
+    so their sum is longer than the call), and info['crossings'] holds the link's own rates."""
+    import threading
+    from concurrent.futures import Future
     import cupy as cp
-    import cupyx.scipy.fft as cf
-    from . import _xp, memory
     powers = g['dist']['powers']
     kern = _cuda(len(powers), max(a + b for a, b in powers))
     S = S.pop() if isinstance(S, list) else S
@@ -1220,49 +1544,46 @@ def _pfa_cuda(S, g, window, correct, complex_image, timing, phase=None, info=Non
     nkr, nka, nfy, nfx, nx, ny = g['nkr'], g['nka'], g['nfy'], g['nfx'], g['nx'], g['ny']
     i32, f32, f64, c64 = np.int32, np.float32, np.float64, np.complex64
     detail = timing.get('detail') if isinstance(timing.get('detail'), dict) else None
-    sync = cp.cuda.get_current_stream().synchronize
-    budget, blk = _xp.cuda_budget(), _xp.cuda_block()
-    plan = _cuda_plan(g, correct, complex_image, budget, blk)
+    main = cp.cuda.get_current_stream()
+    sync = main.synchronize
+    sync()                                            # nothing of the caller's still runs in memory the pool gives out
+    budget, blk, plan = _cuda_room(g, correct, complex_image)
+    if info is not None:
+        info['device'] = dict(budget=int(budget), block=int(blk),
+                              on_host=[k for k in 'ABF' if not plan[k]] + ([] if plan['out'] else ['out']))
     if plan['kept'] and info is not None:
         info['stream'] = (f"the device has {budget / 1e9:.1f} GB to give: {', '.join(plan['kept'])} "
                           f"{'is' if len(plan['kept']) == 1 else 'are'} kept on the host and cross in blocks")
-    def new(on, shape, dtype=c64):
-        """An array on the device, or on the host in page-locked memory (pageable where that much cannot be locked):
-        its blocks then cross several times faster."""
-        if on:
-            return cp.empty(shape, dtype)
-        try:
-            n = int(np.prod(shape))
-            return np.frombuffer(memory._pinned(n * np.dtype(dtype).itemsize), dtype, n).reshape(shape)
-        except Exception:
-            return np.empty(shape, dtype)
-
-    def up(hb):
-        """A host block on the device, through page-locked memory."""
-        try:
-            pin = np.frombuffer(memory._pinned(hb.nbytes), hb.dtype, hb.size).reshape(hb.shape)
-        except Exception:
-            return cp.asarray(hb)
-
-        def copy(sl):
-            np.copyto(pin[sl], hb[sl])
-        _blocks(copy, hb.shape[0], int(max(1, (1 << 18) // hb.shape[1])))
-        d = cp.empty(hb.shape, hb.dtype)
-        d.set(pin)
-        sync()                                        # the copy has left the page-locked block before it is reused
-        return d
-    ptr = lambda a: a.ctypes.data_as(ctypes.c_void_p)
-    at = lambda a, row=0, col=0: ctypes.c_void_p(a.ctypes.data + row * a.strides[0] + col * a.strides[1])
+    raw = not isinstance(S, np.ndarray) and hasattr(S, 'read')         # io.RawSignal
+    staged = raw or isinstance(S, np.ndarray)
+    if isinstance(S, np.ndarray):
+        S = np.ascontiguousarray(S, c64)
+    kind, rowb = (S.kind, K * S.itemsize) if raw else (0, 8 * K)
+    # the staging buffers: a power of two that holds a block of the history, 64 MB for a large one
+    size = 1 << 20
+    while size < (64 << 20) and size < (P * rowb if staged else 64 << 20):
+        size <<= 1
+    while size < rowb and staged:
+        size <<= 1
+    link = _Link(size, detail is not None)
+    device = cp.cuda.Device()
 
     def run(name, width, rows, r0, args, out):
         """Kernel `name` over the rows of a block (at most 32,768 of them, r0 the first one's place in the whole)."""
         kern[name]((-(-width // 256), rows), (256,), args + (i32(r0), i32(rows), out))
 
     def rows_of(n, per_row, floor=1):
-        return int(max(floor, min(n, 32768, blk // max(int(per_row), 1))))
+        """Rows of a block whose temporaries (the slots of the crossings and the plans' work areas among them) take
+        per_row bytes a row: what two blocks of the budget hold, as _cuda_plan leaves room for."""
+        return int(max(floor, min(n, 32768, 2 * blk // max(int(per_row), 1))))
+    plans = {}
+
+    def fft(x, inverse=False):
+        return _cuda_fft(x, inverse, plans, sync)
 
     def lap(name, t0):
         sync()
+        plans.clear()                                 # the stage's plans and their work areas, back to the pool
         timing[name] = timing.get(name, 0.0) + time.perf_counter() - t0
         return time.perf_counter()
 
@@ -1272,73 +1593,169 @@ def _pfa_cuda(S, g, window, correct, complex_image, timing, phase=None, info=Non
         sync()
         detail[name] = detail.get(name, 0.0) + time.perf_counter() - t0
         return time.perf_counter()
+
+    def stage(n, work, feed=None, drain=None, names=('blocks to the device', 'blocks to the device')):
+        """The n blocks of a stage. work(i) starts block i's kernels on the caller's stream. feed(i, after) brings
+        its input up, into the slot i % 2, once `after` (the kernels of block i - 2, which read that slot) is done,
+        and returns the copy's event; drain(i, after) takes its output down from the slot i % 2 once `after` (its
+        kernels) is done, and returns when the host has it. The feeds run on one thread and the drains on another,
+        each a block or two ahead of or behind the kernels; a detailed call makes them one at a time and adds the
+        host's and the link's seconds of a feed to detail under `names`."""
+        if detail is not None or (feed is None and drain is None):
+            for i in range(n):
+                if feed is not None:
+                    h, w = link.stats['up_host'], link.stats['up_link']
+                    feed(i, None)
+                    for name, v in zip(names, (link.stats['up_host'] - h, link.stats['up_link'] - w)):
+                        detail[name] = detail.get(name, 0.0) + v
+                work(i)
+                if drain is not None:
+                    sync()
+                    t1 = time.perf_counter()
+                    drain(i, None)
+                    detail['blocks to the host'] = detail.get('blocks to the host', 0.0) + time.perf_counter() - t1
+            return
+        fed = [Future() for _ in range(n)] if feed is not None else None
+        worked = [Future() for _ in range(n)]
+        drained = [Future() for _ in range(n)] if drain is not None else None
+
+        def feeder():
+            try:
+                with device:
+                    for i in range(n):
+                        fed[i].set_result(feed(i, worked[i - 2].result() if i >= 2 else None))
+            except BaseException as e:
+                for f in fed:
+                    if not f.done():
+                        f.set_exception(e)
+
+        def drainer():
+            try:
+                with device:
+                    for i in range(n):
+                        drained[i].set_result(drain(i, worked[i].result()))
+            except BaseException as e:
+                for f in drained:
+                    if not f.done():
+                        f.set_exception(e)
+        threads = [threading.Thread(target=t, name='fastsar-quicklook-link', daemon=True)
+                   for t, on in ((feeder, feed), (drainer, drain)) if on is not None]
+        for t in threads:
+            t.start()
+        try:
+            for i in range(n):
+                if fed is not None:
+                    ev = fed[i].result()
+                    if ev is not None:
+                        main.wait_event(ev)
+                if drained is not None and i >= 2:
+                    drained[i - 2].result()           # its slot is free again
+                work(i)
+                ev = cp.cuda.Event()
+                ev.record(main)
+                worked[i].set_result(ev)
+            for f in drained or ():
+                f.result()
+        except BaseException as e:
+            for f in worked:
+                if not f.done():
+                    f.set_exception(e)
+            raise
+        finally:
+            for t in threads:
+                t.join()
+
+    def take(kept, cols, slots):
+        """The feed of a stage that reads the kept array `kept`: cols[i] = (lo, hi), the columns block i reads
+        (per stored block, or two numbers) -> (feed, the device tables off, lo, hi [blocks, stored blocks], the
+        values of the largest block)."""
+        sets = [kept.columns(lo, hi) for lo, hi in cols]
+        tabs = tuple(cp.asarray(np.stack([s[j] for s in sets])) for j in (1, 2, 3))
+        return (lambda i, after: link.sendv(sets[i][0], slots[i % 2], after)), tabs, max(s[4] for s in sets)
+
+    def put(kept, slots):
+        """The drain of a stage whose output is the kept array `kept`: block i, turned in the slot i % 2."""
+        def drain(i, after):
+            h = kept.block(i)
+            link.fetch(slots[i % 2][:h.size], h, after)
+        return drain
+    none64, none32 = cp.zeros(1, cp.int64), cp.zeros(1, cp.int32)
+    here = (none64, none32, none32, i32(1), i32(0))   # ql_kept's tables for an array that is on the device
     t0 = time.perf_counter()
     tab = kern['kaiser']
     wk = cp.asarray((g['wk'] * (_taylor(K) if window else 1.0)).astype(np.float32))
     wp = cp.asarray((g['wp'] * (_taylor(P) if window else 1.0)).astype(np.float32))
-    tap_r = cp.asarray(_taper(Nr, g['Er'], g['gy'], g['bin_r']))
+    tap_r = cp.asarray(_taper(Nr, g['Er'], g['gy'], g['bin_r']) * np.float32(1.0 / Kf))    # with the inverse transform's 1 / Kf
     alpha, beta = cp.asarray(g['alpha'].astype(np.float32)), cp.asarray(g['beta'].astype(np.float32))
-    ref = phase is not None
-    ph0, ph1 = (cp.asarray(np.ascontiguousarray(v, f64)) for v in (phase if ref else (np.zeros(1), np.zeros(1))))
+    # the phase of each pulse's samples: the reference to the grid center, and for samples as the file holds them
+    # the reader's own ramps, in one
+    ramps = [v for v in (phase, S.phase() if raw else None) if v is not None]
+    ref = bool(ramps)
+    if ref:
+        a0 = sum(np.asarray(v[0], f64) for v in ramps)
+        ph0, ph1 = cp.asarray(np.ascontiguousarray(a0 - np.floor(a0))), cp.asarray(np.ascontiguousarray(sum(np.asarray(v[1], f64) for v in ramps)))
+    else:
+        ph0 = ph1 = cp.zeros(1, cp.float64)
+    scale_p = S.scale() if raw else None
+    amp = cp.zeros(1, cp.float32) if scale_p is None else cp.asarray(np.ascontiguousarray(scale_p, f32))
+    conj = i32(bool(raw and S.conj))
     t0 = lap('kernels', t0)
     # 1. range, a block of pulses at a time: each pulse on its rows of the raster (all of them, or its own)
     nwin, jlo = g['nwin'], g['jlo']
-    A = new(plan['A'], (P, nwin))
-    on_host = isinstance(S, np.ndarray)
-    nb = rows_of(P, 24 * max(Kf, Nr))
-    if on_host:
-        S = np.ascontiguousarray(S, c64)
-        nb = int(max(1, min(nb, 1024, (128 << 20) // (8 * K))))
-        bufs = [memory._pinned(nb * K * 8) for _ in range(2)]
-        events = [None, None]
-        stream = cp.cuda.get_current_stream()
-        cb = int(max(1, (1 << 18) // K))
-    for b, r in enumerate(range(0, P, nb)):
-        n = min(nb, P - r)
-        t1 = time.perf_counter()
-        if on_host:
-            if events[b % 2] is not None:
-                events[b % 2].synchronize()                  # its last copy has left the buffer
-            hb = np.frombuffer(bufs[b % 2], c64, nb * K).reshape(nb, K)[:n]
+    per = 16 * Kf + 16 * Nr + (8 if plan['A'] else 24) * nwin + (2 * rowb if staged else 0)
+    nb = rows_of(P, per)
+    if staged:
+        nb = int(max(1, min(nb, 1024, size // rowb)))
+    blocks = [(r, min(nb, P - r)) for r in range(0, P, nb)]
+    A = cp.empty((P, nwin), c64) if plan['A'] else _Kept(P, nwin, nb)
+    X = [cp.empty(nb * rowb, cp.uint8) for _ in range(2)] if staged else None
+    D = None if plan['A'] else [cp.empty(nb * nwin, c64) for _ in range(2)]
 
-            def copy(sl, r=r, hb=hb):
-                np.copyto(hb[sl], S[r + sl.start:r + sl.stop])
-            _blocks(copy, n, cb)
-            x = cp.empty((n, K), c64)
-            x.set(hb, stream=stream)
-            events[b % 2] = cp.cuda.Event()
-            events[b % 2].record(stream)
-        else:
-            x = S[r:r + n]
-        t1 = step('upload', t1)
+    def feed(i, after):
+        r, n = blocks[i]
+        if raw:
+            return link.send(n * rowb, lambda buf: S.read(r, n, buf.ctypes.data), X[i % 2].data, after)
+        return link.sendv([S[r:r + n]], X[i % 2], after)
+
+    def work(i):
+        r, n = blocks[i]
+        t1 = time.perf_counter()
         buf = cp.empty((n, Kf), c64)
-        run('weight', Kf, n, 0, (x, wk, wp[r:r + n], ph0[r:r + n] if ref else ph0, ph1[r:r + n] if ref else ph1, i32(K),
-                                 i32(k0), i32(Kf), i32(ref)), buf)
-        del x
+        run('weight', Kf, n, 0, (X[i % 2] if staged else S[r:r + n], amp[r:r + n] if scale_p is not None else amp, wk,
+                                 wp[r:r + n], ph0[r:r + n] if ref else ph0, ph1[r:r + n] if ref else ph1, i32(kind),
+                                 i32(scale_p is not None), conj, i32(K), i32(k0), i32(Kf), i32(ref)), buf)
         t1 = step('weights and padding', t1)
-        prof = cf.ifft(buf, axis=1, overwrite_x=True)
-        del buf
+        fft(buf, True)
         t1 = step('range transforms', t1)
         gate = cp.empty((n, Nr), c64)
-        run('rgate', Nr, n, 0, (prof, tap_r, i32(Kf), i32(Nr)), gate)
-        del prof
+        run('rgate', Nr, n, 0, (buf, tap_r, i32(Kf), i32(Nr)), gate)
+        del buf
         t1 = step('range gate', t1)
-        G = cf.fft(gate, axis=1, overwrite_x=True)
-        del gate
+        fft(gate)
         t1 = step('range transforms', t1)
         Ab = A[r:r + n] if plan['A'] else cp.empty((n, nwin), c64)
-        kern['rows']((-(-nwin // 128), n), (128,), (G, i32(n), i32(Nr), alpha[r:r + n], beta[r:r + n], i32(nwin), tab, Ab))
-        del G
+        kern['rows']((-(-nwin // 128), n), (128,), (gate, i32(n), i32(Nr), alpha[r:r + n], beta[r:r + n], i32(nwin), tab, Ab))
+        del gate
         t1 = step('range resampling', t1)
         if not plan['A']:
-            Ab.get(out=A[r:r + n])
+            run('turn', nwin, n, 0, (Ab, i32(nwin)), D[i % 2])
             step('blocks to the host', t1)
-        del Ab
-    if on_host:
-        sync()
-        del bufs
-    S = None
+    if raw:
+        S.open()
+    try:
+        stage(len(blocks), work, feed if staged else None, None if plan['A'] else put(A, D),
+              ('file read' if raw else 'staging', 'upload'))
+    finally:
+        if raw:
+            S.close()
     t0 = lap('range', t0)
+    went_up = dict(link.stats)
+    if info is not None:
+        info['source'] = ({1: 'int8', 2: 'int16', 4: 'float32'}[S.kind] + ' pairs from the file' if raw else
+                          'complex64 from the host' if staged else 'complex64 on the device')
+        if raw:
+            info['empty'] = int(np.count_nonzero(S.empty[S.rows[0]:S.rows[1]]))
+    S = X = D = None
     # 2. azimuth, in blocks of range wavenumbers, the pulses of each along a row: every transform of this path runs
     # along the rows of its array, and the kernels that pass over an array turn it where the next transform needs
     # it turned. The transform along the pulses, the gate in meters with its cut and the scale, the transform back
@@ -1348,92 +1765,91 @@ def _pfa_cuda(S, g, window, correct, complex_image, timing, phase=None, info=Non
     if place is not None:
         src = np.full(Pp, -1, np.int32)
         src[place] = np.arange(P, dtype=np.int32)
-    dummy = cp.zeros(1, cp.int32)
-    d_jlo, d_src = dummy if jlo is None else cp.asarray(jlo), dummy if src is None else cp.asarray(src)
-    scale = f32(g['gain'] * (g['ov'] * nfy if correct else nfy) * Na / Pf)     # the pulses lie at p0 here: no phase
+    d_jlo, d_src = none32 if jlo is None else cp.asarray(jlo), none32 if src is None else cp.asarray(src)
+    scale = f32(g['gain'] / Pf)     # the pulses lie at p0 here: no phase; the inverse transforms are not normalised
     binm, inv_kr, qtab = cp.asarray(g['bins_a'].astype(np.float32)), cp.asarray(1.0 / g['kr']), cp.asarray(g['qtab'])
-    B = new(plan['B'], (nkr, nka))
-    nJ = rows_of(nkr, 24 * max(Pf, Na))
-    lib = None if plan['A'] and plan['B'] and plan['F'] else _lib()
-    for J0 in range(0, nkr, nJ):
-        n = min(nJ, nkr - J0)
+    spread = 0 if jlo is None else int(max(np.ptp(jlo[r:r + n]) for r, n in blocks))
+    nJ = rows_of(nkr, 16 * Pf + 16 * Na + (0 if plan['A'] else 16 * P) + (0 if plan['B'] else 24 * nka))
+    blocks = [(J, min(nJ, nkr - J)) for J in range(0, nkr, nJ)]
+    B = cp.empty((nkr, nka), c64) if plan['B'] else _Kept(nkr, nka, nJ)
+    feed, tabs = None, None
+    if not plan['A']:
+        # the rows of a pulse block that hold the wavenumbers J .. J + n - 1: all pulses' the same, or each pulse's
+        # own from jlo on, a few more rows where jlo changes within the block
+        if jlo is None:
+            cols = [(J, J + n) for J, n in blocks]
+        else:
+            lo_b = np.array([jlo[b * A.nb:(b + 1) * A.nb].max() for b in range(len(A.blocks))], np.int64)
+            hi_b = np.array([jlo[b * A.nb:(b + 1) * A.nb].min() for b in range(len(A.blocks))], np.int64)
+            cols = [(J - lo_b, J + n - hi_b) for J, n in blocks]
+        U = [None, None]
+        feed, tabs, most = take(A, cols, U)
+        U[:] = [cp.empty(most, c64) for _ in range(2)]
+    D = None if plan['B'] else [cp.empty(nJ * nka, c64) for _ in range(2)]
+
+    def work(i):
+        J0, n = blocks[i]
         t1 = time.perf_counter()
-        if plan['A']:
-            pad = cp.empty((n, Pf), c64)
-            run('pulses', Pf, n, J0, (A, d_jlo, d_src, i32(jlo is not None), i32(src is not None), i32(nwin), i32(P), i32(Pp),
-                                      i32(p0), i32(Pf)), pad)
-            t1 = step('azimuth layout', t1)
-        else:                                         # the block's rows from the host's array, the host's kernels
-            hb = np.empty((n, Pf), c64)
-            hb[:, :p0] = 0
-            if jlo is None and place is None:
-                lib.ql_transpose(at(A, 0, J0), nwin, P, n, at(hb, 0, p0), Pf, None, 0)
-            else:
-                lib.ql_unshear(ptr(A), nwin, P, None if jlo is None else ptr(jlo), None if place is None else ptr(place),
-                               Pp, J0, n, at(hb, 0, p0), Pf)
-            hb[:, p0 + Pp:] = 0
-            pad = up(hb)
-            del hb
-            t1 = step('blocks to the device', t1)
-        prof = cf.fft(pad, axis=1, overwrite_x=True)
-        del pad
+        pad = cp.empty((n, Pf), c64)
+        run('pulses', Pf, n, J0, (A if plan['A'] else U[i % 2], d_jlo, d_src, i32(jlo is not None), i32(src is not None),
+                                  i32(nwin), i32(P), i32(Pp), i32(p0), i32(Pf))
+            + (here if plan['A'] else (tabs[0][i], tabs[1][i], tabs[2][i], i32(A.nb), i32(1))), pad)
+        t1 = step('azimuth layout', t1)
+        fft(pad)
         t1 = step('azimuth transforms', t1)
         gate = cp.empty((n, Na), c64)
-        run('agate', Na, n, J0, (prof, binm[J0:J0 + n], i32(Pf), i32(Na), f32(g['Ex']), f32(g['gx']), scale), gate)
-        del prof
+        run('agate', Na, n, J0, (pad, binm[J0:J0 + n], i32(Pf), i32(Na), f32(g['Ex']), f32(g['gx']), scale), gate)
+        del pad
         t1 = step('azimuth gate', t1)
-        A2 = cf.ifft(gate, axis=1, overwrite_x=True)
-        del gate
+        fft(gate, True)
         t1 = step('azimuth transforms', t1)
         Bb = B[J0:J0 + n] if plan['B'] else cp.empty((n, nka), c64)
-        run('resample_az', nka, n, J0, (A2, i32(Na), inv_kr[J0:J0 + n], f64(g['ka_lo']), f64(g['dka']), qtab,
+        run('resample_az', nka, n, J0, (gate, i32(Na), inv_kr[J0:J0 + n], f64(g['ka_lo']), f64(g['dka']), qtab,
                                         i32(len(g['qtab'])), f64(g['tg0']), f64(g['tg_inv']), i32(nka), tab), Bb)
-        del A2
+        del gate
         t1 = step('azimuth resampling', t1)
         if not plan['B']:
-            Bb.get(out=B[J0:J0 + n])
+            run('turn', nka, n, 0, (Bb, i32(nka)), D[i % 2])
             step('blocks to the host', t1)
-        del Bb
-    del A
+    stage(len(blocks), work, feed, None if plan['B'] else put(B, D))
     t0 = lap('azimuth', t0)
+    A = U = D = None
     # 3. the raster's range transform, in blocks of azimuth wavenumbers (each along a row, its range wavenumbers in
-    # the order the transform takes, the rows of a sheared raster that meet in one bin summed)
+    # the order the transform takes, the rows of a sheared raster that meet in one bin summed), in its place in
+    # the transform's array where that is on the device
     ov = g['ov'] if correct else 1
     Ny, hy, hx = ov * nfy, (g['hy'] if correct else 0), (nka // 2 if correct else 0)
-    F = new(plan['F'], (nka, Ny))
-    na = rows_of(nka, 16 * Ny)
-    if not plan['B'] and correct:
-        sy = ((-1.0) ** (np.arange(nkr) - hy)).astype(np.float32)
-        sx = ((-1.0) ** (np.arange(nka) - hx)).astype(np.float32)
-    for a0 in range(0, nka, na):
-        n = min(na, nka - a0)
+    na = rows_of(nka, (8 if plan['F'] else 32) * Ny + (0 if plan['B'] else 16 * nkr))
+    blocks = [(a, min(na, nka - a)) for a in range(0, nka, na)]
+    F = cp.empty((nka, Ny), c64) if plan['F'] else _Kept(nka, Ny, na)
+    feed, tabs = None, None
+    if not plan['B']:
+        U = [None, None]
+        feed, tabs, most = take(B, [(a, a + n) for a, n in blocks], U)
+        U[:] = [cp.empty(most, c64) for _ in range(2)]
+    D = None if plan['F'] else [cp.empty(na * Ny, c64) for _ in range(2)]
+
+    def work(i):
+        a0, n = blocks[i]
         t1 = time.perf_counter()
-        if plan['B']:
-            Z = cp.empty((n, Ny), c64)
-            run('place', Ny, n, a0, (B, i32(nkr), i32(nka), i32(hy), i32(Ny), i32(1 if correct else 0), i32(hx)), Z)
-        else:
-            M = np.ascontiguousarray(B[:, a0:a0 + n].T)
-            if correct:
-                M *= sy[None, :] * sx[a0:a0 + n, None]
-            Z = up(_fold(M, Ny, hy))
-            del M
-            t1 = step('blocks to the device', t1)
-        Fb = cf.ifft(Z, axis=1, overwrite_x=True)
-        del Z
+        Z = F[a0:a0 + n] if plan['F'] else cp.empty((n, Ny), c64)
+        run('place', Ny, n, a0, (B if plan['B'] else U[i % 2], i32(nkr), i32(nka), i32(hy), i32(Ny), i32(1 if correct else 0),
+                                 i32(hx)) + (here if plan['B'] else (tabs[0][i], tabs[1][i], tabs[2][i], i32(B.nb), i32(1))), Z)
+        fft(Z, True)
         t1 = step('image transforms', t1)
-        if plan['F']:
-            F[a0:a0 + n] = Fb
-        else:
-            Fb.get(out=F[a0:a0 + n])
+        if not plan['F']:
+            run('turn', Ny, n, 0, (Z, i32(Ny)), D[i % 2])
             step('blocks to the host', t1)
-        del Fb
-    del B
+    stage(len(blocks), work, feed, None if plan['F'] else put(F, D))
     t0 = lap('range transform', t0)
+    B = U = D = None
     # 4. the azimuth transform and the picture, in blocks of range pixels: uncorrected, the picture's range bins
     # transformed and cut; corrected, the padded transform of the bins a block's pixels read, and the read at their
     # apparent positions
-    out = new(plan['out'], (ny, nx), c64 if complex_image else np.float32)
+    otype = np.dtype(c64 if complex_image else np.float32)
+    out = cp.empty((ny, nx), otype) if plan['out'] else np.empty((ny, nx), otype)
     Nx = ov * nfx
+    per = 16 * Nx * ov + (0 if plan['F'] else 16 * ov * nka) + (0 if plan['out'] else 2 * otype.itemsize * nx)
     if correct:
         dist = g['dist']
         d_cx, d_cy = cp.asarray(np.asarray(dist['cx'], f64)), cp.asarray(np.asarray(dist['cy'], f64))
@@ -1441,52 +1857,50 @@ def _pfa_cuda(S, g, window, correct, complex_image, timing, phase=None, info=Non
         kr_c, ka_c = g['kr_min'] + hy * g['dkr'], g['ka_lo'] + hx * g['dka']
         shear = float(g['shear'] * g['spy'] / g['spx'])
         msy = int(math.ceil(g['shift'][1] / g['spy'])) * ov + LANCZOS + 2
-        bw = rows_of(ny, 16 * Nx * ov, 16)
+        bw = rows_of(ny, per, 16)
         blocks = [(jb, min(bw, ny - jb)) for jb in range(0, ny, bw)]
+        bins = [(max(0, Ny // 2 + ov * (jb - ny // 2) - msy), min(Ny, Ny // 2 + ov * (jb + n - ny // 2) + msy))
+                for jb, n in blocks]
     else:
         y, x = (np.arange(ny) - ny / 2.0) * g['spy'], (np.arange(nx) - nx / 2.0) * g['spx']
         cy = cp.asarray(np.exp(1j * g['kr_min'] * y).astype(c64))
         cx = cp.asarray(np.exp(-1j * g['ka_lo'] * x).astype(c64))
-        bw = rows_of(ny, 16 * Nx, 16)                 # the blocks end where the bins wrap: at the picture's center
+        bw = rows_of(ny, per, 16)                     # the blocks end where the bins wrap: at the picture's center
         blocks = [(jb, min(bw, e - jb)) for s, e in ((0, ny // 2), (ny // 2, ny)) for jb in range(s, e, bw)]
-    for jb, n in blocks:
+        bins = [((nfy - ny // 2 + jb) % nfy, (nfy - ny // 2 + jb) % nfy + n) for jb, n in blocks]
+    feed, tabs = None, None
+    if not plan['F']:
+        U = [None, None]
+        feed, tabs, most = take(F, bins, U)
+        U[:] = [cp.empty(most, c64) for _ in range(2)]
+    D = None if plan['out'] else [cp.empty((max(n for _, n in blocks), nx), otype) for _ in range(2)]
+
+    def work(i):
+        (jb, n), (rb0, rb1) = blocks[i], bins[i]
+        span = rb1 - rb0
         t1 = time.perf_counter()
-        if correct:
-            rb0 = max(0, Ny // 2 + ov * (jb - ny // 2) - msy)
-            span = min(Ny, Ny // 2 + ov * (jb + n - ny // 2) + msy) - rb0
-        else:
-            rb0, span = (nfy - ny // 2 + jb) % nfy, n
-        if plan['F']:
-            Z = cp.empty((span, Nx), c64)
-            run('aplace', Nx, span, 0, (F, i32(nka), i32(Ny), i32(hx), i32(Nx), i32(rb0)), Z)
-        else:
-            hb = np.empty((span, Nx), c64)
-            lib.ql_transpose(at(F, hx, rb0), Ny, nka - hx, span, ptr(hb), Nx, None, 0)
-            if hx:
-                lib.ql_transpose(at(F, 0, rb0), Ny, hx, span, at(hb, 0, Nx - hx), Nx, None, 0)
-            hb[:, nka - hx:Nx - hx] = 0
-            Z = up(hb)
-            del hb
-            t1 = step('blocks to the device', t1)
-        base = cf.fft(Z, axis=1, overwrite_x=True)
-        del Z
+        Z = cp.empty((span, Nx), c64)
+        run('aplace', Nx, span, 0, (F if plan['F'] else U[i % 2], i32(nka), i32(Ny), i32(hx), i32(Nx), i32(rb0))
+            + (here if plan['F'] else (tabs[0][i], tabs[1][i], tabs[2][i], i32(F.nb), i32(1))), Z)
+        fft(Z)
         t1 = step('image transforms', t1)
-        ob = out[jb:jb + n] if plan['out'] else cp.empty((n, nx), out.dtype)
+        ob = out[jb:jb + n] if plan['out'] else D[i % 2][:n]
         if correct:
             kern['gather']((-(-nx // 128), n), (128,),
-                           (base, i32(span), i32(Nx), i32(Ny), i32(rb0), i32(n), i32(jb), i32(nx), i32(ny), f64(g['spx']),
+                           (Z, i32(span), i32(Nx), i32(Ny), i32(rb0), i32(n), i32(jb), i32(nx), i32(ny), f64(g['spx']),
                             f64(g['spy']), f64(ov), f64(dist['sx']), f64(dist['sy']), d_cx, d_cy, d_pw, f64(kr_c), f64(ka_c),
                             f64(shear), kern['lanczos'], i32(0 if complex_image else 1), np.float32(1.0), ob))
         else:
-            run('cut', nx, n, jb, (base, cy[jb:jb + n], cx, i32(Nx), i32(nx), i32(0 if complex_image else 1)), ob)
-        del base
-        t1 = step('read at the apparent positions' if correct else 'picture', t1)
-        if not plan['out']:
-            ob.get(out=out[jb:jb + n])
-            step('blocks to the host', t1)
-        del ob
-    del F
+            run('cut', nx, n, jb, (Z, cy[jb:jb + n], cx, i32(Nx), i32(nx), i32(0 if complex_image else 1)), ob)
+        step('read at the apparent positions' if correct else 'picture', t1)
+
+    def drain(i, after):
+        jb, n = blocks[i]
+        link.fetch(D[i % 2][:n], out[jb:jb + n], after)
+    stage(len(blocks), work, feed, None if plan['out'] else drain)
     lap('correction' if correct else 'image', t0)
+    if info is not None:
+        info['crossings'] = link.report(went_up)
     return out
 
 
@@ -1520,49 +1934,64 @@ def _ffbp(col, backend, window, timing):
 def write_png(path, image, level=1):
     """Write a uint8 image [rows, cols] (gray), [rows, cols, 3] (RGB) or [rows, cols, 4] (RGBA) as a PNG file, with the
     standard library alone. Blocks of rows are deflated on all cores, each an independent run of the one zlib stream
-    and an IDAT chunk of its own, with its checksums made beside it, so a 16 megapixel picture is written in a few
-    hundredths of a second. level: zlib's, 0 to 9 (speckle hardly compresses, and 1 is as small as 9 on it)."""
+    and an IDAT chunk of its own, with its checksums made beside it, and the blocks go to the file in order while
+    the later ones are still being deflated. level: zlib's, 0 to 9. At 1, the default, the blocks are coded by run
+    lengths and Huffman codes without a search for repeated strings (zlib's Z_RLE): on speckle the search finds
+    nothing (a quick look came out 0.4% smaller without it, at 165 MB/s a core against 60) and it is what a level
+    from 2 up adds; 0 stores the bytes."""
     import struct
     import zlib
     a = np.asarray(image)
     if a.dtype != np.uint8 or a.ndim not in (2, 3) or (a.ndim == 3 and a.shape[2] not in (3, 4)) or a.size == 0:
         raise ValueError(f'write_png takes a uint8 image [rows, cols] or [rows, cols, 3 or 4], got {a.dtype} {a.shape}')
+    if not isinstance(level, (int, np.integer)) or isinstance(level, bool) or not 0 <= level <= 9:
+        raise ValueError(f'level must be 0 to 9 (zlib\'s), got {level!r}')
     rows, cols = a.shape[:2]
     a = a.reshape(rows, -1)
     line = 1 + a.shape[1]                                       # a row and its filter byte (type 0: none)
-    per = int(max(1, min(rows, max(1 << 16, min(4 << 20, rows * line // (4 * _workers()))) // line)))
+    # a block: a megabyte at most (it stays in a core's cache with its output), four or more a thread
+    per = int(max(1, min(rows, max(1 << 16, min(1 << 20, rows * line // (4 * _workers()))) // line)))
     starts = list(range(0, rows, per))
-    parts = [None] * len(starts)
+    last = len(starts) - 1
+    strategy = zlib.Z_RLE if level == 1 else zlib.Z_DEFAULT_STRATEGY
+
+    def deflate(i):
+        """Block i -> (the pieces of its IDAT chunk's data, the chunk's CRC so far, the Adler-32 and the size of
+        its bytes). Nothing here joins or copies the deflated bytes: the pieces go to the file as they are."""
+        raw = np.empty((min(per, rows - starts[i]), line), np.uint8)
+        raw[:, 0] = 0
+        raw[:, 1:] = a[starts[i]:starts[i] + per]
+        co = zlib.compressobj(int(level), zlib.DEFLATED, -15, 9, strategy)
+        pieces = [b'\x78\x01'] if i == 0 else []
+        pieces += [co.compress(raw), co.flush(zlib.Z_FINISH if i == last else zlib.Z_SYNC_FLUSH)]
+        crc = zlib.crc32(b'IDAT')
+        for piece in pieces:
+            crc = zlib.crc32(piece, crc)
+        return pieces, crc, zlib.adler32(raw), raw.size
 
     def chunk(kind, body):
         return struct.pack('>I', len(body)) + kind + body + struct.pack('>I', zlib.crc32(kind + body))
-
-    def deflate(sl):
-        i = sl.start
-        raw = np.zeros((min(per, rows - starts[i]), line), np.uint8)
-        raw[:, 1:] = a[starts[i]:starts[i] + per]
-        co = zlib.compressobj(level, zlib.DEFLATED, -15)
-        last = i == len(starts) - 1
-        body = co.compress(raw) + co.flush(zlib.Z_FINISH if last else zlib.Z_SYNC_FLUSH)
-        parts[i] = [(b'\x78\x01' if i == 0 else b'') + body, zlib.adler32(raw), raw.size]
-        if not last:
-            parts[i][0] = chunk(b'IDAT', parts[i][0])
-    _blocks(deflate, len(starts), 1)
-    # the stream's Adler-32 from the blocks' own (zlib's adler32_combine)
-    adler = 1
-    for _, a2, n2 in parts:
-        rem = n2 % 65521
-        s1 = adler & 0xffff
-        s2 = (rem * s1) % 65521
-        s1 += (a2 & 0xffff) + 65521 - 1
-        s2 += ((adler >> 16) & 0xffff) + ((a2 >> 16) & 0xffff) + 65521 - rem
-        adler = (s1 % 65521) | ((s2 % 65521) << 16)
     color = {1: 0, 3: 2, 4: 6}[1 if np.ndim(image) == 2 else np.shape(image)[2]]
-    with open(path, 'wb') as fh:
+    adler = 1
+    with open(path, 'wb', buffering=0) as fh:
         fh.write(b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', cols, rows, 8, color, 0, 0, 0)))
-        for body, _, _ in parts[:-1]:
-            fh.write(body)
-        fh.write(chunk(b'IDAT', parts[-1][0] + struct.pack('>I', adler)))
+        for i, (pieces, crc, a2, n2) in enumerate(_ordered(deflate, len(starts))):
+            # the stream's Adler-32 from the blocks' own (zlib's adler32_combine)
+            rem = n2 % 65521
+            s1 = adler & 0xffff
+            s2 = (rem * s1) % 65521
+            s1 += (a2 & 0xffff) + 65521 - 1
+            s2 += ((adler >> 16) & 0xffff) + ((a2 >> 16) & 0xffff) + 65521 - rem
+            adler = (s1 % 65521) | ((s2 % 65521) << 16)
+            if i == last:
+                pieces.append(struct.pack('>I', adler))
+                crc = zlib.crc32(pieces[-1], crc)
+            fh.write(struct.pack('>I', sum(len(piece) for piece in pieces)) + b'IDAT')
+            for piece in pieces:
+                view = memoryview(piece)
+                while len(view):                                # (an unbuffered write may take a part)
+                    view = view[fh.write(view):]
+            fh.write(struct.pack('>I', crc))
         fh.write(chunk(b'IEND', b''))
 
 
@@ -1770,7 +2199,8 @@ def quicklook(cphd, output=None, *, size=2048, resolution=None, correct=True, re
             return col
         rows, cols = slice(i * Pl, (i + 1) * Pl), slice(j * Kl, (j + 1) * Kl)
         ph = None if phase is None else (phase[0][rows] + j * Kl * phase[1][rows], phase[1][rows])
-        return dict(col, S=np.ascontiguousarray(S[rows, cols]), ant=ant[rows], fmin=f0 + j * Kl * df, phase=ph)
+        part = S[rows, cols] if isinstance(S, io.RawSignal) else np.ascontiguousarray(S[rows, cols])
+        return dict(col, S=part, ant=ant[rows], fmin=f0 + j * Kl * df, phase=ph)
     info, shift, acc, cimg, defocus = {}, None, None, None, None
     xp = np
     for i in range(la):
@@ -1817,6 +2247,8 @@ def quicklook(cphd, output=None, *, size=2048, resolution=None, correct=True, re
     else:
         if info.get('stream'):
             notes.append(info['stream'])
+        if info.get('empty'):
+            notes.append(f"{info['empty']} interior pulses have no samples")
         algorithm, corrected, shift = 'pfa', bool(correct), tuple(float(v) for v in info['shift_px'])
         notes.append(f'polar format: its displacement of scatterers, up to {shift[0]:.1f} by {shift[1]:.1f} pixels '
                      '(azimuth by range) over the picture, ' + ('removed' if corrected else 'left in (correct=False)'))
@@ -1834,17 +2266,17 @@ def quicklook(cphd, output=None, *, size=2048, resolution=None, correct=True, re
     lay = sidd.shadows_down(grid)
     tr = lay['transform']
     d = sidd._display(dict(image=amp), remap, None, {})[0]             # uint8, range-major, where the image is
-    d = d if tr['transpose'] else d.T
-    d = d[::-1] if tr['flip_rows'] else d
-    d = d[:, ::-1] if tr['flip_cols'] else d
     if _xp.kind(d) == 'cupy':                                          # laid out there, brought over once
+        d = d if tr['transpose'] else d.T
+        d = d[::-1] if tr['flip_rows'] else d
+        d = d[:, ::-1] if tr['flip_cols'] else d
         d = xp.ascontiguousarray(d)
         xp.cuda.get_current_stream().synchronize()
         timing['remap'] = time.perf_counter() - t0
         t0 = time.perf_counter()
         display = _host(d)
     else:
-        display = np.ascontiguousarray(_xp.host(d))
+        display = _oriented(_xp.host(d), not tr['transpose'], tr['flip_rows'], tr['flip_cols'])
     del amp, d
     rows, cols = display.shape
     rc = np.array([[0, 0], [0, cols - 1], [rows - 1, cols - 1], [rows - 1, 0]], np.float64)
