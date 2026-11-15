@@ -59,6 +59,9 @@ _KAISER = {}
 SHEAR_TAPS, SHEAR_KAISER = 10, 7.2   # the kernel of the read at the apparent positions on a sheared raster
 AT_ONCE = 1 << 19             # values of rows a program transforms at once; beyond, in a loop over chunks (_by_rows)
 CHUNK = 16                    # rows of a chunk
+DENSE_ROWS = 128              # rows a read (_dense) takes at once; more in a loop over chunks of at most these (a v6e
+                              # compiled the read along the columns of 1,088 rows of 2,400 samples in 2.1 s and ran
+                              # it in 2.6 ms, in chunks of 128 rows 1.3 s and 1.6 ms)
 
 
 def _mode():
@@ -213,6 +216,9 @@ def _dense(jnp, lax, xr, xi, ib, fr, Rw, taps, wpoly):
     weights (an optimization barrier): a TPU compiles the two fused for 15 s (the azimuth stage's parabolas) to
     53 s (the final read's displacement polynomial), apart for 2 to 3 s, and runs both alike."""
     ib, fr = lax.optimization_barrier((ib, fr))
+    if xr.shape[0] > DENSE_ROWS:                  # an even share of at most DENSE_ROWS, a multiple of 8
+        c = _up(-(-xr.shape[0] // -(-xr.shape[0] // DENSE_ROWS)), 8)
+        return _chunks(jnp, lax, lambda *a: _dense(jnp, lax, *a, Rw, taps, wpoly), (xr, xi, ib, fr), c)
     R, n = xr.shape
     nblk, h = ib.shape[1] // BLOCK, taps // 2
     N = max(-(-n // STRIDE) * STRIDE, Rw)
@@ -255,8 +261,15 @@ def _by_rows(jnp, lax, fn, xs, width):
     runs at 18,432 samples within 4% of the whole (5.1 ms against 4.9 ms at 2,688 rows), at 40,960 samples 1.5
     times as long (17.5 ms against 11.9 ms at 1,536 rows); chunks of 8 rows run 1.2 and 3.3 times as long."""
     R = int(xs[0].shape[0])
-    c = CHUNK
-    if R * width <= AT_ONCE or R <= c:
+    if R * width <= AT_ONCE:
+        return fn(*xs)
+    return _chunks(jnp, lax, fn, xs, CHUNK)
+
+
+def _chunks(jnp, lax, fn, xs, c):
+    """fn applied to the rows of the arrays xs in chunks of c rows (the last padded), a loop over them."""
+    R = int(xs[0].shape[0])
+    if R <= c:
         return fn(*xs)
     m = -(-R // c)
     pad = m * c - R
@@ -955,7 +968,7 @@ def pfa(S, g, window, correct, complex_image, timing, phase=None, info=None, on_
         X0, Y = am[:, None] + bj[None, :], yn[None, :]
         X = X0
         for _ in range(2):                           # the picture's column that lies on this column of H at this row
-            X = X0 + (sig * uy * _poly(jnp, cy, powers, X, Y) - ux * _poly(jnp, cx, powers, X, Y)) * inv
+            X = lax.optimization_barrier(X0 + (sig * uy * _poly(jnp, cy, powers, X, Y) - ux * _poly(jnp, cx, powers, X, Y)) * inv)
         ib, fr = _split(jnp, iyr[None, :], _poly(jnp, cy, powers, X, Y) * uy + half)
         return _dense(jnp, lax, zr, zi, ib, fr, RwY, taps, wfin)
 
