@@ -1170,6 +1170,72 @@ def test_cuda_missing_pulses(monkeypatch):
         assert e < (-40 if correct else -35) and e0 < -60
 
 
+def _integer_copy(src, dst, fmt):
+    """The simulated file src (CF8) rewritten with integer samples, CI4 (16-bit) or CI2 (8-bit), as a vendor stores
+    them: each vector's own AmpSF (along the pulses by a few tenths), the stored integers times AmpSF being the
+    samples, which fill most of the integers' range."""
+    import xml.etree.ElementTree as ET
+    from fastsar import _cphdxml
+    r = _cphdxml.open_cphd(src)
+    S = r.read_chip()
+    P, K = S.shape
+    ns = '{http://api.nsgreg.nga.mil/schema/cphd/1.0.1}'
+    root = ET.fromstring(r.cphd_details.get_cphd_bytes())
+    data, pvp = root.find(ns + 'Data'), root.find(ns + 'PVP')
+    data.find(ns + 'SignalArrayFormat').text = fmt
+    nb = int(data.find(ns + 'NumBytesPVP').text)
+    data.find(ns + 'NumBytesPVP').text = str(nb + 8)
+    amp = ET.fromstring(f'<AmpSF xmlns="{ns[1:-1]}"><Offset>{nb // 8}</Offset><Size>1</Size><Format>F8</Format></AmpSF>')
+    pvp.insert(list(pvp).index(pvp.find(ns + 'SRPPos')) + 1, amp)
+    xml = ET.tostring(root).replace(b'ns0:', b'').replace(b'xmlns:ns0=', b'xmlns=')
+    v0 = r.read_pvp_array(0)
+    v = np.zeros(P, _cphdxml.pvp_dtype(ET.fromstring(xml).find(ns + 'PVP'), nb + 8, '='))
+    for n in v0.dtype.names:
+        v[n] = v0[n]
+    v['AmpSF'] = (1.0 + 0.3 * np.sin(np.linspace(0.0, 3.0, P))) * np.abs(S).max() / {'CI4': 30000.0, 'CI2': 120.0}[fmt]
+    stored = S / v['AmpSF'][:, None]
+    _cphdxml.write_cphd(dst, xml, [v], [(np.rint(stored.real) + 1j * np.rint(stored.imag)).astype(np.complex64)])
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize('fmt', ['CI4', 'CI2'])
+def test_cuda_takes_the_files_integers(spot, monkeypatch, fmt):
+    """A file of 16-bit or 8-bit integer samples with a scale per vector: the CUDA path takes the samples up as the
+    file holds them (half or a quarter of complex64's bytes) and converts them on the device with the scales, the
+    reader's phase ramp (the troposphere delay) and the reference to the grid's center, so that its image is the
+    host's from the same file (to rounding on the host's transform lengths, _against_host), and so is its picture;
+    the file's integers hold the simulated scene."""
+    import cupy as cp
+    path = str(spot['dir'] / f'spot_{fmt}.cphd')
+    _integer_copy(spot['path'], path, fmt)
+    dev, host = quick._collection(path, size=256, backend='cuda'), quick._collection(path, size=256)
+    raw = dev['S']
+    assert isinstance(raw, io.RawSignal) and raw.kind == {'CI4': 2, 'CI2': 1}[fmt] and raw.scale() is not None and raw.ramps
+    grid = tuple(host[k] for k in ('nx', 'ny', 'spx', 'spy', 'e1', 'e2'))
+    h = quick._pfa(host['S'], host['ant'], host['fmin'], host['df'], *grid)
+    for own in (True, False):
+        info = {}
+        with monkeypatch.context() as m:
+            if not own:
+                m.setattr(quick, '_fft_cuda', quick._fft_size)
+            d = quick._pfa([raw], dev['ant'], dev['fmin'], dev['df'], *grid, backend='cuda', info=info, phase=dev['phase'])
+        e = rel_db(cp.asnumpy(d), h)
+        print(f'{fmt}: cuda from the file\'s integers against the host, {"own" if own else "the host\'s"} lengths: {e:.1f} dB')
+        assert info['source'] == {'CI4': 'int16', 'CI2': 'int8'}[fmt] + ' pairs from the file' and e < (-40 if own else -60)
+    b = look(path, size=256, complex_image=True)
+    for own in (True, False):
+        with monkeypatch.context() as m:
+            if not own:
+                m.setattr(quick, '_fft_cuda', quick._fft_size)
+            a = look(path, size=256, backend='cuda', complex_image=True)
+        diff = np.abs(a['display'].astype(int) - b['display'].astype(int))
+        assert a['backend'] == 'cuda' and a['cut'] == b['cut'] and rel_db(a['image'], b['image']) < (-40 if own else -60)
+        assert np.mean(diff <= 2) > 0.98 if own else np.mean(diff <= 1) > 0.999
+    e = rel_db(b['image'], look(spot['path'], size=256, complex_image=True)['image'])
+    print(f'{fmt}: the integer file\'s image against the float file\'s: {e:.1f} dB')
+    assert e < {'CI4': -80, 'CI2': -40}[fmt]
+
+
 @pytest.mark.cuda
 def test_cuda(spot, monkeypatch):
     """The CUDA path (CuPy alone): the host's image (_against_host), corrected and uncorrected, complex and detected,
