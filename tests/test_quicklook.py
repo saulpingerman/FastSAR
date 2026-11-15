@@ -753,6 +753,50 @@ def test_cuda_streams_what_does_not_fit(spot, squinted, monkeypatch, megabytes):
 
 
 @pytest.mark.cuda
+def test_cuda_gives_the_device_back():
+    """A second formation in a process plans with the memory the first one had. On a device that just holds the
+    arrays (CuPy's pool limited to that, with transforms long enough for cuFFT to ask for work areas), both calls
+    keep everything on the device and the pool holds no more after the second than after the first; work areas
+    another caller left in CuPy's plan cache are released before an array would be kept on the host."""
+    import cupy as cp
+    rng = np.random.default_rng(11)
+    col = sim.make_collect(res=0.3, scene=3600.0, r0=30e3)
+    ant = np.ascontiguousarray(col.ant[::128])
+    P, K = len(ant), col.K
+    S = (rng.standard_normal((P, K), np.float32) + 1j * rng.standard_normal((P, K), np.float32)).astype(np.complex64)
+    grid = (128, 1024, 0.3, 0.3, np.array([0.0, 1.0, 0.0]), np.array([1.0, 0.0, 0.0]))
+    g = quick._geometry(ant, col.fmin, col.df, K, *grid, True)
+    assert g['Kf'] > 20000                                                     # a length with a work area
+    pool, cache = cp.get_default_memory_pool(), cp.fft.config.get_plan_cache()
+    quick._cuda()                                                              # the kernels and tables, loaded
+    cache.clear()
+    limit = pool.get_limit()
+    try:
+        for correct in (True, False):
+            need = next(b for b in range(1 << 20, 1 << 30, 1 << 16)
+                        if not quick._cuda_plan(g, correct, False, b, b // 4)['kept'])
+            pool.free_all_blocks()
+            pool.set_limit(size=pool.used_bytes() + int(1.03 * need / 0.9))
+            seen = []
+            for call in range(3):
+                if call == 2:                                                  # another caller's plan, with its work area
+                    cp.fft.fft(cp.zeros((8, 13500), cp.complex64), axis=1)
+                    assert cache.get_curr_memsize() > 0.1 * need
+                info = {}
+                img = quick._pfa(S, ant, col.fmin, col.df, *grid, correct=correct, complex_image=False, backend='cuda', info=info)
+                cp.cuda.get_current_stream().synchronize()
+                assert isinstance(img, cp.ndarray)
+                del img
+                seen.append((info.get('stream'), info['device'], pool.used_bytes(), cache.get_curr_memsize()))
+            assert [s[0] for s in seen] == [None] * 3, seen                    # nothing kept on the host, any call
+            assert seen[0][1]['on_host'] == [] and seen[1][1] == seen[0][1] and seen[2][1] == seen[0][1], seen
+            assert seen[2][2] <= seen[1][2] <= seen[0][2], seen                # the pool holds no more
+            assert [s[3] for s in seen] == [0] * 3                             # and CuPy's plan cache nothing
+    finally:
+        pool.set_limit(size=limit)
+
+
+@pytest.mark.cuda
 def test_cuda_sheared_raster(squinted):
     """The CUDA path on a ground grid under a twisted slant plane: the host's image."""
     import cupy as cp

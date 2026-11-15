@@ -943,8 +943,8 @@ def _apply_phase(S, ph0, ph1):
 # the device works on the block before; each pass over an array that is not a transform is one kernel (the weights,
 # the padding and the reference phase; the range gate and its cut; the azimuth gate, its cut and the scale; the
 # raster's place in the padded transforms with its signs; the read at the apparent positions with the detection);
-# the transforms keep their plans between calls (CuPy's plan cache) and the kernels and tables stay compiled and
-# loaded (_CUDA).
+# the transforms run on plans of the path's own, whose work areas go back to the pool when their stage ends
+# (_cuda_fft), and the kernels and tables stay compiled and loaded (_CUDA).
 
 _CUDA_SRC = r"""
 #define HALF_T (TAPS / 2)
@@ -1153,6 +1153,61 @@ extern "C" __global__ void ql_cut(const float2* T, const float2* cy, const float
 }
 """
 _CUDA = {}
+_PLANS = threading.local()    # .kept: {(n, batch): plan}, the calling thread's cuFFT plans that take no work area
+
+
+def _cuda_fft(x, inverse, plans, sync):
+    """The transform of each row of x [batch, n] (complex64, C-contiguous), in place, by a cuFFT plan of this path's
+    own; the inverse comes without its 1 / n (the stages fold it into a factor they apply anyway, which saves a pass
+    over the array). plans: the dict of the stage's plans by n, which the stage empties when it ends.
+
+    CuPy's own plan cache is not used. It keeps the last 16 plans of a thread for the life of the process, each with
+    a work area the size of its batch (cuFFT asks for one for most lengths above a few thousand), taken from CuPy's
+    pool and counted there as in use: after one full image and its uncorrected twin on an L4, 15 plans held 8 of the
+    device's 23 GB, the next call planned with 14.7 GB in place of 20.7 and kept an array on the host. A plan is
+    made in a quarter of a millisecond, so the plans with a work area live for their stage (one batch size at a
+    time: the last block's plan replaces the others'), and only those without one are kept between calls."""
+    from cupy.cuda import cufft
+    b, n = x.shape
+    p = plans.get(n)
+    if p is None or p.batch != b:
+        kept = _PLANS.__dict__.setdefault('kept', {})
+        p = kept.get((n, b))
+        if p is None:
+            if n in plans:                            # the stage's last block: the work area of the other blocks' plan
+                sync()                                # is released first, once nothing runs in it
+                del plans[n]
+            p = cufft.Plan1d(n, cufft.CUFFT_C2C, b)
+            if not getattr(getattr(p.work_area, 'mem', None), 'size', 0):
+                if len(kept) >= 64:
+                    kept.clear()
+                kept[(n, b)] = p
+        plans[n] = p
+    p.fft(x, x, cufft.CUFFT_INVERSE if inverse else cufft.CUFFT_FORWARD)
+    return x
+
+
+def _cuda_room(g, correct, complex_image):
+    """(budget, block, plan) of the CUDA path for a geometry: the device bytes it may take now, those of a stage's
+    temporaries, and where the arrays live (_cuda_plan). Where the free memory would leave an array on the host and
+    CuPy's plan cache holds work areas (another stage of the library, or the caller's own transforms, left them
+    there), the cache is emptied and the plan made again: streaming costs seconds, a plan a fraction of a
+    millisecond."""
+    import cupy as cp
+    from . import _xp
+    for attempt in (0, 1):
+        budget, blk = _xp.cuda_budget(), _xp.cuda_block()
+        plan = _cuda_plan(g, correct, complex_image, budget, blk)
+        try:
+            cache = cp.fft.config.get_plan_cache()
+            held = cache.get_curr_memsize()
+        except Exception:                             # a CuPy without the cache
+            break
+        if not plan['kept'] or not held or attempt:
+            break
+        cp.cuda.get_current_stream().synchronize()
+        cache.clear()
+    return budget, blk, plan
 
 
 def _cuda(npow=10, deg=3):
@@ -1211,8 +1266,7 @@ def _pfa_cuda(S, g, window, correct, complex_image, timing, phase=None, info=Non
     so their sum is longer than the call)."""
     import ctypes
     import cupy as cp
-    import cupyx.scipy.fft as cf
-    from . import _xp, memory
+    from . import memory
     powers = g['dist']['powers']
     kern = _cuda(len(powers), max(a + b for a, b in powers))
     S = S.pop() if isinstance(S, list) else S
@@ -1221,8 +1275,9 @@ def _pfa_cuda(S, g, window, correct, complex_image, timing, phase=None, info=Non
     i32, f32, f64, c64 = np.int32, np.float32, np.float64, np.complex64
     detail = timing.get('detail') if isinstance(timing.get('detail'), dict) else None
     sync = cp.cuda.get_current_stream().synchronize
-    budget, blk = _xp.cuda_budget(), _xp.cuda_block()
-    plan = _cuda_plan(g, correct, complex_image, budget, blk)
+    budget, blk, plan = _cuda_room(g, correct, complex_image)
+    if info is not None:
+        info['device'] = dict(budget=int(budget), block=int(blk), on_host=[k for k in 'ABF' if not plan[k]] + ([] if plan['out'] else ['out']))
     if plan['kept'] and info is not None:
         info['stream'] = (f"the device has {budget / 1e9:.1f} GB to give: {', '.join(plan['kept'])} "
                           f"{'is' if len(plan['kept']) == 1 else 'are'} kept on the host and cross in blocks")
@@ -1261,8 +1316,14 @@ def _pfa_cuda(S, g, window, correct, complex_image, timing, phase=None, info=Non
     def rows_of(n, per_row, floor=1):
         return int(max(floor, min(n, 32768, blk // max(int(per_row), 1))))
 
+    plans = {}
+
+    def fft(x, inverse=False):
+        return _cuda_fft(x, inverse, plans, sync)
+
     def lap(name, t0):
         sync()
+        plans.clear()                                 # the stage's plans and their work areas, back to the pool
         timing[name] = timing.get(name, 0.0) + time.perf_counter() - t0
         return time.perf_counter()
 
@@ -1276,7 +1337,7 @@ def _pfa_cuda(S, g, window, correct, complex_image, timing, phase=None, info=Non
     tab = kern['kaiser']
     wk = cp.asarray((g['wk'] * (_taylor(K) if window else 1.0)).astype(np.float32))
     wp = cp.asarray((g['wp'] * (_taylor(P) if window else 1.0)).astype(np.float32))
-    tap_r = cp.asarray(_taper(Nr, g['Er'], g['gy'], g['bin_r']))
+    tap_r = cp.asarray(_taper(Nr, g['Er'], g['gy'], g['bin_r']) * np.float32(1.0 / Kf))    # with the inverse transform's 1 / Kf
     alpha, beta = cp.asarray(g['alpha'].astype(np.float32)), cp.asarray(g['beta'].astype(np.float32))
     ref = phase is not None
     ph0, ph1 = (cp.asarray(np.ascontiguousarray(v, f64)) for v in (phase if ref else (np.zeros(1), np.zeros(1))))
@@ -1316,14 +1377,14 @@ def _pfa_cuda(S, g, window, correct, complex_image, timing, phase=None, info=Non
                                  i32(k0), i32(Kf), i32(ref)), buf)
         del x
         t1 = step('weights and padding', t1)
-        prof = cf.ifft(buf, axis=1, overwrite_x=True)
+        prof = fft(buf, True)
         del buf
         t1 = step('range transforms', t1)
         gate = cp.empty((n, Nr), c64)
         run('rgate', Nr, n, 0, (prof, tap_r, i32(Kf), i32(Nr)), gate)
         del prof
         t1 = step('range gate', t1)
-        G = cf.fft(gate, axis=1, overwrite_x=True)
+        G = fft(gate)
         del gate
         t1 = step('range transforms', t1)
         Ab = A[r:r + n] if plan['A'] else cp.empty((n, nwin), c64)
@@ -1350,7 +1411,7 @@ def _pfa_cuda(S, g, window, correct, complex_image, timing, phase=None, info=Non
         src[place] = np.arange(P, dtype=np.int32)
     dummy = cp.zeros(1, cp.int32)
     d_jlo, d_src = dummy if jlo is None else cp.asarray(jlo), dummy if src is None else cp.asarray(src)
-    scale = f32(g['gain'] * (g['ov'] * nfy if correct else nfy) * Na / Pf)     # the pulses lie at p0 here: no phase
+    scale = f32(g['gain'] / Pf)     # the pulses lie at p0 here: no phase; the inverse transforms are not normalised
     binm, inv_kr, qtab = cp.asarray(g['bins_a'].astype(np.float32)), cp.asarray(1.0 / g['kr']), cp.asarray(g['qtab'])
     B = new(plan['B'], (nkr, nka))
     nJ = rows_of(nkr, 24 * max(Pf, Na))
@@ -1375,14 +1436,14 @@ def _pfa_cuda(S, g, window, correct, complex_image, timing, phase=None, info=Non
             pad = up(hb)
             del hb
             t1 = step('blocks to the device', t1)
-        prof = cf.fft(pad, axis=1, overwrite_x=True)
+        prof = fft(pad)
         del pad
         t1 = step('azimuth transforms', t1)
         gate = cp.empty((n, Na), c64)
         run('agate', Na, n, J0, (prof, binm[J0:J0 + n], i32(Pf), i32(Na), f32(g['Ex']), f32(g['gx']), scale), gate)
         del prof
         t1 = step('azimuth gate', t1)
-        A2 = cf.ifft(gate, axis=1, overwrite_x=True)
+        A2 = fft(gate, True)
         del gate
         t1 = step('azimuth transforms', t1)
         Bb = B[J0:J0 + n] if plan['B'] else cp.empty((n, nka), c64)
@@ -1418,7 +1479,7 @@ def _pfa_cuda(S, g, window, correct, complex_image, timing, phase=None, info=Non
             Z = up(_fold(M, Ny, hy))
             del M
             t1 = step('blocks to the device', t1)
-        Fb = cf.ifft(Z, axis=1, overwrite_x=True)
+        Fb = fft(Z, True)
         del Z
         t1 = step('image transforms', t1)
         if plan['F']:
@@ -1468,7 +1529,7 @@ def _pfa_cuda(S, g, window, correct, complex_image, timing, phase=None, info=Non
             Z = up(hb)
             del hb
             t1 = step('blocks to the device', t1)
-        base = cf.fft(Z, axis=1, overwrite_x=True)
+        base = fft(Z)
         del Z
         t1 = step('image transforms', t1)
         ob = out[jb:jb + n] if plan['out'] else cp.empty((n, nx), out.dtype)
