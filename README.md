@@ -150,7 +150,8 @@ time of each stage.
 | Precision | float32 | float32, float16 | three-pass (default), single-pass | float32, float16 |
 | Exact backprojection (`ExactFormer`) | C++ (OpenMP on Linux), float32 with float64 tile centers | CUDA, the same | falls back to `jax` | float32, float64 block centers |
 
-Polar format (`algorithm='pfa'`) runs as a JAX program on any device.
+Polar format (`algorithm='pfa'`) and `quicklook` run as C++ stages on the CPU, CUDA kernels on a GPU and compiled
+float32 programs on a TPU or any JAX device.
 
 ## Documentation
 
