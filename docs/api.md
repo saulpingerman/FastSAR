@@ -34,27 +34,27 @@
   [product-options.md](product-options.md#radiometric-calibration)), `timing` (seconds per stage) and, when
   written, `path` and `metadata`.
 - `quicklook(cphd, output=None, *, size=2048, resolution=None, correct=True, remap='nrl', backend='auto',
-  weighting='taylor', looks=1, complex_image=False, channel=0, extent=None, reader_options=None)`: a
-  reduced-resolution picture of a spotlight CPHD by polar format, from the pulses and samples that resolution
-  needs ([processing-chain.md](processing-chain.md#quick-look), [algorithms.md](algorithms.md#quick-look)).
-  `size`: pixels along the longer side of the picture, the tasked area's bounding rectangle on a slant-plane grid
-  along the mid-aperture line of sight. `resolution`: the ground resolution in meters in place of `size`, or
-  `'full'` for the finest the collection holds on both axes. `correct=False` leaves polar format's displacement
-  in, for the fastest picture. `output`: a `.png` file (the 8-bit picture) or a `.nitf` or `.ntf` file (the
-  complex image as a slant-plane SICD). `backend`: `'cpu'` and `'cuda'` form by polar format; `'jax'` and `'tpu'`
-  form the same cut history on the same grid by the factorized former; `'auto'` is tpu, else cuda, else cpu.
-  `looks`: a count n, or (sub-apertures, sub-bands): the mean power of that many images of the same pixels, for
-  less speckle. `extent`: (across, along) the line of sight in m on the ground, in place of the file's image
-  area. `reader_options`: `troposphere`, `phase_sign`, `ref_freq`, `drop_flagged` or `regrid_tol` for
-  `read_cphd`. Returns a dict: `display` (uint8 [rows, cols], shadows down), `image` (complex64 [nx, ny] with
-  `complex_image=True`, else `None`), the grid as `form_cphd` gives it (`origin`, `e1`, `e2`, `spx`, `spy`,
-  `plane` `'slant'`, `center`, `band`, `bandwidth`, `window`, `pulses`, `meta`), the display's layout
-  (`display_origin`, `row`, `col`, `row_ss`, `col_ss`, `transform`), `corners` (latitude and longitude of the
-  display's corner pixels), `pixel`, `resolution` and `finest` (m on the ground), `graze` and `twist` (rad),
-  `cut` (the file's pulses and samples read, and their bytes), `algorithm`, `backend`, `correct`,
-  `displacement_px`, `corner_error` (polar format's own defocus at the worst corner: the phase left there in rad
-  and the error against exact backprojection in dB), `looks`, `notes` and `timing` (seconds per stage). A
-  moving-beam collection raises `ValueError`; `process_cphd` forms those.
+  weighting='taylor', looks=1, complex_image=False, channel=0, extent=None, reader_options=None)`: a picture of a
+  spotlight CPHD by polar format, from the pulses and samples its resolution needs
+  ([processing-chain.md](processing-chain.md#quick-look)). `size`: pixels along the longer side of the tasked
+  area. `resolution`: the ground resolution in meters in place of `size`, or `'full'` for the whole scene at the
+  finest the collection holds on both axes. `correct=False` leaves polar format's displacement of scatterers
+  in. `output`: a `.png` file (the picture) or a `.nitf` file (the complex image as a ground-plane SICD).
+  `backend`: `'cpu'`, `'cuda'`, `'jax'` or `'tpu'`, each with polar format's stages written for it; `'auto'`
+  takes the one that forms the cut soonest, by the cut's size (`quick.AUTO_CUDA_SAMPLES`,
+  `quick.AUTO_CUDA_FIRST_SAMPLES`, `quick.AUTO_TPU_SAMPLES`). `looks`: a count n, or (sub-apertures, sub-bands):
+  the mean power of that many images of the same pixels, for less speckle. `extent`: (across, along) the line of
+  sight in m on the ground, in place of the file's image area. `reader_options`: `troposphere`, `phase_sign`,
+  `ref_freq`, `drop_flagged` or `regrid_tol` for `read_cphd`. Returns a dict: `display` (uint8 [rows, cols],
+  shadows down), `image` (complex64 [nx, ny] with `complex_image=True`, else `None`), the grid of
+  `form_cphd(axes='los')` (`origin`, `e1`, `e2`, `spx`, `spy`, `plane` `'ground'`, `center`, `band`, `bandwidth`,
+  `window`, `pulses`, `meta`), the display's layout (`display_origin`, `row`, `col`, `row_ss`, `col_ss`,
+  `transform`), `corners` (latitude and longitude of the display's corner pixels), `pixel`, `resolution` and
+  `finest` (m on the ground), `graze` (rad), `cut` (the file's pulses and samples read, and their bytes),
+  `algorithm`, `backend`, `correct`, `displacement_px`, `corner_error` (polar format's own defocus at the worst
+  corner: the phase left there in rad and the error against exact backprojection in dB), `looks`, `notes` and
+  `timing` (seconds per stage). A moving-beam collection raises `ValueError`; `process_cphd` forms those.
+  `FASTSAR_QUICKLOOK_JAX=ffbp` forms by the factorized former on the jax and tpu backends.
 - `process_stack(cphds, output=None, *, product='mean', grid=None, reference=0, spacing=None, extent=None,
   register='fourier', equalize='mean', weights=None, window=7, weighting='taylor', aperture='auto', dem=None,
   remap='nrl', remap_args=None, shadows_down=True, backend='auto', precision='float32', max_shift=64,
@@ -92,6 +92,9 @@
   when it is not `|ant|` (a bistatic half path, a vendor's reference point). `precision`, `T`, `levels`, `pmax` and
   `target_db` apply to `'ffbp'`, `pfa_guard` and `pfa_support` to `'pfa'`; `interp` (`'cubic'` or `'linear'`), `upsample` and
   `center` (the point the grid is centered on) apply to `'bp'` only and raise `ValueError` with the others.
+  `'pfa'` forms on the `cpu` and `cuda` backends by the stages of the quick look and on the `jax` and `tpu`
+  backends by the JAX program of `fastsar.pfa2`; `FASTSAR_PFA_PROGRAM=jax` takes that program on every backend
+  and `FASTSAR_PFA_PROGRAM=stages` the stages on every backend ([algorithms.md](algorithms.md#polar-format)).
 - `ImageFormer(ant, fmin, df, K, nx, ny, spx, spy, e1=(1.0, 0.0, 0.0), e2=(0.0, 1.0, 0.0), *, backend='auto',
   precision='float32', ..., aperture_weight=None, ref=None, range_gate='auto', padded=None)`: plans and compiles
   once; `former(S)` forms each image.

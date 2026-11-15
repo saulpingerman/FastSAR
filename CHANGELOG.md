@@ -8,26 +8,26 @@ was published on PyPI.
 ### Added
 
 - `fastsar.quicklook(cphd, output=None, *, size=2048, resolution=None, correct=True, remap='nrl', backend='auto',
-  weighting='taylor', looks=1, complex_image=False, channel=0, extent=None, reader_options=None)`: a
-  reduced-resolution picture of a spotlight collection for a look at the data
+  weighting='taylor', looks=1, complex_image=False, channel=0, extent=None, reader_options=None)`: a picture of a
+  spotlight collection by polar format, from the part of the file its resolution needs
   ([docs/processing-chain.md](docs/processing-chain.md#quick-look)). The header and a few hundred per-pulse
   parameters decide the cut, the central run of frequency samples and of pulses whose bands give the pixel asked
-  for; only those are read from the file; the cut history is formed by polar format on a slant-plane grid along
-  the mid-aperture line of sight, detected, remapped and laid out shadows down. `size` is the pixel count along
-  the longer side, `resolution` the ground resolution in meters or `'full'`. The output is a `.png` file, written
-  with the standard library, or a `.nitf` file, the complex image as a slant-plane SICD. `correct=False` leaves
-  polar format's displacement of scatterers in. `looks=n` averages the power of n by n images from sub-apertures
-  and sub-bands side by side. On 16 CPU threads, with the file in the page cache, a 2048-pixel picture of a 9.1 GB
-  Capella spotlight takes 0.10 s and reads 65 MB of samples, one of an 8.7 GB Umbra spotlight 0.11 s and 348 MB,
-  and 4096-pixel pictures 0.33 and 0.36 s; `form_cphd` takes 365 s and 31 s on those files. The complex image is
-  within -41 to -44 dB of exact backprojection of the same cut history on the same grid; at full resolution over
-  several kilometers polar format defocuses the corners, and the product says by how much (`corner_error`, and a
-  note). The formation step on the
-  Panama history takes 0.94 s on the published grid of 12,206 by 8,808 pixels (0.53 s uncorrected), where
-  `form_image(algorithm='pfa')` takes 9.8 s ([docs/performance.md](docs/performance.md#quick-look)).
-  The cpu and cuda backends form by polar format (CuPy alone on the GPU); the jax and tpu backends form the same
-  cut history on the same grid by the factorized former. A moving-beam collection is refused with a `ValueError`
-  that names `process_cphd`.
+  for; only those are read. The picture is the tasked area on the ground along the mid-aperture line of sight (the
+  grid of `form_cphd(axes='los')`), detected, remapped and laid out shadows down. `size` is the pixel count along
+  the longer side, `resolution` the ground resolution in meters, or `'full'` for the whole scene at the finest
+  resolution the collection holds. The output is a `.png` file, written with the standard library, or a `.nitf`
+  file, the complex image as a ground-plane SICD. `correct=False` leaves polar format's displacement of scatterers
+  in. `looks=n` averages the power of n by n images from sub-apertures and sub-bands side by side. On 16 CPU
+  threads, with the file in the page cache, a 2048-pixel picture of a 9.1 GB Capella spotlight takes 0.15 s and
+  reads 112 MB of samples, and the whole scene at full resolution (175 megapixels) 7 s; on a GPU 0.07 s and 1.7 s.
+  `form_cphd` takes 365 s on that file. The complex image is within -41 to -43 dB of exact backprojection of the
+  same cut history on the same grid at 1024 to 4096 pixels; at a fine resolution over several kilometers polar
+  format defocuses the corners, and the product says by how much (`corner_error`, and a note)
+  ([docs/performance.md](docs/performance.md#quick-look)). Every backend runs the stages written for it: C++ on
+  the CPU, CUDA kernels on a GPU, compiled float32 programs on a JAX device or a TPU. The device paths work in
+  blocks sized from the device's free memory and keep on the host what does not fit, with a note. `backend='auto'`
+  takes the device that forms the cut soonest, by the cut's size. A moving-beam collection is refused with a
+  `ValueError` that names `process_cphd`.
 - `io.read_cphd(..., pulses=(first, last + 1), samples=(first, last + 1))` reads a part of a collection: those
   vectors' parameters and those samples of each alone, with `pread` on all cores, for CPHD 1.0.1, 1.1.0 and 0.3.
   For a collection with one scene reference point and one frequency grid the result equals the rows and columns of
@@ -35,11 +35,24 @@ was published on PyPI.
 - `fastsar.quick.write_png` and `read_png`: 8-bit PNG files with the standard library alone, the rows deflated in
   blocks on all cores.
 - `examples/quicklook.py`: a quick look from the command line, with the time of each stage.
+  `tests/bench_quicklook.py`: the times of full images and quick looks by backend and stage, as JSON.
+  `tests/bench_tpu_blocks.py`: the device times of the building blocks of a polar format on a JAX device.
 
 ### Changed
 
+- `form_image(algorithm='pfa')` forms by the quick look's stages on the `cpu` and `cuda` backends: the image of
+  the JAX program to its accuracy and at its scale, in a tenth of the time or less (the Panama image, 12,207 by
+  8,808 pixels from 15,186 pulses of 14,399 samples: 1.2 s on 16 CPU threads and 0.3 s on a GPU, where the
+  program takes 9.6 s). Over whole images the stages are the closer of the two to exact backprojection
+  ([docs/performance.md](docs/performance.md#polar-format-by-stages)). On a ground-plane grid the stages' image
+  has backprojection's phase, which the program's does not; the amplitudes agree. A collection that lacks pulses
+  of its evenly timed sequence is formed with each pulse at its place. `backend` now chooses where polar format
+  runs. `FASTSAR_PFA_PROGRAM=jax` takes the JAX program on every backend, bit for bit that of 0.3.0 on the CPU;
+  the `jax` and `tpu` backends keep it (`FASTSAR_PFA_PROGRAM=stages` takes the stages there). `pfa_guard` sets the
+  image's scale as before; the stages set their own gate edges, and form a grid that with its guard exceeds the
+  unambiguous extent.
 - `fastsar.pfa2` imports JAX when a polar-format program is built, not when the module is imported. The images of
-  `form_image(algorithm='pfa')`, `form_cphd` and `process_cphd` are bit for bit those of 0.3.0 on the CPU.
+  `form_cphd` and `process_cphd` are bit for bit those of 0.3.0 on the CPU.
 
 ## [0.3.0] - 2026-11-14
 

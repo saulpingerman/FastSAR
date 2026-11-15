@@ -352,12 +352,12 @@ _KAISER = []
 
 def _kaiser_poly():
     """The Kaiser window of the host kernels (quick.KAISER) as a polynomial in the square of the offset over the
-    half width, float32 coefficients, highest power first: to 1e-7 of the window."""
+    half width, float32 coefficients of degree 7, highest power first: to 1.2e-6 of the window."""
     if not _KAISER:
         from . import quick as Q
         x2 = np.linspace(0.0, 1.0, 4001)
         w = np.i0(Q.KAISER * np.sqrt(1.0 - x2)) / np.i0(Q.KAISER)
-        _KAISER.append(np.polynomial.chebyshev.Chebyshev.fit(x2, w, 14).convert(kind=np.polynomial.Polynomial).coef[::-1].astype(np.float32))
+        _KAISER.append(np.polynomial.chebyshev.Chebyshev.fit(x2, w, 7).convert(kind=np.polynomial.Polynomial).coef[::-1].astype(np.float32))
     return _KAISER[0]
 
 
@@ -441,7 +441,10 @@ def _resident(S, g, window, complex_image, timing, phase=None):
     nkr, nka, nfy, nfx, nx, ny = g['nkr'], g['nka'], g['nfy'], g['nfx'], g['nx'], g['ny']
     Pf, Na, p0, ov = g['Pf'], g['Na'], g['p0'], g['ov']
     Ny, Nx, hy, hx = ov * nfy, ov * nfx, g['hy'], nka // 2
-    blk = _xp.jax_block()
+    import os
+    blk = _xp.jax_block()                             # (a v6e ran 2 GB blocks in 2 s and 4.6 GB blocks in 100 s)
+    if os.environ.get('FASTSAR_JAX_RESIDENT_BLOCK_MB', '').strip():                    # for measurements
+        blk = int(float(os.environ['FASTSAR_JAX_RESIDENT_BLOCK_MB']) * 1e6)
     wpoly = jnp.asarray(_kaiser_poly())
     HI = lax.Precision.HIGHEST
     up = lambda a: jnp.asarray(np.ascontiguousarray(a, f32))
@@ -457,8 +460,9 @@ def _resident(S, g, window, complex_image, timing, phase=None):
         return tuple(jnp.concatenate([o[k] for o in out], axis) for k in range(len(out[0])))
     t0 = time.perf_counter()
     S = np.ascontiguousarray(S.pop() if isinstance(S, list) else S, c64)
-    Sr, Si = jnp.asarray(np.ascontiguousarray(S.real)), jnp.asarray(np.ascontiguousarray(S.imag))
-    del S
+    Sd = jnp.asarray(S.view(np.float32).reshape(P, K, 2))                 # the history's own bytes, split on the device
+    Sr, Si = Sd[..., 0], Sd[..., 1]
+    del S, Sd
     jax.block_until_ready((Sr, Si))
     timing['upload'] = timing.get('upload', 0.0) + time.perf_counter() - t0
     t0 = time.perf_counter()
@@ -636,7 +640,7 @@ def _resident(S, g, window, complex_image, timing, phase=None):
         jax.block_until_ready(outr)
         timing['correction'] = timing.get('correction', 0.0) + time.perf_counter() - t0
         t0 = time.perf_counter()
-        out = np.empty((nx, ny), c64)
+        out = np.empty((nx, ny), c64)                 # (two planes cross four times faster than one array of pairs)
         v = out.view(np.float32).reshape(nx, ny, 2)
         v[..., 0], v[..., 1] = np.asarray(outr[:nx]), np.asarray(outi[:nx])
     else:

@@ -4,7 +4,7 @@
     python tests/bench_quicklook.py scene_CPHD.cphd --history panama.npz --out full_l4.json
     python tests/bench_quicklook.py scene_CPHD.cphd --backends cuda --sizes full,2048 --device-mb 14000 --out part.json
 
-For each backend (cpu, and cuda where CuPy has a GPU) and each size ('full', the whole tasked scene at the finest
+For each backend (cpu, and cuda where CuPy has a GPU; --backends cpu,tpu on a TPU VM) and each size ('full', the whole tasked scene at the finest
 resolution the collection holds, first; then 4096, 2048 and 1024 pixels), with the displacement correction on and
 off: fastsar.quicklook from the file to the PNG, the first call of the process, then `--repeat` calls, of which the
 fastest is kept with its stage times (plan, read, reference, geometry, range, azimuth, the transforms, the
@@ -83,6 +83,8 @@ def main():
             row = dict(mode='form_image', backend=backend, history=list(S.shape), picture=[grid[0], grid[1]])
             try:
                 ts = []
+                if backend in ('jax', 'tpu'):         # the stages there too (form_image's default is the JAX program)
+                    os.environ['FASTSAR_PFA_PROGRAM'] = 'stages'
                 for k in range(a.repeat + 1):
                     t = time.perf_counter()
                     img = fastsar.form_image(S, ant, fmin, df, *grid, algorithm='pfa', backend=backend)

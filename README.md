@@ -116,9 +116,10 @@ fastsar.process_stack(['a_CPHD.cphd', 'b_CPHD.cphd'], 'coherence.tif', product='
   their incoherent average, or the coherence, interferogram, coherent sum or change of a pair
   ([stack.md](https://github.com/saulpingerman/FastSAR/blob/main/docs/stack.md)).
 
-For a look at a spotlight collection without the full chain, `quicklook` reads only the pulses and samples that a
-reduced resolution needs and forms a picture by polar format: a 2048-pixel picture of a 9.1 GB Capella file in
-0.1 s on 16 CPU threads, from 65 MB of its samples
+For a look at a spotlight collection without the full chain, `quicklook` reads only the pulses and samples its
+resolution needs and forms a picture of the tasked scene by polar format: a 2048-pixel picture of a 9.1 GB Capella
+file in 0.15 s on 16 CPU threads, from 112 MB of its samples, and the whole scene at full resolution (175
+megapixels) in 7 s, or 1.7 s on a GPU
 ([processing-chain.md](https://github.com/saulpingerman/FastSAR/blob/main/docs/processing-chain.md#quick-look)).
 
 ```python

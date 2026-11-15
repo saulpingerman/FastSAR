@@ -2,20 +2,22 @@
 that resolution needs.
 
     out = fastsar.quicklook('scene_CPHD.cphd', 'look.png')              # 2048 pixels on the longer side
+    out = fastsar.quicklook('scene_CPHD.cphd', 'full.png', resolution='full')    # the whole scene, full resolution
     out = fastsar.quicklook('scene_CPHD.cphd', size=4096, correct=False)
     out = fastsar.quicklook('scene_CPHD.cphd', 'look.nitf', resolution=1.0)
     out['display']                                                      # uint8 [rows, cols], shadows down
 
 Resolution first. The header and a few hundred of the per-pulse parameters give the collection geometry, the band
-and the tasked area; no sample is read for it. The picture is the tasked area's bounding rectangle on a slant-plane
-grid whose range axis is the mid-aperture line of sight, with pixels of one size on the ground along the ground
-range direction and across it: size pixels along its longer side, or pixels of 0.96 times the resolution asked for.
-That pixel is 0.96 of the reciprocal of the band on each axis, the library's sampling of a complex image, so the cut
-is the central run of frequency samples and the central run of pulses with those bands, never more than the
-collection holds. Contiguous runs keep the sample and pulse spacings, and with them the unambiguous extents; a
-picture is cut to 0.92 of those extents where the tasked area is larger. The picture stays on the slant plane: it is
-the ground sheared by the plane's twist (zero at broadside, tens of degrees for a squinted look at a steep grazing
-angle), and the product gives that angle.
+and the tasked area; no sample is read for it. The picture is the tasked area on the ground, on the grid of
+form_cphd(axes='los'): the range axis along the mid-aperture line of sight projected on the ground, square pixels,
+size of them along the longer side, or pixels of 0.96 times the resolution asked for ('full': the finest the
+collection holds on both axes). That pixel is 0.96 of the reciprocal of the band on each axis, the library's
+sampling of a complex image, so the cut is the central run of frequency samples and the central run of pulses with
+those bands, never more than the collection holds. Contiguous runs keep the sample and pulse spacings, and with
+them the unambiguous extents; a picture is cut to 0.92 of those extents where the tasked area is larger. The grid
+is on the ground because a slant plane is twisted about the line of sight (tens of degrees for a squinted look at
+a steep grazing angle): a rectangle of it that holds the scene spans more Doppler than the pulse rate leaves
+unambiguous, while each range line of the scene does not.
 
 Only those pulses and samples are read (io.read_cphd's pulses= and samples=), and the cut history is formed by polar
 format in stages whose cost follows the picture, not the collection:
@@ -38,13 +40,20 @@ image is within -40 dB of exact backprojection of the same history at the sizes 
 resolution on a scene of several kilometers it falls to -13 to -23 dB at the corners, as form_image(algorithm='pfa')
 does. _corner_error estimates that from the geometry; the product carries it and a note says so past -30 dB.
 
-Devices. 'cpu': scipy's FFTs on all cores, every one along the rows of its array (the arrays are turned between
-the stages), and the C++ kernels of quicklook_cpu.cpp, which read their weights from polyphase tables. 'cuda': the
-same stages in CuPy with the CUDA kernels of polar format (pfa2.py: the range resampling and the final gather) and
-one more for the uneven pulse spacing; the history is windowed and gated on the device in blocks of pulses. 'jax'
-and 'tpu': polar format's resampling steps are gathers, slow on a TPU's vector unit, so the same cut history is
-formed on the same grid by the factorized former (ImageFormer; precision 'single-pass' on a TPU), and a note says
-so. 'auto': the device that forms the cut soonest, by its size (the AUTO_ thresholds below).
+The stages take any pair of grid axes (_geometry): the raster's wavenumbers are the components of the samples'
+along them. On the ground under a twisted slant plane the band of a pulse drifts along the aperture and the samples
+fill a sheared part of the raster; each pulse is then resampled on its own rows, the rows fold into the transform's
+period, and the final kernel reads along the shear. A collection that lacks pulses of its evenly timed sequence is
+formed with each pulse at its place (_places).
+
+Devices, each with the stages written for it. 'cpu': scipy's FFTs on all cores, every one along the rows of its
+array (the arrays are turned between the stages), and the C++ kernels of quicklook_cpu.cpp, which read their
+weights from polyphase tables. 'cuda' (_pfa_cuda): the history goes up in blocks of pulses through page-locked
+buffers while the device works on the block before, each pass that is not a transform is one CUDA kernel, and
+every stage works in blocks sized from the device's free memory; the arrays that do not fit stay on the host and
+cross in blocks. 'jax' and 'tpu' (quick_jax.py): compiled programs over blocks of one shape, in float32 with every
+complex array as two planes. 'auto': the device that forms the cut soonest, by its size (the AUTO_ thresholds
+below).
 
 A moving-beam collection (stripmap, sliding spotlight) is refused: polar format assumes one scene reference point,
 and a moving beam's azimuth resolution is set per pixel by the processed Doppler band, not by a run of pulses, so
@@ -76,9 +85,10 @@ PHASES = 2048                 # fractional positions per sample in the host kern
 # device repays from 2.5e8 samples. (tests/bench_quicklook.py measures both backends on another machine.)
 AUTO_CUDA_SAMPLES = 10_000_000
 AUTO_CUDA_FIRST_SAMPLES = 250_000_000
-# On a TPU host the C++ polar format on the host's cores is taken below this size and the device from it on. Not
-# measured: no TPU was at hand (tests/bench_tpu_blocks.py times both sides on one); set above the collections of
-# this class until it is, since the device's program is compiled for each cut.
+# On a TPU host the C++ polar format on the host's cores is taken below this size and the device from it on.
+# Measured on a v6e VM (44 vCPUs) at 2.2e8 samples, the Panama image from the arrays in memory: 1.27 s on the cores,
+# 1.72 s on the device (quick_jax._resident) after a first call of 106 s. No larger collection was measured there:
+# the threshold stays above the collections of this class.
 AUTO_TPU_SAMPLES = 4_000_000_000
 _LIB = []
 _POOL = []
