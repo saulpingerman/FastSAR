@@ -196,10 +196,189 @@ def _lib():
                 L.phase_ramp_from.restype = None
                 L.cphd_read.argtypes = [i, ctypes.c_longlong, i, n, n, n, n, n, p, i, p, p]
                 L.cphd_read.restype = ctypes.c_longlong
+                L.cphd_raw.argtypes = [i, ctypes.c_longlong, i, n, n, n, n, n, p, p, p]
+                L.cphd_raw.restype = ctypes.c_longlong
             except (RuntimeError, OSError, AttributeError):
                 L = None
         _LIB.append(L)
     return _LIB[0]
+
+
+class RawSignal:
+    """The signal array of a CPHD channel left in the file, for a device that converts it (the CUDA quick look):
+    what _read_cphd(device=True) returns as S in place of the complex64 array. The reader's passes over the samples
+    are recorded here instead of made: the per-vector scale, the conjugation, the rows it zeroes and its phase
+    ramps (the troposphere delay, the re-reference to one scene reference point), which are all linear in the
+    sample number and add up to one ramp per pulse. The device then takes the file's own integers or floats (half
+    the bytes of complex64 for 16-bit samples, a quarter for 8-bit ones), read in blocks into page-locked memory
+    while the block before goes up, and applies everything in one pass.
+
+    shape (pulses, samples) and dtype (complex64) are those of the array it stands for; S[rows] and S[rows, cols]
+    (slices) give a part; kind is the bytes of a sample's part in the file (1 or 2: big-endian integers; 4:
+    big-endian floats); scale() -> float32 [pulses] or None, conj, and phase() -> (ph0, ph1) [pulses] in cycles
+    (sample k of pulse p is to be multiplied by exp(2 pi j (ph0[p] + k ph1[p])), after the scale and the conjugation)
+    say what the conversion is; read(first, n, address) copies n pulses of the part as the file holds them to a
+    buffer and notes the rows that hold nothing in empty; load() -> the complex64 array as the host converts it,
+    by the host's own passes in their order (a fallback, and the reference of the tests)."""
+
+    dtype = np.dtype(np.complex64)
+
+    def __init__(self, path, offset, kind, Kfile, p0, P, k0, K, amp):
+        self.path, self.offset, self.kind, self.Kfile = path, int(offset), int(kind), int(Kfile)
+        self.window = (int(p0), int(P), int(k0), int(K))      # the file's rows and samples the host would read
+        self.rows, self.cols = (0, int(P)), (0, int(K))       # the part of them this object is
+        self.amp = None if amp is None else np.ascontiguousarray(amp, np.float32)
+        self.keep = None                                      # False for the rows zeroed
+        self.conj = False
+        self.ramps = []                                       # _phase_rows' arguments, in the order they came
+        self.ph0, self.ph1 = np.zeros(int(P)), np.zeros(int(P))          # cycles, by sample of the window
+        self.empty = np.zeros(int(P), np.uint8)
+        self._fd = None
+
+    @property
+    def shape(self):
+        return self.rows[1] - self.rows[0], self.cols[1] - self.cols[0]
+
+    @property
+    def itemsize(self):
+        return 2 * self.kind
+
+    @property
+    def nbytes(self):
+        return self.shape[0] * self.shape[1] * self.itemsize
+
+    def __getitem__(self, key):
+        key = key if isinstance(key, tuple) else (key, slice(None))
+        if len(key) != 2 or not all(isinstance(k, slice) and k.step in (None, 1) for k in key):
+            raise IndexError('a RawSignal takes S[rows] or S[rows, cols] with plain slices; load() gives the array')
+        out = RawSignal.__new__(RawSignal)
+        out.__dict__.update(self.__dict__)
+        (ra, rb, _), (ca, cb, _) = key[0].indices(self.shape[0]), key[1].indices(self.shape[1])
+        out.rows = (self.rows[0] + ra, self.rows[0] + max(ra, rb))
+        out.cols = (self.cols[0] + ca, self.cols[0] + max(ca, cb))
+        return out
+
+    def _whole(self):
+        if (self.rows, self.cols) != ((0, self.window[1]), (0, self.window[3])):
+            raise ValueError('the reader\'s passes apply to the whole of a RawSignal, before a part is taken')
+
+    def conjugate(self):
+        self._whole()
+        self.conj = not self.conj
+
+    def zero(self, rows):
+        """Zero the rows of a boolean mask (the pulses a reader drops)."""
+        self._whole()
+        self.keep = ~np.asarray(rows, bool) if self.keep is None else self.keep & ~np.asarray(rows, bool)
+
+    def ramp(self, coef, sign, linear, first, total):
+        """_phase_rows(S, ., coef, sign, linear=linear, first=first, total=total), recorded."""
+        self._whole()
+        P = self.window[1]
+        c = sign * np.asarray(coef, np.float64)
+        l0, l1 = (np.broadcast_to(np.asarray(v, np.float64), (P,)) for v in linear)
+        self.ph0 = self.ph0 + c * l0 + first * (c * l1)
+        self.ph1 = self.ph1 + c * l1
+        self.ramps.append((np.array(coef, np.float64), sign, (np.array(l0), np.array(l1)), int(first), total))
+
+    def scale(self):
+        """The factor of each pulse of this part (the file's AmpSF, 0 for a row zeroed), float32, or None for 1."""
+        if self.amp is None and self.keep is None:
+            return None
+        g = np.ones(self.window[1], np.float32) if self.amp is None else self.amp.copy()
+        if self.keep is not None:
+            g[~self.keep] = 0
+        return g[self.rows[0]:self.rows[1]]
+
+    def phase(self):
+        """(ph0, ph1) [pulses] of this part, in cycles: sample k of pulse p times exp(2 pi j (ph0[p] + k ph1[p]))."""
+        r = slice(*self.rows)
+        a = self.ph0[r] + self.cols[0] * self.ph1[r]
+        return a - np.floor(a), self.ph1[r].copy()
+
+    def open(self):
+        import os
+        if self._fd is None:
+            self._fd = os.open(self.path, os.O_RDONLY)
+            if self.window[3] < self.Kfile and hasattr(os, 'posix_fadvise'):    # rows apart in the file
+                os.posix_fadvise(self._fd, 0, 0, os.POSIX_FADV_RANDOM)
+        return self
+
+    def close(self):
+        import os
+        if self._fd is not None:
+            os.close(self._fd)
+            self._fd = None
+
+    def read(self, first, n, address):
+        """The pulses first .. first + n - 1 of this part as the file holds them, to the buffer at `address`
+        (n times the samples times itemsize bytes); the rows that convert to zeros are noted in empty. With the
+        file open (open(); else it is opened for this call)."""
+        import os
+        mine = self._fd is None
+        self.open()
+        try:
+            p0, _, k0, _ = self.window
+            r, K = self.rows[0] + first, self.shape[1]
+            got = _lib().cphd_raw(self._fd, self.offset, self.kind, self.Kfile, p0 + r, n, k0 + self.cols[0], K,
+                                  None if self.amp is None else self.amp.ctypes.data + 4 * r, address,
+                                  self.empty.ctypes.data + r)
+        finally:
+            if mine:
+                self.close()
+        if got != n * K * self.itemsize:
+            raise ValueError(f'{self.path}: reading pulses {p0 + r} to {p0 + r + n - 1} of the signal array failed: '
+                             + (os.strerror(int(-got)) if got < 0 else f'{got} of {n * K * self.itemsize} bytes read'))
+
+    def load(self):
+        """The complex64 array this stands for, converted on the host by the reader's own passes."""
+        import os
+        from .patches import _rows
+        p0, P, k0, K = self.window
+        S, flags = np.empty((P, K), np.complex64), np.zeros(P, np.uint8)
+        fd = os.open(self.path, os.O_RDONLY)
+        try:
+            got = _lib().cphd_read(fd, self.offset, self.kind, self.Kfile, p0, P, k0, K,
+                                   None if self.amp is None else self.amp.ctypes.data, 0, S.ctypes.data, flags.ctypes.data)
+        finally:
+            os.close(fd)
+        if got != P * K * self.itemsize:
+            raise ValueError(f'{self.path}: reading the signal array failed: '
+                             + (os.strerror(int(-got)) if got < 0 else f'{got} of {P * K * self.itemsize} bytes read'))
+        self.empty[:] = flags
+        if self.conj:
+            def conj(sl):
+                np.conjugate(S[sl], out=S[sl])
+            _rows(conj, P, int(max(1, min(256, (1 << 21) // max(K, 1)))))
+        if self.keep is not None:
+            S[~self.keep] = 0
+        for coef, sign, linear, first, total in self.ramps:
+            _phase_rows(S, None, coef, sign, linear=linear, first=first, total=total)
+        if (self.rows, self.cols) != ((0, P), (0, K)):
+            S = np.ascontiguousarray(S[self.rows[0]:self.rows[1], self.cols[0]:self.cols[1]])
+        return S
+
+
+def _raw_signal(direct, sel, v03, sicd, Kfile, pa, P, ka, K, posbad):
+    """The signal array left in the file for a device (RawSignal), or the reason the host converts it: (raw, None)
+    or (None, why)."""
+    if v03:
+        return None, 'a CPHD 0.3 file'
+    if sicd is not None or not sel:
+        return None, 'the whole array is read, or it is moved onto a SICD grid'
+    lib = _lib()
+    if direct is None or lib is None or not hasattr(lib, 'cphd_raw'):
+        return None, 'the signal array cannot be read in place (it is compressed, or the compiled reader is missing)'
+    sig, amp = direct
+    if sig.dtype.itemsize not in (1, 2, 4):
+        return None, f'samples of {2 * sig.dtype.itemsize} bytes'
+    raw = RawSignal(sig.filename, sig.offset, sig.dtype.itemsize, Kfile, pa, P, ka, K, amp)
+    ends = np.empty((2, K * raw.itemsize), np.uint8)
+    for i, p in enumerate((0, P - 1)):                        # the two pulses that decide what is trimmed
+        raw.read(p, 1, ends[i].ctypes.data)
+    if posbad[0] or posbad[-1] or raw.empty[0] or raw.empty[P - 1]:
+        return None, 'the first or the last pulse read holds no samples or no valid position, and the ends are trimmed'
+    return raw, None
 
 
 def _phase_rows(S, f, coef, sign, linear=None, first=0, total=None):
@@ -213,6 +392,9 @@ def _phase_rows(S, f, coef, sign, linear=None, first=0, total=None):
     pass then gives each sample the value it has in the pass over the whole row, also in the last block of 16 when
     the selection ends inside it."""
     from .patches import _rows_with
+    if isinstance(S, RawSignal):                   # left in the file: the ramp is the device's
+        S.ramp(coef, sign, linear, first, total)
+        return S
     c = sign * 2 * np.pi * np.asarray(coef, np.float64)
     P, K = S.shape
     lib = _lib() if linear is not None and S.dtype == np.complex64 and S.flags.c_contiguous else None
@@ -336,11 +518,11 @@ def _assemble(S, tx, rcv, srp, f0, df, notes, sicd, meta, info, first=0, keep=No
     shift = (origin - s0) @ R.T
     if np.abs(shift).max() > 0:
         ref1 = 0.5 * (np.linalg.norm(tx - origin, axis=1) + np.linalg.norm(rcv - origin, axis=1))
-        S = rereference(S, f0, df, cur_ref - ref1, first)
+        S = rereference(S.load() if isinstance(S, RawSignal) else S, f0, df, cur_ref - ref1, first)
         cur_ref = ref1
         notes.append(f'grid origin moved {np.linalg.norm(shift):.2f} m from the scene reference point onto the SICD pixel grid')
     if keep is not None and tuple(keep) != (0, K):                 # the samples asked for, of those read
-        S = np.ascontiguousarray(S[:, keep[0]:keep[1]])
+        S = S[:, keep[0]:keep[1]] if isinstance(S, RawSignal) else np.ascontiguousarray(S[:, keep[0]:keep[1]])
     k0 = first + (0 if keep is None else keep[0])
     out = dict(S=S, ant=(apc - origin) @ R.T, fmin=f0 + k0 * df if k0 else f0, df=df)
     if sicd is not None:
@@ -441,7 +623,11 @@ def _cphd_channel(r, m, v03, channel):
 
 
 def _read_cphd(cphd, sicd, channel, meta, regrid_tol, drop_flagged, troposphere, phase_sign, ref_freq, pulses=None,
-               samples=None, reader=None):
+               samples=None, reader=None, device=False):
+    """read_cphd's work. device: the samples are for a device that converts them itself: S is then a RawSignal, the
+    array left in the file with the passes the reader would have made over it, wherever those passes are ones a
+    device makes in one (see RawSignal); where they are not (the per-pulse frequency grids are resampled, the ends
+    of the aperture are trimmed, a CPHD 0.3 or compressed array), S is the host's array as ever and a note says why."""
     r = _open_cphd(cphd) if reader is None else reader
     m = r.cphd_meta
     # CPHD 0.3 (the pre-standard NGA format) keeps the per-vector positions and times under the 1.x names but sizes
@@ -509,11 +695,18 @@ def _read_cphd(cphd, sicd, channel, meta, regrid_tol, drop_flagged, troposphere,
             read_rows = _cphd03_channel(r, m, arrays, channel, (pa, pb), (ka, kb))[1]
     # read in pulse blocks into one complex64 array; every later step works in place on blocks of rows, so the
     # reader needs about the history's complex64 size (a 16.5 GB ICEYE file needed over 128 GB with whole-array steps)
-    S = np.empty((P, K), np.complex64)
     direct = None if v03 else _cphd1_samples(r, m, channel, pv if sel else None)
     loaded = None
     signal_bytes = None
-    if sel and direct is not None:
+    raw, on_host = None, None
+    if device:
+        ends = ~np.isfinite(tx[[0, -1]]).all(1) | ~np.isfinite(rcv[[0, -1]]).all(1) | ~np.isfinite(srp[[0, -1]]).all(1)
+        raw, on_host = _raw_signal(direct, sel, v03, sicd, Kfile, pa, P, ka, K, ends)
+    S = np.empty((P, K), np.complex64) if raw is None else raw
+    if raw is not None:
+        signal_bytes = P * K * raw.itemsize
+        loaded = np.zeros(P, np.uint8)              # (rows without samples between the ends are counted as they go up)
+    elif sel and direct is not None:
         # a part of the array: its bytes alone are asked of the file (pread on all cores), or, without the compiled
         # pass, taken through the memory map
         import os
@@ -566,6 +759,8 @@ def _read_cphd(cphd, sicd, channel, meta, regrid_tol, drop_flagged, troposphere,
             p1 = min(P, p0 + 2048)
             S[p0:p1] = read_rows(p0, p1)
     notes = (['CPHD 0.3 file'] if v03 else []) + ref_note
+    if on_host:
+        notes.append(f'the samples were converted on the host, not on the device: {on_host}')
     coll = m.CollectionInfo if v03 else m.CollectionID
     sgn = phase_sign
     if sgn is None:
@@ -591,7 +786,10 @@ def _read_cphd(cphd, sicd, channel, meta, regrid_tol, drop_flagged, troposphere,
                 blk[nonfinite] = 0
             empty[sl] = ~blk.view(np.float32).any(axis=1)
     from .patches import _rows
-    if loaded is None or sgn > 0:
+    if raw is not None:
+        if sgn > 0:
+            raw.conjugate()
+    elif loaded is None or sgn > 0:
         _rows(clean, P, int(max(1, min(256, (1 << 21) // max(K, 1)))))
     if loaded is not None:
         empty[:] = loaded != 0
@@ -615,7 +813,9 @@ def _read_cphd(cphd, sicd, channel, meta, regrid_tol, drop_flagged, troposphere,
         notes.append(f'{int(empty.sum())} interior pulses have no samples')
     P = len(tx)
     if flagged.any():
-        if drop_flagged:
+        if drop_flagged and isinstance(S, RawSignal):
+            S.zero(flagged)
+        elif drop_flagged:
             S[flagged] = 0
         notes.append(f'{int(flagged.sum())} pulses flagged SIGNAL=0 (not normal): ' + ('zeroed' if drop_flagged else 'kept'))
     if troposphere not in (None, True, False, 'model'):
@@ -663,6 +863,12 @@ def _read_cphd(cphd, sicd, channel, meta, regrid_tol, drop_flagged, troposphere,
     # u - k is linear in k for each pulse, so its largest magnitude is at the first or the last sample
     a_, b_ = (f0 - sc0) / scss, df / scss - 1.0
     shift = float(np.maximum(np.abs(a_), np.abs(a_ + (Kfile - 1) * b_)).max())
+    if shift > regrid_tol and isinstance(S, RawSignal):
+        S = S.load()
+        notes.append('the samples were converted on the host, not on the device: the per-pulse frequency grids are '
+                     'resampled')
+        if raw.empty.any():
+            notes.append(f'{int(raw.empty.sum())} interior pulses have no samples')
     if shift > regrid_tol and sel:              # in the file's sample numbers, from the samples read
         _sinc_regrid(S, lambda sl: (f0 + np.arange(ka, ka + K)[None, :] * df - sc0[sl, None]) / scss[sl, None], out=S,
                      first=ka, total=Kfile)

@@ -132,3 +132,57 @@ extern "C" long long cphd_read(int fd, long long off, int kind, long Kf, long p0
   });
   return err.load() ? -(long long)err.load() : total.load();
 }
+
+// The same part of the signal array as the file holds it, for a device that converts it: the rows p0 .. p0 + P - 1
+// and of each the samples k0 .. k0 + K - 1, copied into out [P, K, 2] in the file's own sample type and byte order
+// (pread on the worker threads, as cphd_read asks for them, straight into out: a page-locked buffer the device
+// reads). empty[p]: the row converts to zeros, as cphd_load finds it with the rows' scales amp (or null); a row is
+// looked at up to its first sample that does not, the first sample of nearly every row. -> the bytes read, or the
+// negative errno of a read that failed (-EIO when the file ends before the selection does).
+extern "C" long long cphd_raw(int fd, long long off, int kind, long Kf, long p0, long P, long k0, long K,
+                              const float* amp, unsigned char* out, unsigned char* empty)
+{
+  const long long isz = 2LL * kind, rowb = K * isz;
+  const long rows = (long)std::min<long long>(256, std::max<long long>(1, (2LL << 20) / rowb));
+  std::atomic<long long> total(0);
+  std::atomic<int> err(0);
+  par::for_dynamic((P + rows - 1) / rows, 1, [&](long blk) {
+    const long r0 = blk * rows, nr = std::min(P, r0 + rows) - r0;
+    if (err.load()) return;
+    unsigned char* dst = out + r0 * rowb;
+    const long calls = K == Kf ? 1 : nr;                      // whole rows lie end to end in the file
+    const long long each = K == Kf ? nr * rowb : rowb;
+    for (long c = 0; c < calls; ++c) {
+      long long at = off + ((long long)(p0 + r0 + c) * Kf + k0) * isz, done = 0;
+      while (done < each) {
+        const ssize_t n = pread(fd, dst + c * each + done, (size_t)(each - done), (off_t)(at + done));
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) { err.store(n < 0 ? errno : EIO); return; }
+        done += n;
+      }
+    }
+    total += nr * rowb;
+    for (long r = 0; r < nr; ++r) {
+      const float g = amp ? amp[r0 + r] : 1.f;
+      const unsigned char* s = dst + r * rowb;
+      bool any = false;
+      for (long k = 0; k < K && !any; ++k) {
+        float re, im;
+        if (kind == 4) {
+          uint32_t a, b;
+          std::memcpy(&a, s + 8 * k, 4); std::memcpy(&b, s + 8 * k + 4, 4);
+          a = __builtin_bswap32(a); b = __builtin_bswap32(b);
+          std::memcpy(&re, &a, 4); std::memcpy(&im, &b, 4);
+        } else if (kind == 2) {
+          uint16_t a, b;
+          std::memcpy(&a, s + 4 * k, 2); std::memcpy(&b, s + 4 * k + 2, 2);
+          re = (float)(int16_t)__builtin_bswap16(a); im = (float)(int16_t)__builtin_bswap16(b);
+        } else { re = (float)(int8_t)s[2 * k]; im = (float)(int8_t)s[2 * k + 1]; }
+        re *= g; im *= g;
+        any = std::isfinite(re) && std::isfinite(im) && (re != 0.f || im != 0.f);
+      }
+      empty[r0 + r] = !any;
+    }
+  });
+  return err.load() ? -(long long)err.load() : total.load();
+}
