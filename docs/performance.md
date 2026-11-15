@@ -85,8 +85,8 @@ leaves JAX's settings alone. A cache the user configured (`JAX_COMPILATION_CACHE
 `jax.config.update('jax_compilation_cache_dir', ...)` before FastSAR's first JAX program) is used as it is. It is
 settled at FastSAR's first JAX program in a process and then holds every program the process compiles in more
 than a second (`jax_persistent_cache_min_compile_time_secs`), and the polar format stages' programs whatever their
-compile time. On a TPU v6e the 23 programs of the Panama image take 11 MB there, and a second process loads them in
-0.7 s: its first image takes 2.8 s, against 19.3 s with an empty cache. The directory may be deleted at any time.
+compile time. On a TPU v6e the 30 programs of the Panama image take 11 MB there, and a second process loads them in
+0.7 s: its first image takes 2.7 s, against 19.3 s with an empty cache. The directory may be deleted at any time.
 
 In a mosaic the range profiles are computed once and stay in GPU memory on `cuda` when they fit, with the range gate
 on the GPU. While one patch forms, worker threads prepare the next ones. The CPU uses one thread, since its
@@ -488,11 +488,11 @@ planes); the others stay on the host and cross in blocks, with a note.
 
 | Image, from the history in memory to the complex image on the host | v6e, s | v5e, s | Host's cores, s |
 |---|---|---|---|
-| Panama, 12,207 by 8,808 pixels: later calls | 1.36 | 2.16 | 1.28 (44), 1.8 (24) |
-| Panama: first call of a process, empty cache / warm cache | 19.3 / 2.8 | 27.8 / 3.7 | |
-| Capella slant grid, 19,092 by 13,216 pixels: later calls | 6.0 | 9.35 | 4.3 (44), 6.7 (24) |
-| Capella slant grid: first call, empty cache / warm cache | 34.0 / 7.4 | 44.9 / 10.9 | |
-| Capella quick look on the ground, 13,216 by 13,216 pixels: later calls / first call | 6.2 / 30.2 | | 6.2 (44) |
+| Panama, 12,207 by 8,808 pixels: later calls | 1.39 to 1.49 | 2.18 | 1.28 (44), 1.8 (24) |
+| Panama: first call of a process, empty cache / warm cache | 19.3 / 2.7 | 25.7 / 3.7 | |
+| Capella slant grid, 19,092 by 13,216 pixels: later calls | 6.1 | 9.3 | 4.3 (44), 6.7 (24) |
+| Capella slant grid: first call, empty cache / warm cache | 31.6 / 7.6 | 38.0 / 11.1 | |
+| Capella quick look on the ground, 13,216 by 13,216 pixels: later calls / first call | 6.0 / 29.3 | | 4.8 (44) |
 
 The v6e and the v5e are one chip each, on hosts of 44 and 24 vCPUs; the host's cores run the C++ stages. The
 device's images are the C++ stages' to -68.9 dB (Panama) and -69.1 dB (Capella). On the v6e the Panama image's
@@ -510,14 +510,15 @@ in 2 to 4 s and run as fast. Transforms of many rows: 2,688 rows of 18,432 sampl
 long as the whole and compiles in 2.6 s instead of 11.1 s. The stages transform in chunks of 16 rows
 (`quick_jax.CHUNK`) and read in chunks of at most 128 rows (`quick_jax.DENSE_ROWS`, which also runs the read
 along the columns faster: 1.6 ms against 2.6 ms for 1,088 rows). Seconds of the first calls by program on the
-v6e, Panama, before and after: the read along the columns 54.6 and 2.3, along the rows 15.2 and 2.3, the azimuth
-stage 16.4 and 2.7, the range stage 9.7 and 2.1, the azimuth transform 8.5 and 1.2, the range transform 8.3 and
-1.0; all 23 programs 107 and 17. JAX's persistent compilation cache keeps them for the next process (see
+v6e, Panama, before and after: the read along the columns 54.6 and 2.4, along the rows 15.2 and 2.3, the azimuth
+stage 16.4 and 2.7, the range stage 9.7 and 2.2, the azimuth transform 8.5 and 1.2, the range transform 8.3 and
+1.0, the joins of the large arrays' blocks 1.1 and (written in place) 0.8; all programs 107 and 17. The Capella
+image's take 25 s on the v6e (the azimuth stage, at 40,960 samples, 5.3 s) and 28 s on the v5e. JAX's persistent compilation cache keeps them for the next process (see
 [Compiled programs](#compiled-programs)).
 
 Memory. The stages plan from the device's budget (nine tenths of what is not in use, `FASTSAR_JAX_BLOCK_MB`) and
 count four blocks of a stage's temporaries beside its arrays. On the v5e (16 GB, a budget of 15.2 GB and blocks of
-1.06 GB) the Panama image peaks at 4.6 GB and the Capella image at 11.1 GB, every array on the device; on the v6e
-at 4.9 and 14.7 GB (blocks of 2.1 GB). A 28,672 by 20,480 image (a history of 33,032 by 33,032 samples) keeps the
+1.06 GB) the Panama image peaks at 4.6 GB and the Capella image at 10.1 GB, every array on the device; on the v6e
+at 4.9 and 13.2 GB (blocks of 2.1 GB). A 28,672 by 20,480 image (a history of 33,032 by 33,032 samples) keeps the
 range stage's output and the raster's range transform on the host on the v5e, says so, and peaks at 6.6 GB; its
 later calls take 31 s.

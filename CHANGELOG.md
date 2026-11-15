@@ -37,7 +37,7 @@ was published on PyPI.
 - JAX's persistent compilation cache for FastSAR's programs: a directory `jax` beside the compiled CPU kernels
   (`FASTSAR_CACHE_DIR`), `FASTSAR_JAX_CACHE` to move it or `FASTSAR_JAX_CACHE=off`; a cache the user configured
   for JAX is kept. A second process loads the programs instead of compiling them: on a TPU v6e its first Panama
-  image takes 2.8 s instead of 19 s, its first Capella image 7.4 s instead of 34 s
+  image takes 2.7 s instead of 19 s, its first Capella image 7.6 s instead of 32 s
   ([docs/performance.md](docs/performance.md#compiled-programs)).
 - `examples/quicklook.py`: a quick look from the command line, with the time of each stage.
   `tests/bench_quicklook.py`: the times of full images and quick looks by backend and stage, as JSON.
@@ -60,18 +60,20 @@ was published on PyPI.
   `form_cphd` and `process_cphd` are bit for bit those of 0.3.0 on the CPU.
 - Polar format's stages on a TPU (`quicklook` and `form_image(algorithm='pfa')` on the `tpu` and `jax` backends)
   compile in a sixth of the time, and a process's first image no longer waits two minutes. On a TPU v6e the
-  Panama image's first call takes 19 s instead of 120 s, and a 252-megapixel Capella image's 34 s instead of
+  Panama image's first call takes 19 s instead of 120 s, and a 252-megapixel Capella image's 32 s instead of
   133 s. Two forms took the TPU's compiler long. The positions of a read fused with its weights: the final
   read along the columns compiled for 53 to 67 s and the azimuth stage for 15 s; the positions are now formed
   apart (2 to 4 s). Transforms of many rows: a transform's compile time grows with its rows (7 s for 2,688 rows
   of 18,432 samples, 0.8 s for 16), so the stages transform in a loop over chunks of 16 rows and read in chunks
   of at most 128 rows. A large array's blocks are written into their piece in place, not joined by a
-  concatenation (3 s to compile on a TPU v5e). Later images are faster too: 1.36 s instead of 1.61 s (Panama)
-  and 6.0 s instead of 6.6 s (Capella). The images are unchanged: -68.9 and -69.1 dB from the C++ stages.
+  concatenation (3 s to compile on a TPU v5e). Later images are faster too: 1.4 to 1.5 s instead of 1.6 s
+  (Panama) and 6.1 s instead of 6.2 to 6.7 s (Capella). The images are unchanged: -68.9 and -69.1 dB from the
+  C++ stages.
 - The memory plan of the stages on a JAX device counts four blocks of temporaries beside the arrays, not three:
-  the Capella image peaked at the arrays and 3.7 blocks on a TPU v5e. On the v5e's 16 GB the Panama and Capella
-  images keep every array on the device (peaks of 4.6 and 11.1 GB of a 15.2 GB budget); a 587-megapixel image
-  keeps two arrays on the host, with a note, and peaks at 6.6 GB.
+  with its pieces joined by concatenation the Capella image peaked at the arrays and 3.7 blocks on a TPU v5e, and
+  with its blocks written in place at 2.7. On the v5e's 16 GB the Panama and Capella images keep every array on
+  the device (peaks of 4.6 and 10.1 GB of a 15.2 GB budget); a 587-megapixel image keeps two arrays on the host,
+  with a note.
 
 ### Fixed
 
@@ -79,7 +81,7 @@ was published on PyPI.
   block of the raster's rows was cut out of the range stage's output by a gather that laid the whole array out
   anew on the device for every block, 22 ms a block of a 4.4 GB array. A block is now one slice of each piece of
   the array, the pulses of a piece written from a common first row. On a TPU v6e the 13,216 by 13,216 Capella
-  picture takes 6.2 s instead of 15.6 s (the host's 44 cores take 6.2 s), its cuts 0.3 s instead of 9.0 s.
+  picture takes 6.0 s instead of 15.6 s, its cuts 0.3 s instead of 9.0 s (the host's 44 cores take 4.8 s).
 
 ## [0.3.0] - 2026-11-14
 

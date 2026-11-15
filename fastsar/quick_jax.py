@@ -40,7 +40,7 @@ slower than blocks of 2 GB. So:
   weights of a read: the azimuth stage's parabolas compiled for 15 s, the final read's displacement polynomial
   for 53 s; an optimization barrier keeps the positions apart (2 to 3 s, the same run time). Transforms of many
   rows: the time grows with the rows (at 18,432 samples, 8 rows 0.5 s, 128 rows 8.6 s), so a stage transforms in
-  a loop over chunks of CHUNK rows, and reads in chunks of DENSE_ROWS. The Panama image's 23 programs compiled
+  a loop over chunks of CHUNK rows, and reads in chunks of DENSE_ROWS. The Panama image's programs compiled
   in 17 s on a v6e, 107 s before. JAX's persistent compilation cache (_xp.jax_cache) keeps them for the next
   process, which loads them in 0.7 s.
 
@@ -524,8 +524,9 @@ def _plan(sizes, budget, block):
     `block` bytes for a stage's own arrays: dict(A, B, F: True on the device; kept: the names of those on the
     host). A stage holds the array it reads, the one it writes and an eighth more (a piece and its block),
     and the temporaries of its programs, counted as four blocks; the largest go to the host first until what is
-    left fits. (The 252-megapixel Capella image peaked at 11.1 GB on a TPU v5e, blocks of 1.06 GB, and at 14.7 GB on
-    a v6e, blocks of 2.1 GB: the largest stage's arrays, 7.2 GB, and 3.7 and 3.6 blocks.)"""
+    left fits. (The 252-megapixel Capella image peaked at 10.1 GB on a TPU v5e, blocks of 1.06 GB, and at 13.2 GB on
+    a v6e, blocks of 2.1 GB: the largest stage's arrays, 7.2 GB, and 2.7 and 2.9 blocks; with its pieces joined by
+    concatenation, 3.7 and 3.6 blocks.)"""
     names = dict(A="the range stage's output", B='the raster', F="the raster's range transform")
     on = dict.fromkeys(sizes, True)
     if budget is not None:
