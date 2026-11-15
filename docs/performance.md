@@ -78,6 +78,16 @@ JAX. Range gates are planned the same way, and gates and pulse counts outside th
 Each patch's history is checked, scaled and uploaded on a worker thread (`ImageFormer.stage`). Without the program
 cache, the 2021 Capella stripmap mosaic on a v6e spent 19 s of 52 s rebuilding plan arrays.
 
+FastSAR's JAX programs are kept in JAX's persistent compilation cache, so a second process loads them from disk
+instead of compiling them. The cache is a directory `jax` beside the compiled CPU kernels (`FASTSAR_CACHE_DIR`,
+else `$XDG_CACHE_HOME/fastsar`, else `~/.cache/fastsar`). `FASTSAR_JAX_CACHE` moves it, and `FASTSAR_JAX_CACHE=off`
+leaves JAX's settings alone. A cache the user configured (`JAX_COMPILATION_CACHE_DIR` or
+`jax.config.update('jax_compilation_cache_dir', ...)` before FastSAR's first JAX program) is used as it is. It is
+settled at FastSAR's first JAX program in a process and then holds every program the process compiles in more
+than a second (`jax_persistent_cache_min_compile_time_secs`), and the polar format stages' programs whatever their
+compile time. On a TPU v6e the 30 programs of the Panama image take 11 MB there, and a second process loads them in
+0.7 s: its first image takes 2.7 s, against 19.3 s with an empty cache. The directory may be deleted at any time.
+
 In a mosaic the range profiles are computed once and stay in GPU memory on `cuda` when they fit, with the range gate
 on the GPU. While one patch forms, worker threads prepare the next ones. The CPU uses one thread, since its
 formation already uses every core; a GPU or TPU uses up to four, which would otherwise wait about 0.5 s per patch
@@ -229,6 +239,7 @@ megapixel from 35 to 1,155 Mpx.
 | `FASTSAR_RESAMPLE_JAX` | `blocks` on a TPU, `gather` on JAX's other devices | how `resample` interpolates a JAX image on a knot map (`planes.to_slant`, `planes.to_ground`): `gather` reads every tap with an indexed load, as the CPU and CUDA kernels do; `blocks` reads one window per block of output samples as a row of a table and moves the taps by selects, which a TPU does some fifty times faster |
 | `FASTSAR_REMAP_JAX` | `count` on a TPU, `histogram` on JAX's other devices | how the order statistics of a JAX image are found (`remap.nrl`, `remap.percentile`): from two histograms, or from counts of the pixels below thresholds; the same statistics either way |
 | `FASTSAR_CUDA_BLOCK_MB` | nine tenths of the free device memory, counting the unused blocks of CuPy's pool | megabytes of device memory the stages after formation count on, on the cuda backend: their blocks take a quarter of it at a time (at most 2048 MB), and `process_cphd` keeps on the host the images of a product that do not fit in it (see [Memory](#the-stages-after-formation-on-a-small-gpu)) |
+| `FASTSAR_JAX_CACHE` | `jax` in the kernel cache directory (`FASTSAR_CACHE_DIR`) | the directory of JAX's persistent compilation cache for FastSAR's programs, or `off`; a cache the user configured for JAX is kept (see [Compiled programs](#compiled-programs)) |
 | `FASTSAR_JAX_BLOCK_MB` | nine tenths of the device memory not in use, where the device reports it (a TPU; JAX on a CPU does not, and holds every image) | megabytes of JAX's device the stages after formation count on, on the jax and tpu backends: `process_cphd` keeps on the host the images of a product that do not fit (an image written on the device is there twice while its blocks are joined) and passes them through the device in blocks, with a note; a stage's own blocks take a quarter of it, at most 2048 (by default a sixteenth of the device's memory) |
 | `FASTSAR_FINAL` | `tc3` | `fp32` keeps the cuda float32 final stage on the CUDA cores instead of three bfloat16 tensor-core passes |
 
@@ -469,17 +480,45 @@ samples take 1 ms, of 29,160, 29,400 or 30,000 samples 67 ms; the stages take a 
 up to 243 there. A matrix product needs `Precision.HIGHEST` (the default leaves an error of 2e-3). A complex array
 crosses to the host 68 times slower than its two planes.
 
-The stages therefore keep every array on the device from the upload of the history (its own bytes, as pairs of
-float32) to the download of the image (two planes), read by window rows and products, and make the read at the
-apparent positions two passes, along the padded image's rows and then along its columns, with the positions
-formed on the device as the pixel's index plus the displacement polynomial in float32. The Panama image (12,207 by
-8,808 pixels, complex, from 15,186 pulses of 14,399 samples in memory to the image on the host) takes 1.72 s on
-the v6e: the upload 0.12 s, the range stage 0.28 s, the azimuth stage 0.26 s, the range transform 0.04 s, the
-padded azimuth transform and the read along the rows 0.49 s, the read along the columns with the carrier 0.33 s,
-the download 0.18 s. It is the C++ stages' image to -68 dB. The first call compiles for 106 s. The C++ stages on
-that VM's 44 cores take 1.27 s (range 0.20 s, azimuth 0.20 s, transforms 0.60 s, the read 0.22 s), so on a TPU
-host `backend='auto'` takes the host's cores (`quick.AUTO_TPU_SAMPLES`); `backend='tpu'` forms on the device.
-Blocks of 2 GB ran in 2 s and blocks of 4.6 GB in 100 s on the 32 GB device. This device-resident path takes a
-plain raster (no sheared rows, no missing pulses) that fits on the device; other formations run the same stages
-with the large arrays on the host, their blocks crossing, and indexed loads (21.7 s for the Panama image through
-JAX on 16 CPU threads; on a TPU that read is the slow one above). A TPU v5e was not measured.
+The stages therefore read by window rows and products, transform as two float32 planes, and make the read at
+the apparent positions two passes, along the padded image's rows and then along its columns, with the positions
+formed on the device as the pixel's index plus the displacement polynomial in float32. The arrays that fit stay on
+the device from the upload of the history (its own bytes, as pairs of float32) to the download of the image (two
+planes); the others stay on the host and cross in blocks, with a note.
+
+| Image, from the history in memory to the complex image on the host | v6e, s | v5e, s | Host's cores, s |
+|---|---|---|---|
+| Panama, 12,207 by 8,808 pixels: later calls | 1.39 to 1.49 | 2.18 | 1.28 (44), 1.8 (24) |
+| Panama: first call of a process, empty cache / warm cache | 19.3 / 2.7 | 25.7 / 3.7 | |
+| Capella slant grid, 19,092 by 13,216 pixels: later calls | 6.1 | 9.3 | 4.3 (44), 6.7 (24) |
+| Capella slant grid: first call, empty cache / warm cache | 31.6 / 7.6 | 38.0 / 11.1 | |
+| Capella quick look on the ground, 13,216 by 13,216 pixels: later calls / first call | 6.0 / 29.3 | | 4.8 (44) |
+
+The v6e and the v5e are one chip each, on hosts of 44 and 24 vCPUs; the host's cores run the C++ stages. The
+device's images are the C++ stages' to -68.9 dB (Panama) and -69.1 dB (Capella). On the v6e the Panama image's
+later calls spend 0.28 s in the range stage, 0.21 s in the azimuth stage, 0.03 s in the range transform and
+0.8 s in the padded azimuth transform and the two reads; the image comes to the host as it is made. The full
+quick look of a 9,035 by 117,843 sample Umbra collection (5,822 by 5,822 pixels) takes 1.8 s on the v6e and 2.4 s on
+its host's cores, but its first call 26 s. A process's first image is the host's, so on a TPU host `backend='auto'`
+takes the host's cores below `quick.AUTO_TPU_SAMPLES`; `backend='tpu'` forms on the device.
+
+Compilation. A first call is mostly compilation, and a TPU's compiler takes long over two forms that the stages
+avoid. The positions of a read fused with its weights: the read along the columns compiled for 53 s (Panama) and
+67 s (Capella), the azimuth stage for 15 s; with the positions formed apart (an optimization barrier) they compile
+in 2 to 4 s and run as fast. Transforms of many rows: 2,688 rows of 18,432 samples compile in 7.3 s, 16 rows in
+0.8 s, and a loop over chunks of 16 rows runs within 4% of the whole; at 40,960 samples the loop runs 1.5 times as
+long as the whole and compiles in 2.6 s instead of 11.1 s. The stages transform in chunks of 16 rows
+(`quick_jax.CHUNK`) and read in chunks of at most 128 rows (`quick_jax.DENSE_ROWS`, which also runs the read
+along the columns faster: 1.6 ms against 2.6 ms for 1,088 rows). Seconds of the first calls by program on the
+v6e, Panama, before and after: the read along the columns 54.6 and 2.4, along the rows 15.2 and 2.3, the azimuth
+stage 16.4 and 2.7, the range stage 9.7 and 2.2, the azimuth transform 8.5 and 1.2, the range transform 8.3 and
+1.0, the joins of the large arrays' blocks 1.1 and (written in place) 0.8; all programs 107 and 17. The Capella
+image's take 25 s on the v6e (the azimuth stage, at 40,960 samples, 5.3 s) and 28 s on the v5e. JAX's persistent compilation cache keeps them for the next process (see
+[Compiled programs](#compiled-programs)).
+
+Memory. The stages plan from the device's budget (nine tenths of what is not in use, `FASTSAR_JAX_BLOCK_MB`) and
+count four blocks of a stage's temporaries beside its arrays. On the v5e (16 GB, a budget of 15.2 GB and blocks of
+1.06 GB) the Panama image peaks at 4.6 GB and the Capella image at 10.1 GB, every array on the device; on the v6e
+at 4.9 and 13.2 GB (blocks of 2.1 GB). A 28,672 by 20,480 image (a history of 33,032 by 33,032 samples) keeps the
+range stage's output and the raster's range transform on the host on the v5e, says so, and peaks at 6.6 GB; its
+later calls take 31 s.

@@ -91,7 +91,16 @@ BACKENDS = ('auto', 'tpu', 'cuda', 'cpu', 'jax', 'metal')     # the values form_
 
 
 def _backend(backend):
-    """backend checked against BACKENDS and this machine, 'auto' resolved."""
+    """backend checked against BACKENDS and this machine, 'auto' resolved. On the jax and tpu backends JAX's
+    persistent compilation cache is settled (_xp.jax_cache) before the first program compiles."""
+    b = _resolved(backend)
+    if b in ('jax', 'tpu'):
+        from . import _xp
+        _xp.jax_cache()
+    return b
+
+
+def _resolved(backend):
     if backend not in BACKENDS:
         raise ValueError(f'unknown backend {backend!r}: one of {", ".join(map(repr, BACKENDS))}')
     if backend in ('cpu', 'jax'):            # no device probe (a mosaic builds a former per patch)

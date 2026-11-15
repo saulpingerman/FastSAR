@@ -856,8 +856,8 @@ def test_device_streams_what_does_not_fit(spot, steep, request, monkeypatch, meg
     assert quick_jax.plan(g)['kept'] == [] and not any('kept on the host' in n for n in look(spot['path'], size=128, backend='jax')['notes'])
     sizes = dict(A=4 << 30, B=2 << 30, F=5 << 30)
     assert quick_jax._plan(sizes, None, 1 << 30)['kept'] == [] and quick_jax._plan(sizes, 16 << 30, 2 << 30)['kept'] == []
-    assert quick_jax._plan(sizes, 13 << 30, 2 << 30)['kept'] == ["the raster's range transform"]
-    assert quick_jax._plan(sizes, 12 << 30, 2 << 30)['kept'] == ["the range stage's output", "the raster's range transform"]
+    assert quick_jax._plan(sizes, 15 << 30, 2 << 30)['kept'] == ["the raster's range transform"]
+    assert quick_jax._plan(sizes, 13 << 30, 2 << 30)['kept'] == ["the range stage's output", "the raster's range transform"]
     assert len(quick_jax._plan(sizes, 1 << 30, 1 << 28)['kept']) == 3
 
 
@@ -889,9 +889,63 @@ def test_device_programs_are_shared(spot, squinted, request, monkeypatch):
     assert quick_jax._ladder_down(1087) == 1024 and all(quick_jax._ladder(v) >= v for v in range(1, 5000, 7))
     monkeypatch.setenv('FASTSAR_JAX_PROGRAMS', 'fused')
     assert rel_db(quick._pfa(S, ant, f0, df, *grid, backend='jax'), ref) < -100
+    monkeypatch.delenv('FASTSAR_JAX_PROGRAMS')
+    monkeypatch.setattr(quick_jax, 'AT_ONCE', 0)              # every transform in a loop over chunks of rows
+    for c in (True, False):
+        e = rel_db(quick._pfa(S, ant, f0, df, *grid, correct=c, backend='jax'), quick._pfa(S, ant, f0, df, *grid, correct=c))
+        print(f'transforms in chunks of rows, corrected {c}: {e:.1f} dB against C++')
+        assert e < -70
     monkeypatch.setenv('FASTSAR_JAX_PROGRAMS', 'both')
     with pytest.raises(ValueError, match='FASTSAR_JAX_PROGRAMS'):
         quick._pfa(S, ant, f0, df, *grid, backend='jax')
+
+
+_CACHE_SCRIPT = '''
+import json, sys
+import jax
+hits = []
+jax.monitoring.register_event_listener(lambda name, **kw: hits.append(name))
+import fastsar
+from fastsar import _xp, quick_jax
+if sys.argv[2] == 'form':
+    fastsar.quicklook(sys.argv[1], size=96, backend='jax')
+print(json.dumps(dict(cache=_xp.jax_cache(), jax=jax.config.jax_compilation_cache_dir, compiled=len(quick_jax.COMPILED),
+                      hits=hits.count('/jax/compilation_cache/cache_hits'))))
+'''
+
+
+def test_device_programs_persist_between_processes(spot, tmp_path):
+    """JAX's persistent compilation cache: by default a directory beside the compiled CPU kernels, or
+    FASTSAR_JAX_CACHE; a second process loads every program of the polar format's stages from it, the short ones
+    too; a cache the user configured is kept, and FASTSAR_JAX_CACHE=off leaves JAX's settings alone."""
+    import json
+    import subprocess
+    import sys
+    script = tmp_path / 'cache_probe.py'
+    script.write_text(_CACHE_SCRIPT)
+    base = {k: v for k, v in os.environ.items() if not k.startswith(('JAX_COMPILATION_CACHE', 'FASTSAR_JAX_CACHE', 'FASTSAR_CACHE_DIR'))}
+    base.update(JAX_PLATFORMS='cpu', CUDA_VISIBLE_DEVICES='')
+
+    def run(what, **env):
+        out = subprocess.run([sys.executable, str(script), spot['path'], what], env=dict(base, **env), capture_output=True,
+                             text=True, timeout=600)
+        assert out.returncode == 0, out.stderr[-3000:]
+        return json.loads(out.stdout.strip().splitlines()[-1])
+    kernels = tmp_path / 'kernels'
+    d = run('none', FASTSAR_CACHE_DIR=str(kernels))
+    assert d['cache'] == d['jax'] == str(kernels / 'jax')
+    mine = tmp_path / 'mine'
+    first = run('form', FASTSAR_JAX_CACHE=str(mine))
+    files = sorted(p.name for p in mine.iterdir())
+    assert first['cache'] == str(mine) and first['hits'] == 0 and first['compiled'] > 5 and len(files) >= first['compiled']
+    second = run('form', FASTSAR_JAX_CACHE=str(mine))
+    print('programs of a quick look:', first['compiled'], 'compiled and written,', second['hits'], 'loaded by a second process')
+    assert second['compiled'] == first['compiled'] and second['hits'] >= first['compiled'] and sorted(p.name for p in mine.iterdir()) == files
+    users = tmp_path / 'users'
+    d = run('none', JAX_COMPILATION_CACHE_DIR=str(users), FASTSAR_JAX_CACHE=str(mine))
+    assert d['cache'] == d['jax'] == str(users)
+    d = run('none', FASTSAR_JAX_CACHE='off', FASTSAR_CACHE_DIR=str(kernels))
+    assert d['cache'] is None and d['jax'] is None
 
 
 def test_quicklook_on_jax(spot, squinted, request, monkeypatch):
@@ -1029,6 +1083,40 @@ def test_tpu(spot, squinted, steep, monkeypatch):
     out = fastsar.quicklook(spot['path'], size=128, backend='tpu', complex_image=True)
     assert out['algorithm'] == 'ffbp' and any('single-pass' in n for n in out['notes'])
     assert rel_db(out['image'], ref['image']) < -20
+
+
+@pytest.mark.tpu
+def test_tpu_holds_to_its_budget(monkeypatch):
+    """On a TPU held to less memory than a formation's arrays take (FASTSAR_JAX_BLOCK_MB), the device's peak stays
+    within it: the arrays that do not fit are kept on the host and cross in blocks, a note says so, and the image is
+    the C++ stages' and that of the device with room. (A TPU v5e, 16 GB, forms the 252-megapixel Capella image
+    within its own budget, 15.2 GB, with every array on the device: a peak of 11.1 GB.)"""
+    import math
+    import jax
+    from fastsar import _xp
+    dev = jax.devices('tpu')[0]
+    res, n = 0.5, 2048
+    col = sim.make_collect(res=res, scene=0.96 * res * n / (1.25 * math.sqrt(2.0)) * 1.2, r0=600e3, graze_deg=45.0)
+    P = col.Np
+    e2 = -col.ant[P // 2] / np.linalg.norm(col.ant[P // 2])
+    nrm = np.cross(e2, col.ant[P // 2 + 1] - col.ant[P // 2 - 1])
+    nrm *= np.sign(nrm[2]) / np.linalg.norm(nrm)
+    S = np.random.default_rng(0).standard_normal((P, col.K, 2), np.float32).view(np.complex64)[..., 0]
+    grid = (n, n, 0.96 * res, 0.96 * res, np.cross(e2, nrm), e2)
+    form = lambda backend, info=None: quick._pfa(S.copy(), col.ant, col.fmin, col.df, *grid, backend=backend, info=info, layout='formed')
+    ref = form('cpu')
+    before = dev.memory_stats()
+    monkeypatch.setenv('FASTSAR_JAX_BLOCK_MB', '120')
+    info = {}
+    held, budget = form('tpu', info), _xp.jax_budget()
+    peak = dev.memory_stats()['peak_bytes_in_use']
+    monkeypatch.delenv('FASTSAR_JAX_BLOCK_MB')
+    free = form('tpu')
+    print(f"held to {budget / 1e6:.0f} MB: peak {(peak - before['bytes_in_use']) / 1e6:.0f} MB beside what was in use, "
+          f"{rel_db(held, ref):.1f} dB against C++; {info.get('stream')}")
+    assert 'kept on the host' in info['stream'] and rel_db(held, ref) < -60 and rel_db(held, free) < -100
+    if before['peak_bytes_in_use'] < budget:                  # an earlier test's peak does not hide this one's
+        assert peak <= before['bytes_in_use'] + budget
 
 
 @pytest.mark.cuda

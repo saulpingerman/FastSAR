@@ -19,6 +19,9 @@ changes: environment variables and patched functions through monkeypatch, the st
 test_cphd.py through a module fixture, and JAX's CPU device (jax_platform_name in the scripts) through the jax_cpu
 fixture below, which also sets the default device, so the dense references stay on the CPU of a GPU or TPU host
 whatever ran before. `pytest -n 4 --dist loadfile` (pytest-xdist) runs modules in parallel worker processes.
+
+JAX's persistent compilation cache (fastsar._xp.jax_cache) is off unless FASTSAR_JAX_CACHE is set: the tests write
+no programs into the user's cache, and each run compiles what it times.
 """
 import importlib
 import os
@@ -29,6 +32,7 @@ import threading
 
 import pytest
 
+os.environ.setdefault('FASTSAR_JAX_CACHE', 'off')
 HARDWARE = ('cuda', 'tpu')
 REQUIRABLE = HARDWARE + ('io',)
 KILL_FACTOR = 1.5

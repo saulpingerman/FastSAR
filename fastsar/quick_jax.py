@@ -24,10 +24,10 @@ slower than blocks of 2 GB. So:
   bytes.
 
   Memory. The history is never on the device whole. Of the three large arrays (the range stage's output, the
-  raster, its range transform) those that fit stay on the device, in a few pieces that are joined as their blocks
-  come (never there twice); the others live on the host and their blocks cross (_plan). The read at the apparent
-  positions works in strips of the picture's rows, and the picture comes down strip by strip. Every block is sized
-  from _xp.jax_block() (at most 2 GB).
+  raster, its range transform) those that fit stay on the device, in a few pieces that their blocks are written
+  into as they come (never there twice); the others live on the host and their blocks cross (_plan). The read at
+  the apparent positions works in strips of the picture's rows, and the picture comes down strip by strip. Every
+  block is sized from _xp.jax_block() (at most 2 GB).
 
   Programs. A stage is a chain of three functions: the cut of a block out of the array before it (specific to
   that array's size), the block's layout for the stage (padding, signs, the fold), and the stage's work on a block
@@ -35,6 +35,14 @@ slower than blocks of 2 GB. So:
   transform lengths are few). FASTSAR_JAX_PROGRAMS=shared compiles the three separately, so collections of
   different sizes share the programs that take long to compile; 'fused' compiles a chain as one program. COMPILED
   lists what this process compiled and how long each first call took.
+
+  Compile time. A TPU's compiler takes long over two forms, and the stages avoid both. Positions fused with the
+  weights of a read: the azimuth stage's parabolas compiled for 15 s, the final read's displacement polynomial
+  for 53 s; an optimization barrier keeps the positions apart (2 to 3 s, the same run time). Transforms of many
+  rows: the time grows with the rows (at 18,432 samples, 8 rows 0.5 s, 128 rows 8.6 s), so a stage transforms in
+  a loop over chunks of CHUNK rows, and reads in chunks of DENSE_ROWS. The Panama image's programs compiled
+  in 17 s on a v6e, 107 s before. JAX's persistent compilation cache (_xp.jax_cache) keeps them for the next
+  process, which loads them in 0.7 s.
 
 Positions. A resampling position reaches tens of thousands of samples and must hold to a small part of a sample,
 more than float32 carries, and a TPU has no fast float64. Along a row the range positions are linear and the
@@ -57,6 +65,11 @@ _PROGRAMS = {}
 COMPILED = []                 # (name, key, seconds of the first call) of each program this process compiled
 _KAISER = {}
 SHEAR_TAPS, SHEAR_KAISER = 10, 7.2   # the kernel of the read at the apparent positions on a sheared raster
+AT_ONCE = 1 << 19             # values of rows a program transforms at once; beyond, in a loop over chunks (_by_rows)
+CHUNK = 16                    # rows of a chunk
+DENSE_ROWS = 128              # rows a read (_dense) takes at once; more in a loop over chunks of at most these (a v6e
+                              # compiled the read along the columns of 1,088 rows of 2,400 samples in 2.1 s and ran
+                              # it in 2.6 ms, in chunks of 128 rows 1.3 s and 1.6 ms)
 
 
 def _mode():
@@ -67,7 +80,7 @@ def _mode():
     return v
 
 
-def _program(name, key, make, detail=None):
+def _program(name, key, make, detail=None, donate=()):
     """The compiled program `name` for its static sizes `key`, kept between calls (the newest 256). Its first call
     is brought to completion and timed (COMPILED); with detail (a dict) every call is, and the seconds are added
     to detail[name]."""
@@ -75,16 +88,19 @@ def _program(name, key, make, detail=None):
     p = _PROGRAMS.get(k)
     if p is None:
         import jax
+        from . import _xp
+        _xp.jax_cache()
         if len(_PROGRAMS) >= 256:
             _PROGRAMS.pop(next(iter(_PROGRAMS)))
-        p = _PROGRAMS[k] = [jax.jit(make()), False]
+        p = _PROGRAMS[k] = [jax.jit(make(), donate_argnums=donate), False]
     if p[1] and detail is None:
         return p[0]
 
     def call(*args):
         import jax
+        from . import _xp
         t = time.perf_counter()
-        out = jax.block_until_ready(p[0](*args))
+        out = jax.block_until_ready(p[0](*args) if p[1] else _xp.jax_cache_call(p[0], *args))
         dt = time.perf_counter() - t
         if not p[1]:
             p[1] = True
@@ -204,7 +220,13 @@ def _dense(jnp, lax, xr, xi, ib, fr, Rw, taps, wpoly):
     parity), times the Kaiser window as a polynomial (wpoly, 16 taps) or the sinc window (None: its sine follows
     from the angle sum with constants of w). A tap outside the row counts as zero and the rest are normalised
     again; zero where the position lies outside (-0.5, n - 0.5): quicklook_cpu.cpp's ql_resample_rows, with the
-    weights at the position itself and not at the nearest of 2048 phases."""
+    weights at the position itself and not at the nearest of 2048 phases. The positions are formed apart from the
+    weights (an optimization barrier): a TPU compiles the two fused for 15 s (the azimuth stage's parabolas) to
+    53 s (the final read's displacement polynomial), apart for 2 to 3 s, and runs both alike."""
+    ib, fr = lax.optimization_barrier((ib, fr))
+    if xr.shape[0] > DENSE_ROWS:                  # an even share of at most DENSE_ROWS, a multiple of 8
+        c = _up(-(-xr.shape[0] // -(-xr.shape[0] // DENSE_ROWS)), 8)
+        return _chunks(jnp, lax, lambda *a: _dense(jnp, lax, *a, Rw, taps, wpoly), (xr, xi, ib, fr), c)
     R, n = xr.shape
     nblk, h = ib.shape[1] // BLOCK, taps // 2
     N = max(-(-n // STRIDE) * STRIDE, Rw)
@@ -238,6 +260,33 @@ def _dense(jnp, lax, xr, xi, ib, fr, Rw, taps, wpoly):
     return get(xr), get(xi)
 
 
+def _by_rows(jnp, lax, fn, xs, width):
+    """fn applied to the rows of the arrays xs ([R, ...] each) in chunks of CHUNK rows (the last padded), a loop
+    (lax.map) over them, where the rows hold more than AT_ONCE values of `width` samples: fn's outputs ([R, ...]
+    each). A TPU compiles a transform along the rows in a time that grows with their count until a few hundred, and
+    not evenly (a v6e at 18,432 samples: 8 rows 0.5 s, 16 rows 0.9 s, 128 rows 8.6 s, 2,688 rows 7.3 s; at 40,960
+    samples 1,536 rows 11.1 s, chunks of 8, 16 and 32 rows 4.0, 2.6 and 5.9 s). The loop over chunks of 16 rows
+    runs at 18,432 samples within 4% of the whole (5.1 ms against 4.9 ms at 2,688 rows), at 40,960 samples 1.5
+    times as long (17.5 ms against 11.9 ms at 1,536 rows); chunks of 8 rows run 1.2 and 3.3 times as long."""
+    R = int(xs[0].shape[0])
+    if R * width <= AT_ONCE:
+        return fn(*xs)
+    return _chunks(jnp, lax, fn, xs, CHUNK)
+
+
+def _chunks(jnp, lax, fn, xs, c):
+    """fn applied to the rows of the arrays xs in chunks of c rows (the last padded), a loop over them."""
+    R = int(xs[0].shape[0])
+    if R <= c:
+        return fn(*xs)
+    m = -(-R // c)
+    pad = m * c - R
+    if pad:
+        xs = [jnp.pad(x, ((0, pad),) + ((0, 0),) * (x.ndim - 1)) for x in xs]
+    out = lax.map(lambda a: fn(*a), tuple(x.reshape((m, c) + x.shape[1:]) for x in xs))
+    return tuple(o.reshape((m * c,) + o.shape[2:])[:R] for o in out)
+
+
 # ----------------------------------------------------------------------------------------------- a formation's run
 
 class _Run:
@@ -257,8 +306,8 @@ class _Run:
             self._lib = Q._lib()
         return self._lib
 
-    def program(self, name, key, make):
-        return _program(name, key, make, self.detail)
+    def program(self, name, key, make, donate=()):
+        return _program(name, key, make, self.detail, donate)
 
     def chain(self, parts):
         """parts: (name, key, fn, args) in order; each fn takes the outputs of the one before it, then its own
@@ -323,75 +372,80 @@ def _unpack(x):
 
 class _Device:
     """A large complex array [rows, width] on the device as two float32 planes, kept in at most GROUP pieces of
-    rows: its blocks (`per` rows each, the last moved back to end at the last row) are joined as they come, a
-    piece at a time, so the array is never on the device twice."""
+    rows (_pieces): its blocks (`per` rows each, the last moved back to end at the last row) are written into
+    their piece as they come, in place (a donated buffer), so the array is never on the device twice. (A join of a
+    piece's blocks by one concatenation compiled for 3 s on a TPU v5e where a piece held 109 blocks.)"""
     host = False
 
     def __init__(self, run, total, per, starts, width):
         self.run, self.total, self.per, self.width = run, total, per, width
         self.group = max(1, -(-len(starts) // GROUP))
-        self.pieces, self.waiting, self.done = [], [], 0
+        self.spans = _pieces(starts, per)
+        self.pieces, self.count = [], 0
 
     def put(self, r0, re, im):
-        self.waiting.append((r0, re, im))
-        if len(self.waiting) == self.group:
-            self._join()
+        import jax.numpy as jnp
+        from jax import lax
+        k, self.count = self.count // self.group, self.count + 1
+        first, end = self.spans[k]
+        rows, W, per = end - first, self.width, self.per
+        trim = max(0, first - r0)                     # rows of a block moved back that the piece before holds
+        if trim == 0 and r0 == first and rows == per:
+            self.pieces.append((re, im))
+            return
+        if len(self.pieces) == k:
+            new = self.run.program('piece', (rows, W), lambda: lambda: (jnp.zeros((rows, W), jnp.float32), jnp.zeros((rows, W), jnp.float32)))
+            self.pieces.append(new())
 
-    def _join(self):
-        trims = []
-        for r0, _, _ in self.waiting:
-            trims.append(self.done - r0)             # rows of a block moved back that the one before it holds
-            self.done = r0 + self.per
-        if len(self.waiting) == 1 and trims[0] == 0:
-            self.pieces.append(self.waiting[0][1:])
-        else:
-            n = len(trims)
-
-            def make(trims=tuple(trims)):
-                import jax.numpy as jnp
-
-                def run(*a):
-                    return (jnp.concatenate([x[t:] for x, t in zip(a[:n], trims)], 0),
-                            jnp.concatenate([x[t:] for x, t in zip(a[n:], trims)], 0))
-                return run
-            join = self.run.program('join', (self.per, self.width, tuple(trims)), make)
-            self.pieces.append(join(*(w[1] for w in self.waiting), *(w[2] for w in self.waiting)))
-        self.waiting = []
+        def make():
+            def run(br, bi, re, im, at):
+                return lax.dynamic_update_slice(br, re[trim:], (at, 0)), lax.dynamic_update_slice(bi, im[trim:], (at, 0))
+            return run
+        place = self.run.program('place', (rows, W, per, trim), make, donate=(0, 1))
+        self.pieces[k] = place(*self.pieces[k], re, im, np.int32(r0 + trim - first))
 
     def close(self):
-        if self.waiting:
-            self._join()
         self.rows = sum(int(p[0].shape[0]) for p in self.pieces)
         return self
 
     def cut(self, n, c0, shifts=None):
         """The chain's first part for the block of columns c0 .. c0 + n, turned: [n, rows]. shifts: int32 [rows],
-        row r holds the columns from shifts[r] * BLOCK on (a sheared raster's pulses, each on its own rows):
-        the block's columns are then read as blocks of BLOCK samples, zero where a row does not reach."""
+        row r holds the columns from shifts[r] * BLOCK on (a sheared raster's pulses, each on its own rows), the
+        same for the rows of a piece (_origins): a piece's block is then the columns from c0 - shifts * BLOCK, one
+        slice of it, zero where they lie beyond its columns. (A read of BLOCK samples a row, by a gather from the
+        piece seen as rows of BLOCK samples, turned that piece's layout on a TPU at every block: 22 ms a block of
+        a 4.4 GB array.)"""
         import jax.numpy as jnp
         from jax import lax
         npc, W = len(self.pieces), self.width
         sizes = tuple(int(p[0].shape[0]) for p in self.pieces)
+        Wn = max(W, n)
 
         def fn(*a):
             c = a[2 * npc]
             if shifts is None:
                 f = lambda p: lax.dynamic_slice_in_dim(p, c, n, 1)
                 return jnp.concatenate([f(p) for p in a[:npc]], 0).T, jnp.concatenate([f(p) for p in a[npc:2 * npc]], 0).T
-            sb, nwb, out = a[2 * npc + 1], W // BLOCK, []
+            org, out = a[2 * npc + 1], []
             for planes in (a[:npc], a[npc:2 * npc]):
-                parts, off = [], 0
-                for p, R in zip(planes, sizes):
-                    idx = c // BLOCK + jnp.arange(n // BLOCK, dtype=jnp.int32)[None, :] - sb[off:off + R, None]
-                    flat = jnp.arange(R, dtype=jnp.int32)[:, None] * nwb + jnp.clip(idx, 0, nwb - 1)
-                    v = p.reshape(R * nwb, BLOCK).at[flat].get(mode='promise_in_bounds')
-                    parts.append(jnp.where(((idx >= 0) & (idx < nwb))[..., None], v, 0.0).reshape(R, n))
-                    off += R
+                parts = []
+                for k, p in enumerate(planes):
+                    if Wn > W:
+                        p = jnp.pad(p, ((0, 0), (0, Wn - W)))
+                    t = c - org[k]
+                    tc = jnp.clip(t, 0, Wn - n)
+                    col = t + jnp.arange(n, dtype=jnp.int32)
+                    v = jnp.roll(lax.dynamic_slice_in_dim(p, tc, n, 1), tc - t, axis=1)
+                    parts.append(jnp.where(((col >= 0) & (col < W))[None, :], v, 0.0))
                 out.append(jnp.concatenate(parts, 0).T)
             return tuple(out)
         args = tuple(p[0] for p in self.pieces) + tuple(p[1] for p in self.pieces) + (np.int32(c0),)
         if shifts is not None:
-            args += (jnp.asarray(shifts),)
+            first = np.cumsum((0,) + sizes[:-1])
+            org = np.asarray(shifts, np.int64)[first]
+            if any(np.any(np.asarray(shifts[b:b + R]) != o) for b, R, o in zip(first, sizes, org)):
+                raise AssertionError('quick_jax: the rows of a piece of a sheared raster have different origins')
+            args += (jnp.asarray((org * BLOCK).astype(np.int32)),)
         return ('cut', (sizes, W, n, shifts is not None), fn, args)
 
 
@@ -432,18 +486,54 @@ class _Host:
         return ('unpack', (n, self.rows), _unpack, (x,))
 
 
+def _pieces(starts, per):
+    """The rows each piece of a _Device holds, [(first, end)], for its blocks of `per` rows at `starts`."""
+    group = max(1, -(-len(starts) // GROUP))
+    out, done = [], 0
+    for k in range(0, len(starts), group):
+        end = starts[min(k + group, len(starts)) - 1] + per
+        out.append((done, end))
+        done = end
+    return out
+
+
+def _origins(g, b1):
+    """A sheared raster's pulses on the rows of the range stage's output: row r (pulse r at its place) holds the
+    raster's rows from origin[r] * BLOCK on, the same origin for the rows of a piece of the array (_pieces): the
+    lowest first row of a pulse's band among them, so a block of the raster's rows is one slice of each piece.
+    -> (origin, int64 [max(Pp, rows of a block)]; spread: the most chunks of BLOCK rows between a piece's lowest
+    and highest pulse, which the array's width holds besides a band)."""
+    Pp, place = g['Pp'], g['place']
+    s = np.zeros(Pp, np.int64)
+    there = np.zeros(Pp, bool)
+    idx = np.arange(Pp) if place is None else np.asarray(place)
+    s[idx] = np.asarray(g['jlo'], np.int64) // BLOCK
+    there[idx] = True
+    origin = np.zeros(max(Pp, b1[0]), np.int64)
+    spread = 0
+    for b, e in _pieces(b1[2], b1[0]):
+        q = s[b:e][there[b:e]]
+        if len(q):
+            origin[b:e] = q.min()
+            spread = max(spread, int(q.max() - q.min()))
+    return origin, spread
+
+
 def _plan(sizes, budget, block):
     """Where the three large arrays live for a device with `budget` bytes to give (None: no limit known) and
     `block` bytes for a stage's own arrays: dict(A, B, F: True on the device; kept: the names of those on the
-    host). A stage holds the array it reads, the one it writes with one more piece of it while that is joined,
-    and three blocks; the largest go to the host first until what is left fits."""
+    host). A stage holds the array it reads, the one it writes and an eighth more (a piece and its block),
+    and the temporaries of its programs, counted as four blocks; the largest go to the host first until what is
+    left fits. (The 252-megapixel Capella image peaked at 10.1 GB on a TPU v5e, blocks of 1.06 GB, and at 13.2 GB on
+    a v6e, blocks of 2.1 GB: the largest stage's arrays, 7.2 GB, and 2.7 and 2.9 blocks; with its pieces joined by
+    concatenation, 3.7 and 3.6 blocks.)"""
     names = dict(A="the range stage's output", B='the raster', F="the raster's range transform")
     on = dict.fromkeys(sizes, True)
     if budget is not None:
         def peak():
             s = {k: sizes[k] if on[k] else 0 for k in sizes}
             g = 1.0 + 1.0 / GROUP
-            return max(g * s['A'], s['A'] + g * s['B'], s['B'] + g * s['F'], s['F']) + 3 * block
+            return max(g * s['A'], s['A'] + g * s['B'], s['B'] + g * s['F'], s['F']) + 4 * block
         for k in sorted(sizes, key=lambda k: -sizes[k]):
             if peak() <= budget:
                 break
@@ -476,11 +566,20 @@ def _layout(g, blk, correct=True):
     P, Kf, Nr, nkr, nka, nwin = g['P'], g['Kf'], g['Nr'], g['nkr'], g['nka'], g['nwin']
     Pf, Na, Pp, ov = g['Pf'], g['Na'], g['Pp'], (g['ov'] if correct else 1)
     sheared = g['jlo'] is not None
-    # 1. range: each pulse on the rows of the raster it reaches, from a multiple of BLOCK
-    nblk = _ladder(-(-(nwin + (BLOCK - 1 if sheared else 0)) // BLOCK))
-    W1 = nblk * BLOCK
+    # 1. range: each pulse on the rows of the raster it reaches, from a multiple of BLOCK that is the same for the
+    # pulses of a piece of the array (_origins)
     Rw1 = _window(float(np.abs(g['beta']).max()), Q.TAPS)
-    b1 = _blocks_of(Pp, blk // (40 * max(Kf, Nr, g['K']) + 16 * W1 * Rw1))
+    spread, origin = 0, None
+    for _ in range(8):
+        nblk = _ladder(-(-(nwin + (BLOCK - 1 + BLOCK * spread if sheared else 0)) // BLOCK))
+        W1 = nblk * BLOCK
+        b1 = _blocks_of(Pp, blk // (40 * max(Kf, Nr, g['K']) + 16 * W1 * Rw1))
+        if not sheared:
+            break
+        origin, need = _origins(g, b1)
+        if need <= spread:
+            break
+        spread = need
     # 2. azimuth: the raster's rows, a multiple of BLOCK of them
     rows2 = _up(nkr, BLOCK)
     nblk2 = _ladder(-(-nka // BLOCK))
@@ -510,7 +609,7 @@ def _layout(g, blk, correct=True):
     rows3 = _up(nka, BLOCK)
     b3 = _blocks_of(rows3, blk // (40 * max(fold * Ny, rows2)))
     size = lambda b, total, width: 8 * max(total, b[0]) * width
-    return dict(nblk=nblk, W1=W1, Rw1=Rw1, b1=b1, rows2=rows2, nblk2=nblk2, W2=W2, Rw2=Rw2, pb2=pb2, b2=b2, Ny=Ny, fold=fold,
+    return dict(nblk=nblk, W1=W1, Rw1=Rw1, b1=b1, origin=origin, rows2=rows2, nblk2=nblk2, W2=W2, Rw2=Rw2, pb2=pb2, b2=b2, Ny=Ny, fold=fold,
                 rows3=rows3, b3=b3, sheared=sheared,
                 bytes=dict(A=size(b1, Pp, W1), B=size(b2, rows2, W2), F=size(b3, rows3, Ny)))
 
@@ -597,10 +696,12 @@ def pfa(S, g, window, correct, complex_image, timing, phase=None, info=None, on_
     alpha, beta = placed(g['alpha']), placed(g['beta'])
     wp = placed(g['wp'] * (Q._taylor(P) if window else 1.0))
     jl = placed(jlo, np.int64) if sheared else np.zeros(Pp, np.int64)
-    shift1 = (jl // BLOCK).astype(i32)
-    off = jl - shift1.astype(np.int64) * BLOCK
-    shift1 = np.concatenate([shift1, np.zeros(max(0, L['b1'][0] - Pp), i32)])     # (a single block is padded)
+    shift1 = L['origin'] if sheared else np.zeros(max(Pp, L['b1'][0]), np.int64)   # (a single block is padded)
+    off = jl - shift1[:Pp] * BLOCK
+    shift1 = shift1.astype(i32)
     there = np.ones(Pp, bool) if place is None else src >= 0
+    if sheared and not (np.all(off[there] >= 0) and np.all(off[there] + nwin <= L['W1'])):
+        raise AssertionError("quick_jax: a pulse's band lies beyond the range stage's output")
     clo, chi = np.where(there, off, 0).astype(i32), np.where(there, off + nwin, 0).astype(i32)
     ref = phase is not None
     A0, B0 = (placed(_cycles(v), np.uint32) for v in (phase if ref else (np.zeros(P), np.zeros(P))))
@@ -622,11 +723,14 @@ def pfa(S, g, window, correct, complex_image, timing, phase=None, info=None, on_
         return jnp.pad(sr * w, pad), jnp.pad(si * w, pad)
 
     def range_(zr, zi, tap_r, wpoly, base, lo, s, c2, clo, chi):
-        prof = jnp.fft.ifft(lax.complex(zr, zi), axis=1)
-        gate = jnp.concatenate([prof[:, :pos_], jnp.zeros((nb, Nr - keep), prof.dtype), prof[:, Kf - neg_:]], 1) * tap_r
-        G = jnp.fft.fft(gate, axis=1)
+        def spectra(zr, zi):
+            prof = jnp.fft.ifft(lax.complex(zr, zi), axis=1)
+            gate = jnp.concatenate([prof[:, :pos_], jnp.zeros((zr.shape[0], Nr - keep), prof.dtype), prof[:, Kf - neg_:]], 1) * tap_r
+            G = jnp.fft.fft(gate, axis=1)
+            return jnp.real(G), jnp.imag(G)
+        Gr, Gi = _by_rows(jnp, lax, spectra, (zr, zi), max(Kf, Nr))
         ib, fr = _positions(jnp, base, lo, s, c2)
-        o = _dense(jnp, lax, jnp.real(G), jnp.imag(G), ib, fr, Rw1, Q.TAPS, wpoly)
+        o = _dense(jnp, lax, Gr, Gi, ib, fr, Rw1, Q.TAPS, wpoly)
         col = jnp.arange(W1, dtype=jnp.int32)[None, :]
         m = (col >= clo[:, None]) & (col < chi[:, None])
         return jnp.where(m, o[0], 0.0), jnp.where(m, o[1], 0.0)
@@ -676,13 +780,16 @@ def pfa(S, g, window, correct, complex_image, timing, phase=None, info=None, on_
         return jnp.pad(zr[:, :Pp], pad), jnp.pad(zi[:, :Pp], pad)
 
     def azimuth(zr, zi, dist_bins, live, edge, guard, scale, binm, wpoly, base, lo, s, c2, clo, chi):
-        prof = jnp.fft.fft(lax.complex(zr, zi), axis=1)
-        cz = jnp.concatenate([prof[:, :pa], jnp.zeros((nJ, Na - keep2), prof.dtype), prof[:, Pf - na_:]], 1)
-        d = dist_bins[None, :] * binm[:, None]
-        w = jnp.where(d <= edge, 1.0, jnp.where(d >= edge + guard, 0.0, 0.5 + 0.5 * jnp.cos((d - edge) * (math.pi / guard))))
-        A2 = jnp.fft.ifft(cz * (w * live[None, :] * scale), axis=1)
+        def spectra(zr, zi, binm):
+            prof = jnp.fft.fft(lax.complex(zr, zi), axis=1)
+            cz = jnp.concatenate([prof[:, :pa], jnp.zeros((zr.shape[0], Na - keep2), prof.dtype), prof[:, Pf - na_:]], 1)
+            d = dist_bins[None, :] * binm[:, None]
+            w = jnp.where(d <= edge, 1.0, jnp.where(d >= edge + guard, 0.0, 0.5 + 0.5 * jnp.cos((d - edge) * (math.pi / guard))))
+            A2 = jnp.fft.ifft(cz * (w * live[None, :] * scale), axis=1)
+            return jnp.real(A2), jnp.imag(A2)
+        Ar, Ai = _by_rows(jnp, lax, spectra, (zr, zi, binm), max(Pf, Na))
         ib, fr = _positions(jnp, base, lo, s, c2, pb2)
-        o = _dense(jnp, lax, jnp.real(A2), jnp.imag(A2), ib, fr, Rw2, Q.TAPS, wpoly)
+        o = _dense(jnp, lax, Ar, Ai, ib, fr, Rw2, Q.TAPS, wpoly)
         col = jnp.arange(W2, dtype=jnp.int32)[None, :]
         m = (col >= clo[:, None]) & (col < chi[:, None])
         return jnp.where(m, o[0], 0.0), jnp.where(m, o[1], 0.0)
@@ -730,8 +837,10 @@ def pfa(S, g, window, correct, complex_image, timing, phase=None, info=None, on_
         return f(zr), f(zi)
 
     def inverse(zr, zi):
-        f = jnp.fft.ifft(lax.complex(zr, zi), axis=1)
-        return jnp.real(f), jnp.imag(f)
+        def one(zr, zi):
+            f = jnp.fft.ifft(lax.complex(zr, zi), axis=1)
+            return jnp.real(f), jnp.imag(f)
+        return _by_rows(jnp, lax, one, (zr, zi), Ny)
     F = store('F', rows3, L['b3'], Ny)
     for a0 in starts:
         o = run.chain([B.cut(n3, a0), ('bins', (n3, na, B.rows, rows2, Ny, fold), bins, (sy, jnp.asarray(sxh[a0:a0 + na]), i32(hy))),
@@ -782,12 +891,14 @@ def pfa(S, g, window, correct, complex_image, timing, phase=None, info=None, on_
                 return jnp.pad(zr[:, :nka], pad), jnp.pad(zi[:, :nka], pad)
 
             def picture(zr, zi, cx, cy):
-                t = jnp.roll(jnp.fft.fft(lax.complex(zr, zi), axis=1), nx // 2, axis=1)[:, :nx]
-                if not complex_image:
-                    return (jnp.abs(t),)
-                c = _angle(jnp, cx[None, :] + cy[:, None])
-                t = t * lax.complex(jnp.cos(c), jnp.sin(c))
-                return jnp.real(t), jnp.imag(t)
+                def one(zr, zi, cy):
+                    t = jnp.roll(jnp.fft.fft(lax.complex(zr, zi), axis=1), nx // 2, axis=1)[:, :nx]
+                    if not complex_image:
+                        return (jnp.abs(t),)
+                    c = _angle(jnp, cx[None, :] + cy[:, None])
+                    t = t * lax.complex(jnp.cos(c), jnp.sin(c))
+                    return jnp.real(t), jnp.imag(t)
+                return _by_rows(jnp, lax, one, (zr, zi, cy), Nx)
             for jb in _starts(e_ - s_, nv)[1]:
                 jb += s_
                 o = run.chain([F.cut(nv, (nfy - ny // 2 + jb) % nfy), ('columns', (nv, bw, F.rows, nka, Nx), columns, ()),
@@ -853,15 +964,17 @@ def pfa(S, g, window, correct, complex_image, timing, phase=None, info=None, on_
         return (jnp.roll(jnp.pad(zr * cs - zi * sn, pad), -hx, axis=1), jnp.roll(jnp.pad(zr * sn + zi * cs, pad), -hx, axis=1))
 
     def transform(zr, zi):
-        h = jnp.fft.fft(lax.complex(zr, zi), axis=1)
-        h = jnp.concatenate([h] * tiles, 1)[:, :Nm] if tiles > 1 or Nm < Nx else h
-        return jnp.real(h), jnp.imag(h)
+        def one(zr, zi):
+            h = jnp.fft.fft(lax.complex(zr, zi), axis=1)
+            h = jnp.concatenate([h] * tiles, 1)[:, :Nm] if tiles > 1 or Nm < Nx else h
+            return jnp.real(h), jnp.imag(h)
+        return _by_rows(jnp, lax, one, (zr, zi), max(Nx, Nm))
 
     def to_rows(zr, zi, am, bj, yn, iyr, cx, cy, inv, sig, ux, uy, half):
         X0, Y = am[:, None] + bj[None, :], yn[None, :]
         X = X0
         for _ in range(2):                           # the picture's column that lies on this column of H at this row
-            X = X0 + (sig * uy * _poly(jnp, cy, powers, X, Y) - ux * _poly(jnp, cx, powers, X, Y)) * inv
+            X = lax.optimization_barrier(X0 + (sig * uy * _poly(jnp, cy, powers, X, Y) - ux * _poly(jnp, cx, powers, X, Y)) * inv)
         ib, fr = _split(jnp, iyr[None, :], _poly(jnp, cy, powers, X, Y) * uy + half)
         return _dense(jnp, lax, zr, zi, ib, fr, RwY, taps, wfin)
 
@@ -869,6 +982,7 @@ def pfa(S, g, window, correct, complex_image, timing, phase=None, info=None, on_
         X, Y = xn[None, :], yn[:, None]
         dx, dy = _poly(jnp, cx, powers, X, Y), _poly(jnp, cy, powers, X, Y)
         ib, fr = _split(jnp, ixm[None, :] + qi[:, None], qf[:, None] + dx * ux - sig * (dy * uy) + half)
+        ib, fr, dx, dy = lax.optimization_barrier((ib, fr, dx, dy))
         ar, ai = _dense(jnp, lax, zr, zi, ib, fr, RwX, taps, wfin)
         if not complex_image:
             return (jnp.sqrt(ar * ar + ai * ai),)
