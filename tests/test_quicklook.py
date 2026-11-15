@@ -1311,7 +1311,8 @@ def test_cuda_takes_the_files_integers(spot, monkeypatch, fmt):
                 m.setattr(quick, '_fft_cuda', quick._fft_size)
             d = quick._pfa([raw], dev['ant'], dev['fmin'], dev['df'], *grid, backend='cuda', info=info, phase=dev['phase'])
         e = rel_db(cp.asnumpy(d), h)
-        print(f'{fmt}: cuda from the file\'s integers against the host, {"own" if own else "the host\'s"} lengths: {e:.1f} dB')
+        which = 'own' if own else "the host's"
+        print(f"{fmt}: cuda from the file's integers against the host, {which} lengths: {e:.1f} dB")
         assert info['source'] == {'CI4': 'int16', 'CI2': 'int8'}[fmt] + ' pairs from the file' and e < (-40 if own else -60)
     b = look(path, size=256, complex_image=True)
     for own in (True, False):
