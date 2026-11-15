@@ -282,8 +282,8 @@ class _Run:
         return self.program(' + '.join(p[0] for p in parts), key, make)(*(a for p in parts for a in p[3]))
 
     def fetch(self, dev, dst):
-        """dst[...] = the device block dev (its leading rows and columns; a complex block as [.., 2] float32),
-        once the next block has been started: the copy overlaps the device's work."""
+        """dst[...] = the device block dev (its leading rows and columns; a complex block as its two planes), once
+        the next block has been started: the copy overlaps the device's work."""
         prev, self.pending = self.pending, (dev, dst)
         if prev is not None:
             self._get(*prev)
@@ -294,11 +294,25 @@ class _Run:
             self._get(*prev)
 
     def _get(self, dev, dst):
+        """A TPU hands an array over in the layout it keeps it in (np.asarray's strides are the device's, by rows or
+        by columns as it chose), so the copy into the host's rows is a strided one: it runs in blocks of rows on
+        the host's threads."""
+        from . import quick as Q
         t = time.perf_counter()
-        a = np.asarray(dev)
-        if a.ndim == 3:
-            a = a.view(np.complex64)[..., 0]
-        dst[...] = a[:dst.shape[0], :dst.shape[1]]
+        n, m = dst.shape
+        if isinstance(dev, tuple):
+            re, im = np.asarray(dev[0]), np.asarray(dev[1])
+            v = dst.view(np.float32).reshape(n, m, 2)
+
+            def rows(sl):
+                v[sl, :, 0] = re[sl, :m]
+                v[sl, :, 1] = im[sl, :m]
+        else:
+            a = np.asarray(dev)
+
+            def rows(sl):
+                dst[sl] = a[sl, :m]
+        Q._blocks(rows, n, int(max(1, (1 << 17) // max(m, 1))))
         if self.detail is not None:
             self.detail['blocks to the host'] = self.detail.get('blocks to the host', 0.0) + time.perf_counter() - t
 
@@ -392,9 +406,7 @@ class _Host:
         self.a = np.empty((self.rows, width), np.complex64)
 
     def put(self, r0, re, im):
-        import jax.numpy as jnp
-        pack = self.run.program('pack', (self.per, self.width), lambda: lambda a, b: jnp.stack([a, b], -1))
-        self.run.fetch(pack(re, im), self.a[r0:r0 + self.per])
+        self.run.fetch((re, im), self.a[r0:r0 + self.per])
 
     def close(self):
         self.run.flush()
@@ -775,13 +787,13 @@ def pfa(S, g, window, correct, complex_image, timing, phase=None, info=None, on_
                     return (jnp.abs(t),)
                 c = _angle(jnp, cx[None, :] + cy[:, None])
                 t = t * lax.complex(jnp.cos(c), jnp.sin(c))
-                return (jnp.stack([jnp.real(t), jnp.imag(t)], -1),)
+                return jnp.real(t), jnp.imag(t)
             for jb in _starts(e_ - s_, nv)[1]:
                 jb += s_
                 o = run.chain([F.cut(nv, (nfy - ny // 2 + jb) % nfy), ('columns', (nv, bw, F.rows, nka, Nx), columns, ()),
                                ('picture', (bw, Nx, nx, bool(complex_image)), picture,
                                 (cxd, rows_of(cyh, slice(jb, jb + nv), bw, np.uint32)))])
-                deliver(o[0], jb, nv)
+                deliver(o if complex_image else o[0], jb, nv)
         out = finished()
         timing['image'] = timing.get('image', 0.0) + time.perf_counter() - t0
         return out
@@ -863,7 +875,7 @@ def pfa(S, g, window, correct, complex_image, timing, phase=None, info=None, on_
         c = cxx[None, :] + cyy[:, None] + (krc * dy - kac * dx)
         c = (c - jnp.floor(c)) * (2.0 * math.pi)
         cs, sn = jnp.cos(c), jnp.sin(c)
-        return (jnp.stack([ar * cs - ai * sn, ar * sn + ai * cs], -1),)
+        return ar * cs - ai * sn, ar * sn + ai * cs
 
     def strip_rows(zr, zi):
         pad = ((0, njc - nvc), (0, 0))
@@ -900,7 +912,7 @@ def pfa(S, g, window, correct, complex_image, timing, phase=None, info=None, on_
                             (xn, rows_of(yn, sl, njc, f32), ixm, rows_of(qi, sl, njc, i32), rows_of(qf, sl, njc, f32), cx, cy,
                              scal(sig), scal(ux), scal(uy), scal(half_x), cxx, rows_of(cyy, sl, njc, f32), krc, kac))])
             n = min(nvc, ny - (j0 + c0))
-            deliver(o[0], j0 + c0, n)
+            deliver(o if complex_image else o[0], j0 + c0, n)
         del G
     out = finished()
     if stay:
