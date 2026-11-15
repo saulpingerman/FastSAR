@@ -219,7 +219,7 @@ def _phase_rows(S, f, coef, sign, linear=None, first=0, total=None):
     if lib is not None and (not first or (first % 16 == 0 and hasattr(lib, 'phase_ramp_from'))):
         a = np.ascontiguousarray(np.broadcast_to(np.asarray(linear[0], np.float64) * c, (P,)))
         b = np.ascontiguousarray(np.broadcast_to(np.asarray(linear[1], np.float64) * c, (P,)))
-        if first:
+        if first or (total is not None and total > K):
             lib.phase_ramp_from(S.ctypes.data, P, K, a.ctypes.data, b.ctypes.data, first, int(total or first + K))
         else:
             lib.phase_ramp(S.ctypes.data, P, K, a.ctypes.data, b.ctypes.data)
