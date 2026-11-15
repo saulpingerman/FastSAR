@@ -10,7 +10,11 @@
 // remaining weights are normalised again, as pfa_cpu.cpp's kernels do.
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <algorithm>
+#include <atomic>
+#include <mutex>
+#include <vector>
 #include "par.hpp"
 
 static const int T = 16;       // taps of the range and azimuth resampling (quick.py's TAPS)
@@ -295,4 +299,104 @@ extern "C" void ql_weight_pad(const float* S, long R, long K, const float* wk, c
     }
     std::fill(o + 2 * (k0 + K), o + 2 * Kf, 0.f);
   }
+}
+
+// The display's passes over the picture.
+//
+// Counts of float32 values by key, added into h: the key of a value orders as the value does (the sign bit set for
+// a positive value, every bit turned for a negative one; a NaN last), remap.py's _key. Without lut, h [65536] counts
+// by the key's high half; with lut [65536] (a slot 0 .. 3 for some high halves, -1 for the others), h [4 * 65536]
+// counts by slot * 65536 + the key's low half. amp: the key is of |x|. valid: a byte per value, nonzero where the
+// value counts, or null. Each thread counts a run of the values in a table of its own (the 65,536 counters fit its
+// second-level cache) and adds it to h at the end; serial: on the calling thread, straight into h (the caller's
+// pool gives each thread its own h).
+extern "C" void ql_hist(const float* x, long n, const unsigned char* valid, const int* lut, int amp, int serial,
+                        long long* h) {
+  const long nb = lut ? 4L * 65536 : 65536;
+  const uint32_t top = amp ? 0x7fffffffu : 0xffffffffu;
+  auto count = [&](long a, long b, auto* c) {
+    for (long i = a; i < b; ++i) {
+      if (valid && !valid[i]) continue;
+      uint32_t u;
+      std::memcpy(&u, x + i, 4);
+      u &= top;
+      u = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+      if (!lut) ++c[u >> 16];
+      else { const int s = lut[u >> 16]; if (s >= 0) ++c[(long)s * 65536 + (u & 0xffffu)]; }
+    }
+  };
+  if (serial) { count(0, n, h); return; }
+  const long run = 1L << 22;                            // values per task: no counter of a task can overflow
+  std::mutex m;
+  par::for_dynamic((n + run - 1) / run, 1, [&](long t) {
+    std::vector<uint32_t> c(nb, 0u);
+    count(t * run, std::min(n, (t + 1) * run), c.data());
+    std::lock_guard<std::mutex> lock(m);
+    for (long k = 0; k < nb; ++k) h[k] += c[k];
+  });
+}
+
+// The linear part of the nrl remap (remap.py's _nrl_u8) of float32 values, on all cores: out[i] = the display value
+// of (|x| - amin) c / knee where |x| <= thr, in single precision as NumPy takes it (three correctly rounded
+// operations, then MATLAB's uint8: halves away from zero, saturated), and 0 where valid (a byte per value, or null)
+// is 0. The values above thr (one in a hundred: thr is the 99th percentile's) and the NaNs are left 0 and their
+// indices written to rest [cap], in no order: their logarithm is the caller's, taken by the library whose values
+// the remap's other paths have. -> their number, or -1 when rest cannot hold them.
+extern "C" long ql_nrl8(const float* x, long n, const unsigned char* valid, float amin, float thr, float knee, float c,
+                        unsigned char* out, long* rest, long cap) {
+  const long run = 1L << 16;
+  std::atomic<long> used(0);
+  par::for_dynamic((n + run - 1) / run, 4, [&](long t) {
+    const long a = t * run, b = std::min(n, a + run);
+    static thread_local std::vector<long> scratch;
+    if ((long)scratch.size() < run) scratch.resize(run);
+    long* left = scratch.data();
+    #pragma omp simd
+    for (long i = a; i < b; ++i) {                      // every value's linear part, whether it is kept or not
+      const float A = std::fabs(x[i]);
+      const float d = (A - amin) * c / knee;
+      const float q = std::floor((d < 0.f ? 0.f : d > 255.f ? 255.f : d) + 0.5f);
+      out[i] = (A <= thr && d == d && (!valid || valid[i])) ? (unsigned char)q : (unsigned char)0;
+    }
+    long k = 0;
+    for (long i = a; i < b; ++i) {
+      left[k] = i;
+      k += (!(std::fabs(x[i]) <= thr) && (!valid || valid[i])) ? 1 : 0;
+    }
+    if (k) {
+      const long at = used.fetch_add(k);
+      if (at + k <= cap) std::memcpy(rest + at, left, (size_t)k * sizeof(long));
+    }
+  });
+  return used.load() <= cap ? used.load() : -1;
+}
+
+// dst [R, C] = the picture src [rows, cols] (bytes) laid out for display: turned first when turn (R = cols,
+// C = rows), then with its rows and its columns in reverse order when flip_rows and flip_cols; dst[r, c] =
+// t[flip_rows ? R - 1 - r : r][flip_cols ? C - 1 - c : c] for t = src or its transpose. On all cores; a turn goes
+// in tiles of 64 output rows by 256 columns, so that a tile reads 256 runs of 64 bytes and writes 16 kB.
+extern "C" void ql_orient8(const unsigned char* src, long rows, long cols, int turn, int flip_rows, int flip_cols,
+                           unsigned char* dst) {
+  const long R = turn ? cols : rows, C = turn ? rows : cols;
+  if (!turn) {
+    par::for_dynamic(R, 64, [&](long r) {
+      const unsigned char* s = src + (flip_rows ? R - 1 - r : r) * C;
+      unsigned char* d = dst + r * C;
+      if (!flip_cols) std::memcpy(d, s, (size_t)C);
+      else for (long c = 0; c < C; ++c) d[c] = s[C - 1 - c];
+    });
+    return;
+  }
+  const long TR = 64, TC = 256;
+  par::for_dynamic((R + TR - 1) / TR, 1, [&](long rb) {
+    const long r0 = rb * TR, r1 = std::min(R, r0 + TR);
+    for (long c0 = 0; c0 < C; c0 += TC) {
+      const long c1 = std::min(C, c0 + TC);
+      for (long c = c0; c < c1; ++c) {
+        const unsigned char* s = src + (flip_cols ? C - 1 - c : c) * cols;      // the source row this column is
+        if (!flip_rows) for (long r = r0; r < r1; ++r) dst[r * C + c] = s[r];
+        else for (long r = r0; r < r1; ++r) dst[r * C + c] = s[R - 1 - r];
+      }
+    }
+  });
 }

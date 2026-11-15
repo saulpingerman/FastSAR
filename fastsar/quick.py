@@ -117,6 +117,11 @@ def _lib():
         L.ql_unshear.argtypes = [p, n, n, p, p, n, n, n, p, n]
         L.ql_resample_rows.restype = L.ql_resample_az.restype = L.ql_gather.restype = L.ql_weight_pad.restype = None
         L.ql_transpose.restype = L.ql_unshear.restype = None
+        L.ql_hist.argtypes = [p, n, p, p, i, i, p]
+        L.ql_orient8.argtypes = [p, n, n, i, i, i, p]
+        L.ql_hist.restype = L.ql_orient8.restype = None
+        L.ql_nrl8.argtypes = [p, n, p, fl, fl, fl, fl, p, p, n]
+        L.ql_nrl8.restype = n
         _LIB.append(L)
     return _LIB[0]
 
@@ -146,6 +151,21 @@ def _blocks(fn, n, chunk):
             _POOL[:] = [(w, ThreadPoolExecutor(w, thread_name_prefix='fastsar-quicklook'))]
         pool = _POOL[0][1]
     list(pool.map(fn, sl))
+
+
+def _ordered(fn, n):
+    """fn(0), fn(1), ... fn(n - 1), each as soon as it and those before it are done, computed on the pool."""
+    w = _workers()
+    if n == 1 or w == 1:
+        for i in range(n):
+            yield fn(i)
+        return
+    with _LOCK:
+        if not _POOL or _POOL[0][0] != w:
+            from concurrent.futures import ThreadPoolExecutor
+            _POOL[:] = [(w, ThreadPoolExecutor(w, thread_name_prefix='fastsar-quicklook'))]
+        pool = _POOL[0][1]
+    yield from pool.map(fn, range(n))
 
 
 def _unit(v):
@@ -928,6 +948,22 @@ def _host(d):
     return host
 
 
+def _oriented(d, turn, flip_rows, flip_cols):
+    """The picture d [rows, cols] laid out for display, a new contiguous array: turned (its transpose) when turn,
+    then with its rows and its columns reversed when flip_rows and flip_cols. A uint8 picture is laid out in tiles on
+    all cores (quicklook_cpu.cpp's ql_orient8): NumPy's copy of a turned view runs on one core, down the columns of
+    its source, 1.5 s of a 275-megapixel picture."""
+    d = np.asarray(d)
+    if d.dtype != np.uint8 or d.ndim != 2 or not d.flags.c_contiguous or not d.size:
+        d = d.T if turn else d
+        d = d[::-1] if flip_rows else d
+        return np.ascontiguousarray(d[:, ::-1] if flip_cols else d)
+    out = np.empty(d.shape[::-1] if turn else d.shape, np.uint8)
+    _lib().ql_orient8(d.ctypes.data, d.shape[0], d.shape[1], int(bool(turn)), int(bool(flip_rows)), int(bool(flip_cols)),
+                      out.ctypes.data)
+    return out
+
+
 def _apply_phase(S, ph0, ph1):
     """S[p, k] *= exp(2 pi j (ph0[p] + k ph1[p])) in place, in blocks of pulses on the pool."""
     k = np.arange(S.shape[1])
@@ -1581,49 +1617,64 @@ def _ffbp(col, backend, window, timing):
 def write_png(path, image, level=1):
     """Write a uint8 image [rows, cols] (gray), [rows, cols, 3] (RGB) or [rows, cols, 4] (RGBA) as a PNG file, with the
     standard library alone. Blocks of rows are deflated on all cores, each an independent run of the one zlib stream
-    and an IDAT chunk of its own, with its checksums made beside it, so a 16 megapixel picture is written in a few
-    hundredths of a second. level: zlib's, 0 to 9 (speckle hardly compresses, and 1 is as small as 9 on it)."""
+    and an IDAT chunk of its own, with its checksums made beside it, and the blocks go to the file in order while
+    the later ones are still being deflated. level: zlib's, 0 to 9. At 1, the default, the blocks are coded by run
+    lengths and Huffman codes without a search for repeated strings (zlib's Z_RLE): on speckle the search finds
+    nothing (a quick look came out 0.4% smaller without it, at 165 MB/s a core against 60) and it is what a level
+    from 2 up adds; 0 stores the bytes."""
     import struct
     import zlib
     a = np.asarray(image)
     if a.dtype != np.uint8 or a.ndim not in (2, 3) or (a.ndim == 3 and a.shape[2] not in (3, 4)) or a.size == 0:
         raise ValueError(f'write_png takes a uint8 image [rows, cols] or [rows, cols, 3 or 4], got {a.dtype} {a.shape}')
+    if not isinstance(level, (int, np.integer)) or isinstance(level, bool) or not 0 <= level <= 9:
+        raise ValueError(f'level must be 0 to 9 (zlib\'s), got {level!r}')
     rows, cols = a.shape[:2]
     a = a.reshape(rows, -1)
     line = 1 + a.shape[1]                                       # a row and its filter byte (type 0: none)
-    per = int(max(1, min(rows, max(1 << 16, min(4 << 20, rows * line // (4 * _workers()))) // line)))
+    # a block: a megabyte at most (it stays in a core's cache with its output), four or more a thread
+    per = int(max(1, min(rows, max(1 << 16, min(1 << 20, rows * line // (4 * _workers()))) // line)))
     starts = list(range(0, rows, per))
-    parts = [None] * len(starts)
+    last = len(starts) - 1
+    strategy = zlib.Z_RLE if level == 1 else zlib.Z_DEFAULT_STRATEGY
+
+    def deflate(i):
+        """Block i -> (the pieces of its IDAT chunk's data, the chunk's CRC so far, the Adler-32 and the size of
+        its bytes). Nothing here joins or copies the deflated bytes: the pieces go to the file as they are."""
+        raw = np.empty((min(per, rows - starts[i]), line), np.uint8)
+        raw[:, 0] = 0
+        raw[:, 1:] = a[starts[i]:starts[i] + per]
+        co = zlib.compressobj(int(level), zlib.DEFLATED, -15, 9, strategy)
+        pieces = [b'\x78\x01'] if i == 0 else []
+        pieces += [co.compress(raw), co.flush(zlib.Z_FINISH if i == last else zlib.Z_SYNC_FLUSH)]
+        crc = zlib.crc32(b'IDAT')
+        for piece in pieces:
+            crc = zlib.crc32(piece, crc)
+        return pieces, crc, zlib.adler32(raw), raw.size
 
     def chunk(kind, body):
         return struct.pack('>I', len(body)) + kind + body + struct.pack('>I', zlib.crc32(kind + body))
-
-    def deflate(sl):
-        i = sl.start
-        raw = np.zeros((min(per, rows - starts[i]), line), np.uint8)
-        raw[:, 1:] = a[starts[i]:starts[i] + per]
-        co = zlib.compressobj(level, zlib.DEFLATED, -15)
-        last = i == len(starts) - 1
-        body = co.compress(raw) + co.flush(zlib.Z_FINISH if last else zlib.Z_SYNC_FLUSH)
-        parts[i] = [(b'\x78\x01' if i == 0 else b'') + body, zlib.adler32(raw), raw.size]
-        if not last:
-            parts[i][0] = chunk(b'IDAT', parts[i][0])
-    _blocks(deflate, len(starts), 1)
-    # the stream's Adler-32 from the blocks' own (zlib's adler32_combine)
-    adler = 1
-    for _, a2, n2 in parts:
-        rem = n2 % 65521
-        s1 = adler & 0xffff
-        s2 = (rem * s1) % 65521
-        s1 += (a2 & 0xffff) + 65521 - 1
-        s2 += ((adler >> 16) & 0xffff) + ((a2 >> 16) & 0xffff) + 65521 - rem
-        adler = (s1 % 65521) | ((s2 % 65521) << 16)
     color = {1: 0, 3: 2, 4: 6}[1 if np.ndim(image) == 2 else np.shape(image)[2]]
-    with open(path, 'wb') as fh:
+    adler = 1
+    with open(path, 'wb', buffering=0) as fh:
         fh.write(b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', cols, rows, 8, color, 0, 0, 0)))
-        for body, _, _ in parts[:-1]:
-            fh.write(body)
-        fh.write(chunk(b'IDAT', parts[-1][0] + struct.pack('>I', adler)))
+        for i, (pieces, crc, a2, n2) in enumerate(_ordered(deflate, len(starts))):
+            # the stream's Adler-32 from the blocks' own (zlib's adler32_combine)
+            rem = n2 % 65521
+            s1 = adler & 0xffff
+            s2 = (rem * s1) % 65521
+            s1 += (a2 & 0xffff) + 65521 - 1
+            s2 += ((adler >> 16) & 0xffff) + ((a2 >> 16) & 0xffff) + 65521 - rem
+            adler = (s1 % 65521) | ((s2 % 65521) << 16)
+            if i == last:
+                pieces.append(struct.pack('>I', adler))
+                crc = zlib.crc32(pieces[-1], crc)
+            fh.write(struct.pack('>I', sum(len(piece) for piece in pieces)) + b'IDAT')
+            for piece in pieces:
+                view = memoryview(piece)
+                while len(view):                                # (an unbuffered write may take a part)
+                    view = view[fh.write(view):]
+            fh.write(struct.pack('>I', crc))
         fh.write(chunk(b'IEND', b''))
 
 
@@ -1895,17 +1946,17 @@ def quicklook(cphd, output=None, *, size=2048, resolution=None, correct=True, re
     lay = sidd.shadows_down(grid)
     tr = lay['transform']
     d = sidd._display(dict(image=amp), remap, None, {})[0]             # uint8, range-major, where the image is
-    d = d if tr['transpose'] else d.T
-    d = d[::-1] if tr['flip_rows'] else d
-    d = d[:, ::-1] if tr['flip_cols'] else d
     if _xp.kind(d) == 'cupy':                                          # laid out there, brought over once
+        d = d if tr['transpose'] else d.T
+        d = d[::-1] if tr['flip_rows'] else d
+        d = d[:, ::-1] if tr['flip_cols'] else d
         d = xp.ascontiguousarray(d)
         xp.cuda.get_current_stream().synchronize()
         timing['remap'] = time.perf_counter() - t0
         t0 = time.perf_counter()
         display = _host(d)
     else:
-        display = np.ascontiguousarray(_xp.host(d))
+        display = _oriented(_xp.host(d), not tr['transpose'], tr['flip_rows'], tr['flip_cols'])
     del amp, d
     rows, cols = display.shape
     rc = np.array([[0, 0], [0, cols - 1], [rows - 1, cols - 1], [rows - 1, 0]], np.float64)
