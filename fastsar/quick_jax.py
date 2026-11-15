@@ -75,6 +75,8 @@ def _program(name, key, make, detail=None):
     p = _PROGRAMS.get(k)
     if p is None:
         import jax
+        from . import _xp
+        _xp.jax_cache()
         if len(_PROGRAMS) >= 256:
             _PROGRAMS.pop(next(iter(_PROGRAMS)))
         p = _PROGRAMS[k] = [jax.jit(make()), False]
@@ -83,8 +85,9 @@ def _program(name, key, make, detail=None):
 
     def call(*args):
         import jax
+        from . import _xp
         t = time.perf_counter()
-        out = jax.block_until_ready(p[0](*args))
+        out = jax.block_until_ready(p[0](*args) if p[1] else _xp.jax_cache_call(p[0], *args))
         dt = time.perf_counter() - t
         if not p[1]:
             p[1] = True

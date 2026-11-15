@@ -894,6 +894,54 @@ def test_device_programs_are_shared(spot, squinted, request, monkeypatch):
         quick._pfa(S, ant, f0, df, *grid, backend='jax')
 
 
+_CACHE_SCRIPT = '''
+import json, sys
+import jax
+hits = []
+jax.monitoring.register_event_listener(lambda name, **kw: hits.append(name))
+import fastsar
+from fastsar import _xp, quick_jax
+if sys.argv[2] == 'form':
+    fastsar.quicklook(sys.argv[1], size=96, backend='jax')
+print(json.dumps(dict(cache=_xp.jax_cache(), jax=jax.config.jax_compilation_cache_dir, compiled=len(quick_jax.COMPILED),
+                      hits=hits.count('/jax/compilation_cache/cache_hits'))))
+'''
+
+
+def test_device_programs_persist_between_processes(spot, tmp_path):
+    """JAX's persistent compilation cache: by default a directory beside the compiled CPU kernels, or
+    FASTSAR_JAX_CACHE; a second process loads every program of the polar format's stages from it, the short ones
+    too; a cache the user configured is kept, and FASTSAR_JAX_CACHE=off leaves JAX's settings alone."""
+    import json
+    import subprocess
+    import sys
+    script = tmp_path / 'cache_probe.py'
+    script.write_text(_CACHE_SCRIPT)
+    base = {k: v for k, v in os.environ.items() if not k.startswith(('JAX_COMPILATION_CACHE', 'FASTSAR_JAX_CACHE', 'FASTSAR_CACHE_DIR'))}
+    base.update(JAX_PLATFORMS='cpu', CUDA_VISIBLE_DEVICES='')
+
+    def run(what, **env):
+        out = subprocess.run([sys.executable, str(script), spot['path'], what], env=dict(base, **env), capture_output=True,
+                             text=True, timeout=600)
+        assert out.returncode == 0, out.stderr[-3000:]
+        return json.loads(out.stdout.strip().splitlines()[-1])
+    kernels = tmp_path / 'kernels'
+    d = run('none', FASTSAR_CACHE_DIR=str(kernels))
+    assert d['cache'] == d['jax'] == str(kernels / 'jax')
+    mine = tmp_path / 'mine'
+    first = run('form', FASTSAR_JAX_CACHE=str(mine))
+    files = sorted(p.name for p in mine.iterdir())
+    assert first['cache'] == str(mine) and first['hits'] == 0 and first['compiled'] > 5 and len(files) >= first['compiled']
+    second = run('form', FASTSAR_JAX_CACHE=str(mine))
+    print('programs of a quick look:', first['compiled'], 'compiled and written,', second['hits'], 'loaded by a second process')
+    assert second['compiled'] == first['compiled'] and second['hits'] >= first['compiled'] and sorted(p.name for p in mine.iterdir()) == files
+    users = tmp_path / 'users'
+    d = run('none', JAX_COMPILATION_CACHE_DIR=str(users), FASTSAR_JAX_CACHE=str(mine))
+    assert d['cache'] == d['jax'] == str(users)
+    d = run('none', FASTSAR_JAX_CACHE='off', FASTSAR_CACHE_DIR=str(kernels))
+    assert d['cache'] is None and d['jax'] is None
+
+
 def test_quicklook_on_jax(spot, squinted, request, monkeypatch):
     """quicklook(backend='jax'): the cut referenced to the grid center on the device (a phase in 32-bit integer
     arithmetic), the picture and the complex image of the cpu backend, on a plain and on a sheared raster; looks;

@@ -9,7 +9,7 @@ image crosses to the host once, at the end.
 """
 import numpy as np
 
-__all__ = ['kind', 'module', 'fft', 'host', 'device', 'jax_block', 'jax_budget', 'cuda_budget', 'cuda_block']
+__all__ = ['kind', 'module', 'fft', 'host', 'device', 'jax_block', 'jax_budget', 'jax_cache', 'cuda_budget', 'cuda_block']
 
 
 def kind(a):
@@ -81,6 +81,56 @@ def jax_budget():
         return env
     st = _jax_stats()
     return int(0.9 * (st['bytes_limit'] - st.get('bytes_in_use', 0))) if st.get('bytes_limit') else None
+
+
+_CACHE = []
+_OFF = ('0', 'off', 'none', 'false', 'no')
+
+
+def jax_cache():
+    """The directory of JAX's persistent compilation cache that FastSAR's programs are kept in, or None: the cache
+    the user configured (jax_compilation_cache_dir, JAX_COMPILATION_CACHE_DIR) if there is one, else
+    FASTSAR_JAX_CACHE, else the directory 'jax' beside the compiled CPU kernels (_build.cache_dir():
+    $FASTSAR_CACHE_DIR, else $XDG_CACHE_HOME/fastsar, else ~/.cache/fastsar). None where FASTSAR_JAX_CACHE is 0 or
+    off, or the user turned JAX's cache off (jax_enable_compilation_cache). Settled at FastSAR's first JAX program
+    in the process; the directory then holds every program the process compiles in more than JAX's
+    jax_persistent_cache_min_compile_time_secs (FastSAR's own at any compile time: jax_cache_call). A second
+    process loads them instead of compiling."""
+    if _CACHE:
+        return _CACHE[0]
+    import os
+    import jax
+    v = os.environ.get('FASTSAR_JAX_CACHE', '').strip()
+    user = jax.config.jax_compilation_cache_dir
+    if v.lower() in _OFF or not jax.config.jax_enable_compilation_cache:
+        d = None
+    elif user:
+        d = user
+    else:
+        from . import _build
+        d = os.path.abspath(os.path.expanduser(v)) if v else os.path.join(_build.cache_dir(), 'jax')
+        try:
+            os.makedirs(d, exist_ok=True)
+            jax.config.update('jax_compilation_cache_dir', d)
+        except OSError:                                            # an unwritable place: compile as before
+            d = None
+    _CACHE.append(d)
+    return d
+
+
+def jax_cache_call(fn, *args):
+    """fn(*args), the first call of a FastSAR program: with the persistent cache on (jax_cache), the compiled
+    program is written to it whatever its compile time (JAX's default writes only those over a second, and a TPU
+    program of the polar format's stages compiles in less)."""
+    if jax_cache() is None:
+        return fn(*args)
+    try:
+        from jax._src import config as jc
+        low = jc.persistent_cache_min_compile_time_secs(0.0)
+    except (ImportError, AttributeError):                          # another JAX: its own threshold
+        return fn(*args)
+    with low:
+        return fn(*args)
 
 
 def jax_block():
