@@ -1180,7 +1180,7 @@ def test_cuda_gives_the_device_back():
                 if call == 2:                                                  # another caller's plan, with its work area
                     rows = max(8, int(0.15 * need / (13500 * 8)) + 1)          # a work area of 15% of the need,
                     cp.fft.fft(cp.zeros((rows, 13500), cp.complex64), axis=1)  # past the 8% the limit leaves
-                    assert cache.get_curr_memsize() > 0.05 * need                # beyond the 3% the limit leaves
+                    assert cache.get_curr_memsize() > 0.09 * need                # beyond the 8% the limit leaves
                 info = {}
                 img = quick._pfa(S, ant, col.fmin, col.df, *grid, correct=correct, complex_image=False, backend='cuda', info=info)
                 cp.cuda.get_current_stream().synchronize()
