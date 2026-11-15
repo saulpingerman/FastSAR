@@ -118,6 +118,13 @@ def pfa(S, g, window, correct, complex_image, timing, phase=None, info=None):
     from . import _xp
     from . import quick as Q
     f32, i32, c64 = np.float32, np.int32, np.complex64
+    import os
+    how = os.environ.get('FASTSAR_JAX_PFA', '').strip().lower() or 'auto'
+    if how not in ('auto', 'resident', 'streamed'):
+        raise ValueError(f"FASTSAR_JAX_PFA must be 'resident', 'streamed' or 'auto', got {how!r}")
+    K_ = (S[0] if isinstance(S, list) else S).shape[1]
+    if correct and how != 'streamed' and _fits(g, K_) and (how == 'resident' or jax.devices()[0].platform == 'tpu'):
+        return _resident(S, g, window, complex_image, timing, phase).T      # range-major, as the other paths return
     lib = Q._lib()
     S = S.pop() if isinstance(S, list) else S
     S = np.ascontiguousarray(S, c64)
@@ -330,4 +337,313 @@ def pfa(S, g, window, correct, complex_image, timing, phase=None, info=None):
         else:
             out[jb:jb + bw] = np.asarray(o[0][:, :nx])
     timing['correction'] = timing.get('correction', 0.0) + time.perf_counter() - t0
+    return out
+
+
+# ------------------------------------------------------------------------------------- the forms a TPU runs fast
+# A TPU v6e does an indexed load per tap at 1e8 a second (a resampling pass of 113 million outputs: 119 s) and a
+# row of a table of windows followed by a matrix product of each block of outputs with its weights in 0.19 s
+# (tests/bench_tpu_blocks.py). The reads below are of that form, and the arrays stay on the device from the upload of
+# the history to the download of the image: _resident.
+
+STRIDE = 8                    # samples between the starts of the windows in the table of windows
+_KAISER = []
+
+
+def _kaiser_poly():
+    """The Kaiser window of the host kernels (quick.KAISER) as a polynomial in the square of the offset over the
+    half width, float32 coefficients, highest power first: to 1e-7 of the window."""
+    if not _KAISER:
+        from . import quick as Q
+        x2 = np.linspace(0.0, 1.0, 4001)
+        w = np.i0(Q.KAISER * np.sqrt(1.0 - x2)) / np.i0(Q.KAISER)
+        _KAISER.append(np.polynomial.chebyshev.Chebyshev.fit(x2, w, 14).convert(kind=np.polynomial.Polynomial).coef[::-1].astype(np.float32))
+    return _KAISER[0]
+
+
+def _windows(jnp, u, w0, Rw):
+    """u [R, N] (N a multiple of STRIDE), w0 [R, nblk] (multiples of STRIDE) -> u[r, w0 : w0 + Rw] [R, nblk, Rw], each
+    read as one row of the table of the windows that start at every STRIDE-th sample (resample_jax's)."""
+    R, N = u.shape
+    c = u.reshape(R, N // STRIDE, STRIDE)
+    nrow = (N - Rw) // STRIDE + 1
+    tab = jnp.concatenate([c[:, i:nrow + i] for i in range(Rw // STRIDE)], -1).reshape(R * nrow, Rw)
+    return tab.at[jnp.arange(R, dtype=jnp.int32)[:, None] * nrow + w0 // STRIDE].get(mode='promise_in_bounds')
+
+
+def _dense(jnp, lax, xr, xi, ib, fr, Rw, taps, wpoly):
+    """_read without indexed loads of the taps: rows of x [R, n] (two planes) at the positions ib + fr [R, m] (m a
+    multiple of BLOCK), by blocks of BLOCK outputs. A block's taps lie in one window of Rw samples, read as a row
+    of the table of windows; the block's outputs are the product of that window with weights [BLOCK, Rw] formed on
+    the device: the sinc from one sine per output (the sine of pi (u - w) is that of pi u with the sign of w's
+    parity), times the Kaiser window as a polynomial (wpoly, 16 taps) or the sinc window (None: its sine follows
+    from the angle sum with constants of w). A tap outside the row counts as zero and the rest are normalised
+    again; zero where the position lies outside (-0.5, n - 0.5)."""
+    R, n = xr.shape
+    nblk, h = ib.shape[1] // BLOCK, taps // 2
+    N = max(-(-n // STRIDE) * STRIDE, Rw)
+    ibb, frb = ib.reshape(R, nblk, BLOCK), fr.reshape(R, nblk, BLOCK)
+    w0 = jnp.clip(((jnp.min(ibb, axis=-1) - (h - 1)) // STRIDE) * STRIDE, 0, N - Rw)
+    rel = ibb - w0[..., None]
+    wv = jnp.arange(Rw, dtype=jnp.float32)
+    u = rel.astype(jnp.float32) + frb
+    d = u[..., None] - wv                                                          # [R, nblk, BLOCK, Rw]
+    s1 = jnp.sin(math.pi * frb) * jnp.where(rel % 2 == 0, 1.0, -1.0)
+    par = jnp.where(jnp.arange(Rw) % 2 == 0, 1.0, -1.0).astype(jnp.float32)
+    near = jnp.abs(d) < 1e-4
+    k = (s1[..., None] * par) / (math.pi * jnp.where(near, 1.0, d))
+    if wpoly is None:
+        a = (math.pi / h) * u
+        sh = jnp.sin(a)[..., None] * jnp.cos((math.pi / h) * wv) - jnp.cos(a)[..., None] * jnp.sin((math.pi / h) * wv)
+        k = k * sh * (h / math.pi) / jnp.where(near, 1.0, d)
+    else:
+        x2 = (d * (1.0 / h)) ** 2
+        win = jnp.zeros_like(x2) + wpoly[0]
+        for c in wpoly[1:]:
+            win = win * x2 + c
+        k = k * win
+    k = jnp.where(near, 1.0, k)
+    k = jnp.where((jnp.abs(d) < h) & ((w0[..., None, None] + jnp.arange(Rw, dtype=jnp.int32)) < n), k, 0.0)
+    k = k / jnp.maximum(jnp.abs(k.sum(-1, keepdims=True)), 1e-12) * jnp.sign(k.sum(-1, keepdims=True) + 1e-30)
+    inside = ((ib >= 0) | ((ib == -1) & (fr > 0.5))) & ((ib < n - 1) | ((ib == n - 1) & (fr < 0.5)))
+    pad = lambda p: jnp.pad(p, ((0, 0), (0, N - n)))
+    get = lambda p: jnp.where(inside, jnp.einsum('rbjw,rbw->rbj', k, _windows(jnp, pad(p), w0, Rw),
+                                                 precision=lax.Precision.HIGHEST).reshape(R, -1), 0.0)
+    return get(xr), get(xi)
+
+
+def _fits(g, K):
+    """Whether _resident takes this formation: a plain raster (no sheared rows, no missing pulses, no fold) and
+    room on the device for the history, the stages' arrays and the padded image at once."""
+    from . import _xp
+    if g['jlo'] is not None or g['place'] is not None or g['shear'] != 0.0 or g['nkr'] > g['nfy']:
+        return False
+    budget = _xp.jax_budget()
+    Ny, Nx = g['ov'] * g['nfy'], g['ov'] * g['nfx']
+    need = 8 * (g['P'] * K + g['P'] * g['nkr'] + g['nkr'] * g['nka'] + g['nka'] * Ny + Ny * g['nx'] + g['nx'] * g['ny'])
+    return budget is None or 1.5 * need + 4 * _xp.jax_block() < budget
+
+
+def _resident(S, g, window, complex_image, timing, phase=None):
+    """The corrected image with every array on the device from the upload of the history (two planes) to the
+    download of the image (two planes, or the amplitude), in the forms a TPU runs fast: transforms, _dense reads
+    and, for the read at the apparent positions, two passes of _dense, along the baseband image's rows and then
+    along its columns. The apparent positions are formed on the device, as the pixel's own index (an integer) plus
+    the displacement polynomial in float32, which holds a displacement of tens of pixels to a millionth of one.
+    -> the image on the host, azimuth-major [nx, ny] (form_image's layout)."""
+    import jax
+    import jax.numpy as jnp
+    from jax import lax
+    from . import _xp
+    from . import quick as Q
+    f32, i32, c64 = np.float32, np.int32, np.complex64
+    P, K, Kf, Nr, k0 = g['P'], g['K'], g['Kf'], g['Nr'], g['k0']
+    nkr, nka, nfy, nfx, nx, ny = g['nkr'], g['nka'], g['nfy'], g['nfx'], g['nx'], g['ny']
+    Pf, Na, p0, ov = g['Pf'], g['Na'], g['p0'], g['ov']
+    Ny, Nx, hy, hx = ov * nfy, ov * nfx, g['hy'], nka // 2
+    blk = _xp.jax_block()
+    wpoly = jnp.asarray(_kaiser_poly())
+    HI = lax.Precision.HIGHEST
+    up = lambda a: jnp.asarray(np.ascontiguousarray(a, f32))
+    cut = lambda a, at, n, axis: lax.dynamic_slice_in_dim(a, at, n, axis)
+    window_of = lambda step, taps: int(-(-int(BLOCK * step + taps + STRIDE + 6) // STRIDE) * STRIDE)
+
+    def joined(parts, starts, per, axis=0):
+        """Blocks that end at the last row (the last one moved back) -> the whole, along an axis."""
+        out, done = [], 0
+        for a0, p in zip(starts, parts):
+            out.append(tuple(lax.slice_in_dim(v, done - a0, per, axis=axis) for v in p))
+            done = a0 + per
+        return tuple(jnp.concatenate([o[k] for o in out], axis) for k in range(len(out[0])))
+    t0 = time.perf_counter()
+    S = np.ascontiguousarray(S.pop() if isinstance(S, list) else S, c64)
+    Sr, Si = jnp.asarray(np.ascontiguousarray(S.real)), jnp.asarray(np.ascontiguousarray(S.imag))
+    del S
+    jax.block_until_ready((Sr, Si))
+    timing['upload'] = timing.get('upload', 0.0) + time.perf_counter() - t0
+    t0 = time.perf_counter()
+    # 1. range
+    wk = up(g['wk'] * (Q._taylor(K) if window else 1.0))
+    wp = (g['wp'] * (Q._taylor(P) if window else 1.0)).astype(f32)
+    tap_r = up(Q._taper(Nr, g['Er'], g['gy'], g['bin_r']))
+    nblk = -(-nkr // BLOCK)
+    keep = min(Nr, Kf)
+    pos_, neg_ = keep - keep // 2, keep // 2
+    ref = phase is not None
+    Rw1 = window_of(float(np.abs(g['beta']).max()), Q.TAPS)
+
+    def make1():
+        def run(Sr, Si, r, wk, tap_r, wpoly, wpb, a0, b0, base, lo, s, c2):
+            sr, si = cut(Sr, r, nb, 0), cut(Si, r, nb, 0)
+            if ref:
+                c = a0[:, None] + jnp.arange(K, dtype=jnp.float32) * b0[:, None]
+                c = (c - jnp.floor(c)) * (2.0 * math.pi)
+                cs, sn = jnp.cos(c), jnp.sin(c)
+                sr, si = sr * cs - si * sn, sr * sn + si * cs
+            w = wk[None, :] * wpb[:, None]
+            prof = jnp.fft.ifft(jnp.pad(lax.complex(sr * w, si * w), ((0, 0), (k0, Kf - K - k0))), axis=1)
+            gate = jnp.concatenate([prof[:, :pos_], jnp.zeros((nb, Nr - keep), prof.dtype), prof[:, Kf - neg_:]], 1) * tap_r
+            G = jnp.fft.fft(gate, axis=1)
+            ib, fr = _positions(jnp, base, lo, s, c2)
+            return _dense(jnp, lax, jnp.real(G), jnp.imag(G), ib, fr, Rw1, Q.TAPS, wpoly)
+        return run
+    nb, starts = _starts(P, blk // (24 * max(Kf, Nr) + 16 * nblk * BLOCK * Rw1))
+    step1 = _program(('r1', nb, P, K, k0, Kf, Nr, nblk, Rw1, ref), make1)
+    j = np.arange(2 * nblk + 1, dtype=np.float64) * (BLOCK / 2)
+    ph0, ph1 = (np.asarray(v, np.float64) for v in (phase if ref else (np.zeros(P), np.zeros(P))))
+    parts = []
+    for r in starts:
+        sl = slice(r, r + nb)
+        kn = _knots(g['alpha'][sl, None] + j[None, :] * g['beta'][sl, None])
+        parts.append(step1(Sr, Si, i32(r), wk, tap_r, wpoly, jnp.asarray(wp[sl]), up(ph0[sl]), up(ph1[sl]),
+                           *(jnp.asarray(v) for v in kn)))
+    Ar, Ai = (v[:, :nkr] for v in joined(parts, starts, nb))
+    del Sr, Si, parts
+    jax.block_until_ready(Ar)
+    timing['range'] = timing.get('range', 0.0) + time.perf_counter() - t0
+    t0 = time.perf_counter()
+    # 2. azimuth
+    scale = jnp.float32(g['gain'] * Ny * Na / Pf)
+    kk = np.arange(Na)
+    nbin = np.where(kk < Na - Na // 2, kk, kk - Na)
+    keep = min(Na, Pf)
+    pa, na_ = keep - keep // 2, keep // 2
+    dist_bins, live = up(np.abs(nbin)), up((nbin < pa) & (nbin >= -na_))
+    edge, guard = jnp.float32(g['Ex']), jnp.float32(g['gx'])
+    nblk2 = -(-nka // BLOCK)
+    ja = np.arange(2 * nblk2 + 1, dtype=np.float64) * (BLOCK / 2)
+    qtab, ntab = g['qtab'], len(g['qtab'])
+    u = ((g['ka_lo'] + ja[None, :] * g['dka']) / g['kr'][:, None] - g['tg0']) * g['tg_inv']
+    kq = np.clip(np.floor(u), 0, ntab - 2).astype(np.int64)
+    posa = qtab[kq] + (u - kq) * (qtab[kq + 1] - qtab[kq])                 # [nkr, 2 nblk2 + 1]
+    Rw2 = window_of(float(np.abs(np.diff(posa[:, ::2], axis=1)).max()) / BLOCK, Q.TAPS)
+    del u, kq
+
+    def make2():
+        def run(Ar, Ai, J0, wpoly, dist_bins, live, edge, guard, scale, binm, base, lo, s, c2):
+            z = jnp.pad(lax.complex(cut(Ar, J0, nJ, 1), cut(Ai, J0, nJ, 1)).T, ((0, 0), (p0, Pf - P - p0)))
+            prof = jnp.fft.fft(z, axis=1)
+            cz = jnp.concatenate([prof[:, :pa], jnp.zeros((nJ, Na - keep), prof.dtype), prof[:, Pf - na_:]], 1)
+            d = dist_bins[None, :] * binm[:, None]
+            w = jnp.where(d <= edge, 1.0, jnp.where(d >= edge + guard, 0.0, 0.5 + 0.5 * jnp.cos((d - edge) * (math.pi / guard))))
+            A2 = jnp.fft.ifft(cz * (w * live[None, :] * scale), axis=1)
+            ib, fr = _positions(jnp, base, lo, s, c2)
+            return _dense(jnp, lax, jnp.real(A2), jnp.imag(A2), ib, fr, Rw2, Q.TAPS, wpoly)
+        return run
+    nJ, starts = _starts(nkr, blk // (24 * max(Pf, Na) + 16 * nblk2 * BLOCK * Rw2))
+    step2 = _program(('r2', nJ, P, nkr, Pf, Na, p0, nblk2, Rw2), make2)
+    parts = []
+    for J0 in starts:
+        kn = _knots(posa[J0:J0 + nJ])
+        parts.append(step2(Ar, Ai, i32(J0), wpoly, dist_bins, live, edge, guard, scale, up(g['bins_a'][J0:J0 + nJ]),
+                           *(jnp.asarray(v) for v in kn)))
+    Br, Bi = (v[:, :nka] for v in joined(parts, starts, nJ))
+    del Ar, Ai, parts, posa
+    jax.block_until_ready(Br)
+    timing['azimuth'] = timing.get('azimuth', 0.0) + time.perf_counter() - t0
+    t0 = time.perf_counter()
+    # 3. the range transform: [nka, Ny]
+    sy, sxh = up((-1.0) ** (np.arange(nkr) - hy)), ((-1.0) ** (np.arange(nka) - hx)).astype(f32)
+
+    def make3():
+        def run(Br, Bi, a0, sy, sxb):
+            z = lax.complex(cut(Br, a0, na, 1), cut(Bi, a0, na, 1)).T * (sy[None, :] * sxb[:, None])
+            f = jnp.fft.ifft(jnp.roll(jnp.pad(z, ((0, 0), (0, Ny - nkr))), -hy, axis=1), axis=1)
+            return jnp.real(f), jnp.imag(f)
+        return run
+    na, starts = _starts(nka, blk // (40 * Ny))
+    step3 = _program(('r3', na, nkr, nka, Ny, hy), make3)
+    Fr, Fi = joined([step3(Br, Bi, i32(a0), sy, jnp.asarray(sxh[a0:a0 + na])) for a0 in starts], starts, na)
+    del Br, Bi
+    jax.block_until_ready(Fr)
+    timing['range transform'] = timing.get('range transform', 0.0) + time.perf_counter() - t0
+    t0 = time.perf_counter()
+    # 4. the azimuth transform of the baseband rows the picture reads, and the read along them: row R of the padded
+    # image at the columns where the picture's columns lie on it
+    dist = g['dist']
+    powers = [(int(a), int(b)) for a, b in dist['powers']]
+    cx, cy = up(dist['cx']), up(dist['cy'])
+    msy = int(math.ceil(g['shift'][1] / g['spy'])) * ov + Q.LANCZOS + 2
+    R_lo = max(0, Ny // 2 - ov * (ny // 2 + 1) - msy)
+    R_hi = min(Ny, Ny // 2 + ov * (ny - ny // 2 + 1) + msy)
+    nxp, nyp = -(-nx // BLOCK) * BLOCK, -(-ny // BLOCK) * BLOCK
+    xn = up((np.arange(nxp) - nx / 2.0) * g['spx'] / dist['sx'])            # the picture's columns, normalised
+    yn = up((np.arange(nyp) - ny / 2.0) * g['spy'] / dist['sy'])
+    ixc = jnp.asarray((ov * np.arange(nxp) + (Nx // 2 - (ov * nx) // 2)).astype(i32))     # their columns on the padded image
+    iyc = jnp.asarray((ov * np.arange(nyp) + (Ny // 2 - (ov * ny) // 2) - R_lo).astype(i32))
+    half_x, half_y = f32(0.5 * ((ov * nx) % 2)), f32(0.5 * ((ov * ny) % 2))
+    ux, uy = f32(ov / g['spx']), f32(ov / g['spy'])
+    Rw3 = window_of(ov * 1.02, Q.LANCZOS)
+
+    def shift(coef, x, y):
+        """The displacement polynomial (m) at normalised coordinates."""
+        px, py = [jnp.ones_like(x)], [jnp.ones_like(y)]
+        for _ in range(max(a for a, _ in powers)):
+            px.append(px[-1] * x)
+        for _ in range(max(b for _, b in powers)):
+            py.append(py[-1] * y)
+        return sum(coef[k] * px[a] * py[b] for k, (a, b) in enumerate(powers))
+
+    def split(index, frac):
+        fl = jnp.floor(frac)
+        return index + fl.astype(jnp.int32), frac - fl
+
+    def make4():
+        def run(Fr, Fi, R0, cx, cy, xn, ixc):
+            z = lax.complex(cut(Fr, R0, nR, 1), cut(Fi, R0, nR, 1)).T                      # [nR, nka]
+            base = jnp.fft.fft(jnp.roll(jnp.pad(z, ((0, 0), (0, Nx - nka))), -hx, axis=1), axis=1)
+            yr = ((R0 + jnp.arange(nR)).astype(jnp.float32) - Ny / 2.0) * (g['spy'] / ov / dist['sy'])
+            X, Y = xn[None, :], yr[:, None]
+            yo = Y - shift(cy, X, Y) * (1.0 / dist['sy'])                                  # the picture's row that reads
+            yo = Y - shift(cy, X, yo) * (1.0 / dist['sy'])                                 # this baseband row there
+            ib, fr = split(ixc[None, :], shift(cx, X, yo) * ux + half_x)
+            return _dense(jnp, lax, jnp.real(base), jnp.imag(base), ib, fr, Rw3, Q.LANCZOS, None)
+        return run
+    nR, starts = _starts(R_hi - R_lo, blk // (24 * Nx + 16 * nxp * Rw3))
+    step4 = _program(('r4', nR, nka, Ny, Nx, hx, nxp, Rw3, float(g['spy']), float(dist['sy']), float(ux), float(half_x)), make4)
+    Ir, Ii = joined([step4(Fr, Fi, i32(R_lo + R0), cx, cy, xn, ixc) for R0 in starts], starts, nR)       # [rows, nxp]
+    del Fr, Fi
+    jax.block_until_ready(Ir)
+    timing['azimuth transform'] = timing.get('azimuth transform', 0.0) + time.perf_counter() - t0
+    t0 = time.perf_counter()
+    # 5. the read along the columns, the carrier (the pixel's own part of it from the host, in cycles; the
+    # displacement's on the device) or the amplitude: [nx, ny]
+    kr_c, ka_c = g['kr_min'] + hy * g['dkr'], g['ka_lo'] + hx * g['dka']
+    cyc = lambda v: up(v - np.floor(v))
+    cxx = cyc(-ka_c * (np.arange(nxp) - nx / 2.0) * g['spx'] / (2 * math.pi))
+    cyy = cyc(kr_c * (np.arange(nyp) - ny / 2.0) * g['spy'] / (2 * math.pi))
+    nrows = R_hi - R_lo
+
+    def make5():
+        def run(Ir, Ii, j0, cx, cy, xn, yn, iyc, cxx, cyy):
+            zr, zi = cut(Ir, j0, nc, 1).T, cut(Ii, j0, nc, 1).T                             # [nc, rows]
+            X, Y = cut(xn, j0, nc, 0)[:, None], yn[None, :]
+            dy = shift(cy, X, Y)
+            ib, fr = split(iyc[None, :], dy * uy + half_y)
+            ar, ai = _dense(jnp, lax, zr, zi, ib, fr, Rw3, Q.LANCZOS, None)
+            if not complex_image:
+                return jnp.sqrt(ar * ar + ai * ai)[:, :ny], jnp.zeros((1, 1), jnp.float32)
+            c = cut(cxx, j0, nc, 0)[:, None] + cyy[None, :] + (kr_c * dy - ka_c * shift(cx, X, Y)) * (1.0 / (2 * math.pi))
+            c = (c - jnp.floor(c)) * (2.0 * math.pi)
+            cs, sn = jnp.cos(c), jnp.sin(c)
+            return (ar * cs - ai * sn)[:, :ny], (ar * sn + ai * cs)[:, :ny]
+        return run
+    nc, starts = _starts(nxp, blk // (24 * nrows + 16 * nyp * Rw3))
+    step5 = _program(('r5', nc, nrows, nxp, nyp, ny, Rw3, bool(complex_image), float(kr_c), float(ka_c), float(uy), float(half_y)), make5)
+    parts = [step5(Ir, Ii, i32(j0), cx, cy, xn, yn, iyc, cxx, cyy) for j0 in starts]
+    if complex_image:
+        outr, outi = joined(parts, starts, nc)
+        jax.block_until_ready(outr)
+        timing['correction'] = timing.get('correction', 0.0) + time.perf_counter() - t0
+        t0 = time.perf_counter()
+        out = np.empty((nx, ny), c64)
+        v = out.view(np.float32).reshape(nx, ny, 2)
+        v[..., 0], v[..., 1] = np.asarray(outr[:nx]), np.asarray(outi[:nx])
+    else:
+        amp = joined([(p[0],) for p in parts], starts, nc)[0]
+        jax.block_until_ready(amp)
+        timing['correction'] = timing.get('correction', 0.0) + time.perf_counter() - t0
+        t0 = time.perf_counter()
+        out = np.asarray(amp[:nx])
+    timing['download'] = timing.get('download', 0.0) + time.perf_counter() - t0
     return out
