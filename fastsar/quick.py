@@ -79,15 +79,23 @@ PASS = 0.65                   # the part of a gated transform's period that the 
 OVERSAMPLE, LANCZOS = 2, 6    # the corrected image: the raster's padding and the taps of the final kernel
 PHASES = 2048                 # fractional positions per sample in the host kernels' weight tables
 # backend='auto' takes the device that forms a cut history soonest, by the history's size in samples (pulses times
-# frequency samples). Measured on 16 threads of a Threadripper PRO 7965WX against an RTX PRO 6000 that another job
-# kept busy, a 9.1 GB Capella file in the page cache, CPU / CUDA seconds of a process's later calls: 0.4e6 samples
-# 0.03 / 0.05, 1.8e6 0.04 / 0.045, 7.0e6 0.055 / 0.053, 28e6 0.14 / 0.076, 112e6 0.49 / 0.15, 449e6 1.9 / 0.53: the
-# GPU is the faster from about 1e7 samples, by 3 ns a sample. A process's first CUDA quick look also loads CuPy,
-# makes the context, loads the kernels and plans the transforms: first calls of 0.10 / 0.82, 0.14 / 0.78, 0.24 /
-# 0.84, 0.59 / 0.98 and 2.0 / 1.4 s at 0.4e6, 7e6, 28e6, 112e6 and 449e6 samples, a start of 0.7 s that the
-# device repays from 2.5e8 samples. (tests/bench_quicklook.py measures both backends on another machine.)
-AUTO_CUDA_SAMPLES = 10_000_000
-AUTO_CUDA_FIRST_SAMPLES = 250_000_000
+# frequency samples). Measured on a g2-standard-32 (an NVIDIA L4; the host's 32 vCPUs, Cascade Lake at 2.2 GHz, all
+# on the CPU path), the file in the page cache, seconds from the file to the PNG, CPU / CUDA, on a Capella and an
+# Umbra spotlight (tests/bench_quicklook.py):
+# - in a process whose device has started, at a new size of picture: 4.7e5 samples 0.044 / 0.036, 1.9e6 0.060 /
+#   0.043, 4.7e6 0.059 / 0.038, 7.5e6 0.10 / 0.075, 3.0e7 0.25 / 0.080, 3.3e7 0.20 / 0.070, 1.2e8 0.87 / 0.22,
+#   5.3e8 2.5 / 0.69: the GPU was the faster at every cut measured, from the smallest on. (On a machine whose
+#   driver cache does not yet hold them, cuFFT compiles each of the transform lengths _fft_cuda takes when first
+#   planned, 25 to 160 ms; there are 26 below 12,672 points, so a machine pays about 1.5 s once.)
+# - the first look of a process, which also imports CuPy, makes the context and loads the kernels (the transform
+#   lengths in the driver's cache): 7.5e6 samples 0.30 / 0.65, 3.0e7 0.48 / 0.72, 1.2e8 1.04 / 0.92 on the Capella
+#   file: the device repays its start from about 1e8.
+# The CPU's side assumes a host like that one: on fewer or slower cores the CPU path is slower and the device pays
+# from smaller cuts, on more or faster ones from larger. (The rule before, measured on 16 threads of a Threadripper
+# PRO 7965WX against an RTX PRO 6000 that another job kept busy, when cuFFT compiled most transform lengths at run
+# time, put the two at 1e7 and 2.5e8 samples.)
+AUTO_CUDA_SAMPLES = 500_000
+AUTO_CUDA_FIRST_SAMPLES = 100_000_000
 # On a TPU host the C++ polar format on the host's cores is taken below this size and the device from it on.
 # Measured on a v6e VM (44 vCPUs) at 2.2e8 samples, the Panama image from the arrays in memory: 1.27 s on the cores,
 # 1.72 s on the device (quick_jax._resident) after a first call of 106 s. No larger collection was measured there:

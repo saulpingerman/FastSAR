@@ -405,9 +405,21 @@ arrays that do not fit: held to 21.6 GB (a 24 GB device) both collections form w
 above; held to 6 GB the 175 megapixel picture keeps the range stage's output and the raster's range transform on
 the host and takes about ten times as long.
 
-`backend='auto'` takes the CPU for a cut below `quick.AUTO_CUDA_SAMPLES` (1e7 samples, where the two met here) and,
-for the first GPU quick look of a process, below `quick.AUTO_CUDA_FIRST_SAMPLES` (2.5e8 samples, where the device
-repays its 0.7 s start).
+On an NVIDIA L4 (g2-standard-32, 32 vCPUs of a Cascade Lake host) a quick look at a size the process has not formed
+before costs little more than a later one at that size: 0.075 against 0.037 s at 1024 pixels of the first Capella
+collection, 0.080 against 0.075 s at 2048, 0.22 against 0.21 s at 4096, where the first call at each new size used to
+take 0.3 to 0.4 s more. That time went to cuFFT, which compiles a transform when the first plan of its length is
+made unless the library ships it compiled; the GPU path now takes only lengths that cuFFT either ships or compiles
+once for good, which the driver keeps in `~/.nv/ComputeCache`
+([algorithms.md](algorithms.md#polar-format)). Those are about 26 lengths; a machine whose cache holds none of them
+pays 25 to 160 ms for each when it first needs it, about 1.5 s in all, and later processes find them there.
+
+`backend='auto'` takes the CPU for a cut below `quick.AUTO_CUDA_SAMPLES` (5e5 samples: on the L4 the GPU was the
+faster at every cut measured, 0.036 against 0.044 s at 4.7e5 samples and 0.075 against 0.10 s at 7.5e6) and, for
+the first GPU quick look of a process, below `quick.AUTO_CUDA_FIRST_SAMPLES` (1e8 samples, where the device repays
+the import of CuPy, the context and the kernels: 0.65 against 0.30 s at 7.5e6 samples, 0.92 against 1.04 s at
+1.2e8). The CPU's side of both assumes a host like the L4's; on fewer or slower cores the device pays from
+smaller cuts.
 
 `looks` costs its count: n by n looks read n by n times the samples and form as many images.
 
