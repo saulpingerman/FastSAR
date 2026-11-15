@@ -70,6 +70,30 @@ def test_selection_equals_slicing_the_whole_read(spot):
             io.read_cphd(path, **bad)
 
 
+def test_phase_ramp_of_a_selection_has_the_whole_rows_values():
+    """The compiled phase ramp on the samples first .. last - 1 of longer rows gives each sample the value it has in
+    the pass over the whole rows, wherever the selection ends in a block of 16 samples (the vector part and the
+    remainder of the kernel's loop round differently on some CPUs)."""
+    rng = np.random.default_rng(3)
+    P, K = 9, 203
+    S = (rng.standard_normal((P, K)) + 1j * rng.standard_normal((P, K))).astype(np.complex64)
+    f0, df, coef = 9.6e9 + rng.uniform(0, 1e6, P), 2.5e5 + rng.uniform(0, 10, P), rng.uniform(-3e-9, 3e-9, P)
+
+    def freq(first, n):
+        kk = np.arange(first, first + n)
+
+        def f(sl, out):
+            out[:] = f0[sl, None] + df[sl, None] * kk[None, :]
+        return f
+    full = io._phase_rows(S.copy(), freq(0, K), coef, +1, linear=(f0, df))
+    assert not np.array_equal(full, S)
+    for first in (0, 16, 96, 192):
+        for last in range(first + 1, K + 1):
+            part = io._phase_rows(S[:, first:last].copy(), freq(first, last - first), coef, +1, linear=(f0, df),
+                                  first=first, total=K)
+            assert np.array_equal(part, full[:, first:last]), (first, last)
+
+
 def test_selection_without_the_compiled_pass(spot, monkeypatch):
     """The NumPy passes (no compiler, or FASTSAR_IO_KERNEL=0) select the same values."""
     path, P, K = spot['path'], *spot['S'].shape

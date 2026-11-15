@@ -10,10 +10,13 @@
 
 // S [P, K] complex64 (as float pairs), in place: S[p, k] *= exp(j (a[p] + (first + k) b[p])). The phasor is formed
 // exactly in double at the start of every block of 16 samples and stepped inside it by the block's 16 rotations in
-// float, so the phase error stays at float32's rounding for any K. first: a multiple of 16, the place of the row's
-// first sample in a longer row whose ramp this is a part of (a reader's sample selection): the blocks, and with them
-// every value, are then those of the pass over the whole row.
-static void ramp_rows(float* S, long P, long K, const double* a, const double* b, long first)
+// float, so the phase error stays at float32's rounding for any K. first, total: the row is the samples first ..
+// first + K - 1 (first a multiple of 16) of a longer row of total samples whose ramp this is a part of (a reader's
+// sample selection). Every value is then that of the pass over the whole row: the blocks are the whole row's, and
+// a block that the selection ends inside is completed in a copy and passed through the loop at the length it has in
+// the whole row (the loop's vector part and its remainder round differently on some targets, so the same samples
+// at another trip count are not the same values).
+static void ramp_rows(float* S, long P, long K, const double* a, const double* b, long first, long total)
 {
   par::for_dynamic(P, 16, [&](long p) {
     float* s = S + 2 * p * K;
@@ -24,27 +27,36 @@ static void ramp_rows(float* S, long P, long K, const double* a, const double* b
     for (long k0 = 0; k0 < K; k0 += 16) {
       const double ph = std::remainder(a0 + (double)(first + k0) * b0, 6.283185307179586476925286766559);
       const float zr = (float)std::cos(ph), zi = (float)std::sin(ph);
-      const int n = (int)(K - k0 < 16 ? K - k0 : 16);
+      const int n = (int)(K - k0 < 16 ? K - k0 : 16);          // the samples here
+      const long left = total - first - k0;
+      const int m = (int)(left < 16 ? left : 16);              // the block's samples in the whole row
+      float part[32];
       float* q = s + 2 * k0;
+      if (n < m) {
+        std::memcpy(part, q, 8 * (size_t)n);
+        std::memset(part + 2 * n, 0, 8 * (size_t)(m - n));
+        q = part;
+      }
       #pragma omp simd
-      for (int j = 0; j < n; ++j) {
+      for (int j = 0; j < m; ++j) {
         const float er = zr * wr[j] - zi * wi[j], ei = zr * wi[j] + zi * wr[j];
         const float xr = q[2 * j], xi = q[2 * j + 1];
         q[2 * j] = xr * er - xi * ei;
         q[2 * j + 1] = xr * ei + xi * er;
       }
+      if (n < m) std::memcpy(s + 2 * k0, part, 8 * (size_t)n);
     }
   });
 }
 
 extern "C" void phase_ramp(float* S, long P, long K, const double* a, const double* b)
 {
-  ramp_rows(S, P, K, a, b, 0);
+  ramp_rows(S, P, K, a, b, 0, K);
 }
 
-extern "C" void phase_ramp_from(float* S, long P, long K, const double* a, const double* b, long first)
+extern "C" void phase_ramp_from(float* S, long P, long K, const double* a, const double* b, long first, long total)
 {
-  ramp_rows(S, P, K, a, b, first);
+  ramp_rows(S, P, K, a, b, first, total < first + K ? first + K : total);
 }
 
 // The signal array of a CPHD file into complex64: src [P, K, 2] big-endian samples of kind 1 (int8), 2 (int16) or

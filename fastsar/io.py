@@ -192,7 +192,7 @@ def _lib():
                 L.phase_ramp.argtypes = [p, n, n, p, p]
                 L.cphd_load.argtypes = [p, i, n, n, p, i, p, p, p, p]
                 L.phase_ramp.restype = L.cphd_load.restype = None
-                L.phase_ramp_from.argtypes = [p, n, n, p, p, n]
+                L.phase_ramp_from.argtypes = [p, n, n, p, p, n, n]
                 L.phase_ramp_from.restype = None
                 L.cphd_read.argtypes = [i, ctypes.c_longlong, i, n, n, n, n, n, p, i, p, p]
                 L.cphd_read.restype = ctypes.c_longlong
@@ -202,14 +202,16 @@ def _lib():
     return _LIB[0]
 
 
-def _phase_rows(S, f, coef, sign, linear=None, first=0):
+def _phase_rows(S, f, coef, sign, linear=None, first=0, total=None):
     """In place, in row blocks on all cores: S[p, k] *= exp(sign 2j pi f[p, k] coef[p]) with f(slice, out) writing the
     frequencies (Hz) of a row slice into out [rows, K] (no full-size temporary). The phase is formed in float64 and its
     cosine and sine taken straight into complex64 (on one core a 17 GB history took 100 s, the most of a read).
     linear: (f0, df), numbers or arrays [P], when the frequencies are f0[p] + k df[p]: the compiled pass then steps
     the phasor along each row instead of taking a cosine and a sine per sample, in a fifth of the time. first: a
     multiple of 16, when S holds the samples from `first` on of longer rows (a reader's sample selection) and the
-    frequencies are f0[p] + (first + k) df[p]; f writes those."""
+    frequencies are f0[p] + (first + k) df[p]; f writes those. total: the samples of those longer rows; the compiled
+    pass then gives each sample the value it has in the pass over the whole row, also in the last block of 16 when
+    the selection ends inside it."""
     from .patches import _rows_with
     c = sign * 2 * np.pi * np.asarray(coef, np.float64)
     P, K = S.shape
@@ -218,7 +220,7 @@ def _phase_rows(S, f, coef, sign, linear=None, first=0):
         a = np.ascontiguousarray(np.broadcast_to(np.asarray(linear[0], np.float64) * c, (P,)))
         b = np.ascontiguousarray(np.broadcast_to(np.asarray(linear[1], np.float64) * c, (P,)))
         if first:
-            lib.phase_ramp_from(S.ctypes.data, P, K, a.ctypes.data, b.ctypes.data, first)
+            lib.phase_ramp_from(S.ctypes.data, P, K, a.ctypes.data, b.ctypes.data, first, int(total or first + K))
         else:
             lib.phase_ramp(S.ctypes.data, P, K, a.ctypes.data, b.ctypes.data)
         return S
@@ -268,13 +270,14 @@ def _start(v):
     return str(v)
 
 
-def _assemble(S, tx, rcv, srp, f0, df, notes, sicd, meta, info, first=0, keep=None):
+def _assemble(S, tx, rcv, srp, f0, df, notes, sicd, meta, info, first=0, keep=None, total=None):
     """The tail shared by the readers: the local frame at the mid-aperture scene reference point, the reference
     range of each pulse (re-referenced to one point when the scene reference point barely moves), the SICD grid
     when one is given, and the (col, meta) outputs. S [P, K] is the frequency-domain phase history on the grid
     f0 + k df compensated to each pulse's srp [P, 3] (ECF), tx and rcv [P, 3] the antenna positions (ECF), info
     the source-specific metadata fields. first, keep: a reader's sample selection, S holding the samples from
-    `first` on of the grid (a multiple of 16) and the columns keep = (first, last + 1) of S the ones returned."""
+    `first` on of the grid (a multiple of 16) and the columns keep = (first, last + 1) of S the ones returned;
+    total: the samples of the whole grid."""
     P, K = S.shape
     # local frame at the mid-aperture scene reference point, z along the ellipsoid normal (not the geocentric radial,
     # which leans up to 0.19 degrees from it: 3 m of height across 1 km)
@@ -298,7 +301,7 @@ def _assemble(S, tx, rcv, srp, f0, df, notes, sicd, meta, info, first=0, keep=No
 
             def freq(sl, out):
                 out[:] = fk
-            _phase_rows(S, freq, 2 * (ref - ref0) / C, -1, linear=(f0, df), first=first)
+            _phase_rows(S, freq, 2 * (ref - ref0) / C, -1, linear=(f0, df), first=first, total=total)
             notes.append(f're-referenced to the mid-aperture scene reference point (range change up to {moved:.1f} m)')
         else:
             fixed_ref = False
@@ -645,7 +648,7 @@ def _read_cphd(cphd, sicd, channel, meta, regrid_tol, drop_flagged, troposphere,
         def freq(sl, out):                      # sc0 + scss k, formed in out
             np.multiply(scss[sl, None], kk[None, :], out=out)
             out += sc0[sl, None]
-        _phase_rows(S, freq, td, +1, linear=(sc0, scss), first=ka if sel else 0)
+        _phase_rows(S, freq, td, +1, linear=(sc0, scss), first=ka if sel else 0, total=Kfile if sel else None)
         notes.append(f'removed {what} at the SRP (mean {td.mean() * 1e9:.2f} ns, span {np.ptp(td) * 1e9:.3f} ns)')
     f0, df = float(np.median(sc0)), float(np.median(scss))
     t1, t2 = pv('TOA1'), pv('TOA2')
@@ -679,7 +682,7 @@ def _read_cphd(cphd, sicd, channel, meta, regrid_tol, drop_flagged, troposphere,
         signal_bytes = (pb - pa) * K * 2 * (r.signal_map(channel).dtype.itemsize if hasattr(r, 'signal_map') else 4)
     info.update(samples=(k0, k1), signal_bytes=int(signal_bytes))
     notes.append(f'read pulses {pa} to {pb - 1} of {int(ch.NumVectors)} and samples {k0} to {k1 - 1} of {Kfile}')
-    return _assemble(S, tx, rcv, srp, f0, df, notes, sicd, meta, info, first=ka, keep=(k0 - ka, k1 - ka))
+    return _assemble(S, tx, rcv, srp, f0, df, notes, sicd, meta, info, first=ka, keep=(k0 - ka, k1 - ka), total=Kfile)
 
 
 def read_collection(path, **kw):
