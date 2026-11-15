@@ -889,6 +889,12 @@ def test_device_programs_are_shared(spot, squinted, request, monkeypatch):
     assert quick_jax._ladder_down(1087) == 1024 and all(quick_jax._ladder(v) >= v for v in range(1, 5000, 7))
     monkeypatch.setenv('FASTSAR_JAX_PROGRAMS', 'fused')
     assert rel_db(quick._pfa(S, ant, f0, df, *grid, backend='jax'), ref) < -100
+    monkeypatch.delenv('FASTSAR_JAX_PROGRAMS')
+    monkeypatch.setattr(quick_jax, 'AT_ONCE', 0)              # every transform in a loop over chunks of rows
+    for c in (True, False):
+        e = rel_db(quick._pfa(S, ant, f0, df, *grid, correct=c, backend='jax'), quick._pfa(S, ant, f0, df, *grid, correct=c))
+        print(f'transforms in chunks of rows, corrected {c}: {e:.1f} dB against C++')
+        assert e < -70
     monkeypatch.setenv('FASTSAR_JAX_PROGRAMS', 'both')
     with pytest.raises(ValueError, match='FASTSAR_JAX_PROGRAMS'):
         quick._pfa(S, ant, f0, df, *grid, backend='jax')
