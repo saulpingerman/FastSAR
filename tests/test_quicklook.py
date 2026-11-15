@@ -505,7 +505,10 @@ def test_png_round_trip(tmp_path):
             n = int.from_bytes(b[at:at + 4], 'big')
             assert zlib.crc32(b[at + 4:at + 8 + n]) == int.from_bytes(b[at + 8 + n:at + 12 + n], 'big')
             data, at = data + b[at + 8:at + 8 + n], at + 12 + n
-        assert at == len(b) - 12 and len(zlib.decompress(data)) == a.shape[0] * (1 + a[0].size)
+        assert at == len(b) - 12 and len(zlib.decompress(data)) == a.shape[0] * (1 + a[0].size)   # nothing after
+    os.symlink(tmp_path / 'a.png', tmp_path / 'link.png')         # written over in place, through a link
+    quick.write_png(str(tmp_path / 'link.png'), a[:7])
+    assert os.path.islink(tmp_path / 'link.png') and np.array_equal(quick.read_png(str(tmp_path / 'a.png')), a[:7])
     for bad in (np.zeros((4, 4), np.float32), np.zeros((4,), np.uint8), np.zeros((4, 4, 2), np.uint8)):
         with pytest.raises(ValueError, match='uint8'):
             quick.write_png(str(tmp_path / 'b.png'), bad)

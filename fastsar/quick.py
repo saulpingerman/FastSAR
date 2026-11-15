@@ -63,6 +63,7 @@ the cut above does not apply. process_cphd forms those.
 """
 import math
 import os
+import stat
 import threading
 import time
 
@@ -2153,7 +2154,11 @@ def write_png(path, image, level=1):
         return struct.pack('>I', len(body)) + kind + body + struct.pack('>I', zlib.crc32(kind + body))
     color = {1: 0, 3: 2, 4: 6}[1 if np.ndim(image) == 2 else np.shape(image)[2]]
     adler = 1
-    with open(path, 'wb', buffering=0) as fh:
+    # An existing file is written over and cut to the new length at the end, not truncated to nothing first: ext4
+    # (auto_da_alloc) then starts writing a file out when it is closed, and the next truncation of it waits for that
+    # write, which on a network disk took 0.4 to 0.5 s of every quick look written to one path.
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | getattr(os, 'O_BINARY', 0), 0o666)
+    with open(fd, 'wb', buffering=0) as fh:
         fh.write(b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', cols, rows, 8, color, 0, 0, 0)))
         for i, (pieces, crc, a2, n2) in enumerate(_ordered(deflate, len(starts))):
             # the stream's Adler-32 from the blocks' own (zlib's adler32_combine)
@@ -2173,6 +2178,8 @@ def write_png(path, image, level=1):
                     view = view[fh.write(view):]
             fh.write(struct.pack('>I', crc))
         fh.write(chunk(b'IEND', b''))
+        if stat.S_ISREG(os.fstat(fd).st_mode):
+            os.ftruncate(fd, fh.tell())
 
 
 def read_png(path):
