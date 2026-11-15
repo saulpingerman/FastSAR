@@ -597,10 +597,45 @@ def test_looks(tmp_path):
         look(path, looks=2, complex_image=True)
 
 
-def test_factorized_former_on_jax(spot, request):
-    """backend='jax': the same cut history on the same grid by the factorized former, with a note; the picture
-    agrees with polar format's."""
+def test_polar_format_on_jax(spot, squinted, request, monkeypatch):
+    """backend='jax': polar format's stages on JAX's device, in float32 with every complex array as two planes and
+    the positions sent as parabolas over blocks of outputs. The image is the host's: corrected and uncorrected,
+    complex and detected, on a plain raster and on a sheared one, and with pulses missing."""
     request.getfixturevalue('jax_cpu')
+    for f, limit in ((spot, -70), (squinted, -55)):
+        col = quick._collection(f['path'], size=128)
+        S, ant, f0, df = col['S'], col['ant'], col['fmin'], col['df']
+        grid = tuple(col[k] for k in ('nx', 'ny', 'spx', 'spy', 'e1', 'e2'))
+        for correct in (True, False):
+            for cplx in (True, False):
+                h = quick._pfa(S, ant, f0, df, *grid, correct=correct, complex_image=cplx)
+                j = quick._pfa(S, ant, f0, df, *grid, correct=correct, complex_image=cplx, backend='jax')
+                e = rel_db(np.asarray(j).astype(np.complex64), h.astype(np.complex64))
+                print(f'jax against the host, correct {correct}, complex {cplx}: {e:.1f} dB')
+                assert isinstance(j, np.ndarray) and j.dtype == h.dtype and j.shape == h.shape and e < limit
+    keep = np.ones(len(ant), bool)
+    keep[[20, 21, 90]] = False
+    S2, ant2 = np.ascontiguousarray(S[keep]), ant[keep]
+    assert quick._geometry(ant2, f0, df, S.shape[1], *grid, True)['place'] is not None
+    assert rel_db(quick._pfa(S2, ant2, f0, df, *grid, backend='jax'), quick._pfa(S2, ant2, f0, df, *grid)) < -55
+    ref = look(spot['path'], size=128, complex_image=True)
+    out = look(spot['path'], size=128, backend='jax', complex_image=True)
+    assert out['algorithm'] == 'pfa' and out['backend'] == 'jax' and out['cut'] == ref['cut'] and out['correct']
+    assert rel_db(out['image'], ref['image']) < -70 and any('cross to the JAX device in blocks' in n for n in out['notes'])
+    assert np.mean(np.abs(out['display'].astype(int) - ref['display'].astype(int)) <= 1) > 0.999
+    monkeypatch.setenv('FASTSAR_JAX_BLOCK_MB', '2')                           # a device with little to give: small blocks
+    small = look(spot['path'], size=128, backend='jax', complex_image=True)
+    monkeypatch.delenv('FASTSAR_JAX_BLOCK_MB')
+    assert rel_db(small['image'], out['image']) < -90
+    lk = look(spot['path'], size=64, backend='jax', looks=2)
+    assert lk['looks'] == (2, 2) and np.mean(np.abs(lk['display'].astype(int) - look(spot['path'], size=64, looks=2)['display'].astype(int)) <= 1) > 0.99
+
+
+def test_factorized_former_on_jax(spot, request, monkeypatch):
+    """FASTSAR_QUICKLOOK_JAX=ffbp: the same cut history on the same grid by the factorized former, with a note; the
+    picture agrees with polar format's."""
+    request.getfixturevalue('jax_cpu')
+    monkeypatch.setenv('FASTSAR_QUICKLOOK_JAX', 'ffbp')
     ref = look(spot['path'], size=128, complex_image=True)
     out = look(spot['path'], size=128, backend='jax', complex_image=True)
     assert out['algorithm'] == 'ffbp' and out['backend'] == 'jax' and out['displacement_px'] is None
@@ -613,6 +648,9 @@ def test_factorized_former_on_jax(spot, request):
     rows, cols = _expected_pixels(out)
     for r, c in zip(rows, cols):
         assert out['display'][int(round(r)) - 2:int(round(r)) + 3, int(round(c)) - 2:int(round(c)) + 3].max() >= 250
+    monkeypatch.setenv('FASTSAR_QUICKLOOK_JAX', 'gathers')
+    with pytest.raises(ValueError, match='FASTSAR_QUICKLOOK_JAX'):
+        look(spot['path'], size=128, backend='jax')
 
 
 def test_auto_backend_by_the_size_of_the_cut(spot, monkeypatch):
@@ -650,17 +688,20 @@ def test_auto_backend_by_the_size_of_the_cut(spot, monkeypatch):
 
 @pytest.mark.tpu
 def test_tpu(spot, monkeypatch):
-    """On a TPU: 'auto' picks it, the cut history is formed by the factorized former at precision 'single-pass',
-    and the picture agrees with polar format's on the host."""
+    """On a TPU: 'auto' picks it from its threshold on, the device's stages form the host's image, and the
+    factorized former (precision 'single-pass') stays selectable."""
     ref = look(spot['path'], size=128, complex_image=True)
     monkeypatch.setattr(quick, 'AUTO_TPU_SAMPLES', 0)
     out = fastsar.quicklook(spot['path'], size=128, complex_image=True)
-    assert out['backend'] == 'tpu' and out['algorithm'] == 'ffbp' and out['corner_error'] is None
-    assert any('single-pass' in n for n in out['notes']) and out['cut'] == ref['cut']
+    assert out['backend'] == 'tpu' and out['algorithm'] == 'pfa' and out['cut'] == ref['cut']
     e = rel_db(out['image'], ref['image'])
-    print(f'factorized former on the TPU against polar format on the host: {e:.1f} dB')
-    assert e < -20
-    assert np.mean(np.abs(out['display'].astype(int) - ref['display'].astype(int)) <= 16) > 0.9
+    print(f'polar format on the TPU against the host: {e:.1f} dB')
+    assert e < -50
+    assert np.mean(np.abs(out['display'].astype(int) - ref['display'].astype(int)) <= 2) > 0.99
+    monkeypatch.setenv('FASTSAR_QUICKLOOK_JAX', 'ffbp')
+    out = fastsar.quicklook(spot['path'], size=128, backend='tpu', complex_image=True)
+    assert out['algorithm'] == 'ffbp' and any('single-pass' in n for n in out['notes'])
+    assert rel_db(out['image'], ref['image']) < -20
 
 
 @pytest.mark.cuda

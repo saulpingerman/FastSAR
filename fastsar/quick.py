@@ -363,7 +363,8 @@ def _collection(cphd, size=2048, resolution=None, extent=None, channel=0, reader
     # referenced to the grid center, |ant - center| (as form_cphd moves a spotlight's reference)
     dref = np.asarray(meta['ref'], np.float64) - np.linalg.norm(rel, axis=1)
     phase = None
-    if backend == 'cuda':                             # S[p, k] exp(-2 pi j (f0 + k df) 2 dref[p] / c), on the device
+    if backend == 'cuda' or (backend in ('jax', 'tpu') and _jax_algorithm() == 'pfa'):
+        # S[p, k] exp(-2 pi j (f0 + k df) 2 dref[p] / c), on the device
         a = -f0 * (2 * dref / C)
         phase = (a - np.floor(a), -df * (2 * dref / C))
     else:
@@ -864,6 +865,9 @@ def _pfa(S, ant, fmin, df, nx, ny, spx, spy, e1, e2, *, correct=True, window=Tru
         g['gain'] = g['gain'] * float(scale)
     if backend == 'cuda':
         img = _pfa_cuda(box, g, window, correct, complex_image, timing, phase, info)
+    elif backend in ('jax', 'tpu'):
+        from . import quick_jax
+        img = quick_jax.pfa(box, g, window, correct, complex_image, timing, phase, info)
     else:
         box[0] = np.ascontiguousarray(box[0], np.complex64)
         if phase is not None:
@@ -1194,7 +1198,30 @@ def _pfa_cuda(S, g, window, correct, complex_image, timing, phase=None, info=Non
     if plan['kept'] and info is not None:
         info['stream'] = (f"the device has {budget / 1e9:.1f} GB to give: {', '.join(plan['kept'])} "
                           f"{'is' if len(plan['kept']) == 1 else 'are'} kept on the host and cross in blocks")
-    new = lambda on, shape, dtype=c64: cp.empty(shape, dtype) if on else np.empty(shape, dtype)
+    def new(on, shape, dtype=c64):
+        """An array on the device, or on the host in page-locked memory (pageable where that much cannot be locked):
+        its blocks then cross several times faster."""
+        if on:
+            return cp.empty(shape, dtype)
+        try:
+            n = int(np.prod(shape))
+            return np.frombuffer(memory._pinned(n * np.dtype(dtype).itemsize), dtype, n).reshape(shape)
+        except Exception:
+            return np.empty(shape, dtype)
+
+    def up(hb):
+        """A host block on the device, through page-locked memory."""
+        try:
+            pin = np.frombuffer(memory._pinned(hb.nbytes), hb.dtype, hb.size).reshape(hb.shape)
+        except Exception:
+            return cp.asarray(hb)
+
+        def copy(sl):
+            np.copyto(pin[sl], hb[sl])
+        _blocks(copy, hb.shape[0], int(max(1, (1 << 18) // hb.shape[1])))
+        d = cp.empty(hb.shape, hb.dtype)
+        d.set(pin)
+        return d
     ptr = lambda a: a.ctypes.data_as(ctypes.c_void_p)
     at = lambda a, row=0, col=0: ctypes.c_void_p(a.ctypes.data + row * a.strides[0] + col * a.strides[1])
 
@@ -1316,7 +1343,7 @@ def _pfa_cuda(S, g, window, correct, complex_image, timing, phase=None, info=Non
                 lib.ql_unshear(ptr(A), nwin, P, None if jlo is None else ptr(jlo), None if place is None else ptr(place),
                                Pp, J0, n, at(hb, 0, p0), Pf)
             hb[:, p0 + Pp:] = 0
-            pad = cp.asarray(hb)
+            pad = up(hb)
             del hb
             t1 = step('blocks to the device', t1)
         prof = cf.fft(pad, axis=1, overwrite_x=True)
@@ -1359,7 +1386,7 @@ def _pfa_cuda(S, g, window, correct, complex_image, timing, phase=None, info=Non
             M = np.ascontiguousarray(B[:, a0:a0 + n].T)
             if correct:
                 M *= sy[None, :] * sx[a0:a0 + n, None]
-            Z = cp.asarray(_fold(M, Ny, hy))
+            Z = up(_fold(M, Ny, hy))
             del M
             t1 = step('blocks to the device', t1)
         Fb = cf.ifft(Z, axis=1, overwrite_x=True)
@@ -1409,7 +1436,7 @@ def _pfa_cuda(S, g, window, correct, complex_image, timing, phase=None, info=Non
             if hx:
                 lib.ql_transpose(at(F, 0, rb0), Ny, hx, span, at(hb, 0, Nx - hx), Nx, None, 0)
             hb[:, nka - hx:Nx - hx] = 0
-            Z = cp.asarray(hb)
+            Z = up(hb)
             del hb
             t1 = step('blocks to the device', t1)
         base = cf.fft(Z, axis=1, overwrite_x=True)
@@ -1564,6 +1591,15 @@ def read_png(path):
 
 # ------------------------------------------------------------------------------------------------- the quick look
 
+def _jax_algorithm():
+    """What forms a quick look on the jax and tpu backends: 'pfa', polar format's stages on the device
+    (quick_jax.py), or, with FASTSAR_QUICKLOOK_JAX=ffbp, the factorized former on the same cut and grid."""
+    v = os.environ.get('FASTSAR_QUICKLOOK_JAX', '').strip().lower() or 'pfa'
+    if v not in ('pfa', 'ffbp'):
+        raise ValueError(f"FASTSAR_QUICKLOOK_JAX must be 'pfa' or 'ffbp', got {v!r}")
+    return v
+
+
 def _backend(backend):
     """A backend named by the caller, checked against this machine ('auto' is resolved by _auto, once the cut is
     known)."""
@@ -1616,8 +1652,9 @@ def quicklook(cphd, output=None, *, size=2048, resolution=None, correct=True, re
         displacement, a smooth field that grows with the square of the distance from the center, stays, and
         displacement_px says how large it is at the corners.
     remap: the display remap, a name of fastsar.remap.REMAPS other than 'linear' or a function (sidd.to_display's).
-    backend: 'auto', 'cpu', 'cuda', 'jax' or 'tpu'. cpu and cuda form by polar format; jax and tpu form the same
-        cut history on the same grid by the factorized former (ImageFormer), where correct does not apply. 'auto'
+    backend: 'auto', 'cpu', 'cuda', 'jax' or 'tpu', each with polar format's stages written for it (the jax and
+        tpu backends form by the factorized former instead with FASTSAR_QUICKLOOK_JAX=ffbp, where correct does not
+        apply). 'auto'
         takes the device that forms the cut soonest, by its size: the CPU for a small one (no device is started),
         a GPU or a TPU from the sizes of AUTO_CUDA_SAMPLES, AUTO_CUDA_FIRST_SAMPLES and AUTO_TPU_SAMPLES on.
     weighting: 'taylor' (nbar 4, 35 dB, along frequency and along pulses: the default) or 'uniform'.
@@ -1710,7 +1747,7 @@ def quicklook(cphd, output=None, *, size=2048, resolution=None, correct=True, re
     for i in range(la):
         for j in range(lr):
             sub = look(i, j)
-            if backend in ('jax', 'tpu'):
+            if backend in ('jax', 'tpu') and _jax_algorithm() == 'ffbp':
                 img = _ffbp(sub, backend, window, timing)[0]
                 cimg = img if want else None
                 rm = np.ascontiguousarray(img.T)
@@ -1743,11 +1780,11 @@ def quicklook(cphd, output=None, *, size=2048, resolution=None, correct=True, re
         del acc
         notes.append(f'{la} by {lr} looks (sub-apertures of {Pl} pulses by sub-bands of {Kl} samples), their power '
                      'averaged')
-    if backend in ('jax', 'tpu'):
+    if backend in ('jax', 'tpu') and _jax_algorithm() == 'ffbp':
         algorithm, corrected = 'ffbp', True
         notes.append(f"formed by factorized backprojection on the '{backend}' backend"
-                     + (" (precision 'single-pass')" if backend == 'tpu' else '') + ': polar format\'s resampling '
-                     'steps are gathers, which are slow on this device; correct does not apply')
+                     + (" (precision 'single-pass')" if backend == 'tpu' else '') + ' (FASTSAR_QUICKLOOK_JAX=ffbp); '
+                     'correct does not apply')
     else:
         if info.get('stream'):
             notes.append(info['stream'])

@@ -107,6 +107,12 @@ def test_program_choice(scene, monkeypatch):
     from fastsar import api
     assert api._pfa_stages('cpu', 'union') == 'cpu' and api._pfa_stages('cpu', 'inscribed') == 'cpu'
     assert api._pfa_stages('jax', 'union') is None
+    monkeypatch.setenv('FASTSAR_PFA_PROGRAM', 'stages')
+    assert api._pfa_stages('jax', 'union') == 'jax' and api._pfa_stages('cpu', 'union') == 'cpu'
+    col, S = scene
+    a = fastsar.form_image(S, col.ant, col.fmin, col.df, **GRID, algorithm='pfa', pfa_guard=10.0, backend='jax')
+    b = fastsar.form_image(S, col.ant, col.fmin, col.df, **GRID, algorithm='pfa', pfa_guard=10.0, backend='cpu')
+    assert a.shape == b.shape and a.dtype == np.complex64 and rel_db(a, b) < -70
     monkeypatch.setenv('FASTSAR_PFA_PROGRAM', 'jax')
     assert api._pfa_stages('cpu', 'union') is None
     monkeypatch.setenv('FASTSAR_PFA_PROGRAM', 'fast')
