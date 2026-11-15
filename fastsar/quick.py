@@ -51,8 +51,9 @@ array (the arrays are turned between the stages), and the C++ kernels of quicklo
 weights from polyphase tables. 'cuda' (_pfa_cuda): the samples go up as the file holds them (16-bit integers at
 half the bytes of complex64) in blocks of pulses through page-locked buffers, on a stream of their own, while a
 thread reads the next block from the file and the device converts and forms the one before; each pass that is not
-a transform is one CUDA kernel, and every stage works in blocks sized from the device's free memory; the arrays
-that do not fit stay on the host and cross in blocks by the same link. 'jax' and 'tpu' (quick_jax.py): compiled programs over blocks of one shape, in float32 with every
+a transform is one CUDA kernel, the transforms take lengths cuFFT ships compiled (_fft_cuda: no new size of
+picture compiles one), and every stage works in blocks sized from the device's free memory; the arrays that do
+not fit stay on the host and cross in blocks by the same link. 'jax' and 'tpu' (quick_jax.py): compiled programs over blocks of one shape, in float32 with every
 complex array as two planes. 'auto': the device that forms the cut soonest, by its size (the AUTO_ thresholds
 below).
 

@@ -27,7 +27,12 @@ was published on PyPI.
   the CPU, CUDA kernels on a GPU, compiled float32 programs on a JAX device or a TPU. The device paths work in
   blocks sized from the device's free memory and keep on the host what does not fit, with a note. `backend='auto'`
   takes the device that forms the cut soonest, by the cut's size. A moving-beam collection is refused with a
-  `ValueError` that names `process_cphd`.
+  `ValueError` that names `process_cphd`. On a GPU the file's own samples go up (16-bit integers in half the bytes
+  of complex64, 8-bit ones in a quarter) and the device converts them, and the transforms take lengths cuFFT ships
+  compiled, so that a new size of picture costs no compilation: with the CPU's lengths cuFFT compiled 0.3 to 0.4 s
+  of kernels at each new size on a machine whose driver cache did not hold them. The GPU's corrected picture then
+  differs from the CPU's by the final interpolation's own error, about -43 dB, at the same distance from exact
+  backprojection ([docs/algorithms.md](docs/algorithms.md#polar-format)).
 - `io.read_cphd(..., pulses=(first, last + 1), samples=(first, last + 1))` reads a part of a collection: those
   vectors' parameters and those samples of each alone, with `pread` on all cores, for CPHD 1.0.1, 1.1.0 and 0.3.
   For a collection with one scene reference point and one frequency grid the result equals the rows and columns of
@@ -53,6 +58,10 @@ was published on PyPI.
   unambiguous extent.
 - `fastsar.pfa2` imports JAX when a polar-format program is built, not when the module is imported. The images of
   `form_cphd` and `process_cphd` are bit for bit those of 0.3.0 on the CPU.
+- `backend='cuda'` asks CuPy alone for a GPU; it imported JAX to look for a TPU, a third of a second of a process's
+  first call.
+- Images and quick looks come back from a GPU into page-locked blocks that the next one takes when its size is
+  within a factor of two, instead of locking memory of their own size each time (about a second per gigabyte).
 
 ## [0.3.0] - 2026-11-14
 
