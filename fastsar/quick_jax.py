@@ -528,12 +528,12 @@ def _split(jnp, index, frac):
     return index + fl.astype(jnp.int32), frac - fl
 
 
-def pfa(S, g, window, correct, complex_image, timing, phase=None, info=None, keep=False):
+def pfa(S, g, window, correct, complex_image, timing, phase=None, info=None, on_device=False):
     """fastsar.quick's polar format on JAX's device -> the image on the host, range-major [ny, nx] (complex64, or
     its amplitude, float32). S [P, K] complex64 on the host (or a one-element list that hands it over); g:
     quick._geometry's; phase: (ph0, ph1) [P] in cycles, a reference phase exp(2 pi j (ph0 + k ph1)) of sample k
     that the device applies with the weights. info['stream']: what was kept on the host, where the device had no
-    room. keep: the amplitude is left on the device and returned as a JAX array (for a remap there). timing: the stages' seconds; with timing['detail'] a dict, every program's call is brought to completion
+    room. on_device: the amplitude is left on the device and returned as a JAX array (for a remap there). timing: the stages' seconds; with timing['detail'] a dict, every program's call is brought to completion
     and its seconds are added there by name."""
     import jax
     import jax.numpy as jnp
@@ -730,19 +730,19 @@ def pfa(S, g, window, correct, complex_image, timing, phase=None, info=None, kee
     jax.block_until_ready(o)
     timing['range transform'] = timing.get('range transform', 0.0) + time.perf_counter() - t0
     t0 = time.perf_counter()
-    keep = bool(keep) and not complex_image
-    out = None if keep else np.empty((ny, nx), c64 if complex_image else np.float32)
+    stay = bool(on_device) and not complex_image
+    out = None if stay else np.empty((ny, nx), c64 if complex_image else np.float32)
     kept = []
 
     def deliver(o, j, n):
         """Rows j .. j + n of the picture: the leading rows of the device block o, to the host or kept."""
-        if keep:
+        if stay:
             kept.append((j, n, o))
         else:
             run.fetch(o, out[j:j + n])
 
     def finished():
-        if not keep:
+        if not stay:
             run.flush()
             return out
         rows, done = [], 0
@@ -903,7 +903,7 @@ def pfa(S, g, window, correct, complex_image, timing, phase=None, info=None, kee
             deliver(o[0], j0 + c0, n)
         del G
     out = finished()
-    if keep:
+    if stay:
         jax.block_until_ready(out)
     timing['correction'] = timing.get('correction', 0.0) + time.perf_counter() - t0
     return out
