@@ -700,17 +700,17 @@ _PFA_LOCK = threading.Lock()
 
 
 def _pfa_stages(backend, support):
-    """Which polar format forms on `backend`: 'cpu' or 'cuda' for the stages of fastsar.quick (C++ on the host's
-    cores, CuPy on a GPU), or None for the JAX program of fastsar.pfa2, which the jax and tpu backends and
-    FASTSAR_PFA_PROGRAM=jax keep. FASTSAR_PFA_PROGRAM=stages takes the stages on the jax and tpu backends too
-    (fastsar.quick_jax)."""
+    """Which polar format forms on `backend`: 'cpu', 'cuda', 'jax' or 'tpu' for the stages of fastsar.quick (C++ on
+    the host's cores, CuPy on a GPU, fastsar.quick_jax on a JAX device or a TPU), or None for the JAX program of
+    fastsar.pfa2, the polar format of 0.3.0, which FASTSAR_PFA_PROGRAM=jax keeps on every backend
+    (FASTSAR_PFA_PROGRAM=stages, the default, is accepted)."""
     v = os.environ.get('FASTSAR_PFA_PROGRAM', '').strip().lower() or 'auto'
     if v not in ('auto', 'jax', 'stages'):
         raise ValueError(f"FASTSAR_PFA_PROGRAM must be 'jax', 'stages' or 'auto', got {v!r}")
     b = _backend(backend)
     if support not in ('union', 'inscribed'):
         raise ValueError(f"support must be 'union' or 'inscribed', not {support!r}")
-    if v == 'jax' or (b in ('jax', 'tpu') and v != 'stages'):
+    if v == 'jax':
         return None
     return b if b in ('cuda', 'jax', 'tpu') else 'cpu'
 

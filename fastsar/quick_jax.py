@@ -180,7 +180,7 @@ def _kaiser_poly(beta=None):
 
 def _window(step, taps):
     """Samples of the window that holds the taps of BLOCK outputs `step` samples apart, a multiple of 16."""
-    return _up(BLOCK * float(step) + taps + STRIDE + 6, 16)
+    return _up(math.ceil(BLOCK * float(step)) + taps + STRIDE + 6, 16)
 
 
 def _windows(jnp, u, w0, Rw):
@@ -538,8 +538,10 @@ def pfa(S, g, window, correct, complex_image, timing, phase=None, info=None):
     L = _layout(g, blk, correct)
     where = _plan(L['bytes'], budget, blk)
     if where['kept'] and info is not None:
-        info['stream'] = (f"the JAX device has {budget / 1e9:.1f} GB to give: {', '.join(where['kept'])} "
-                          f"{'is' if len(where['kept']) == 1 else 'are'} kept on the host and cross in blocks")
+        from .memory import _gb
+        one = len(where['kept']) == 1
+        info['stream'] = (f"the JAX device has {_gb(budget)} to give: {', '.join(where['kept'])} {'is' if one else 'are'} "
+                          f"kept on the host and {'crosses' if one else 'cross'} in blocks")
     store = lambda name, total, b, width: (_Device if where[name] else _Host)(run, total, b[0], b[2], width)
     up = lambda a, t=f32: jnp.asarray(np.ascontiguousarray(a, t))
     HI = lax.Precision.HIGHEST
@@ -649,7 +651,7 @@ def pfa(S, g, window, correct, complex_image, timing, phase=None, info=None):
         pad = ((0, nJ - n2), (p0, Pf - Pp - p0))
         return jnp.pad(zr[:, :Pp], pad), jnp.pad(zi[:, :Pp], pad)
 
-    def azimuth(zr, zi, dist_bins, live, edge, guard, scale, binm, wpoly, base, lo, s, c2):
+    def azimuth(zr, zi, dist_bins, live, edge, guard, scale, binm, wpoly, base, lo, s, c2, clo, chi):
         prof = jnp.fft.fft(lax.complex(zr, zi), axis=1)
         cz = jnp.concatenate([prof[:, :pa], jnp.zeros((nJ, Na - keep2), prof.dtype), prof[:, Pf - na_:]], 1)
         d = dist_bins[None, :] * binm[:, None]
@@ -657,17 +659,25 @@ def pfa(S, g, window, correct, complex_image, timing, phase=None, info=None):
         A2 = jnp.fft.ifft(cz * (w * live[None, :] * scale), axis=1)
         ib, fr = _positions(jnp, base, lo, s, c2, pb2)
         o = _dense(jnp, lax, jnp.real(A2), jnp.imag(A2), ib, fr, Rw2, Q.TAPS, wpoly)
-        m = jnp.arange(W2, dtype=jnp.int32)[None, :] < nka
+        col = jnp.arange(W2, dtype=jnp.int32)[None, :]
+        m = (col >= clo[:, None]) & (col < chi[:, None])
         return jnp.where(m, o[0], 0.0), jnp.where(m, o[1], 0.0)
     B = store('B', rows2, L['b2'], W2)
+    ntab = len(g['qtab'])
     for J0 in starts:
         kr = g['kr_min'] + g['dkr'] * (J0 + np.arange(nJ, dtype=np.float64))
         kn = _knots(_az_positions(g, kr, ja), pb2)
         binm = 2 * math.pi / (kr * abs(g['dts']) * Pf)
+        # the raster's columns whose tangent lies in the table of the pulses' positions (the aperture and 16 pulses
+        # beyond each end): the others are zero, as the host kernel leaves them
+        u0, sl = (g['ka_lo'] / kr - g['tg0']) * g['tg_inv'], g['dka'] / kr * g['tg_inv']
+        ends = np.sort(np.stack([-u0 / sl, (ntab - 1 - u0) / sl]), axis=0)
+        c_lo = np.clip(np.ceil(ends[0] - 1e-9), 0, nka).astype(i32)
+        c_hi = np.clip(np.ceil(ends[1] - 1e-9), 0, nka).astype(i32)
         o = run.chain([A.cut(n2, J0, shift1 if sheared else None),
                        ('pulses', (n2, nJ, A.rows, Pp, Pf, p0), pulses, ()),
-                       ('azimuth', (nJ, Pf, Na, nblk2, Rw2, pb2, nka), azimuth,
-                        (dist_bins, live, edge, guard, scale, up(binm), wpoly) + tuple(jnp.asarray(v) for v in kn))])
+                       ('azimuth', (nJ, Pf, Na, nblk2, Rw2, pb2), azimuth,
+                        (dist_bins, live, edge, guard, scale, up(binm), wpoly) + tuple(jnp.asarray(v) for v in kn) + (jnp.asarray(c_lo), jnp.asarray(c_hi)))])
         B.put(J0, *o)
     B.close()
     del A
@@ -773,19 +783,18 @@ def pfa(S, g, window, correct, complex_image, timing, phase=None, info=None):
     nj, nvj, jstarts = _blocks_of(ny, max(BLOCK, (blk // (32 * Nx) - 2 * msy) // ov), 1)
     nj = _up(nj, BLOCK)
     nR = min(ov * nj + 2 * msy, Ny)
+    # H's columns: the columns of the padded image a strip reads, less the shear's drift from the image's center
+    # row (the same shifted image whatever the strips, so a picture does not depend on their height)
     hw = ov * nx / 2.0 + shx + abs(sig) * (ov * nj / 2.0 + shy + 1) + taps + 4
-    m_lo = int(math.floor(Nx / 2.0 - hw))
     Nm = _ladder(-(-int(math.ceil(2 * hw) + 2) // BLOCK)) * BLOCK
-    am = ((np.arange(Nm) + m_lo - Nx / 2.0) / (ux * sx_)).astype(f32)             # H's columns, normalised (at no shear)
+    Rg = Ny // 2
     inv = f32(1.0 / (ux * sx_))
     xn = up((np.arange(nxp) - nx / 2.0) * g['spx'] / sx_)
-    ixm = jnp.asarray((ov * np.arange(nxp) + ix0 - m_lo).astype(i32))
     ac = jnp.asarray((np.arange(nka) - hx).astype(np.int64).astype(np.uint32))
     kr_c, ka_c = g['kr_min'] + hy * g['dkr'], g['ka_lo'] + hx * g['dka']
     cxx = up(np.modf(-ka_c * (np.arange(nxp) - nx / 2.0) * g['spx'] / (2 * math.pi))[0])
     krc, kac = f32(kr_c / (2 * math.pi)), f32(ka_c / (2 * math.pi))
     nm, _, mstarts = _blocks_of(Nm, blk // (24 * nR + 16 * nj * RwY), BLOCK)
-    am = {m0: jnp.asarray(am[m0:m0 + nm]) for m0 in mstarts}
     njc, nvc, _ = _blocks_of(nvj, blk // (24 * Nm + 16 * nxp * RwX))
     tiles = -(-Nm // Nx)
 
@@ -820,16 +829,22 @@ def pfa(S, g, window, correct, complex_image, timing, phase=None, info=None):
         c = (c - jnp.floor(c)) * (2.0 * math.pi)
         cs, sn = jnp.cos(c), jnp.sin(c)
         return (jnp.stack([ar * cs - ai * sn, ar * sn + ai * cs], -1),)
+
+    def strip_rows(zr, zi):
+        pad = ((0, njc - nvc), (0, 0))
+        return jnp.pad(zr[:, :Nm], pad), jnp.pad(zi[:, :Nm], pad)
     scal = lambda v: f32(v)
     for j0 in jstarts:
         jj = j0 + np.arange(nj)
         iya = ov * jj + iy0                                                       # the padded row of each picture row
         R0 = int(min(max(0, iya[0] - msy), Ny - nR))
-        Rc = int(iya[nj // 2])
-        bq = jnp.asarray(_cycles(-(m_lo + sig * (R0 + np.arange(nR) - Rc)) / Nx))
+        m_lo = int(math.floor(Nx / 2.0 - sig * (iya[nj // 2] - Rg) - hw))         # the first column of H, of the padded image's
+        bq = jnp.asarray(_cycles(-(m_lo + sig * (R0 + np.arange(nR) - Rg)) / Nx))
         yn = ((jj - ny / 2.0) * g['spy'] / sy_).astype(f32)
-        bj = up(sig * (iya - Rc) / (ux * sx_))
-        q = -sig * (iya - Rc)
+        am = ((np.arange(Nm) + m_lo - Nx / 2.0) / (ux * sx_)).astype(f32)         # H's columns, normalised (at the center row)
+        bj = up(sig * (iya - Rg) / (ux * sx_))
+        ixm = jnp.asarray((ov * np.arange(nxp) + ix0 - m_lo).astype(i32))
+        q = -sig * (iya - Rg)
         qi, qf = np.floor(q).astype(i32), (q - np.floor(q)).astype(f32)
         cyy = np.modf(kr_c * (jj - ny / 2.0) * g['spy'] / (2 * math.pi))[0].astype(f32)
         H = _Device(run, nR, nR, [0], Nm)
@@ -839,15 +854,14 @@ def pfa(S, g, window, correct, complex_image, timing, phase=None, info=None):
         G = _Device(run, Nm, nm, mstarts, nj)
         for m0 in mstarts:
             G.put(m0, *run.chain([H.cut(nm, m0), ('to rows', (nm, nR, nj, RwY, taps, powers), to_rows,
-                                                  (am[m0], bj, jnp.asarray(yn), jnp.asarray((iya - R0).astype(i32)), cx, cy,
+                                                  (jnp.asarray(am[m0:m0 + nm]), bj, jnp.asarray(yn), jnp.asarray((iya - R0).astype(i32)), cx, cy,
                                                    inv, scal(sig), scal(ux), scal(uy), scal(half_y)))]))
         G.close()
         del H
         for c0 in _starts(nvj, nvc)[1]:
             sl = slice(c0, c0 + nvc)
-            o = run.chain([G.cut(nvc, c0),
-                           ('to columns', (nvc, njc, Nm, nxp, RwX, taps, powers, bool(complex_image)),
-                            lambda zr, zi, *a: to_columns(jnp.pad(zr, ((0, njc - nvc), (0, 0))), jnp.pad(zi, ((0, njc - nvc), (0, 0))), *a),
+            o = run.chain([G.cut(nvc, c0), ('strip rows', (nvc, njc, G.rows), strip_rows, ()),
+                           ('to columns', (njc, Nm, nxp, RwX, taps, powers, bool(complex_image)), to_columns,
                             (xn, rows_of(yn, sl, njc, f32), ixm, rows_of(qi, sl, njc, i32), rows_of(qf, sl, njc, f32), cx, cy,
                              scal(sig), scal(ux), scal(uy), scal(half_x), cxx, rows_of(cyy, sl, njc, f32), krc, kac))])
             n = min(nvc, ny - (j0 + c0))

@@ -364,7 +364,7 @@ def _collection(cphd, size=2048, resolution=None, extent=None, channel=0, reader
         r = io._open_cphd(cphd)
         plan = _plan(r, cphd, channel, size, resolution, extent, opts.get('ref_freq'), tuple(looks), notes)
         if backend == 'auto':
-            backend = _auto((plan['pulses'][1] - plan['pulses'][0]) * (plan['samples'][1] - plan['samples'][0]))
+            backend = _auto((plan['pulses'][1] - plan['pulses'][0]) * (plan['samples'][1] - plan['samples'][0]), notes)
         timing['plan'] = time.perf_counter() - t0
         t0 = time.perf_counter()
         col, meta = io._read_cphd(cphd, None, plan['channel'], True, opts.get('regrid_tol', 1e-3),
@@ -1637,18 +1637,27 @@ def _backend(backend):
     return 'cpu' if b == 'metal' else b
 
 
-def _auto(samples):
-    """backend='auto' for a cut history of `samples` samples: the device that forms its picture soonest, by the
-    AUTO_ thresholds above. No device is asked for below them: importing CuPy or JAX takes longer than a small
-    quick look. JAX is asked for a TPU only where one may be present (JAX already imported, the libtpu package
-    installed, or TPU_LIBRARY_PATH set)."""
+def _tpu_host():
+    """Whether this machine may have a TPU, without asking JAX: JAX already imported, the libtpu package installed,
+    or TPU_LIBRARY_PATH set."""
     import importlib.util
     import sys
-    if samples >= AUTO_TPU_SAMPLES and ('jax' in sys.modules or os.environ.get('TPU_LIBRARY_PATH')
-                                        or importlib.util.find_spec('libtpu') is not None):
+    return bool('jax' in sys.modules or os.environ.get('TPU_LIBRARY_PATH') or importlib.util.find_spec('libtpu') is not None)
+
+
+def _auto(samples, notes=None):
+    """backend='auto' for a cut history of `samples` samples: the device that forms its picture soonest, by the
+    AUTO_ thresholds above. No device is asked for below them: importing CuPy or JAX takes longer than a small
+    quick look. JAX is asked for a TPU only where one may be present (_tpu_host). notes: a list that receives, on
+    such a machine, which of the TPU and the host's cores was taken and why."""
+    tpu = _tpu_host()
+    if samples >= AUTO_TPU_SAMPLES and tpu:
         from . import api
         try:
             if 'tpu' in api.available_backends():
+                if notes is not None:
+                    notes.append(f"backend 'auto': formed on the TPU (a cut of {samples:.3g} samples; the device is "
+                                 f'taken from {AUTO_TPU_SAMPLES:.3g} on, quick.AUTO_TPU_SAMPLES)')
                 return 'tpu'
         except Exception:
             pass
@@ -1659,6 +1668,9 @@ def _auto(samples):
                 return 'cuda'
         except Exception:
             pass
+    if tpu and notes is not None and samples < AUTO_TPU_SAMPLES:
+        notes.append(f"backend 'auto': formed on the host's cores (a cut of {samples:.3g} samples; a TPU is taken from "
+                     f"{AUTO_TPU_SAMPLES:.3g} on, quick.AUTO_TPU_SAMPLES; backend='tpu' forms on the device)")
     return 'cpu'
 
 

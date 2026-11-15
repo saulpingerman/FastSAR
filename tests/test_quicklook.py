@@ -597,36 +597,219 @@ def test_looks(tmp_path):
         look(path, looks=2, complex_image=True)
 
 
-def test_polar_format_on_jax(spot, squinted, request, monkeypatch):
-    """backend='jax': polar format's stages on JAX's device, in float32 with every complex array as two planes and
-    the positions sent as parabolas over blocks of outputs. The image is the host's: corrected and uncorrected,
-    complex and detected, on a plain raster and on a sheared one, and with pulses missing."""
+def _cut(f, size=128, drop=()):
+    """The cut history of a quick look of a fixture's file, on its grid; drop: pulses left out of it."""
+    col = quick._collection(f['path'], size=size)
+    S, ant = col['S'], col['ant']
+    if len(drop):
+        keep = np.ones(len(ant), bool)
+        keep[list(drop)] = False
+        S, ant = np.ascontiguousarray(S[keep]), ant[keep]
+    return S, ant, col['fmin'], col['df'], tuple(col[k] for k in ('nx', 'ny', 'spx', 'spy', 'e1', 'e2'))
+
+
+def _device_against_host(S, ant, f0, df, grid, backend='jax'):
+    """quick._pfa on a JAX device against the C++ stages -> the errors (dB) of the four images: corrected and
+    uncorrected, complex and detected, and the two corrected complex images."""
+    err = {}
+    for correct in (True, False):
+        for cplx in (True, False):
+            h = quick._pfa(S, ant, f0, df, *grid, correct=correct, complex_image=cplx)
+            j = quick._pfa(S, ant, f0, df, *grid, correct=correct, complex_image=cplx, backend=backend)
+            assert isinstance(j, np.ndarray) and j.dtype == h.dtype and j.shape == h.shape
+            err[correct, cplx] = rel_db(j.astype(np.complex64), h.astype(np.complex64))
+            if correct and cplx:
+                pair = (j, h)
+    return err, pair
+
+
+@pytest.fixture(scope='module')
+def steep(tmp_path_factory):
+    """A 0.5 m spotlight at 72 degrees of grazing whose track passes 26 km to the side of broadside: on the ground
+    the bands of the pulses together span 2.4 times one pulse's, more than the padded transform's period holds."""
+    col = sim.make_collect(res=0.5, scene=160.0, r0=30e3, graze_deg=72.0, offset=(0.0, 26e3, 0.0))
+    S = sim.simulate_brute(col, TARGETS, np.ones(len(TARGETS)) + 0j)
+    rng = np.random.default_rng(6)
+    S = (S + 0.02 * (rng.standard_normal(S.shape) + 1j * rng.standard_normal(S.shape))).astype(np.complex64)
+    path = str(tmp_path_factory.mktemp('steep') / 'steep.cphd')
+    sim.write_cphd(path, col, S, LAT, LON, scene=120.0)
+    return dict(path=path, col=col, S=S)
+
+
+def test_device_stages_on_a_plain_raster(spot, request):
+    """backend='jax': polar format's stages as a TPU runs them (window reads and products of blocks with their
+    weights, float32 planes, no indexed load of a sample), on JAX's CPU device. On a plain raster the two passes of
+    the read at the apparent positions take the C++ kernel's own taps, and the four images are the C++ stages'."""
     request.getfixturevalue('jax_cpu')
-    for f, limit in ((spot, -70), (squinted, -55)):
-        col = quick._collection(f['path'], size=128)
-        S, ant, f0, df = col['S'], col['ant'], col['fmin'], col['df']
-        grid = tuple(col[k] for k in ('nx', 'ny', 'spx', 'spy', 'e1', 'e2'))
+    from fastsar import quick_jax
+    S, ant, f0, df, grid = _cut(spot)
+    g = quick._geometry(ant, f0, df, S.shape[1], *grid, True)
+    assert g['jlo'] is None and g['place'] is None and quick_jax._layout(g, 1 << 30)['fold'] == 1
+    err, _ = _device_against_host(S, ant, f0, df, grid)
+    print('plain raster, device against C++:', {k: round(v, 1) for k, v in err.items()})
+    assert max(err.values()) < -70
+    # an odd pixel count, and no window
+    odd = (grid[0] - 1, grid[1] - 3) + grid[2:]
+    assert rel_db(quick._pfa(S, ant, f0, df, *odd, backend='jax'), quick._pfa(S, ant, f0, df, *odd)) < -70
+    assert rel_db(quick._pfa(S, ant, f0, df, *grid, window=False, backend='jax'), quick._pfa(S, ant, f0, df, *grid, window=False)) < -65
+
+
+def test_device_stages_on_a_sheared_raster(squinted, request):
+    """A picture on the ground under a twisted slant plane: each pulse is read on its own rows of the raster, and
+    the raster and the uncorrected images are the C++ stages'. The corrected image is read from the baseband image
+    shifted along its shear, whose samples are not the ones the C++ kernel takes its taps from: the two differ by
+    the C++ kernel's error (6 taps), and the device's image, read with 10 taps, is the closer to exact
+    backprojection."""
+    request.getfixturevalue('jax_cpu')
+    S, ant, f0, df, grid = _cut(squinted)
+    g = quick._geometry(ant, f0, df, S.shape[1], *grid, True)
+    assert g['jlo'] is not None and abs(g['shear']) > 0.3
+    err, (dev, host) = _device_against_host(S, ant, f0, df, grid)
+    ex = fastsar.ExactFormer(ant, f0, df, S.shape[1], *grid, backend='cpu', window=True)(S)
+    e_dev, e_host = rel_db(dev, ex), rel_db(host, ex)
+    print('sheared raster, device against C++:', {k: round(v, 1) for k, v in err.items()},
+          f'; against exact backprojection: device {e_dev:.1f} dB, C++ {e_host:.1f} dB')
+    assert err[False, True] < -70 and err[False, False] < -70 and err[True, True] < -45 and err[True, False] < -45
+    assert e_dev < e_host + 0.2 and e_dev < -40
+
+
+def test_device_stages_on_a_folded_raster_with_pulses_missing(steep, request):
+    """A twist steep enough that the raster's rows exceed the padded transform's period and fold into it, from a
+    history that lacks pulses: each pulse at its place, the fold a reshape and a sum."""
+    request.getfixturevalue('jax_cpu')
+    from fastsar import quick_jax
+    S, ant, f0, df, grid = _cut(steep, 160, drop=(20, 21, 90, 200))
+    g = quick._geometry(ant, f0, df, S.shape[1], *grid, True)
+    assert g['place'] is not None and g['nkr'] > g['ov'] * g['nfy'] and quick_jax._layout(g, 1 << 30)['fold'] == 2
+    err, (dev, host) = _device_against_host(S, ant, f0, df, grid)
+    ex = fastsar.ExactFormer(ant, f0, df, S.shape[1], *grid, backend='cpu', window=True)(S)
+    e_dev, e_host = rel_db(dev, ex), rel_db(host, ex)
+    print('folded raster with gaps, device against C++:', {k: round(v, 1) for k, v in err.items()},
+          f'; against exact backprojection: device {e_dev:.1f} dB, C++ {e_host:.1f} dB')
+    assert err[False, True] < -70 and err[False, False] < -70 and err[True, True] < -45 and e_dev < e_host + 0.2
+
+
+def test_device_stages_with_missing_and_uneven_pulses(request):
+    """Pulses missing from a plain raster's history, and pulses unevenly spaced along the track (the positions of
+    the azimuth read then curve within a block of outputs, and are sent as parabolas over fewer of them)."""
+    request.getfixturevalue('jax_cpu')
+    from fastsar import quick_jax
+    rng = np.random.default_rng(8)
+    col = sim.make_collect(res=0.5, scene=260.0, r0=60e3)
+    keep = np.ones(col.Np, bool)
+    keep[[40, 41, 300, 700, 702]] = False
+    P = col.Np
+    a = col.ant[P // 2]
+    e2 = -a / np.linalg.norm(a)
+    n = np.cross(e2, col.ant[P // 2 + 1] - col.ant[P // 2 - 1])
+    n *= np.sign(n[2]) / np.linalg.norm(n)
+    e1 = np.cross(e2, n)
+    grid = (480, 200, 0.48, 0.48, e1, e2)
+    tg = np.concatenate([rng.uniform(-110, -100, (15, 1)) * e1 + rng.uniform(-40, 40, (15, 1)) * e2,
+                         rng.uniform(100, 110, (15, 1)) * e1 + rng.uniform(-40, 40, (15, 1)) * e2])
+    S = sim.simulate_brute(col, tg, rng.standard_normal(30) + 1j * rng.standard_normal(30)).astype(np.complex64)
+    S, ant = np.ascontiguousarray(S[keep]), col.ant[keep]
+    assert quick._geometry(ant, col.fmin, col.df, col.K, *grid, True)['place'] is not None
+    err, _ = _device_against_host(S, ant, col.fmin, col.df, grid)
+    print('pulses missing, device against C++:', {k: round(v, 1) for k, v in err.items()})
+    assert max(err.values()) < -65
+    col = sim.make_collect(res=0.5, scene=90.0, r0=20e3)
+    P = col.Np
+    y = col.ant[:, 1]
+    col.ant[:, 1] = y + 0.02 * (y[-1] - y[0]) * np.sin(np.pi * np.arange(P) / (P - 1)) ** 2      # up to 6% in spacing
+    tg = np.stack([rng.uniform(-30, 30, 40), rng.uniform(-30, 30, 40), np.zeros(40)], 1)
+    S = sim.simulate_brute(col, tg, rng.standard_normal(40) + 1j * rng.standard_normal(40)).astype(np.complex64)
+    a = col.ant[P // 2]
+    e2 = -a / np.linalg.norm(a)
+    n = np.cross(e2, col.ant[P // 2 + 1] - col.ant[P // 2 - 1])
+    n *= np.sign(n[2]) / np.linalg.norm(n)
+    grid = (128, 96, 0.48, 0.48, np.cross(e2, n), e2)
+    g = quick._geometry(col.ant, col.fmin, col.df, col.K, *grid, True)
+    assert quick_jax._layout(g, 1 << 30)['pb2'] < quick_jax.BLOCK
+    err, _ = _device_against_host(S, col.ant, col.fmin, col.df, grid)
+    print('uneven pulses, device against C++:', {k: round(v, 1) for k, v in err.items()})
+    assert max(err.values()) < -65
+
+
+@pytest.mark.parametrize('megabytes', ['0.5', '1.5'])
+def test_device_streams_what_does_not_fit(spot, steep, request, monkeypatch, megabytes):
+    """A JAX device with less memory to give than the arrays take (FASTSAR_JAX_BLOCK_MB): the stages work in
+    smaller blocks, the arrays that do not fit live on the host and their blocks cross, a note names them, and the
+    pictures are those of a device with room."""
+    request.getfixturevalue('jax_cpu')
+    from fastsar import quick_jax
+    cases = [(_cut(spot), ()), (_cut(steep, 160, drop=(20, 21, 90)), ())]
+    full = [{c: quick._pfa(*k[:4], *k[4], correct=c, backend='jax') for c in (True, False)} for k, _ in cases]
+    monkeypatch.setenv('FASTSAR_JAX_BLOCK_MB', megabytes)
+    for (k, _), ref in zip(cases, full):
+        S, ant, f0, df, grid = k
+        g = quick._geometry(ant, f0, df, S.shape[1], *grid, True)
+        where = quick_jax.plan(g)
+        assert where['kept'] and where['budget'] == int(float(megabytes) * (1 << 20))
         for correct in (True, False):
-            for cplx in (True, False):
-                h = quick._pfa(S, ant, f0, df, *grid, correct=correct, complex_image=cplx)
-                j = quick._pfa(S, ant, f0, df, *grid, correct=correct, complex_image=cplx, backend='jax')
-                e = rel_db(np.asarray(j).astype(np.complex64), h.astype(np.complex64))
-                print(f'jax against the host, correct {correct}, complex {cplx}: {e:.1f} dB')
-                assert isinstance(j, np.ndarray) and j.dtype == h.dtype and j.shape == h.shape and e < limit
-    keep = np.ones(len(ant), bool)
-    keep[[20, 21, 90]] = False
-    S2, ant2 = np.ascontiguousarray(S[keep]), ant[keep]
-    assert quick._geometry(ant2, f0, df, S.shape[1], *grid, True)['place'] is not None
-    assert rel_db(quick._pfa(S2, ant2, f0, df, *grid, backend='jax'), quick._pfa(S2, ant2, f0, df, *grid)) < -55
-    ref = look(spot['path'], size=128, complex_image=True)
+            info = {}
+            img = quick._pfa(S, ant, f0, df, *grid, correct=correct, backend='jax', info=info)
+            e = rel_db(img, ref[correct])
+            print(f'{megabytes} MB of device memory, correct {correct}: {e:.1f} dB against the device with room; {info["stream"]}')
+            assert e < -90 and 'kept on the host' in info['stream'] and where['kept'][0] in info['stream']
     out = look(spot['path'], size=128, backend='jax', complex_image=True)
-    assert out['algorithm'] == 'pfa' and out['backend'] == 'jax' and out['cut'] == ref['cut'] and out['correct']
-    assert rel_db(out['image'], ref['image']) < -70 and any('cross to the JAX device in blocks' in n for n in out['notes'])
-    assert np.mean(np.abs(out['display'].astype(int) - ref['display'].astype(int)) <= 1) > 0.999
-    monkeypatch.setenv('FASTSAR_JAX_BLOCK_MB', '2')                           # a device with little to give: small blocks
-    small = look(spot['path'], size=128, backend='jax', complex_image=True)
+    assert any('kept on the host and cross' in n for n in out['notes'])
     monkeypatch.delenv('FASTSAR_JAX_BLOCK_MB')
-    assert rel_db(small['image'], out['image']) < -90
+    assert quick_jax.plan(g)['kept'] == [] and not any('kept on the host' in n for n in look(spot['path'], size=128, backend='jax')['notes'])
+    sizes = dict(A=4 << 30, B=2 << 30, F=5 << 30)
+    assert quick_jax._plan(sizes, None, 1 << 30)['kept'] == [] and quick_jax._plan(sizes, 16 << 30, 2 << 30)['kept'] == []
+    assert quick_jax._plan(sizes, 13 << 30, 2 << 30)['kept'] == ["the raster's range transform"]
+    assert quick_jax._plan(sizes, 12 << 30, 2 << 30)['kept'] == ["the range stage's output", "the raster's range transform"]
+    assert len(quick_jax._plan(sizes, 1 << 30, 1 << 28)['kept']) == 3
+
+
+def test_device_programs_are_shared(spot, squinted, request, monkeypatch):
+    """The programs that take long to compile (the transforms and the reads) are compiled for block sizes of a
+    short ladder and for a TPU's few transform lengths, so a second collection of nearly the same size compiles
+    none of them, only the cuts and layouts that hold its own sizes, and a formation repeated compiles nothing.
+    FASTSAR_JAX_PROGRAMS=fused, one program a stage, forms the same image. With a TPU's transform lengths (a power
+    of two times an odd part up to 243) the device's images are the C++ stages' at the same lengths."""
+    request.getfixturevalue('jax_cpu')
+    from fastsar import quick_jax
+    monkeypatch.setattr(quick, '_fft_size', quick._fft_tpu)
+    assert [quick._fft_tpu(n) for n in (2, 1000, 1025, 29160, 30000, 31105)] == [2, 1000, 1080, 30720, 30720, 32000]
+    for f in (spot, squinted):
+        S, ant, f0, df, grid = _cut(f)
+        e = rel_db(quick._pfa(S, ant, f0, df, *grid, backend='jax'), quick._pfa(S, ant, f0, df, *grid))
+        print(f"a TPU's transform lengths, device against C++: {e:.1f} dB")
+        assert e < (-45 if f is squinted else -70)
+    S, ant, f0, df, grid = _cut(spot)
+    ref = quick._pfa(S, ant, f0, df, *grid, backend='jax')
+    n = len(quick_jax.COMPILED)
+    quick._pfa(S, ant, f0, df, *grid, backend='jax')
+    assert len(quick_jax.COMPILED) == n
+    quick._pfa(S[:-2], ant[:-2], f0, df, *grid, backend='jax')                   # two pulses fewer
+    new = [c[0] for c in quick_jax.COMPILED[n:]]
+    print('compiled for the second collection:', new)
+    assert new and not {'range', 'azimuth', 'inverse transform', 'transform', 'to rows', 'to columns'} & set(new)
+    assert quick_jax._ladder(1000) == 1024 and quick_jax._ladder(1025) == 1088 and quick_jax._ladder(20) == 20
+    assert quick_jax._ladder_down(1087) == 1024 and all(quick_jax._ladder(v) >= v for v in range(1, 5000, 7))
+    monkeypatch.setenv('FASTSAR_JAX_PROGRAMS', 'fused')
+    assert rel_db(quick._pfa(S, ant, f0, df, *grid, backend='jax'), ref) < -100
+    monkeypatch.setenv('FASTSAR_JAX_PROGRAMS', 'both')
+    with pytest.raises(ValueError, match='FASTSAR_JAX_PROGRAMS'):
+        quick._pfa(S, ant, f0, df, *grid, backend='jax')
+
+
+def test_quicklook_on_jax(spot, squinted, request):
+    """quicklook(backend='jax'): the cut referenced to the grid center on the device (a phase in 32-bit integer
+    arithmetic), the picture and the complex image of the cpu backend, on a plain and on a sheared raster; looks."""
+    request.getfixturevalue('jax_cpu')
+    for f, limit in ((spot, -70), (squinted, -45)):
+        ref = look(f['path'], size=128, complex_image=True)
+        out = look(f['path'], size=128, backend='jax', complex_image=True)
+        assert out['algorithm'] == 'pfa' and out['backend'] == 'jax' and out['cut'] == ref['cut'] and out['correct']
+        e = rel_db(out['image'], ref['image'])
+        print(f'quicklook on jax against cpu: {e:.1f} dB')
+        assert e < limit and out['image'].flags.c_contiguous and out['display'].shape == ref['display'].shape
+        assert np.mean(np.abs(out['display'].astype(int) - ref['display'].astype(int)) <= (1 if f is spot else 2)) > (0.999 if f is spot else 0.98)
+        raw = look(f['path'], size=128, backend='jax', correct=False)
+        assert np.mean(np.abs(raw['display'].astype(int) - look(f['path'], size=128, correct=False)['display'].astype(int)) <= 1) > 0.999
     lk = look(spot['path'], size=64, backend='jax', looks=2)
     assert lk['looks'] == (2, 2) and np.mean(np.abs(lk['display'].astype(int) - look(spot['path'], size=64, looks=2)['display'].astype(int)) <= 1) > 0.99
 
