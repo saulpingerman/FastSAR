@@ -147,6 +147,17 @@ def _fft_size(n):
     return int(f(int(max(n, 2))))
 
 
+_TPU_ODD = (1, 3, 5, 9, 15, 25, 27, 45, 75, 81, 125, 135, 225, 243)
+
+
+def _fft_tpu(n):
+    """The transform length a TPU takes for n samples: the smallest power of two times an odd part of 3s and 5s
+    up to 243. A v6e transformed 128 rows of 21,600 (odd part 675), 24,576, 31,104 and 32,768 samples in 1 ms, and
+    of 29,160, 29,400 and 30,000 (odd parts 3,645, 3,675 and 1,875) in 67 ms."""
+    n = int(max(n, 2))
+    return min(q << max(0, math.ceil(math.log2(n / q))) for q in _TPU_ODD)
+
+
 def _taylor(n, nbar=4, sll=35.0):
     """The Taylor window of n points as the formers apply it (scipy.signal.windows.taylor with norm=False), computed
     here: importing scipy.signal takes a quarter of a second, more than a small quick look."""
@@ -430,12 +441,13 @@ def _places(t):
 
 
 def _geometry(ant, fmin, df, K, nx, ny, spx, spy, e1, e2, correct, ov=OVERSAMPLE, window=True, warn=False,
-              support='union'):
+              support='union', fft=None):
     """The float64 setup of the quick look's polar format for a cut history: the raster, the two gates, the
     resampling positions and the distortion model. e1, e2: the picture's axes, any pair that spans its plane with
     e2 away from the radar (a slant plane along the line of sight, the ground plane along the ground range): the
     raster's wavenumbers are the components of the samples' along them."""
     P = len(ant)
+    fs = fft or _fft_size                           # the transform lengths (a TPU takes its own: _fft_tpu)
     r0 = np.linalg.norm(ant, axis=1)
     u = ant / r0[:, None]
     ur = -(u @ e2)
@@ -480,8 +492,8 @@ def _geometry(ant, fmin, df, K, nx, ny, spx, spy, e1, e2, correct, ov=OVERSAMPLE
     Er = float(np.abs(dR).max()) + 2 * spy * ur_hi
     Ex = (Hx + shx) * float(1 + np.abs(dtp / dts - 1).max()) + 2 * spx
     # the raster: its periods hold the picture, the displacement and a gate's far edge
-    nfy = _fft_size(int(np.ceil((Hy + shy + (Er + gy) / ur_lo) / spy)) + 2)
-    nfx = _fft_size(int(np.ceil((Hx + shx + Ex + gx) / spx)) + 2)
+    nfy = fs(int(np.ceil((Hy + shy + (Er + gy) / ur_lo) / spy)) + 2)
+    nfx = fs(int(np.ceil((Hx + shx + Ex + gx) / spx)) + 2)
     dkr, dka = 2 * math.pi / (nfy * spy), 2 * math.pi / (nfx * spx)
     kr_lo, kr_hi = 4 * math.pi * f[0] / C * ur, 4 * math.pi * f[-1] / C * ur     # each pulse's band
     kr_min, kr_max = float(kr_lo.min()), float(kr_hi.max())
@@ -541,8 +553,8 @@ def _geometry(ant, fmin, df, K, nx, ny, spx, spy, e1, e2, correct, ov=OVERSAMPLE
     Xr = C / (2 * df)
     rho = 2 * (Er + gy) / PASS / Xr
     k0 = int(np.ceil((TAPS // 2 + 1) / rho)) + 1
-    Kf = _fft_size(K + 2 * k0)
-    Nr = _fft_size(int(np.ceil(rho * Kf)))
+    Kf = fs(K + 2 * k0)
+    Nr = fs(int(np.ceil(rho * Kf)))
     bin_r = Xr / Kf
     scale = C / (4 * math.pi * ur * df)             # frequency samples per unit of kr, per pulse
     alpha = ((kr_min * scale - fmin / df) + k0) * (Nr / Kf)
@@ -553,8 +565,8 @@ def _geometry(ant, fmin, df, K, nx, ny, spx, spy, e1, e2, correct, ov=OVERSAMPLE
     Xa = 2 * math.pi / (kr_max * abs(dts))          # the shortest period, the highest wavenumber's
     rho_a = 2 * (Ex + gx) / PASS / Xa
     p0 = int(np.ceil((TAPS // 2 + 1) / rho_a)) + 1
-    Pf = _fft_size(Pp + 2 * p0)
-    Na = _fft_size(int(np.ceil(rho_a * Pf)))
+    Pf = fs(Pp + 2 * p0)
+    Na = fs(int(np.ceil(rho_a * Pf)))
     bin_a = Xa / Pf
     bins_a = 2 * math.pi / (kr * abs(dts) * Pf)     # the bin of each range wavenumber's transform (m): wider at a lower one
     # the row position (in the Na pulses) of a tangent t, from the pulses' own t: a table at four points per pulse
@@ -853,8 +865,12 @@ def _pfa(S, ant, fmin, df, nx, ny, spx, spy, e1, e2, *, correct=True, window=Tru
         raise ValueError(f'the uncorrected image takes even pixel counts, got {nx} by {ny}')
     box = S if isinstance(S, list) else [S]            # a one-element list hands the history over: it is freed
     del S                                              # as soon as the range stage has read it
+    fft = None
+    if backend in ('jax', 'tpu'):
+        import jax
+        fft = _fft_tpu if jax.devices()[0].platform == 'tpu' else None
     g = _geometry(ant, float(fmin), float(df), box[0].shape[1], int(nx), int(ny), float(spx), float(spy), e1, e2, correct,
-                  window=bool(window), warn=warn, support=support)
+                  window=bool(window), warn=warn, support=support, fft=fft)
     timing['geometry'] = timing.get('geometry', 0.0) + time.perf_counter() - t0
     info = {} if info is None else info
     info.update(shift_px=g['dist']['max_shift_px'], fit_rms_px=g['dist']['rms_px'], raster=(g['nkr'], g['nka']),
@@ -876,6 +892,8 @@ def _pfa(S, ant, fmin, df, nx, ny, spx, spy, e1, e2, *, correct=True, window=Tru
     if layout == 'range':
         return img.T
     t0 = time.perf_counter()
+    if isinstance(img, np.ndarray) and img.T.flags.c_contiguous:     # formed azimuth-major (the resident JAX path)
+        return img.T
     if type(img).__module__.startswith('cupy'):
         out = __import__('cupy').ascontiguousarray(img.T)
     elif img.dtype == np.complex64:                    # turned in tiles on all cores
