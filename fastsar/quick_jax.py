@@ -1,44 +1,117 @@
 """The quick look's polar format on a JAX device (a TPU, or whatever JAX runs on): the stages of fastsar.quick in
-float32, with every complex array as two real planes outside the transforms.
+float32, every complex array as two real planes outside the transforms, and no indexed load of a sample.
 
-The device is a block processor. Each stage is one compiled program that takes a block of rows of one shape (the
-last block is moved back to end at the last row, so a stage compiles once) and the blocks are sized from the
-device's memory (_xp.jax_block); the four large arrays (the range stage's output, the raster, its range transform
-and the picture) live on the host and their blocks cross as the stages need them, so a full image forms on a
-device that holds a small part of it. Which of them could stay on a device with room is a question of its transfer
-rates, which tests/bench_tpu_blocks.py measures.
+What a TPU does fast and slowly decides the form of every stage (tests/bench_tpu_blocks.py, on a v6e at 113
+million values): a 2-D transform takes 0.04 s; a resampling pass with an indexed load per tap 119 s; the same pass
+as one row of a table of windows per block of 32 outputs, then a matrix product of the block with its weights,
+0.19 s; a complex array crosses to the host 68 times slower than its two planes; a block of 4.6 GB ran 50 times
+slower than blocks of 2 GB. So:
 
-Positions. A resampling position reaches tens of thousands of samples and must hold to a part in 2048 of a sample,
-more than float32 carries, and a TPU has no fast float64. The host therefore forms the positions in float64 at the
-first, middle and last outputs of blocks of BLOCK outputs and sends, for each row and block, the integer part at
-the block's first output (int32) and the remainder, the step and the curvature (float32); the device forms the
-block's positions from those. Along a row
-the range positions are linear and the azimuth positions and the apparent positions of the final read are smooth,
-so a parabola over 32 outputs holds them to a millionth of a sample. The carrier of the complex image goes the
-same way, in cycles.
+  Reads. Every resampling is _dense: a block's taps lie in one window of the row, read as a row of the table of
+  windows, and the block's outputs are the product of that window with weights formed on the device
+  (Precision.HIGHEST: the default leaves 2e-3). The only indexed loads are of whole rows of 32 to 100 samples.
 
-The reads are indexed loads of each tap (jnp.take_along_axis), with the weights a row of the host kernels' own
-polyphase tables: right on every device and fast on a CPU or a GPU. A TPU does indexed loads slowly; its reads
-(window rows, dense products, separable passes for the final read) are to be chosen from its measured block times
-and set in _read and _read2 alone, which the stages call.
+  A sheared raster (a picture on the ground under a twisted slant plane). Each pulse is read on its own rows of the
+  raster, from a row that is a multiple of 32, and the azimuth stage takes its rows across the pulses as blocks of
+  32 samples (one indexed load a block). The rows fold into the transform's period by a reshape and a sum. The
+  baseband image is then smooth along sheared lines and not along its columns; its rows are shifted by the shear
+  before their transform (a phase ramp over the azimuth wavenumbers, exact), which makes it smooth along both
+  axes, and the read at the apparent positions is two passes of _dense: along the columns of the shifted image to
+  the picture's rows, then along those rows to the picture's columns. A plain raster is the same with no shear.
+
+  Missing pulses. The history goes up in blocks of pulses, each pulse at its place in the evenly timed sequence;
+  the host builds the blocks that hold a gap (a copy of those blocks alone) and the others are the history's own
+  bytes.
+
+  Memory. The history is never on the device whole. Of the three large arrays (the range stage's output, the
+  raster, its range transform) those that fit stay on the device, in a few pieces that are joined as their blocks
+  come (never there twice); the others live on the host and their blocks cross (_plan). The read at the apparent
+  positions works in strips of the picture's rows, and the picture comes down strip by strip. Every block is sized
+  from _xp.jax_block() (at most 2 GB).
+
+  Programs. A stage is a chain of three functions: the cut of a block out of the array before it (specific to
+  that array's size), the block's layout for the stage (padding, signs, the fold), and the stage's work on a block
+  whose sizes are all taken from a short ladder (_ladder: rows per block, outputs per row, windows; a TPU's
+  transform lengths are few). FASTSAR_JAX_PROGRAMS=shared compiles the three separately, so collections of
+  different sizes share the programs that take long to compile; 'fused' compiles a chain as one program. COMPILED
+  lists what this process compiled and how long each first call took.
+
+Positions. A resampling position reaches tens of thousands of samples and must hold to a small part of a sample,
+more than float32 carries, and a TPU has no fast float64. Along a row the range positions are linear and the
+azimuth positions smooth: the host forms them in float64 at the first, middle and last outputs of blocks of BLOCK
+outputs and sends the integer part at the block's first output (int32) and the remainder, the step and the
+curvature (float32). The apparent positions of the final read are the pixel's own index (an integer) plus the
+displacement polynomial, which the device evaluates in float32. Phases that reach many cycles (the reference to
+the grid center, the shear's ramp) are formed in 32-bit integer arithmetic, a cycle being 2^32.
 """
 import math
+import os
 import time
 
 import numpy as np
 
-BLOCK = 32                    # outputs whose positions are one parabola
+BLOCK = 32                    # outputs whose positions are one parabola, and whose taps lie in one window
+STRIDE = 8                    # samples between the starts of the windows in the table of windows
+GROUP = 8                     # pieces a device array is kept in
 _PROGRAMS = {}
+COMPILED = []                 # (name, key, seconds of the first call) of each program this process compiled
+_KAISER = {}
+SHEAR_TAPS, SHEAR_KAISER = 10, 7.2   # the kernel of the read at the apparent positions on a sheared raster
 
 
-def _program(key, make):
-    """The compiled program of a stage for its static sizes, kept between calls (the newest 32)."""
-    if key not in _PROGRAMS:
+def _mode():
+    """'shared' or 'fused': FASTSAR_JAX_PROGRAMS (see the module docstring)."""
+    v = os.environ.get('FASTSAR_JAX_PROGRAMS', '').strip().lower() or 'shared'
+    if v not in ('shared', 'fused'):
+        raise ValueError(f"FASTSAR_JAX_PROGRAMS must be 'shared' or 'fused', got {v!r}")
+    return v
+
+
+def _program(name, key, make, detail=None):
+    """The compiled program `name` for its static sizes `key`, kept between calls (the newest 256). Its first call
+    is brought to completion and timed (COMPILED); with detail (a dict) every call is, and the seconds are added
+    to detail[name]."""
+    k = (name,) + tuple(key)
+    p = _PROGRAMS.get(k)
+    if p is None:
         import jax
-        if len(_PROGRAMS) >= 32:
+        if len(_PROGRAMS) >= 256:
             _PROGRAMS.pop(next(iter(_PROGRAMS)))
-        _PROGRAMS[key] = jax.jit(make())
-    return _PROGRAMS[key]
+        p = _PROGRAMS[k] = [jax.jit(make()), False]
+    if p[1] and detail is None:
+        return p[0]
+
+    def call(*args):
+        import jax
+        t = time.perf_counter()
+        out = jax.block_until_ready(p[0](*args))
+        dt = time.perf_counter() - t
+        if not p[1]:
+            p[1] = True
+            COMPILED.append((name, k[1:], dt))
+        elif detail is not None:
+            detail[name] = detail.get(name, 0.0) + dt
+        return out
+    return call
+
+
+def _ladder(n, fine=16):
+    """The smallest size >= n of those programs are compiled for: k 2^e with fine <= k <= 2 fine (at most a
+    sixteenth more than n, a thirty-second on average), n itself up to 2 fine."""
+    n = int(max(n, 1))
+    e = max(0, n.bit_length() - fine.bit_length())
+    return -(-n >> e) << e
+
+
+def _ladder_down(n, fine=16):
+    """The largest size <= n of _ladder's."""
+    n = int(max(n, 1))
+    e = max(0, n.bit_length() - fine.bit_length())
+    return (n >> e) << e
+
+
+def _up(n, m):
+    return -(-int(n) // m) * m
 
 
 def _starts(n, per):
@@ -50,315 +123,64 @@ def _starts(n, per):
     return per, starts
 
 
-def _knots(pos):
-    """Positions at the blocks' first outputs, middles and ends, [R, 2 nblk + 1] (float64) -> each block's parabola
-    through its three: the integer part at its first output (int32 [R, nblk]), the remainder there, the step and
-    the curvature per output (float32): output i of the block lies at base + lo + i s + i^2 c."""
+def _blocks_of(total, per, multiple=1):
+    """The blocks of a stage over `total` rows when `per` fit in its memory: (rows of a block, a size of the
+    ladder; rows of it that are the array's; starts). One block where the rows fit: it is padded to the ladder's
+    next size. multiple: the block's rows are a multiple of it (total is)."""
+    per = int(max(multiple, (_ladder_down(max(per, 1)) // multiple) * multiple))
+    if total <= per:
+        return _up(_ladder(total), multiple), int(total), [0]
+    return per, per, _starts(total, per)[1]
+
+
+def _knots(pos, pb=BLOCK):
+    """Positions at the first outputs, middles and ends of runs of pb outputs, [R, 2 n + 1] (float64) -> each run's
+    parabola through its three: the integer part at its first output (int32 [R, n]), the remainder there, the step
+    and the curvature per output (float32): output i of the run lies at base + lo + i s + i^2 c."""
     p0, pm, pe = pos[:, 0:-1:2], pos[:, 1::2], pos[:, 2::2]
-    c = 2.0 * (pe - 2.0 * pm + p0) / BLOCK ** 2
+    c = 2.0 * (pe - 2.0 * pm + p0) / pb ** 2
     base = np.floor(p0)
-    return (base.astype(np.int32), (p0 - base).astype(np.float32), ((pe - p0) / BLOCK - c * BLOCK).astype(np.float32),
+    return (base.astype(np.int32), (p0 - base).astype(np.float32), ((pe - p0) / pb - c * pb).astype(np.float32),
             c.astype(np.float32))
 
 
-def _positions(jnp, base, lo, s, c):
-    """A block's positions as the sample below (int32) and the fraction above it, [R, nblk * BLOCK]."""
-    i = jnp.arange(BLOCK, dtype=jnp.float32)
+def _positions(jnp, base, lo, s, c, pb=BLOCK):
+    """The positions of runs of pb outputs as the sample below (int32) and the fraction above it, [R, n * pb]."""
+    i = jnp.arange(pb, dtype=jnp.float32)
     f = lo[..., None] + i * s[..., None] + (i * i) * c[..., None]
     fl = jnp.floor(f)
     R = base.shape[0]
     return (base[..., None] + fl.astype(jnp.int32)).reshape(R, -1), (f - fl).reshape(R, -1)
 
 
-def _read(jnp, xr, xi, ib, fr, tab, phases):
-    """Rows of x [R, n] (two planes) at the positions ib + fr [R, m], with the taps of tab [phases + 1, taps] (the row
-    of the fraction's nearest phase); a tap outside the row counts as zero and the rest are normalised again; zero
-    where the position lies outside (-0.5, n - 0.5): quicklook_cpu.cpp's ql_resample_rows."""
-    n, taps = xr.shape[1], tab.shape[1]
-    w = jnp.take(tab, jnp.rint(fr * phases).astype(jnp.int32), axis=0)                    # [R, m, taps]
-    idx = ib[..., None] - (taps // 2 - 1) + jnp.arange(taps, dtype=jnp.int32)
-    w = jnp.where((idx >= 0) & (idx < n), w, 0.0)
-    w = w / jnp.maximum(w.sum(-1, keepdims=True), 1e-12)
-    idx = jnp.clip(idx, 0, n - 1).reshape(idx.shape[0], -1)
-    inside = ((ib >= 0) | ((ib == -1) & (fr > 0.5))) & ((ib < n - 1) | ((ib == n - 1) & (fr < 0.5)))
-    get = lambda p: jnp.where(inside, (jnp.take_along_axis(p, idx, axis=1).reshape(w.shape) * w).sum(-1), 0.0)
-    return get(xr), get(xi)
+def _cycles(v):
+    """Phases in cycles (float64) -> their fractions as 32-bit integers, a cycle being 2^32 (uint32): sums and
+    products of them with integers wrap by whole cycles."""
+    v = np.asarray(v, np.float64)
+    return (np.rint((v - np.floor(v)) * 4294967296.0).astype(np.int64) & 0xFFFFFFFF).astype(np.uint32)
 
 
-def _read2(jnp, br, bi, ix, fx, iy, fy, shear, tab, phases):
-    """The baseband block (two planes [span, Nx]) at the positions (iy + fy, ix + fx) [n, m] with taps x taps taps
-    of tab, each row of taps at the column where the line of the raster's shear through the position meets it:
-    quicklook_cpu.cpp's ql_gather."""
-    span, Nx = br.shape
-    taps = tab.shape[1]
-    half = taps // 2
-    wy = jnp.take(tab, jnp.rint(fy * phases).astype(jnp.int32), axis=0)                    # [n, m, taps]
-    fr_, fi_ = br.reshape(-1), bi.reshape(-1)
-    ar = ai = 0.0
-    for a in range(taps):
-        t = fx + shear * ((a - half + 1) - fy)
-        fl = jnp.floor(t)
-        wx = jnp.take(tab, jnp.rint((t - fl) * phases).astype(jnp.int32), axis=0)
-        row = jnp.clip(iy - half + 1 + a, 0, span - 1) * Nx
-        cols = jnp.clip((ix + fl.astype(jnp.int32))[..., None] - half + 1 + jnp.arange(taps, dtype=jnp.int32), 0, Nx - 1)
-        at = row[..., None] + cols
-        ar = ar + wy[..., a] * (jnp.take(fr_, at) * wx).sum(-1)
-        ai = ai + wy[..., a] * (jnp.take(fi_, at) * wx).sum(-1)
-    return ar, ai
+def _angle(jnp, c):
+    """A phase as a 32-bit integer (_cycles) -> radians (float32, to 4e-7 rad)."""
+    return (c >> 8).astype(jnp.float32) * (2.0 * math.pi / 16777216.0)
 
 
-def pfa(S, g, window, correct, complex_image, timing, phase=None, info=None):
-    """fastsar.quick's polar format on JAX's device -> the image on the host, range-major [ny, nx] (complex64, or
-    its amplitude, float32). S [P, K] complex64 on the host; g: quick._geometry's; phase: (ph0, ph1) [P] in cycles,
-    a reference phase the device applies with the weights."""
-    import ctypes
-    import jax
-    import jax.numpy as jnp
-    from jax import lax
-    from . import _xp
-    from . import quick as Q
-    f32, i32, c64 = np.float32, np.int32, np.complex64
-    import os
-    how = os.environ.get('FASTSAR_JAX_PFA', '').strip().lower() or 'auto'
-    if how not in ('auto', 'resident', 'streamed'):
-        raise ValueError(f"FASTSAR_JAX_PFA must be 'resident', 'streamed' or 'auto', got {how!r}")
-    K_ = (S[0] if isinstance(S, list) else S).shape[1]
-    if correct and how != 'streamed' and _fits(g, K_) and (how == 'resident' or jax.devices()[0].platform == 'tpu'):
-        return _resident(S, g, window, complex_image, timing, phase).T      # range-major, as the other paths return
-    lib = Q._lib()
-    S = S.pop() if isinstance(S, list) else S
-    S = np.ascontiguousarray(S, c64)
-    P, K, Kf, Nr, k0 = g['P'], g['K'], g['Kf'], g['Nr'], g['k0']
-    nkr, nka, nfy, nfx, nx, ny = g['nkr'], g['nka'], g['nfy'], g['nfx'], g['nx'], g['ny']
-    nwin, jlo, Pf, Na, p0, Pp, place = g['nwin'], g['jlo'], g['Pf'], g['Na'], g['p0'], g['Pp'], g['place']
-    blk = _xp.jax_block()
-    PH = Q.PHASES
-    tab = jnp.asarray(Q._polyphase('kaiser', Q.TAPS, PH))
-    ptr = lambda a: a.ctypes.data_as(ctypes.c_void_p)
-    at = lambda a, row=0, col=0: ctypes.c_void_p(a.ctypes.data + row * a.strides[0] + col * a.strides[1])
-    planes = lambda a: (jnp.asarray(np.ascontiguousarray(a.real)), jnp.asarray(np.ascontiguousarray(a.imag)))
-
-    def to_host(dst, re, im):
-        v = dst.view(np.float32).reshape(dst.shape + (2,))
-        v[..., 0], v[..., 1] = np.asarray(re), np.asarray(im)
-    if info is not None:
-        info['stream'] = ("the range stage's output, the raster, its range transform and the picture are kept on the "
-                          'host and cross to the JAX device in blocks')
-    t0 = time.perf_counter()
-    # 1. range: a block of pulses weighted, padded, gated in range and read at the raster's range wavenumbers
-    wk = jnp.asarray((g['wk'] * (Q._taylor(K) if window else 1.0)).astype(f32))
-    wp = (g['wp'] * (Q._taylor(P) if window else 1.0)).astype(f32)
-    tap_r = jnp.asarray(Q._taper(Nr, g['Er'], g['gy'], g['bin_r']))
-    nblk = -(-nwin // BLOCK)
-    keep = min(Nr, Kf)
-    pos_, neg_ = keep - keep // 2, keep // 2
-    ref = phase is not None
-
-    def make1():
-        def run(sr, si, wk, tap_r, tab, wpb, a0, b0, base, lo, s, c2):
-            if ref:
-                c = a0[:, None] + jnp.arange(K, dtype=jnp.float32) * b0[:, None]
-                c = (c - jnp.floor(c)) * (2.0 * math.pi)
-                cs, sn = jnp.cos(c), jnp.sin(c)
-                sr, si = sr * cs - si * sn, sr * sn + si * cs
-            w = wk[None, :] * wpb[:, None]
-            z = jnp.pad(lax.complex(sr * w, si * w), ((0, 0), (k0, Kf - K - k0)))
-            prof = jnp.fft.ifft(z, axis=1)
-            gate = jnp.concatenate([prof[:, :pos_], jnp.zeros((prof.shape[0], Nr - keep), prof.dtype), prof[:, Kf - neg_:]], 1) * tap_r
-            G = jnp.fft.fft(gate, axis=1)
-            ib, fr = _positions(jnp, base, lo, s, c2)
-            return _read(jnp, jnp.real(G), jnp.imag(G), ib, fr, tab, PH)
-        return run
-    nb, starts = _starts(P, blk // (24 * max(Kf, Nr) + 300 * nblk * BLOCK))
-    step1 = _program(('range', nb, K, k0, Kf, Nr, nblk, ref), make1)
-    j = np.arange(2 * nblk + 1, dtype=np.float64) * (BLOCK / 2)
-    A = np.empty((P, nwin), c64)
-    ph0, ph1 = (np.asarray(v, np.float64) for v in (phase if ref else (np.zeros(P), np.zeros(P))))
-    for r in starts:
-        sl = slice(r, r + nb)
-        kn = _knots(g['alpha'][sl, None] + j[None, :] * g['beta'][sl, None])
-        o = step1(*planes(S[sl]), wk, tap_r, tab, jnp.asarray(wp[sl]), jnp.asarray(ph0[sl].astype(f32)),
-                  jnp.asarray(ph1[sl].astype(f32)), *(jnp.asarray(v) for v in kn))
-        to_host(A[sl], o[0][:, :nwin], o[1][:, :nwin])
-    del S
-    timing['range'] = timing.get('range', 0.0) + time.perf_counter() - t0
-    t0 = time.perf_counter()
-    # 2. azimuth: a block of range wavenumbers, the pulses of each along a row, gated in azimuth (in meters, for
-    # each wavenumber's own bins) and read at the raster's azimuth wavenumbers at the pulses' own spacing
-    Nfft = (g['ov'] if correct else 1) * nfy
-    scale = jnp.float32(g['gain'] * Nfft * Na / Pf)
-    k = np.arange(Na)
-    nbin = np.where(k < Na - Na // 2, k, k - Na)
-    keep = min(Na, Pf)
-    pa, na_ = keep - keep // 2, keep // 2
-    dist_bins = jnp.asarray(np.abs(nbin).astype(f32))
-    live = jnp.asarray(((nbin < pa) & (nbin >= -na_)).astype(f32))
-    edge, guard = jnp.float32(g['Ex']), jnp.float32(g['gx'])
-    nblk2 = -(-nka // BLOCK)
-
-    def make2():
-        def run(pr, pi, tab, dist_bins, live, edge, guard, scale, binm, base, lo, s, c2):
-            prof = jnp.fft.fft(lax.complex(pr, pi), axis=1)
-            cut = jnp.concatenate([prof[:, :pa], jnp.zeros((prof.shape[0], Na - keep), prof.dtype), prof[:, Pf - na_:]], 1)
-            d = dist_bins[None, :] * binm[:, None]
-            w = jnp.where(d <= edge, 1.0, jnp.where(d >= edge + guard, 0.0, 0.5 + 0.5 * jnp.cos((d - edge) * (math.pi / guard))))
-            A2 = jnp.fft.ifft(cut * (w * live[None, :] * scale), axis=1)
-            ib, fr = _positions(jnp, base, lo, s, c2)
-            return _read(jnp, jnp.real(A2), jnp.imag(A2), ib, fr, tab, PH)
-        return run
-    nJ, starts = _starts(nkr, blk // (24 * max(Pf, Na) + 300 * nblk2 * BLOCK))
-    step2 = _program(('azimuth', nJ, Pf, Na, nblk2), make2)
-    ja = np.arange(2 * nblk2 + 1, dtype=np.float64) * (BLOCK / 2)
-    B = np.empty((nkr, nka), c64)
-    qtab, ntab = g['qtab'], len(g['qtab'])
-    for J0 in starts:
-        hb = np.empty((nJ, Pf), c64)
-        hb[:, :p0] = 0
-        if jlo is None and place is None:
-            lib.ql_transpose(at(A, 0, J0), nwin, P, nJ, at(hb, 0, p0), Pf, None, 0)
-        else:
-            lib.ql_unshear(ptr(A), nwin, P, None if jlo is None else ptr(jlo), None if place is None else ptr(place), Pp,
-                           J0, nJ, at(hb, 0, p0), Pf)
-        hb[:, p0 + Pp:] = 0
-        # the pulse position of each knot's tangent, from the pulses' own (quicklook_cpu.cpp's ql_resample_az)
-        # (beyond the table the line of its last two points: such positions lie outside the row and read zero)
-        u = ((g['ka_lo'] + ja[None, :] * g['dka']) / g['kr'][J0:J0 + nJ, None] - g['tg0']) * g['tg_inv']
-        kq = np.clip(np.floor(u), 0, ntab - 2).astype(np.int64)
-        kn = _knots(qtab[kq] + (u - kq) * (qtab[kq + 1] - qtab[kq]))
-        o = step2(*planes(hb), tab, dist_bins, live, edge, guard, scale, jnp.asarray(g['bins_a'][J0:J0 + nJ].astype(f32)),
-                  *(jnp.asarray(v) for v in kn))
-        to_host(B[J0:J0 + nJ], o[0][:, :nka], o[1][:, :nka])
-    del A
-    timing['azimuth'] = timing.get('azimuth', 0.0) + time.perf_counter() - t0
-    t0 = time.perf_counter()
-    # 3. the raster's range transform, in blocks of azimuth wavenumbers: the rows of a sheared raster that meet in
-    # one bin summed (a reshape and a sum), the signs that make the padded transforms count from the image's center
-    ov = g['ov'] if correct else 1
-    Ny, hy, hx = ov * nfy, (g['hy'] if correct else 0), (nka // 2 if correct else 0)
-    m = -(-nkr // Ny)
-    sy = jnp.asarray(((-1.0) ** (np.arange(nkr) - hy)).astype(f32) if correct else np.ones(nkr, f32))
-    sxh = ((-1.0) ** (np.arange(nka) - hx)).astype(f32) if correct else np.ones(nka, f32)
-
-    def make3():
-        def run(br, bi, sy, sxb):
-            z = lax.complex(br, bi) * (sy[None, :] * sxb[:, None])
-            z = jnp.pad(z, ((0, 0), (0, m * Ny - nkr))).reshape(z.shape[0], m, Ny).sum(1)
-            f = jnp.fft.ifft(jnp.roll(z, -hy, axis=1), axis=1)
-            return jnp.real(f), jnp.imag(f)
-        return run
-    na, starts = _starts(nka, blk // (40 * max(Ny, nkr)))
-    step3 = _program(('transform', na, nkr, Ny, hy, bool(correct)), make3)
-    F = np.empty((nka, Ny), c64)
-    for a0 in starts:
-        o = step3(*planes(np.ascontiguousarray(B[:, a0:a0 + na].T)), sy, jnp.asarray(sxh[a0:a0 + na]))
-        to_host(F[a0:a0 + na], *o)
-    del B
-    timing['range transform'] = timing.get('range transform', 0.0) + time.perf_counter() - t0
-    t0 = time.perf_counter()
-    # 4. the azimuth transform and the picture, in blocks of range pixels
-    out = np.empty((ny, nx), c64 if complex_image else np.float32)
-    Nx = ov * nfx
-    if not correct:
-        cols = jnp.asarray(((np.arange(nx) - nx // 2) % nfx).astype(i32))
-        y, x = (np.arange(ny) - ny / 2.0) * g['spy'], (np.arange(nx) - nx / 2.0) * g['spx']
-        cyh = np.exp(1j * g['kr_min'] * y).astype(c64)
-        cxd = planes(np.exp(-1j * g['ka_lo'] * x).astype(c64))
-
-        def make4():
-            def run(zr, zi, cols, cxr, cxi, cyr, cyi):
-                t = jnp.take(jnp.fft.fft(lax.complex(zr, zi), axis=1), cols, axis=1)
-                if not complex_image:
-                    return jnp.abs(t), jnp.zeros((1, 1), jnp.float32)
-                t = t * lax.complex(cyr, cyi)[:, None] * lax.complex(cxr, cxi)[None, :]
-                return jnp.real(t), jnp.imag(t)
-            return run
-        bw = int(max(1, min(ny // 2, blk // (40 * Nx))))
-        step4 = _program(('picture', bw, Nx, nx, bool(complex_image)), make4)
-        for s_, e_ in ((0, ny // 2), (ny // 2, ny)):                     # the bins wrap at the picture's center
-            for jb in _starts(e_ - s_, bw)[1]:
-                jb += s_
-                rb = (nfy - ny // 2 + jb) % nfy
-                hb = np.zeros((bw, Nx), c64)
-                lib.ql_transpose(at(F, 0, rb), Ny, nka, bw, ptr(hb), Nx, None, 0)
-                o = step4(*planes(hb), cols, *cxd, *planes(cyh[jb:jb + bw]))
-                if complex_image:
-                    to_host(out[jb:jb + bw], *o)
-                else:
-                    out[jb:jb + bw] = np.asarray(o[0])
-        timing['image'] = timing.get('image', 0.0) + time.perf_counter() - t0
-        return out
-    dist = g['dist']
-    ltab = jnp.asarray(Q._polyphase('lanczos', Q.LANCZOS, PH))
-    shear = jnp.float32(g['shear'] * g['spy'] / g['spx'])
-    kr_c, ka_c = g['kr_min'] + hy * g['dkr'], g['ka_lo'] + hx * g['dka']
-    msy = int(math.ceil(g['shift'][1] / g['spy'])) * ov + Q.LANCZOS + 2
-    nxb = -(-nx // BLOCK)
-    bw = int(max(1, min(ny, blk // (40 * Nx * ov + 700 * nxb * BLOCK))))
-    span = min(Ny, ov * bw + 2 * msy)
-    xk = (np.arange(2 * nxb + 1, dtype=np.float64) * (BLOCK / 2) - nx / 2.0) * g['spx']
-    powers = dist['powers']
-
-    def apparent(yk):
-        """The apparent positions (m) of the knots [n, nxb + 1] of the range pixels at yk [n]."""
-        X, Y = np.broadcast_to(xk[None, :], (len(yk), len(xk))), np.broadcast_to(yk[:, None], (len(yk), len(xk)))
-        dx = sum(c * (X / dist['sx']) ** a * (Y / dist['sy']) ** b for c, (a, b) in zip(dist['cx'], powers))
-        dy = sum(c * (X / dist['sx']) ** a * (Y / dist['sy']) ** b for c, (a, b) in zip(dist['cy'], powers))
-        return X + dx, Y + dy
-
-    def make5():
-        def run(zr, zi, ltab, shear, bx, lx, sx_, cx_, by, ly, sy_, cy_, c0, dc, ddc):
-            base = jnp.fft.fft(lax.complex(zr, zi), axis=1)
-            ix, fx = _positions(jnp, bx, lx, sx_, cx_)
-            iy, fy = _positions(jnp, by, ly, sy_, cy_)
-            ar, ai = _read2(jnp, jnp.real(base), jnp.imag(base), ix, fx, iy, fy, shear, ltab, PH)
-            if not complex_image:
-                return jnp.sqrt(ar * ar + ai * ai), jnp.zeros((1, 1), jnp.float32)
-            i = jnp.arange(BLOCK, dtype=jnp.float32)
-            c = (c0[..., None] + i * dc[..., None] + (i * i) * ddc[..., None]).reshape(ar.shape)
-            c = (c - jnp.floor(c)) * (2.0 * math.pi)
-            cs, sn = jnp.cos(c), jnp.sin(c)
-            return ar * cs - ai * sn, ar * sn + ai * cs
-        return run
-    step5 = _program(('read', bw, span, Nx, nxb, bool(complex_image)), make5)
-    for jb in _starts(ny, bw)[1]:
-        rb0 = int(min(max(0, Ny // 2 + ov * (jb - ny // 2) - msy), Ny - span))
-        hb = np.empty((span, Nx), c64)
-        lib.ql_transpose(at(F, hx, rb0), Ny, nka - hx, span, ptr(hb), Nx, None, 0)
-        if hx:
-            lib.ql_transpose(at(F, 0, rb0), Ny, hx, span, at(hb, 0, Nx - hx), Nx, None, 0)
-        hb[:, nka - hx:Nx - hx] = 0
-        Xa, Ya = apparent((jb + np.arange(bw) - ny / 2.0) * g['spy'])
-        kx = _knots(Xa * (ov / g['spx']) + Nx / 2.0)
-        ky = _knots(Ya * (ov / g['spy']) + Ny / 2.0 - rb0)
-        _, c0, dc, ddc = _knots((kr_c * Ya - ka_c * Xa) / (2.0 * math.pi))        # the carrier, in cycles
-        o = step5(*planes(hb), ltab, shear, *(jnp.asarray(v) for v in kx + ky + (c0, dc, ddc)))
-        if complex_image:
-            to_host(out[jb:jb + bw], o[0][:, :nx], o[1][:, :nx])
-        else:
-            out[jb:jb + bw] = np.asarray(o[0][:, :nx])
-    timing['correction'] = timing.get('correction', 0.0) + time.perf_counter() - t0
-    return out
-
-
-# ------------------------------------------------------------------------------------- the forms a TPU runs fast
-# A TPU v6e does an indexed load per tap at 1e8 a second (a resampling pass of 113 million outputs: 119 s) and a
-# row of a table of windows followed by a matrix product of each block of outputs with its weights in 0.19 s
-# (tests/bench_tpu_blocks.py). The reads below are of that form, and the arrays stay on the device from the upload of
-# the history to the download of the image: _resident.
-
-STRIDE = 8                    # samples between the starts of the windows in the table of windows
-_KAISER = []
-
-
-def _kaiser_poly():
-    """The Kaiser window of the host kernels (quick.KAISER) as a polynomial in the square of the offset over the
-    half width, float32 coefficients of degree 7, highest power first: to 1.2e-6 of the window."""
-    if not _KAISER:
+def _kaiser_poly(beta=None):
+    """A Kaiser window (beta; the host kernels' quick.KAISER by default) as a polynomial in the square of the offset
+    over the half width, float32 coefficients of degree 7, highest power first: to 1.2e-6 of the window."""
+    if beta is None:
         from . import quick as Q
+        beta = Q.KAISER
+    if beta not in _KAISER:
         x2 = np.linspace(0.0, 1.0, 4001)
-        w = np.i0(Q.KAISER * np.sqrt(1.0 - x2)) / np.i0(Q.KAISER)
-        _KAISER.append(np.polynomial.chebyshev.Chebyshev.fit(x2, w, 7).convert(kind=np.polynomial.Polynomial).coef[::-1].astype(np.float32))
-    return _KAISER[0]
+        w = np.i0(beta * np.sqrt(1.0 - x2)) / np.i0(beta)
+        _KAISER[beta] = np.polynomial.chebyshev.Chebyshev.fit(x2, w, 7).convert(kind=np.polynomial.Polynomial).coef[::-1].astype(np.float32)
+    return _KAISER[beta]
+
+
+def _window(step, taps):
+    """Samples of the window that holds the taps of BLOCK outputs `step` samples apart, a multiple of 16."""
+    return _up(BLOCK * float(step) + taps + STRIDE + 6, 16)
 
 
 def _windows(jnp, u, w0, Rw):
@@ -372,13 +194,14 @@ def _windows(jnp, u, w0, Rw):
 
 
 def _dense(jnp, lax, xr, xi, ib, fr, Rw, taps, wpoly):
-    """_read without indexed loads of the taps: rows of x [R, n] (two planes) at the positions ib + fr [R, m] (m a
-    multiple of BLOCK), by blocks of BLOCK outputs. A block's taps lie in one window of Rw samples, read as a row
-    of the table of windows; the block's outputs are the product of that window with weights [BLOCK, Rw] formed on
+    """Rows of x [R, n] (two planes) at the positions ib + fr [R, m] (m a multiple of BLOCK), by blocks of BLOCK
+    outputs, without an indexed load of a tap. A block's taps lie in one window of Rw samples, read as a row of
+    the table of windows; the block's outputs are the product of that window with weights [BLOCK, Rw] formed on
     the device: the sinc from one sine per output (the sine of pi (u - w) is that of pi u with the sign of w's
     parity), times the Kaiser window as a polynomial (wpoly, 16 taps) or the sinc window (None: its sine follows
     from the angle sum with constants of w). A tap outside the row counts as zero and the rest are normalised
-    again; zero where the position lies outside (-0.5, n - 0.5)."""
+    again; zero where the position lies outside (-0.5, n - 0.5): quicklook_cpu.cpp's ql_resample_rows, with the
+    weights at the position itself and not at the nearest of 2048 phases."""
     R, n = xr.shape
     nblk, h = ib.shape[1] // BLOCK, taps // 2
     N = max(-(-n // STRIDE) * STRIDE, Rw)
@@ -412,242 +235,624 @@ def _dense(jnp, lax, xr, xi, ib, fr, Rw, taps, wpoly):
     return get(xr), get(xi)
 
 
-def _fits(g, K):
-    """Whether _resident takes this formation: a plain raster (no sheared rows, no missing pulses, no fold) and
-    room on the device for the history, the stages' arrays and the padded image at once."""
+# ----------------------------------------------------------------------------------------------- a formation's run
+
+class _Run:
+    """What a formation's steps share: the programs' mode, the timing of every call (timing['detail'] a dict), the
+    host kernels, and the block that is on its way down while the device works on the next."""
+
+    def __init__(self, timing):
+        self.detail = timing.get('detail') if isinstance(timing.get('detail'), dict) else None
+        self.mode = _mode()
+        self.pending = None
+        self._lib = None
+
+    @property
+    def lib(self):
+        if self._lib is None:
+            from . import quick as Q
+            self._lib = Q._lib()
+        return self._lib
+
+    def program(self, name, key, make):
+        return _program(name, key, make, self.detail)
+
+    def chain(self, parts):
+        """parts: (name, key, fn, args) in order; each fn takes the outputs of the one before it, then its own
+        args, and returns a tuple. 'shared': each its own program; 'fused': one program of them all."""
+        if self.mode == 'shared' or len(parts) == 1:
+            out = ()
+            for name, key, fn, args in parts:
+                out = self.program(name, key, lambda fn=fn: fn)(*out, *args)
+            return out
+        fns, counts = [p[2] for p in parts], [len(p[3]) for p in parts]
+
+        def make():
+            def run(*flat):
+                out, i = (), 0
+                for fn, n in zip(fns, counts):
+                    out = fn(*out, *flat[i:i + n])
+                    i += n
+                return out
+            return run
+        key = tuple(v for p in parts for v in (p[0],) + tuple(p[1]))
+        return self.program(' + '.join(p[0] for p in parts), key, make)(*(a for p in parts for a in p[3]))
+
+    def fetch(self, dev, dst):
+        """dst[...] = the device block dev (its leading rows and columns; a complex block as [.., 2] float32),
+        once the next block has been started: the copy overlaps the device's work."""
+        prev, self.pending = self.pending, (dev, dst)
+        if prev is not None:
+            self._get(*prev)
+
+    def flush(self):
+        prev, self.pending = self.pending, None
+        if prev is not None:
+            self._get(*prev)
+
+    def _get(self, dev, dst):
+        t = time.perf_counter()
+        a = np.asarray(dev)
+        if a.ndim == 3:
+            a = a.view(np.complex64)[..., 0]
+        dst[...] = a[:dst.shape[0], :dst.shape[1]]
+        if self.detail is not None:
+            self.detail['blocks to the host'] = self.detail.get('blocks to the host', 0.0) + time.perf_counter() - t
+
+
+def _unpack(x):
+    return x[..., 0], x[..., 1]
+
+
+class _Device:
+    """A large complex array [rows, width] on the device as two float32 planes, kept in at most GROUP pieces of
+    rows: its blocks (`per` rows each, the last moved back to end at the last row) are joined as they come, a
+    piece at a time, so the array is never on the device twice."""
+    host = False
+
+    def __init__(self, run, total, per, starts, width):
+        self.run, self.total, self.per, self.width = run, total, per, width
+        self.group = max(1, -(-len(starts) // GROUP))
+        self.pieces, self.waiting, self.done = [], [], 0
+
+    def put(self, r0, re, im):
+        self.waiting.append((r0, re, im))
+        if len(self.waiting) == self.group:
+            self._join()
+
+    def _join(self):
+        trims = []
+        for r0, _, _ in self.waiting:
+            trims.append(self.done - r0)             # rows of a block moved back that the one before it holds
+            self.done = r0 + self.per
+        if len(self.waiting) == 1 and trims[0] == 0:
+            self.pieces.append(self.waiting[0][1:])
+        else:
+            n = len(trims)
+
+            def make(trims=tuple(trims)):
+                import jax.numpy as jnp
+
+                def run(*a):
+                    return (jnp.concatenate([x[t:] for x, t in zip(a[:n], trims)], 0),
+                            jnp.concatenate([x[t:] for x, t in zip(a[n:], trims)], 0))
+                return run
+            join = self.run.program('join', (self.per, self.width, tuple(trims)), make)
+            self.pieces.append(join(*(w[1] for w in self.waiting), *(w[2] for w in self.waiting)))
+        self.waiting = []
+
+    def close(self):
+        if self.waiting:
+            self._join()
+        self.rows = sum(int(p[0].shape[0]) for p in self.pieces)
+        return self
+
+    def cut(self, n, c0, shifts=None):
+        """The chain's first part for the block of columns c0 .. c0 + n, turned: [n, rows]. shifts: int32 [rows],
+        row r holds the columns from shifts[r] * BLOCK on (a sheared raster's pulses, each on its own rows):
+        the block's columns are then read as blocks of BLOCK samples, zero where a row does not reach."""
+        import jax.numpy as jnp
+        from jax import lax
+        npc, W = len(self.pieces), self.width
+        sizes = tuple(int(p[0].shape[0]) for p in self.pieces)
+
+        def fn(*a):
+            c = a[2 * npc]
+            if shifts is None:
+                f = lambda p: lax.dynamic_slice_in_dim(p, c, n, 1)
+                return jnp.concatenate([f(p) for p in a[:npc]], 0).T, jnp.concatenate([f(p) for p in a[npc:2 * npc]], 0).T
+            sb, nwb, out = a[2 * npc + 1], W // BLOCK, []
+            for planes in (a[:npc], a[npc:2 * npc]):
+                parts, off = [], 0
+                for p, R in zip(planes, sizes):
+                    idx = c // BLOCK + jnp.arange(n // BLOCK, dtype=jnp.int32)[None, :] - sb[off:off + R, None]
+                    flat = jnp.arange(R, dtype=jnp.int32)[:, None] * nwb + jnp.clip(idx, 0, nwb - 1)
+                    v = p.reshape(R * nwb, BLOCK).at[flat].get(mode='promise_in_bounds')
+                    parts.append(jnp.where(((idx >= 0) & (idx < nwb))[..., None], v, 0.0).reshape(R, n))
+                    off += R
+                out.append(jnp.concatenate(parts, 0).T)
+            return tuple(out)
+        args = tuple(p[0] for p in self.pieces) + tuple(p[1] for p in self.pieces) + (np.int32(c0),)
+        if shifts is not None:
+            args += (jnp.asarray(shifts),)
+        return ('cut', (sizes, W, n, shifts is not None), fn, args)
+
+
+class _Host:
+    """The same array on the host (complex64), for a device without room for it: its blocks come down as they are
+    made and go up, turned, as the next stage takes them."""
+    host = True
+
+    def __init__(self, run, total, per, starts, width):
+        self.run, self.total, self.per, self.width = run, total, per, width
+        self.rows = max(total, per)
+        self.a = np.empty((self.rows, width), np.complex64)
+
+    def put(self, r0, re, im):
+        import jax.numpy as jnp
+        pack = self.run.program('pack', (self.per, self.width), lambda: lambda a, b: jnp.stack([a, b], -1))
+        self.run.fetch(pack(re, im), self.a[r0:r0 + self.per])
+
+    def close(self):
+        self.run.flush()
+        return self
+
+    def cut(self, n, c0, shifts=None):
+        import ctypes
+        import jax.numpy as jnp
+        lib, a = self.run.lib, self.a
+        t = time.perf_counter()
+        hb = np.empty((n, self.rows), np.complex64)
+        ptr = lambda v: v.ctypes.data_as(ctypes.c_void_p)
+        if shifts is None:
+            lib.ql_transpose(ctypes.c_void_p(a.ctypes.data + c0 * a.strides[1]), self.width, self.rows, n, ptr(hb), self.rows,
+                             None, 0)
+        else:
+            jb = np.ascontiguousarray(np.asarray(shifts, np.int64) * BLOCK, np.int32)
+            lib.ql_unshear(ptr(a), self.width, self.rows, ptr(jb), None, self.rows, c0, n, ptr(hb), self.rows)
+        x = jnp.asarray(hb.view(np.float32).reshape(n, self.rows, 2))
+        if self.run.detail is not None:
+            d = self.run.detail
+            d['blocks to the device'] = d.get('blocks to the device', 0.0) + time.perf_counter() - t
+        return ('unpack', (n, self.rows), _unpack, (x,))
+
+
+def _plan(sizes, budget, block):
+    """Where the three large arrays live for a device with `budget` bytes to give (None: no limit known) and
+    `block` bytes for a stage's own arrays: dict(A, B, F: True on the device; kept: the names of those on the
+    host). A stage holds the array it reads, the one it writes with one more piece of it while that is joined,
+    and three blocks; the largest go to the host first until what is left fits."""
+    names = dict(A="the range stage's output", B='the raster', F="the raster's range transform")
+    on = dict.fromkeys(sizes, True)
+    if budget is not None:
+        def peak():
+            s = {k: sizes[k] if on[k] else 0 for k in sizes}
+            g = 1.0 + 1.0 / GROUP
+            return max(g * s['A'], s['A'] + g * s['B'], s['B'] + g * s['F'], s['F']) + 3 * block
+        for k in sorted(sizes, key=lambda k: -sizes[k]):
+            if peak() <= budget:
+                break
+            on[k] = False
+    return dict(on, kept=[names[k] for k in sizes if not on[k]])
+
+
+def plan(g, K=None):
+    """The sizes of a formation on the JAX device and where its arrays live, for a geometry of quick._geometry:
+    dict(bytes: of A, B and F; A, B, F: on the device; kept; budget, block). What pfa takes."""
     from . import _xp
-    if g['jlo'] is not None or g['place'] is not None or g['shear'] != 0.0 or g['nkr'] > g['nfy']:
-        return False
-    budget = _xp.jax_budget()
-    Ny, Nx = g['ov'] * g['nfy'], g['ov'] * g['nfx']
-    need = 8 * (g['P'] * K + g['P'] * g['nkr'] + g['nkr'] * g['nka'] + g['nka'] * Ny + Ny * g['nx'] + g['nx'] * g['ny'])
-    return budget is None or 1.5 * need + 4 * _xp.jax_block() < budget
+    lay = _layout(g, _xp.jax_block())
+    return dict(_plan(lay['bytes'], _xp.jax_budget(), _xp.jax_block()), bytes=lay['bytes'], budget=_xp.jax_budget(),
+                block=_xp.jax_block())
 
 
-def _resident(S, g, window, complex_image, timing, phase=None):
-    """The corrected image with every array on the device from the upload of the history (two planes) to the
-    download of the image (two planes, or the amplitude), in the forms a TPU runs fast: transforms, _dense reads
-    and, for the read at the apparent positions, two passes of _dense, along the baseband image's rows and then
-    along its columns. The apparent positions are formed on the device, as the pixel's own index (an integer) plus
-    the displacement polynomial in float32, which holds a displacement of tens of pixels to a millionth of one.
-    -> the image on the host, azimuth-major [nx, ny] (form_image's layout)."""
+def _layout(g, blk, correct=True):
+    """The blocks of the stages for a geometry and `blk` bytes a block: dict of each stage's (rows of a block,
+    rows of it that are the array's, starts), the padded widths, the windows, and the bytes of the three arrays."""
+    from . import quick as Q
+    P, Kf, Nr, nkr, nka, nwin = g['P'], g['Kf'], g['Nr'], g['nkr'], g['nka'], g['nwin']
+    Pf, Na, Pp, ov = g['Pf'], g['Na'], g['Pp'], (g['ov'] if correct else 1)
+    sheared = g['jlo'] is not None
+    # 1. range: each pulse on the rows of the raster it reaches, from a multiple of BLOCK
+    nblk = _ladder(-(-(nwin + (BLOCK - 1 if sheared else 0)) // BLOCK))
+    W1 = nblk * BLOCK
+    Rw1 = _window(float(np.abs(g['beta']).max()), Q.TAPS)
+    b1 = _blocks_of(Pp, blk // (40 * max(Kf, Nr, g['K']) + 16 * W1 * Rw1))
+    # 2. azimuth: the raster's rows, a multiple of BLOCK of them
+    rows2 = _up(nkr, BLOCK)
+    nblk2 = _ladder(-(-nka // BLOCK))
+    W2 = nblk2 * BLOCK
+    j = np.arange(2 * nblk2 + 1, dtype=np.float64) * (BLOCK / 2)
+    kr = g['kr_min'] + g['dkr'] * np.array([0.0, nkr - 1.0])
+    pos = _az_positions(g, kr, j)
+    Rw2 = _window(float(np.abs(np.diff(pos[:, ::2], axis=1)).max()) / BLOCK, Q.TAPS)
+    # the outputs whose positions are one parabola: BLOCK where the pulses' spacing is smooth over them (any picture
+    # of more than a few hundred pixels), fewer where a parabola through three of them misses the others by more
+    # than 2e-4 of a sample (a small picture of unevenly spaced pulses)
+    pb2 = BLOCK
+    while pb2 > 4:
+        q = _az_positions(g, kr, np.arange(4 * W2 // pb2 + 1, dtype=np.float64) * (pb2 / 4))
+        a, m, e = q[:, 0:-1:4], q[:, 2::4], q[:, 4::4]               # each run's first output, middle and end
+        cc = 2.0 * (e - 2.0 * m + a) / pb2 ** 2
+        ss = (e - a) / pb2 - cc * pb2
+        ok = (a > -0.5) & (e < Na - 0.5)
+        miss = lambda i, v: np.abs(a + ss * i + cc * i * i - v)[ok].max(initial=0.0)
+        if max(miss(pb2 / 4, q[:, 1::4]), miss(3 * pb2 / 4, q[:, 3::4])) < 2e-4:
+            break
+        pb2 //= 2
+    b2 = _blocks_of(rows2, blk // (40 * max(Pf, Na) + 16 * W2 * Rw2), BLOCK)
+    # 3. the range transform: the raster's columns
+    Ny = ov * g['nfy']
+    fold = -(-rows2 // Ny)
+    rows3 = _up(nka, BLOCK)
+    b3 = _blocks_of(rows3, blk // (40 * max(fold * Ny, rows2)))
+    size = lambda b, total, width: 8 * max(total, b[0]) * width
+    return dict(nblk=nblk, W1=W1, Rw1=Rw1, b1=b1, rows2=rows2, nblk2=nblk2, W2=W2, Rw2=Rw2, pb2=pb2, b2=b2, Ny=Ny, fold=fold,
+                rows3=rows3, b3=b3, sheared=sheared,
+                bytes=dict(A=size(b1, Pp, W1), B=size(b2, rows2, W2), F=size(b3, rows3, Ny)))
+
+
+def _az_positions(g, kr, j):
+    """The pulse position (in the Na pulses of the gated row) of the azimuth wavenumbers ka_lo + j dka at the range
+    wavenumbers kr: [len(kr), len(j)] (float64), from the pulses' own tangents (quick._geometry's table; beyond
+    it the line of its last two points: such positions lie outside the row and read zero)."""
+    qtab = g['qtab']
+    u = ((g['ka_lo'] + j[None, :] * g['dka']) / kr[:, None] - g['tg0']) * g['tg_inv']
+    kq = np.clip(np.floor(u), 0, len(qtab) - 2).astype(np.int64)
+    return qtab[kq] + (u - kq) * (qtab[kq + 1] - qtab[kq])
+
+
+def _poly(jnp, coef, powers, x, y):
+    """The displacement polynomial (m) at normalised coordinates: the sum of coef[k] x^a y^b over the powers."""
+    px, py = [jnp.ones_like(x)], [jnp.ones_like(y)]
+    for _ in range(max(a for a, _ in powers)):
+        px.append(px[-1] * x)
+    for _ in range(max(b for _, b in powers)):
+        py.append(py[-1] * y)
+    return sum(coef[k] * px[a] * py[b] for k, (a, b) in enumerate(powers))
+
+
+def _split(jnp, index, frac):
+    fl = jnp.floor(frac)
+    return index + fl.astype(jnp.int32), frac - fl
+
+
+def pfa(S, g, window, correct, complex_image, timing, phase=None, info=None):
+    """fastsar.quick's polar format on JAX's device -> the image on the host, range-major [ny, nx] (complex64, or
+    its amplitude, float32). S [P, K] complex64 on the host (or a one-element list that hands it over); g:
+    quick._geometry's; phase: (ph0, ph1) [P] in cycles, a reference phase exp(2 pi j (ph0 + k ph1)) of sample k
+    that the device applies with the weights. info['stream']: what was kept on the host, where the device had no
+    room. timing: the stages' seconds; with timing['detail'] a dict, every program's call is brought to completion
+    and its seconds are added there by name."""
     import jax
     import jax.numpy as jnp
     from jax import lax
     from . import _xp
     from . import quick as Q
     f32, i32, c64 = np.float32, np.int32, np.complex64
+    run = _Run(timing)
+    S = np.ascontiguousarray(S.pop() if isinstance(S, list) else S, c64)
     P, K, Kf, Nr, k0 = g['P'], g['K'], g['Kf'], g['Nr'], g['k0']
     nkr, nka, nfy, nfx, nx, ny = g['nkr'], g['nka'], g['nfy'], g['nfx'], g['nx'], g['ny']
-    Pf, Na, p0, ov = g['Pf'], g['Na'], g['p0'], g['ov']
-    Ny, Nx, hy, hx = ov * nfy, ov * nfx, g['hy'], nka // 2
-    import os
-    blk = _xp.jax_block()                             # (a v6e ran 2 GB blocks in 2 s and 4.6 GB blocks in 100 s)
-    if os.environ.get('FASTSAR_JAX_RESIDENT_BLOCK_MB', '').strip():                    # for measurements
-        blk = int(float(os.environ['FASTSAR_JAX_RESIDENT_BLOCK_MB']) * 1e6)
-    wpoly = jnp.asarray(_kaiser_poly())
+    nwin, jlo, Pf, Na, p0, Pp, place = g['nwin'], g['jlo'], g['Pf'], g['Na'], g['p0'], g['Pp'], g['place']
+    blk, budget = _xp.jax_block(), _xp.jax_budget()
+    L = _layout(g, blk, correct)
+    where = _plan(L['bytes'], budget, blk)
+    if where['kept'] and info is not None:
+        info['stream'] = (f"the JAX device has {budget / 1e9:.1f} GB to give: {', '.join(where['kept'])} "
+                          f"{'is' if len(where['kept']) == 1 else 'are'} kept on the host and cross in blocks")
+    store = lambda name, total, b, width: (_Device if where[name] else _Host)(run, total, b[0], b[2], width)
+    up = lambda a, t=f32: jnp.asarray(np.ascontiguousarray(a, t))
     HI = lax.Precision.HIGHEST
-    up = lambda a: jnp.asarray(np.ascontiguousarray(a, f32))
-    cut = lambda a, at, n, axis: lax.dynamic_slice_in_dim(a, at, n, axis)
-    window_of = lambda step, taps: int(-(-int(BLOCK * step + taps + STRIDE + 6) // STRIDE) * STRIDE)
+    wpoly = jnp.asarray(_kaiser_poly())
+    sheared = L['sheared']
 
-    def joined(parts, starts, per, axis=0):
-        """Blocks that end at the last row (the last one moved back) -> the whole, along an axis."""
-        out, done = [], 0
-        for a0, p in zip(starts, parts):
-            out.append(tuple(lax.slice_in_dim(v, done - a0, per, axis=axis) for v in p))
-            done = a0 + per
-        return tuple(jnp.concatenate([o[k] for o in out], axis) for k in range(len(out[0])))
+    def rows_of(v, sl, n, dtype):
+        """v[sl] as `dtype`, zeros to n rows, on the device."""
+        out = np.zeros((n,) + v.shape[1:], dtype)
+        out[:sl.stop - sl.start] = v[sl]
+        return jnp.asarray(out)
+
     t0 = time.perf_counter()
-    S = np.ascontiguousarray(S.pop() if isinstance(S, list) else S, c64)
-    Sd = jnp.asarray(S.view(np.float32).reshape(P, K, 2))                 # the history's own bytes, split on the device
-    Sr, Si = Sd[..., 0], Sd[..., 1]
-    del S, Sd
-    jax.block_until_ready((Sr, Si))
-    timing['upload'] = timing.get('upload', 0.0) + time.perf_counter() - t0
-    t0 = time.perf_counter()
-    # 1. range
+    # ------------------------------------------------------------------------------------------------ 1. range
+    # A block of pulses, each at its place: weighted (the reference phase with the weights), padded, gated in range
+    # and read at the raster's range wavenumbers, each pulse on its own rows of the raster from row BLOCK * shift
+    src = None
+    if place is not None:
+        src = np.full(Pp, -1, np.int64)
+        src[place] = np.arange(P)
+
+    def placed(v, dtype=np.float64):
+        v = np.asarray(v, dtype)
+        if place is None:
+            return v
+        out = np.zeros((Pp,) + v.shape[1:], dtype)
+        out[place] = v
+        return out
+    alpha, beta = placed(g['alpha']), placed(g['beta'])
+    wp = placed(g['wp'] * (Q._taylor(P) if window else 1.0))
+    jl = placed(jlo, np.int64) if sheared else np.zeros(Pp, np.int64)
+    shift1 = (jl // BLOCK).astype(i32)
+    off = jl - shift1.astype(np.int64) * BLOCK
+    shift1 = np.concatenate([shift1, np.zeros(max(0, L['b1'][0] - Pp), i32)])     # (a single block is padded)
+    there = np.ones(Pp, bool) if place is None else src >= 0
+    clo, chi = np.where(there, off, 0).astype(i32), np.where(there, off + nwin, 0).astype(i32)
+    ref = phase is not None
+    A0, B0 = (placed(_cycles(v), np.uint32) for v in (phase if ref else (np.zeros(P), np.zeros(P))))
     wk = up(g['wk'] * (Q._taylor(K) if window else 1.0))
-    wp = (g['wp'] * (Q._taylor(P) if window else 1.0)).astype(f32)
     tap_r = up(Q._taper(Nr, g['Er'], g['gy'], g['bin_r']))
-    nblk = -(-nkr // BLOCK)
+    nblk, W1, Rw1 = L['nblk'], L['W1'], L['Rw1']
+    nb, n1, starts = L['b1']
     keep = min(Nr, Kf)
     pos_, neg_ = keep - keep // 2, keep // 2
-    ref = phase is not None
-    Rw1 = window_of(float(np.abs(g['beta']).max()), Q.TAPS)
 
-    def make1():
-        def run(Sr, Si, r, wk, tap_r, wpoly, wpb, a0, b0, base, lo, s, c2):
-            sr, si = cut(Sr, r, nb, 0), cut(Si, r, nb, 0)
-            if ref:
-                c = a0[:, None] + jnp.arange(K, dtype=jnp.float32) * b0[:, None]
-                c = (c - jnp.floor(c)) * (2.0 * math.pi)
-                cs, sn = jnp.cos(c), jnp.sin(c)
-                sr, si = sr * cs - si * sn, sr * sn + si * cs
-            w = wk[None, :] * wpb[:, None]
-            prof = jnp.fft.ifft(jnp.pad(lax.complex(sr * w, si * w), ((0, 0), (k0, Kf - K - k0))), axis=1)
-            gate = jnp.concatenate([prof[:, :pos_], jnp.zeros((nb, Nr - keep), prof.dtype), prof[:, Kf - neg_:]], 1) * tap_r
-            G = jnp.fft.fft(gate, axis=1)
-            ib, fr = _positions(jnp, base, lo, s, c2)
-            return _dense(jnp, lax, jnp.real(G), jnp.imag(G), ib, fr, Rw1, Q.TAPS, wpoly)
-        return run
-    nb, starts = _starts(P, blk // (24 * max(Kf, Nr) + 16 * nblk * BLOCK * Rw1))
-    step1 = _program(('r1', nb, P, K, k0, Kf, Nr, nblk, Rw1, ref), make1)
+    def weights(x, wk, wpb, a0, b0):
+        sr, si = x[..., 0], x[..., 1]
+        if ref:
+            c = _angle(jnp, jnp.arange(K, dtype=jnp.uint32)[None, :] * b0[:, None] + a0[:, None])
+            cs, sn = jnp.cos(c), jnp.sin(c)
+            sr, si = sr * cs - si * sn, sr * sn + si * cs
+        w = wk[None, :] * wpb[:, None]
+        pad = ((0, nb - n1), (k0, Kf - K - k0))
+        return jnp.pad(sr * w, pad), jnp.pad(si * w, pad)
+
+    def range_(zr, zi, tap_r, wpoly, base, lo, s, c2, clo, chi):
+        prof = jnp.fft.ifft(lax.complex(zr, zi), axis=1)
+        gate = jnp.concatenate([prof[:, :pos_], jnp.zeros((nb, Nr - keep), prof.dtype), prof[:, Kf - neg_:]], 1) * tap_r
+        G = jnp.fft.fft(gate, axis=1)
+        ib, fr = _positions(jnp, base, lo, s, c2)
+        o = _dense(jnp, lax, jnp.real(G), jnp.imag(G), ib, fr, Rw1, Q.TAPS, wpoly)
+        col = jnp.arange(W1, dtype=jnp.int32)[None, :]
+        m = (col >= clo[:, None]) & (col < chi[:, None])
+        return jnp.where(m, o[0], 0.0), jnp.where(m, o[1], 0.0)
+    S3 = S.view(np.float32).reshape(P, K, 2)
     j = np.arange(2 * nblk + 1, dtype=np.float64) * (BLOCK / 2)
-    ph0, ph1 = (np.asarray(v, np.float64) for v in (phase if ref else (np.zeros(P), np.zeros(P))))
-    parts = []
+    A = store('A', Pp, L['b1'], W1)
     for r in starts:
-        sl = slice(r, r + nb)
-        kn = _knots(g['alpha'][sl, None] + j[None, :] * g['beta'][sl, None])
-        parts.append(step1(Sr, Si, i32(r), wk, tap_r, wpoly, jnp.asarray(wp[sl]), up(ph0[sl]), up(ph1[sl]),
-                           *(jnp.asarray(v) for v in kn)))
-    Ar, Ai = (v[:, :nkr] for v in joined(parts, starts, nb))
-    del Sr, Si, parts
-    jax.block_until_ready(Ar)
+        sl = slice(r, r + n1)
+        if src is None:
+            x = S3[sl]
+        elif src[r] >= 0 and src[r + n1 - 1] - src[r] == n1 - 1:       # no gap in the block: the history's own bytes
+            x = S3[src[r]:src[r] + n1]
+        else:                                                          # the host places the pulses of this block
+            x = np.zeros((n1, K, 2), f32)
+            q = np.nonzero(src[sl] >= 0)[0]
+            x[q] = S3[src[sl][q]]
+        kn = _knots(alpha[sl, None] + (j[None, :] - off[sl, None]) * beta[sl, None])
+        o = run.chain([('weights', (n1, nb, K, Kf, k0, ref), weights,
+                        (jnp.asarray(x), wk, rows_of(wp, sl, n1, f32), jnp.asarray(A0[sl]), jnp.asarray(B0[sl]))),
+                       ('range', (nb, Kf, Nr, nblk, Rw1), range_,
+                        (tap_r, wpoly) + tuple(rows_of(v, slice(0, n1), nb, v.dtype) for v in kn)
+                        + (rows_of(clo, sl, nb, i32), rows_of(chi, sl, nb, i32)))])
+        A.put(r, *o)
+    A.close()
+    del S, S3, x
+    jax.block_until_ready(o)
     timing['range'] = timing.get('range', 0.0) + time.perf_counter() - t0
     t0 = time.perf_counter()
-    # 2. azimuth
-    scale = jnp.float32(g['gain'] * Ny * Na / Pf)
+    # ---------------------------------------------------------------------------------------------- 2. azimuth
+    # A block of the raster's range wavenumbers, the pulses of each along a row: gated in azimuth (in meters, for
+    # each wavenumber's own bins) and read at the raster's azimuth wavenumbers at the pulses' own spacing
+    ov = g['ov'] if correct else 1
+    Ny = L['Ny']
+    rows2, nblk2, W2, Rw2 = L['rows2'], L['nblk2'], L['W2'], L['Rw2']
+    nJ, n2, starts = L['b2']
     kk = np.arange(Na)
     nbin = np.where(kk < Na - Na // 2, kk, kk - Na)
-    keep = min(Na, Pf)
-    pa, na_ = keep - keep // 2, keep // 2
+    keep2 = min(Na, Pf)
+    pa, na_ = keep2 - keep2 // 2, keep2 // 2
     dist_bins, live = up(np.abs(nbin)), up((nbin < pa) & (nbin >= -na_))
-    edge, guard = jnp.float32(g['Ex']), jnp.float32(g['gx'])
-    nblk2 = -(-nka // BLOCK)
-    ja = np.arange(2 * nblk2 + 1, dtype=np.float64) * (BLOCK / 2)
-    qtab, ntab = g['qtab'], len(g['qtab'])
-    u = ((g['ka_lo'] + ja[None, :] * g['dka']) / g['kr'][:, None] - g['tg0']) * g['tg_inv']
-    kq = np.clip(np.floor(u), 0, ntab - 2).astype(np.int64)
-    posa = qtab[kq] + (u - kq) * (qtab[kq + 1] - qtab[kq])                 # [nkr, 2 nblk2 + 1]
-    Rw2 = window_of(float(np.abs(np.diff(posa[:, ::2], axis=1)).max()) / BLOCK, Q.TAPS)
-    del u, kq
+    edge, guard, scale = f32(g['Ex']), f32(g['gx']), f32(g['gain'] * Ny * Na / Pf)
+    pb2 = L['pb2']
+    ja = np.arange(2 * (W2 // pb2) + 1, dtype=np.float64) * (pb2 / 2)
 
-    def make2():
-        def run(Ar, Ai, J0, wpoly, dist_bins, live, edge, guard, scale, binm, base, lo, s, c2):
-            z = jnp.pad(lax.complex(cut(Ar, J0, nJ, 1), cut(Ai, J0, nJ, 1)).T, ((0, 0), (p0, Pf - P - p0)))
-            prof = jnp.fft.fft(z, axis=1)
-            cz = jnp.concatenate([prof[:, :pa], jnp.zeros((nJ, Na - keep), prof.dtype), prof[:, Pf - na_:]], 1)
-            d = dist_bins[None, :] * binm[:, None]
-            w = jnp.where(d <= edge, 1.0, jnp.where(d >= edge + guard, 0.0, 0.5 + 0.5 * jnp.cos((d - edge) * (math.pi / guard))))
-            A2 = jnp.fft.ifft(cz * (w * live[None, :] * scale), axis=1)
-            ib, fr = _positions(jnp, base, lo, s, c2)
-            return _dense(jnp, lax, jnp.real(A2), jnp.imag(A2), ib, fr, Rw2, Q.TAPS, wpoly)
-        return run
-    nJ, starts = _starts(nkr, blk // (24 * max(Pf, Na) + 16 * nblk2 * BLOCK * Rw2))
-    step2 = _program(('r2', nJ, P, nkr, Pf, Na, p0, nblk2, Rw2), make2)
-    parts = []
+    def pulses(zr, zi):
+        pad = ((0, nJ - n2), (p0, Pf - Pp - p0))
+        return jnp.pad(zr[:, :Pp], pad), jnp.pad(zi[:, :Pp], pad)
+
+    def azimuth(zr, zi, dist_bins, live, edge, guard, scale, binm, wpoly, base, lo, s, c2):
+        prof = jnp.fft.fft(lax.complex(zr, zi), axis=1)
+        cz = jnp.concatenate([prof[:, :pa], jnp.zeros((nJ, Na - keep2), prof.dtype), prof[:, Pf - na_:]], 1)
+        d = dist_bins[None, :] * binm[:, None]
+        w = jnp.where(d <= edge, 1.0, jnp.where(d >= edge + guard, 0.0, 0.5 + 0.5 * jnp.cos((d - edge) * (math.pi / guard))))
+        A2 = jnp.fft.ifft(cz * (w * live[None, :] * scale), axis=1)
+        ib, fr = _positions(jnp, base, lo, s, c2, pb2)
+        o = _dense(jnp, lax, jnp.real(A2), jnp.imag(A2), ib, fr, Rw2, Q.TAPS, wpoly)
+        m = jnp.arange(W2, dtype=jnp.int32)[None, :] < nka
+        return jnp.where(m, o[0], 0.0), jnp.where(m, o[1], 0.0)
+    B = store('B', rows2, L['b2'], W2)
     for J0 in starts:
-        kn = _knots(posa[J0:J0 + nJ])
-        parts.append(step2(Ar, Ai, i32(J0), wpoly, dist_bins, live, edge, guard, scale, up(g['bins_a'][J0:J0 + nJ]),
-                           *(jnp.asarray(v) for v in kn)))
-    Br, Bi = (v[:, :nka] for v in joined(parts, starts, nJ))
-    del Ar, Ai, parts, posa
-    jax.block_until_ready(Br)
+        kr = g['kr_min'] + g['dkr'] * (J0 + np.arange(nJ, dtype=np.float64))
+        kn = _knots(_az_positions(g, kr, ja), pb2)
+        binm = 2 * math.pi / (kr * abs(g['dts']) * Pf)
+        o = run.chain([A.cut(n2, J0, shift1 if sheared else None),
+                       ('pulses', (n2, nJ, A.rows, Pp, Pf, p0), pulses, ()),
+                       ('azimuth', (nJ, Pf, Na, nblk2, Rw2, pb2, nka), azimuth,
+                        (dist_bins, live, edge, guard, scale, up(binm), wpoly) + tuple(jnp.asarray(v) for v in kn))])
+        B.put(J0, *o)
+    B.close()
+    del A
+    jax.block_until_ready(o)
     timing['azimuth'] = timing.get('azimuth', 0.0) + time.perf_counter() - t0
     t0 = time.perf_counter()
-    # 3. the range transform: [nka, Ny]
-    sy, sxh = up((-1.0) ** (np.arange(nkr) - hy)), ((-1.0) ** (np.arange(nka) - hx)).astype(f32)
+    # ------------------------------------------------------------------------------ 3. the raster's range transform
+    # A block of azimuth wavenumbers, the range wavenumbers of each along a row: the rows of a sheared raster that
+    # meet in one bin of the transform's period summed (a reshape and a sum); corrected, the signs that make the
+    # padded transforms count from the image's center, and the band's center at index 0
+    fold = L['fold']
+    hy, hx = (g['hy'], nka // 2) if correct else (0, 0)
+    rows3 = L['rows3']
+    na, n3, starts = L['b3']
+    sy = np.zeros(rows2, f32)
+    sy[:nkr] = (-1.0) ** (np.arange(nkr) - hy) if correct else 1.0
+    sxh = np.ones(rows3 + na, f32)
+    if correct:
+        sxh[:nka] = (-1.0) ** (np.arange(nka) - hx)
+    sy = jnp.asarray(sy)
 
-    def make3():
-        def run(Br, Bi, a0, sy, sxb):
-            z = lax.complex(cut(Br, a0, na, 1), cut(Bi, a0, na, 1)).T * (sy[None, :] * sxb[:, None])
-            f = jnp.fft.ifft(jnp.roll(jnp.pad(z, ((0, 0), (0, Ny - nkr))), -hy, axis=1), axis=1)
-            return jnp.real(f), jnp.imag(f)
-        return run
-    na, starts = _starts(nka, blk // (40 * Ny))
-    step3 = _program(('r3', na, nkr, nka, Ny, hy), make3)
-    Fr, Fi = joined([step3(Br, Bi, i32(a0), sy, jnp.asarray(sxh[a0:a0 + na])) for a0 in starts], starts, na)
-    del Br, Bi
-    jax.block_until_ready(Fr)
+    def bins(zr, zi, sy, sxb, hy):
+        w = sy[None, :] * sxb[:n3, None]
+        pad = ((0, na - n3), (0, fold * Ny - rows2))
+        f = lambda z: jnp.roll(jnp.pad(z[:, :rows2] * w, pad).reshape(na, fold, Ny).sum(1), -hy, axis=1)
+        return f(zr), f(zi)
+
+    def inverse(zr, zi):
+        f = jnp.fft.ifft(lax.complex(zr, zi), axis=1)
+        return jnp.real(f), jnp.imag(f)
+    F = store('F', rows3, L['b3'], Ny)
+    for a0 in starts:
+        o = run.chain([B.cut(n3, a0), ('bins', (n3, na, B.rows, rows2, Ny, fold), bins, (sy, jnp.asarray(sxh[a0:a0 + na]), i32(hy))),
+                       ('inverse transform', (na, Ny), inverse, ())])
+        F.put(a0, *o)
+    F.close()
+    del B
+    jax.block_until_ready(o)
     timing['range transform'] = timing.get('range transform', 0.0) + time.perf_counter() - t0
     t0 = time.perf_counter()
-    # 4. the azimuth transform of the baseband rows the picture reads, and the read along them: row R of the padded
-    # image at the columns where the picture's columns lie on it
+    out = np.empty((ny, nx), c64 if complex_image else np.float32)
+    Nx = ov * nfx
+    if not correct:
+        # 4. the azimuth transform of the picture's range bins, cut to its columns, with the carriers. The bins
+        # wrap at the picture's center, so the blocks stop there
+        bw, _, _ = _blocks_of(ny // 2, blk // (40 * Nx))
+        y, x = (np.arange(ny) - ny / 2.0) * g['spy'], (np.arange(nx) - nx / 2.0) * g['spx']
+        cyh = _cycles(g['kr_min'] * y / (2 * math.pi))
+        cxd = jnp.asarray(_cycles(-g['ka_lo'] * x / (2 * math.pi)))
+        for s_, e_ in ((0, ny // 2), (ny // 2, ny)):
+            nv = min(bw, e_ - s_)
+
+            def columns(zr, zi):
+                pad = ((0, bw - nv), (0, Nx - nka))
+                return jnp.pad(zr[:, :nka], pad), jnp.pad(zi[:, :nka], pad)
+
+            def picture(zr, zi, cx, cy):
+                t = jnp.roll(jnp.fft.fft(lax.complex(zr, zi), axis=1), nx // 2, axis=1)[:, :nx]
+                if not complex_image:
+                    return (jnp.abs(t),)
+                c = _angle(jnp, cx[None, :] + cy[:, None])
+                t = t * lax.complex(jnp.cos(c), jnp.sin(c))
+                return (jnp.stack([jnp.real(t), jnp.imag(t)], -1),)
+            for jb in _starts(e_ - s_, nv)[1]:
+                jb += s_
+                o = run.chain([F.cut(nv, (nfy - ny // 2 + jb) % nfy), ('columns', (nv, bw, F.rows, nka, Nx), columns, ()),
+                               ('picture', (bw, Nx, nx, bool(complex_image)), picture,
+                                (cxd, rows_of(cyh, slice(jb, jb + nv), bw, np.uint32)))])
+                run.fetch(o[0], out[jb:jb + nv])
+        run.flush()
+        timing['image'] = timing.get('image', 0.0) + time.perf_counter() - t0
+        return out
+    # 4. the read at the apparent positions, in strips of the picture's rows (range pixels). A strip's rows of the
+    # padded image are transformed along azimuth with each row shifted by the raster's shear (and brought to start
+    # at the first column the strip reads), which leaves an image H that is smooth along its columns; H's columns
+    # are read at the strip's rows (G), and G's rows at the picture's columns
     dist = g['dist']
-    powers = [(int(a), int(b)) for a, b in dist['powers']]
+    powers = tuple((int(a), int(b)) for a, b in dist['powers'])
     cx, cy = up(dist['cx']), up(dist['cy'])
-    msy = int(math.ceil(g['shift'][1] / g['spy'])) * ov + Q.LANCZOS + 2
-    R_lo = max(0, Ny // 2 - ov * (ny // 2 + 1) - msy)
-    R_hi = min(Ny, Ny // 2 + ov * (ny - ny // 2 + 1) + msy)
-    nxp, nyp = -(-nx // BLOCK) * BLOCK, -(-ny // BLOCK) * BLOCK
-    xn = up((np.arange(nxp) - nx / 2.0) * g['spx'] / dist['sx'])            # the picture's columns, normalised
-    yn = up((np.arange(nyp) - ny / 2.0) * g['spy'] / dist['sy'])
-    ixc = jnp.asarray((ov * np.arange(nxp) + (Nx // 2 - (ov * nx) // 2)).astype(i32))     # their columns on the padded image
-    iyc = jnp.asarray((ov * np.arange(nyp) + (Ny // 2 - (ov * ny) // 2) - R_lo).astype(i32))
-    half_x, half_y = f32(0.5 * ((ov * nx) % 2)), f32(0.5 * ((ov * ny) % 2))
-    ux, uy = f32(ov / g['spx']), f32(ov / g['spy'])
-    Rw3 = window_of(ov * 1.02, Q.LANCZOS)
-
-    def shift(coef, x, y):
-        """The displacement polynomial (m) at normalised coordinates."""
-        px, py = [jnp.ones_like(x)], [jnp.ones_like(y)]
-        for _ in range(max(a for a, _ in powers)):
-            px.append(px[-1] * x)
-        for _ in range(max(b for _, b in powers)):
-            py.append(py[-1] * y)
-        return sum(coef[k] * px[a] * py[b] for k, (a, b) in enumerate(powers))
-
-    def split(index, frac):
-        fl = jnp.floor(frac)
-        return index + fl.astype(jnp.int32), frac - fl
-
-    def make4():
-        def run(Fr, Fi, R0, cx, cy, xn, ixc):
-            z = lax.complex(cut(Fr, R0, nR, 1), cut(Fi, R0, nR, 1)).T                      # [nR, nka]
-            base = jnp.fft.fft(jnp.roll(jnp.pad(z, ((0, 0), (0, Nx - nka))), -hx, axis=1), axis=1)
-            yr = ((R0 + jnp.arange(nR)).astype(jnp.float32) - Ny / 2.0) * (g['spy'] / ov / dist['sy'])
-            X, Y = xn[None, :], yr[:, None]
-            yo = Y - shift(cy, X, Y) * (1.0 / dist['sy'])                                  # the picture's row that reads
-            yo = Y - shift(cy, X, yo) * (1.0 / dist['sy'])                                 # this baseband row there
-            ib, fr = split(ixc[None, :], shift(cx, X, yo) * ux + half_x)
-            return _dense(jnp, lax, jnp.real(base), jnp.imag(base), ib, fr, Rw3, Q.LANCZOS, None)
-        return run
-    nR, starts = _starts(R_hi - R_lo, blk // (24 * Nx + 16 * nxp * Rw3))
-    step4 = _program(('r4', nR, nka, Ny, Nx, hx, nxp, Rw3, float(g['spy']), float(dist['sy']), float(ux), float(half_x)), make4)
-    Ir, Ii = joined([step4(Fr, Fi, i32(R_lo + R0), cx, cy, xn, ixc) for R0 in starts], starts, nR)       # [rows, nxp]
-    del Fr, Fi
-    jax.block_until_ready(Ir)
-    timing['azimuth transform'] = timing.get('azimuth transform', 0.0) + time.perf_counter() - t0
-    t0 = time.perf_counter()
-    # 5. the read along the columns, the carrier (the pixel's own part of it from the host, in cycles; the
-    # displacement's on the device) or the amplitude: [nx, ny]
+    sx_, sy_ = float(dist['sx']), float(dist['sy'])
+    ux, uy = ov / g['spx'], ov / g['spy']
+    sig = float(g['shear'] * g['spy'] / g['spx'])                 # columns of the padded image per row, along the shear
+    shx, shy = g['shift'][0] * ux, g['shift'][1] * uy             # the displacement's bounds, in padded samples
+    half_x, half_y = -0.5 * ((ov * nx) % 2), -0.5 * ((ov * ny) % 2)
+    ix0, iy0 = Nx // 2 - (ov * nx) // 2, Ny // 2 - (ov * ny) // 2  # the padded sample of pixel 0, less the half
+    # the displacement's slopes over the picture, for the windows: BLOCK outputs span BLOCK ov (1 + slope) samples
+    t = np.linspace(-1.0, 1.0, 33)
+    Xg, Yg = np.meshgrid(t * nx / 2 * g['spx'] / sx_, t * ny / 2 * g['spy'] / sy_, indexing='ij')
+    dxg = sum(c * Xg ** a * Yg ** b for c, (a, b) in zip(dist['cx'], powers))
+    dyg = sum(c * Xg ** a * Yg ** b for c, (a, b) in zip(dist['cy'], powers))
+    per_x, per_y = nx * g['spx'] / 32, ny * g['spy'] / 32
+    dy_dx = float(np.abs(np.diff(dyg, axis=0)).max() / per_x)
+    slope_y = float(np.abs(np.diff(dyg, axis=1)).max() / per_y) + abs(sig) * dy_dx * g['spx'] / g['spy']
+    slope_x = float(np.abs(np.diff(dxg, axis=0)).max() / per_x) + abs(sig) * dy_dx * g['spx'] / g['spy']
+    # the kernel: the host's on a plain raster, where the two passes then take the host kernel's own taps; on a
+    # sheared raster the taps lie on the shifted image's samples and cannot be the host's, and a wider kernel
+    # costs a product of blocks with their weights nothing
+    taps, wfin = (SHEAR_TAPS, jnp.asarray(_kaiser_poly(SHEAR_KAISER))) if sig != 0.0 else (Q.LANCZOS, None)
+    RwY, RwX = _window(ov * (1.0 + 1.5 * slope_y), taps), _window(ov * (1.0 + 1.5 * slope_x), taps)
+    msy = _up(math.ceil(shy) + taps + 2, 16)
+    nxp = _ladder(-(-nx // BLOCK)) * BLOCK
+    # a strip: nj rows of the picture, nR rows of the padded image
+    nj, nvj, jstarts = _blocks_of(ny, max(BLOCK, (blk // (32 * Nx) - 2 * msy) // ov), 1)
+    nj = _up(nj, BLOCK)
+    nR = min(ov * nj + 2 * msy, Ny)
+    hw = ov * nx / 2.0 + shx + abs(sig) * (ov * nj / 2.0 + shy + 1) + taps + 4
+    m_lo = int(math.floor(Nx / 2.0 - hw))
+    Nm = _ladder(-(-int(math.ceil(2 * hw) + 2) // BLOCK)) * BLOCK
+    am = ((np.arange(Nm) + m_lo - Nx / 2.0) / (ux * sx_)).astype(f32)             # H's columns, normalised (at no shear)
+    inv = f32(1.0 / (ux * sx_))
+    xn = up((np.arange(nxp) - nx / 2.0) * g['spx'] / sx_)
+    ixm = jnp.asarray((ov * np.arange(nxp) + ix0 - m_lo).astype(i32))
+    ac = jnp.asarray((np.arange(nka) - hx).astype(np.int64).astype(np.uint32))
     kr_c, ka_c = g['kr_min'] + hy * g['dkr'], g['ka_lo'] + hx * g['dka']
-    cyc = lambda v: up(v - np.floor(v))
-    cxx = cyc(-ka_c * (np.arange(nxp) - nx / 2.0) * g['spx'] / (2 * math.pi))
-    cyy = cyc(kr_c * (np.arange(nyp) - ny / 2.0) * g['spy'] / (2 * math.pi))
-    nrows = R_hi - R_lo
+    cxx = up(np.modf(-ka_c * (np.arange(nxp) - nx / 2.0) * g['spx'] / (2 * math.pi))[0])
+    krc, kac = f32(kr_c / (2 * math.pi)), f32(ka_c / (2 * math.pi))
+    nm, _, mstarts = _blocks_of(Nm, blk // (24 * nR + 16 * nj * RwY), BLOCK)
+    am = {m0: jnp.asarray(am[m0:m0 + nm]) for m0 in mstarts}
+    njc, nvc, _ = _blocks_of(nvj, blk // (24 * Nm + 16 * nxp * RwX))
+    tiles = -(-Nm // Nx)
 
-    def make5():
-        def run(Ir, Ii, j0, cx, cy, xn, yn, iyc, cxx, cyy):
-            zr, zi = cut(Ir, j0, nc, 1).T, cut(Ii, j0, nc, 1).T                             # [nc, rows]
-            X, Y = cut(xn, j0, nc, 0)[:, None], yn[None, :]
-            dy = shift(cy, X, Y)
-            ib, fr = split(iyc[None, :], dy * uy + half_y)
-            ar, ai = _dense(jnp, lax, zr, zi, ib, fr, Rw3, Q.LANCZOS, None)
-            if not complex_image:
-                return jnp.sqrt(ar * ar + ai * ai)[:, :ny], jnp.zeros((1, 1), jnp.float32)
-            c = cut(cxx, j0, nc, 0)[:, None] + cyy[None, :] + (kr_c * dy - ka_c * shift(cx, X, Y)) * (1.0 / (2 * math.pi))
-            c = (c - jnp.floor(c)) * (2.0 * math.pi)
-            cs, sn = jnp.cos(c), jnp.sin(c)
-            return (ar * cs - ai * sn)[:, :ny], (ar * sn + ai * cs)[:, :ny]
-        return run
-    nc, starts = _starts(nxp, blk // (24 * nrows + 16 * nyp * Rw3))
-    step5 = _program(('r5', nc, nrows, nxp, nyp, ny, Rw3, bool(complex_image), float(kr_c), float(ka_c), float(uy), float(half_y)), make5)
-    parts = [step5(Ir, Ii, i32(j0), cx, cy, xn, yn, iyc, cxx, cyy) for j0 in starts]
-    if complex_image:
-        outr, outi = joined(parts, starts, nc)
-        jax.block_until_ready(outr)
-        timing['correction'] = timing.get('correction', 0.0) + time.perf_counter() - t0
-        t0 = time.perf_counter()
-        out = np.empty((nx, ny), c64)                 # (two planes cross four times faster than one array of pairs)
-        v = out.view(np.float32).reshape(nx, ny, 2)
-        v[..., 0], v[..., 1] = np.asarray(outr[:nx]), np.asarray(outi[:nx])
-    else:
-        amp = joined([(p[0],) for p in parts], starts, nc)[0]
-        jax.block_until_ready(amp)
-        timing['correction'] = timing.get('correction', 0.0) + time.perf_counter() - t0
-        t0 = time.perf_counter()
-        out = np.asarray(amp[:nx])
-    timing['download'] = timing.get('download', 0.0) + time.perf_counter() - t0
+    def rows(zr, zi, ac, bq, hx):
+        c = _angle(jnp, ac[None, :] * bq[:, None])
+        cs, sn = jnp.cos(c), jnp.sin(c)
+        zr, zi = zr[:, :nka], zi[:, :nka]
+        pad = ((0, 0), (0, Nx - nka))
+        return (jnp.roll(jnp.pad(zr * cs - zi * sn, pad), -hx, axis=1), jnp.roll(jnp.pad(zr * sn + zi * cs, pad), -hx, axis=1))
+
+    def transform(zr, zi):
+        h = jnp.fft.fft(lax.complex(zr, zi), axis=1)
+        h = jnp.concatenate([h] * tiles, 1)[:, :Nm] if tiles > 1 or Nm < Nx else h
+        return jnp.real(h), jnp.imag(h)
+
+    def to_rows(zr, zi, am, bj, yn, iyr, cx, cy, inv, sig, ux, uy, half):
+        X0, Y = am[:, None] + bj[None, :], yn[None, :]
+        X = X0
+        for _ in range(2):                           # the picture's column that lies on this column of H at this row
+            X = X0 + (sig * uy * _poly(jnp, cy, powers, X, Y) - ux * _poly(jnp, cx, powers, X, Y)) * inv
+        ib, fr = _split(jnp, iyr[None, :], _poly(jnp, cy, powers, X, Y) * uy + half)
+        return _dense(jnp, lax, zr, zi, ib, fr, RwY, taps, wfin)
+
+    def to_columns(zr, zi, xn, yn, ixm, qi, qf, cx, cy, sig, ux, uy, half, cxx, cyy, krc, kac):
+        X, Y = xn[None, :], yn[:, None]
+        dx, dy = _poly(jnp, cx, powers, X, Y), _poly(jnp, cy, powers, X, Y)
+        ib, fr = _split(jnp, ixm[None, :] + qi[:, None], qf[:, None] + dx * ux - sig * (dy * uy) + half)
+        ar, ai = _dense(jnp, lax, zr, zi, ib, fr, RwX, taps, wfin)
+        if not complex_image:
+            return (jnp.sqrt(ar * ar + ai * ai),)
+        c = cxx[None, :] + cyy[:, None] + (krc * dy - kac * dx)
+        c = (c - jnp.floor(c)) * (2.0 * math.pi)
+        cs, sn = jnp.cos(c), jnp.sin(c)
+        return (jnp.stack([ar * cs - ai * sn, ar * sn + ai * cs], -1),)
+    scal = lambda v: f32(v)
+    for j0 in jstarts:
+        jj = j0 + np.arange(nj)
+        iya = ov * jj + iy0                                                       # the padded row of each picture row
+        R0 = int(min(max(0, iya[0] - msy), Ny - nR))
+        Rc = int(iya[nj // 2])
+        bq = jnp.asarray(_cycles(-(m_lo + sig * (R0 + np.arange(nR) - Rc)) / Nx))
+        yn = ((jj - ny / 2.0) * g['spy'] / sy_).astype(f32)
+        bj = up(sig * (iya - Rc) / (ux * sx_))
+        q = -sig * (iya - Rc)
+        qi, qf = np.floor(q).astype(i32), (q - np.floor(q)).astype(f32)
+        cyy = np.modf(kr_c * (jj - ny / 2.0) * g['spy'] / (2 * math.pi))[0].astype(f32)
+        H = _Device(run, nR, nR, [0], Nm)
+        H.put(0, *run.chain([F.cut(nR, R0), ('rows', (nR, F.rows, nka, Nx), rows, (ac, bq, i32(hx))),
+                             ('transform', (nR, Nx, Nm), transform, ())]))
+        H.close()
+        G = _Device(run, Nm, nm, mstarts, nj)
+        for m0 in mstarts:
+            G.put(m0, *run.chain([H.cut(nm, m0), ('to rows', (nm, nR, nj, RwY, taps, powers), to_rows,
+                                                  (am[m0], bj, jnp.asarray(yn), jnp.asarray((iya - R0).astype(i32)), cx, cy,
+                                                   inv, scal(sig), scal(ux), scal(uy), scal(half_y)))]))
+        G.close()
+        del H
+        for c0 in _starts(nvj, nvc)[1]:
+            sl = slice(c0, c0 + nvc)
+            o = run.chain([G.cut(nvc, c0),
+                           ('to columns', (nvc, njc, Nm, nxp, RwX, taps, powers, bool(complex_image)),
+                            lambda zr, zi, *a: to_columns(jnp.pad(zr, ((0, njc - nvc), (0, 0))), jnp.pad(zi, ((0, njc - nvc), (0, 0))), *a),
+                            (xn, rows_of(yn, sl, njc, f32), ixm, rows_of(qi, sl, njc, i32), rows_of(qf, sl, njc, f32), cx, cy,
+                             scal(sig), scal(ux), scal(uy), scal(half_x), cxx, rows_of(cyy, sl, njc, f32), krc, kac))])
+            n = min(nvc, ny - (j0 + c0))
+            run.fetch(o[0], out[j0 + c0:j0 + c0 + n])
+        del G
+    run.flush()
+    timing['correction'] = timing.get('correction', 0.0) + time.perf_counter() - t0
     return out
