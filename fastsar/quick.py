@@ -2109,12 +2109,17 @@ def _ffbp(col, backend, window, timing):
         def rows(sl):
             S[sl] *= wp[sl, None] * wk[None, :]
         _blocks(rows, P, int(max(1, (1 << 18) // K)))
-    former = ImageFormer(col['ant'], col['fmin'], col['df'], K, col['nx'], col['ny'], col['spx'], col['spy'], col['e1'],
-                         col['e2'], backend=backend, precision='single-pass' if backend == 'tpu' else 'float32',
-                         window=False, range_gate=True)
-    timing['plan and compile'] = timing.get('plan and compile', 0.0) + time.perf_counter() - t0
-    t0 = time.perf_counter()
-    img = former(S)
+    import contextlib
+    import jax
+    # on the TPU itself, whatever device the process made JAX's default (the TPU programs do not lower for a CPU)
+    on = jax.default_device(jax.devices('tpu')[0]) if backend == 'tpu' else contextlib.nullcontext()
+    with on:
+        former = ImageFormer(col['ant'], col['fmin'], col['df'], K, col['nx'], col['ny'], col['spx'], col['spy'],
+                             col['e1'], col['e2'], backend=backend, precision='single-pass' if backend == 'tpu' else 'float32',
+                             window=False, range_gate=True)
+        timing['plan and compile'] = timing.get('plan and compile', 0.0) + time.perf_counter() - t0
+        t0 = time.perf_counter()
+        img = former(S)
     timing['formation'] = timing.get('formation', 0.0) + time.perf_counter() - t0
     return img, former
 
