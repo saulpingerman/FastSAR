@@ -115,10 +115,17 @@ def main():
                     slowest=[top[0], top[1], round(1e3 * top[2], 1)] if top else None)
 
     def save():
-        tmp = a.out + '.tmp'
-        with open(tmp, 'w') as fh:
-            json.dump(doc, fh, indent=1)
-        os.replace(tmp, a.out)
+        """The JSON written over in place and cut to its length: a file renamed over another, or truncated, makes
+        ext4 force its data out, which held up the timed calls that followed by up to half a second on an L4 VM."""
+        data = json.dumps(doc, indent=1).encode()
+        fd = os.open(a.out, os.O_WRONLY | os.O_CREAT, 0o666)
+        try:
+            view = memoryview(data)
+            while len(view):
+                view = view[os.write(fd, view):]
+            os.ftruncate(fd, len(data))
+        finally:
+            os.close(fd)
     doc['device_mb'] = a.device_mb
     if a.history:
         d = np.load(a.history)
