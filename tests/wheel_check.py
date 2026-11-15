@@ -42,6 +42,14 @@ def main(argv=None):
     cc = np.corrcoef(np.abs(imgs['pfa']).ravel(), np.abs(imgs['bp']).ravel())[0, 1]      # (polar format: its own scale)
     print(f'form_image: ffbp against exact backprojection {err:.1f} dB, pfa amplitude correlation {cc:.3f}')
     assert all(np.isfinite(img).all() for img in imgs.values()) and err < -30.0 and cc > 0.9
+    os.environ['FASTSAR_PFA_PROGRAM'] = 'jax'          # 0.3.0's polar format, whose final read is the pfa_cpu kernel
+    try:
+        old = fastsar.form_image(S, col.ant, col.fmin, col.df, *grid, backend='cpu', algorithm='pfa', pfa_guard=40.0)
+    finally:
+        del os.environ['FASTSAR_PFA_PROGRAM']
+    cc0 = np.corrcoef(np.abs(old).ravel(), np.abs(imgs['bp']).ravel())[0, 1]
+    print(f'form_image, FASTSAR_PFA_PROGRAM=jax: pfa amplitude correlation {cc0:.3f}')
+    assert np.isfinite(old).all() and cc0 > 0.9
     from fastsar import bp
     v = bp.backproject(S, col.ant, col.fmin, col.df, np.vstack([targets, [[7.3, 31.0, 0.0]]]), backend='cpu')
     print(f'backproject: at the targets {np.abs(v[:-1]).min():.1f} to {np.abs(v[:-1]).max():.1f}, elsewhere {abs(v[-1]):.1f}')
