@@ -4,7 +4,8 @@
     python tests/bench_tpu_blocks.py --only fft,transfer --sizes 2048,4096 --repeat 5 --out part.json
 
 Written for a TPU VM: it needs jax (jax[tpu]) and numpy, nothing else, for every group but the last. Each block is
-compiled, run once, then timed `--repeat` times with its result brought to completion on the device; the JSON holds
+compiled, run once, then timed `--repeat` times with its result brought to completion (a value of every array of
+it comes to the host before the clock stops); the JSON holds
 the least and the median time, the compile time, and the block's error against a float64 NumPy evaluation of a few
 of its outputs (a TPU's default matrix products and transforms are not all float32-exact, so a fast block that is
 wrong shows here). The file is rewritten after every block, so a run that is stopped keeps what it measured.
@@ -22,8 +23,9 @@ Groups (--only):
             matrix for all rows, which fits a stage whose positions are the same for every row).
   warp      The final resampling of a baseband image oversampled by 2 at smoothly displaced positions, as two
             separable 1-D passes with a 6-tap kernel (rows, then columns), by the same three reads.
-  transfer  Host to device of a cut history (complex64, and as two float32 planes) and device to host of a picture
-            (uint8, float32, complex64).
+  transfer  Host to device of a cut history (complex64, and as two float32 planes; with a sum over it on the device,
+            and that sum alone beside it) and device to host of a picture (uint8, float32, complex64 and its two
+            planes), from a fresh device array every time.
   detect    The amplitude of a complex image from two planes and its 8-bit remap by a power law.
   cpu       This package's C++ polar format (fastsar.quick._pfa) on the machine's own cores for a history and a
             picture of the same sizes, corrected and uncorrected: what a device has to beat. Needs this package and
@@ -233,9 +235,17 @@ def make_blocks(jax, jnp):
 
 # ------------------------------------------------------------------------------------------------------ timing
 
+def finish(res):
+    """Bring a result to completion beyond doubt: its last value, of every array of it, comes to the host."""
+    import jax
+    for leaf in jax.tree_util.tree_leaves(jax.block_until_ready(res)):
+        np.asarray(leaf.reshape(-1)[-1:])
+    return res
+
+
 class Bench:
-    def __init__(self, out, repeat, meta):
-        self.out, self.repeat, self.doc = out, repeat, dict(meta, results=[])
+    def __init__(self, out, repeat, meta, skip=()):
+        self.out, self.repeat, self.doc, self.skip = out, repeat, dict(meta, results=[]), tuple(skip)
 
     def save(self):
         if self.out:
@@ -256,15 +266,16 @@ class Bench:
 
     def run(self, group, block, size, fn, args, check=None, **params):
         """fn(*args) on the device: compile and first run, then `repeat` timed runs; check(result) -> error."""
-        import jax
+        if any(k in block for k in self.skip):
+            return
         try:
             t = time.perf_counter()
-            res = jax.block_until_ready(fn(*args))
+            res = finish(fn(*args))
             first = time.perf_counter() - t
             ts = []
             for _ in range(self.repeat):
                 t = time.perf_counter()
-                res = jax.block_until_ready(fn(*args))
+                res = finish(fn(*args))
                 ts.append(time.perf_counter() - t)
             err = None if check is None else check(res)
             self.record(group, block, size, seconds_min=min(ts), seconds_median=float(np.median(ts)),
@@ -452,48 +463,71 @@ def group_warp(b, sizes, taps=6, B=32):
 
 
 def group_transfer(b, sizes):
+    """Host to device: the array put on the device and a sum over it brought back, so that every byte has arrived
+    before the clock stops (the sum alone, of an array already there, is timed beside it). Device to host: a fresh
+    device array for every repeat (JAX keeps the host copy of an array it has converted once), brought to
+    completion first, then converted."""
     import jax
     import jax.numpy as jnp
     rng = np.random.default_rng(0)
     for A, Bn in sizes:
         h = (rng.standard_normal((A, Bn), np.float32) + 1j * rng.standard_normal((A, Bn), np.float32)).astype(np.complex64)
         hr, hi = np.ascontiguousarray(h.real), np.ascontiguousarray(h.imag)
+        total = jax.jit(lambda *p: sum(jnp.sum(jnp.abs(v)) for v in p))
+        bump = jax.jit(lambda v, k: v + k)
 
-        def timed(name, fn, nbytes):
+        def timed(name, fn, nbytes, prepare=None, **kw):
             ts = []
-            for _ in range(b.repeat + 1):
+            for k in range(b.repeat + 1):
+                arg = prepare(k) if prepare else None
                 t = time.perf_counter()
-                fn()
+                fn(arg)
                 ts.append(time.perf_counter() - t)
             ts = ts[1:]
             b.record('transfer', name, (A, Bn), seconds_min=min(ts), seconds_median=float(np.median(ts)), megabytes=nbytes / 1e6,
-                     megabytes_per_second=nbytes / 1e6 / min(ts))
+                     megabytes_per_second=nbytes / 1e6 / min(ts), **kw)
         try:
-            timed('to_device_complex64', lambda: jax.block_until_ready(jax.device_put(h)), h.nbytes)
-            timed('to_device_two_planes', lambda: jax.block_until_ready((jax.device_put(hr), jax.device_put(hi))), h.nbytes)
-            d = jax.block_until_ready(jax.device_put(h))
-            d8 = jax.block_until_ready(jnp.zeros((A, Bn), jnp.uint8))
-            df = jax.block_until_ready(jnp.real(d))
-            timed('to_host_uint8', lambda: np.asarray(d8), A * Bn)
-            timed('to_host_float32', lambda: np.asarray(df), 4 * A * Bn)
-            timed('to_host_complex64', lambda: np.asarray(d), 8 * A * Bn)
-            del d, d8, df
+            d = finish(jax.device_put(h))
+            dr, di = finish((jax.device_put(hr), jax.device_put(hi)))
+            timed('sum_on_device_complex64', lambda _: float(total(d)), h.nbytes)
+            timed('sum_on_device_two_planes', lambda _: float(total(dr, di)), h.nbytes)
+            fresh = lambda a: (lambda k: a + np.float32(1e-3 * k))        # new bytes on the host for every repeat
+            timed('to_device_and_sum_complex64', lambda a: float(total(jax.device_put(a))), h.nbytes, prepare=fresh(h))
+            timed('to_device_and_sum_two_planes', lambda a: float(total(jax.device_put(a[0]), jax.device_put(a[1]))), h.nbytes,
+                  prepare=lambda k: (hr + np.float32(1e-3 * k), hi + np.float32(1e-3 * k)))
+            d8 = finish(jnp.zeros((A, Bn), jnp.uint8))
+            timed('to_host_uint8', lambda a: np.asarray(a), A * Bn, prepare=lambda k: finish(bump(d8, np.uint8(k))))
+            timed('to_host_float32', lambda a: np.asarray(a), 4 * A * Bn, prepare=lambda k: finish(bump(dr, np.float32(k))))
+            timed('to_host_two_planes', lambda a: (np.asarray(a[0]), np.asarray(a[1])), 8 * A * Bn,
+                  prepare=lambda k: (finish(bump(dr, np.float32(k))), finish(bump(di, np.float32(k)))))
+            timed('to_host_complex64', lambda a: np.asarray(a), 8 * A * Bn, prepare=lambda k: finish(bump(d, np.float32(k))))
+            del d, d8, dr, di
         except Exception as e:
             b.record('transfer', 'transfer', (A, Bn), failed=f'{type(e).__name__}: {str(e)[:300]}')
 
 
 def group_detect(b, sizes):
+    """The amplitude of a complex image and its 8-bit remap; a factor that changes with every call makes each
+    result new."""
     import jax
     import jax.numpy as jnp
     for A, Bn in sizes:
         xr = jax.random.normal(jax.random.PRNGKey(6), (A, Bn), jnp.float32)
         xi = jax.random.normal(jax.random.PRNGKey(7), (A, Bn), jnp.float32)
-        b.run('detect', 'amplitude', (A, Bn), jax.jit(lambda a, c: jnp.sqrt(a * a + c * c)), (xr, xi))
+        calls = [0]
 
-        def remap(a, c):
-            amp = jnp.sqrt(a * a + c * c)
-            return jnp.clip(255.0 * (amp / (3.0 * jnp.mean(amp))) ** 0.7, 0, 255).astype(jnp.uint8)
-        b.run('detect', 'amplitude_and_8bit', (A, Bn), jax.jit(remap), (xr, xi))
+        def fresh(fn):
+            def run(a, c):
+                calls[0] += 1
+                return fn(a, c, np.float32(1.0 + 1e-3 * calls[0]))
+            return run
+        amp = jax.jit(lambda a, c, k: jnp.sqrt(a * a + c * c) * k)
+        b.run('detect', 'amplitude', (A, Bn), fresh(amp), (xr, xi))
+
+        def remap(a, c, k):
+            v = jnp.sqrt(a * a + c * c) * k
+            return jnp.clip(255.0 * (v / (3.0 * jnp.mean(v))) ** 0.7, 0, 255).astype(jnp.uint8)
+        b.run('detect', 'amplitude_and_8bit', (A, Bn), fresh(jax.jit(remap)), (xr, xi))
 
 
 def group_cpu(b, sizes):
@@ -548,6 +582,7 @@ def main():
     ap.add_argument('--sizes', default='1024,2048,4096,8192,12288x9216')
     ap.add_argument('--only', default=','.join(GROUPS), help='groups, comma separated: ' + ', '.join(GROUPS))
     ap.add_argument('--repeat', type=int, default=3)
+    ap.add_argument('--skip', default='', help='blocks whose names hold one of these (comma separated) are left out')
     a = ap.parse_args()
     sizes = []
     for s in a.sizes.split(','):
@@ -565,7 +600,7 @@ def main():
         meta.update(jax=jax.__version__, backend=jax.default_backend(), devices=[str(d) for d in devs],
                     platform=devs[0].platform)
         print(f"jax {jax.__version__} on {devs[0].platform} ({len(devs)} device(s)); {a.repeat} timed runs per block", flush=True)
-    b = Bench(a.out, a.repeat, meta)
+    b = Bench(a.out, a.repeat, meta, [k for k in a.skip.split(',') if k])
     for g in groups:
         GROUPS[g](b, sizes)
     b.save()
