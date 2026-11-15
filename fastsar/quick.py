@@ -1302,7 +1302,7 @@ extern "C" __global__ void ql_cut(const float2* T, const float2* cy, const float
 }
 """
 _CUDA = {}
-_PLANS = threading.local()    # .kept: {(n, batch): plan}, the calling thread's cuFFT plans
+_PLANS = threading.local()    # .kept: {(device, n, batch): plan}, the calling thread's cuFFT plans
 _CUFFT = []
 
 
@@ -1422,14 +1422,15 @@ def _cuda_fft(x, inverse, plans, sync):
             sync()                                    # first, once nothing runs in it
             p.release()
             del plans[n]
-        kept = _PLANS.__dict__.setdefault('kept', {})
-        p = kept.get((n, b))
+        import cupy as cp
+        kept, key = _PLANS.__dict__.setdefault('kept', {}), (cp.cuda.Device().id, n, b)
+        p = kept.get(key)
         if p is None:
             p = (_Plan if _cufft() is not None else _CupyPlan)(n, b)
             if isinstance(p, _Plan) or not p.work:
                 if len(kept) >= 64:
                     kept.clear()
-                kept[(n, b)] = p
+                kept[key] = p
         p.attach()
         plans[n] = p
     p.run(x, inverse)
