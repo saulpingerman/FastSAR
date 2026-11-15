@@ -31,7 +31,10 @@ smaller device's blocks and what it keeps on the host.
 
 The JSON also holds what backend='auto' takes for each cut and the thresholds it used (quick.AUTO_CUDA_SAMPLES,
 quick.AUTO_CUDA_FIRST_SAMPLES, quick.AUTO_TPU_SAMPLES), so the crossover between the host's cores and a device can
-be read off the two backends' times by the cut's samples.
+be read off the two backends' times by the cut's samples. --fresh N: then, for each backend and size, N new
+processes that each import fastsar and make one quick look to the PNG (`fresh`: the seconds of that look, which on
+cuda include importing CuPy, making the context and loading the kernels; and of the import): the first look of a
+process, which quick.AUTO_CUDA_FIRST_SAMPLES is for.
 """
 import argparse
 import json
@@ -54,6 +57,7 @@ def main():
     ap.add_argument('--history', default=None, help='a prepared collection (.npz) for form_image(algorithm=\'pfa\')')
     ap.add_argument('--device-mb', default=None, help='megabytes the device paths may take (FASTSAR_CUDA_BLOCK_MB, FASTSAR_JAX_BLOCK_MB)')
     ap.add_argument('--program', action='store_true', help='with --history: also time the JAX program of 0.3.0')
+    ap.add_argument('--fresh', type=int, default=0, help='new processes per backend and size, each timing its first quick look')
     a = ap.parse_args()
     if a.device_mb:
         os.environ['FASTSAR_CUDA_BLOCK_MB'] = os.environ['FASTSAR_JAX_BLOCK_MB'] = a.device_mb
@@ -262,6 +266,35 @@ def main():
                     row['failed'] = f'{type(e).__name__}: {str(e)[:300]}'
                     print(f'{backend} {size} corrected={correct}: {row["failed"]}', flush=True)
                 doc['results'].append(row)
+                save()
+    if a.fresh:
+        import subprocess
+        code = ('import json, sys, time\nt0 = time.perf_counter()\nimport fastsar\nt1 = time.perf_counter()\n'
+                'out = fastsar.quicklook(sys.argv[1], sys.argv[2], backend=sys.argv[3], **json.loads(sys.argv[4]))\n'
+                't2 = time.perf_counter()\nc = out["cut"]\n'
+                'print(json.dumps(dict(import_seconds=t1 - t0, seconds=t2 - t1, backend=out["backend"], '
+                'samples=(c["pulses"][1] - c["pulses"][0]) * (c["samples"][1] - c["samples"][0]))))\n')
+        env = dict(os.environ, PYTHONPATH=os.pathsep.join(
+            [os.path.dirname(os.path.dirname(os.path.abspath(fastsar.__file__)))] + [p for p in [os.environ.get('PYTHONPATH')] if p]))
+        doc['fresh'] = []
+        for backend in backends:
+            for size in sizes:
+                kw = dict(resolution='full') if size == 'full' else dict(size=int(size))
+                row = dict(backend=backend, size=size, seconds=[], import_seconds=[])
+                try:
+                    for _ in range(a.fresh):
+                        r = subprocess.run([sys.executable, '-c', code, a.cphd, png, backend, json.dumps(kw)], env=env,
+                                           capture_output=True, text=True, check=True)
+                        got = json.loads(r.stdout.strip().splitlines()[-1])
+                        row['seconds'].append(round(got['seconds'], 4))
+                        row['import_seconds'].append(round(got['import_seconds'], 4))
+                        row.update(samples=got['samples'], formed_on=got['backend'])
+                    print(f"{backend:5s} {size:>5s} first look of a new process: {min(row['seconds']):.3f} s (of "
+                          f"{', '.join(f'{s:.3f}' for s in row['seconds'])}); {row['samples']:.3g} samples", flush=True)
+                except Exception as e:
+                    row['failed'] = f'{type(e).__name__}: {str(getattr(e, "stderr", "") or e)[-300:]}'
+                    print(f'{backend} {size} fresh: {row["failed"]}', flush=True)
+                doc['fresh'].append(row)
                 save()
     save()
     print(f'wrote {a.out}')
