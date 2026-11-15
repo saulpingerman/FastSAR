@@ -140,14 +140,31 @@ Three things make the stages hold on any collection and any pair of grid axes:
 
 Devices. On the CPU each of the first two stages is one pass per block of rows on a thread pool, every transform
 runs along the rows of its array, and the kernels read their weights from polyphase tables of 2048 positions per
-sample. On a GPU the history goes up in blocks of pulses through two page-locked buffers while the device works on
-the block before, each pass that is not a transform is one CUDA kernel that also turns the array where the next
-transform needs it turned, and every stage works in blocks sized from the device's free memory; of the four large
-arrays (the range stage's output, the raster, its range transform and the picture) those that do not fit stay on
-the host and cross in blocks. On a JAX device the stages are compiled programs over blocks of one shape, in
-float32 with every complex array as two real planes, the positions sent as parabolas over blocks of 32 outputs
-(integer part, remainder, step and curvature), and the four large arrays on the host. Nothing is compiled per
-geometry on the CPU and the GPU.
+sample. On a GPU the history goes up in blocks of pulses through page-locked buffers, as the file holds it (16-bit
+integers in half the bytes of complex64, 8-bit ones in a quarter), while the device converts and forms the block
+before; each pass that is not a transform is one CUDA kernel that also turns the array where the next transform
+needs it turned, and every stage works in blocks sized from the device's free memory; of the four large arrays
+(the range stage's output, the raster, its range transform and the picture) those that do not fit stay on the host
+and cross in blocks. On a JAX device the stages are compiled programs over blocks of one shape, in float32 with
+every complex array as two real planes, the positions sent as parabolas over blocks of 32 outputs (integer part,
+remainder, step and curvature), and the four large arrays on the host. Nothing is compiled per geometry on the CPU
+and the GPU.
+
+The GPU's transforms take their own lengths. cuFFT (11.4) runs a transform whose points fit in a block's shared
+memory as one kernel, and ships that kernel compiled only for powers of 2, 3 and 5; for any other length it
+compiles one when the first plan of that length is made, 30 to 240 ms, which the driver keeps in its cache of
+compiled code (`~/.nv/ComputeCache`, up to `CUDA_CACHE_MAXSIZE`). The CPU's lengths, products of 2, 3 and 5, are
+mostly of that kind, so each new size of picture cost 0.3 to 0.4 s of compilation for its six transform lengths on
+a machine whose cache did not hold them. On the GPU a length up to the shared memory's points (12,672 on an L4) is
+therefore a power of 2, 3 or 5, and a longer one the CPU's; the gates are longer by 25% on average, and the
+corrected picture keeps the CPU's raster and reads from padded transforms 2 to 4 times its periods instead of
+exactly twice (an uncorrected one, which is the raster's transform itself, takes such lengths for the periods).
+The final kernel then interpolates the baseband image at other points, so the GPU's corrected picture differs from
+the CPU's by that kernel's own error, -43 dB on the collections below at 1024 to 4096 pixels (-43 to -47 dB on the
+simulated scenes of `tests/test_quicklook.py`), at the same distance from exact backprojection. Where both raster
+periods exceed 6,336 points (the full image of a large scene) the padded transforms are the CPU's and the images
+agree to rounding: longer gates change nothing beyond it. The plans are kept between calls, their work areas
+taken from CuPy's pool for a stage and given back at its end.
 
 Against exact backprojection of the same cut history on the same grid (`ExactFormer`, the same Taylor window; the
 rms of the complex difference over that of the exact image, with one complex gain fitted), the corrected picture

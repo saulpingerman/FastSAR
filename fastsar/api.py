@@ -105,6 +105,13 @@ def _resolved(backend):
         raise ValueError(f'unknown backend {backend!r}: one of {", ".join(map(repr, BACKENDS))}')
     if backend in ('cpu', 'jax'):            # no device probe (a mosaic builds a former per patch)
         return backend
+    if backend == 'cuda':                    # CuPy's probe alone: available_backends imports JAX to look for a TPU,
+        try:                                 # a third of a second of a process's first call
+            import cupy
+            if cupy.cuda.runtime.getDeviceCount() > 0:
+                return backend
+        except Exception:
+            pass
     have = available_backends()
     if backend == 'auto':
         return have[0]
@@ -249,13 +256,14 @@ def _jax_runtime_error():
 def _to_host(dev):
     """A complex64 host copy of a device image through pinned memory, several times faster than a copy into pageable
     memory (0.03 s against 0.2 s for an 860 MB image). The block comes from CuPy's pinned pool, which keeps it for
-    the next image once this one is released (the returned image is itself page-locked memory while it is held);
-    FASTSAR_PINNED=0 restores the plain copy."""
+    the next image once this one is released (the returned image is itself page-locked memory while it is held),
+    and serves an image of another size within a factor of two (memory._pinned_reused: locking 860 MB anew takes
+    most of a second); FASTSAR_PINNED=0 restores the plain copy."""
     import cupy as cp
     if _mem._env_choice('FASTSAR_PINNED', '1', {'0', '1'}) == '0':
         return cp.asnumpy(dev).astype(np.complex64, copy=False)
     dev = cp.ascontiguousarray(dev.astype(cp.complex64, copy=False))
-    mem = _mem._pinned(dev.nbytes)
+    mem = _mem._pinned_reused(dev.nbytes, 'image')
     host = np.frombuffer(mem, np.complex64, dev.size).reshape(dev.shape)
     dev.get(out=host)
     return host

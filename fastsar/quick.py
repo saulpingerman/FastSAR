@@ -51,8 +51,9 @@ array (the arrays are turned between the stages), and the C++ kernels of quicklo
 weights from polyphase tables. 'cuda' (_pfa_cuda): the samples go up as the file holds them (16-bit integers at
 half the bytes of complex64) in blocks of pulses through page-locked buffers, on a stream of their own, while a
 thread reads the next block from the file and the device converts and forms the one before; each pass that is not
-a transform is one CUDA kernel, and every stage works in blocks sized from the device's free memory; the arrays
-that do not fit stay on the host and cross in blocks by the same link. 'jax' and 'tpu' (quick_jax.py): compiled programs over blocks of one shape, in float32 with every
+a transform is one CUDA kernel, the transforms take lengths cuFFT ships compiled (_fft_cuda: no new size of
+picture compiles one), and every stage works in blocks sized from the device's free memory; the arrays that do
+not fit stay on the host and cross in blocks by the same link. 'jax' and 'tpu' (quick_jax.py): compiled programs over blocks of one shape, in float32 with every
 complex array as two planes. 'auto': the device that forms the cut soonest, by its size (the AUTO_ thresholds
 below).
 
@@ -62,6 +63,7 @@ the cut above does not apply. process_cphd forms those.
 """
 import math
 import os
+import stat
 import threading
 import time
 
@@ -77,15 +79,23 @@ PASS = 0.65                   # the part of a gated transform's period that the 
 OVERSAMPLE, LANCZOS = 2, 6    # the corrected image: the raster's padding and the taps of the final kernel
 PHASES = 2048                 # fractional positions per sample in the host kernels' weight tables
 # backend='auto' takes the device that forms a cut history soonest, by the history's size in samples (pulses times
-# frequency samples). Measured on 16 threads of a Threadripper PRO 7965WX against an RTX PRO 6000 that another job
-# kept busy, a 9.1 GB Capella file in the page cache, CPU / CUDA seconds of a process's later calls: 0.4e6 samples
-# 0.03 / 0.05, 1.8e6 0.04 / 0.045, 7.0e6 0.055 / 0.053, 28e6 0.14 / 0.076, 112e6 0.49 / 0.15, 449e6 1.9 / 0.53: the
-# GPU is the faster from about 1e7 samples, by 3 ns a sample. A process's first CUDA quick look also loads CuPy,
-# makes the context, loads the kernels and plans the transforms: first calls of 0.10 / 0.82, 0.14 / 0.78, 0.24 /
-# 0.84, 0.59 / 0.98 and 2.0 / 1.4 s at 0.4e6, 7e6, 28e6, 112e6 and 449e6 samples, a start of 0.7 s that the
-# device repays from 2.5e8 samples. (tests/bench_quicklook.py measures both backends on another machine.)
-AUTO_CUDA_SAMPLES = 10_000_000
-AUTO_CUDA_FIRST_SAMPLES = 250_000_000
+# frequency samples). Measured on a g2-standard-32 (an NVIDIA L4; the host's 32 vCPUs, Cascade Lake at 2.2 GHz, all
+# on the CPU path), the file in the page cache, seconds from the file to the PNG, CPU / CUDA, on a Capella and an
+# Umbra spotlight (tests/bench_quicklook.py):
+# - in a process whose device has started, at a new size of picture: 4.7e5 samples 0.044 / 0.036, 1.9e6 0.060 /
+#   0.043, 4.7e6 0.059 / 0.038, 7.5e6 0.10 / 0.075, 3.0e7 0.25 / 0.080, 3.3e7 0.20 / 0.070, 1.2e8 0.87 / 0.22,
+#   5.3e8 2.5 / 0.69: the GPU was the faster at every cut measured, from the smallest on. (On a machine whose
+#   driver cache does not yet hold them, cuFFT compiles each of the transform lengths _fft_cuda takes when first
+#   planned, 25 to 160 ms; there are 26 below 12,672 points, so a machine pays about 1.5 s once.)
+# - the first look of a process, which also imports CuPy, makes the context and loads the kernels (the transform
+#   lengths in the driver's cache): 7.5e6 samples 0.30 / 0.65, 3.0e7 0.48 / 0.72, 1.2e8 1.04 / 0.92 on the Capella
+#   file: the device repays its start from about 1e8.
+# The CPU's side assumes a host like that one: on fewer or slower cores the CPU path is slower and the device pays
+# from smaller cuts, on more or faster ones from larger. (The rule before, measured on 16 threads of a Threadripper
+# PRO 7965WX against an RTX PRO 6000 that another job kept busy, when cuFFT compiled most transform lengths at run
+# time, put the two at 1e7 and 2.5e8 samples.)
+AUTO_CUDA_SAMPLES = 500_000
+AUTO_CUDA_FIRST_SAMPLES = 100_000_000
 # On a TPU host the C++ polar format on the host's cores is taken below this size and the device from it on.
 # Measured on a v6e VM (44 vCPUs) at 2.2e8 samples, the Panama image from the arrays in memory: 1.28 s on the cores,
 # 1.4 to 1.5 s on the device after a first call of 19 s (2.7 s with the programs in the persistent compilation
@@ -178,6 +188,50 @@ def _unit(v):
 def _fft_size(n):
     from .pfa2 import _fft_size as f
     return int(f(int(max(n, 2))))
+
+
+_SHARED = []
+
+
+def _fft_cuda(n):
+    """The transform length the CUDA path takes for n samples: the smallest m >= n whose transform cuFFT plans from
+    the kernels it ships. cuFFT (11.4) transforms a length whose points fit in a block's shared memory in one
+    kernel, and only for powers of 2, 3 and 5 is that kernel in the library: for any other length it is compiled
+    when the first plan of that length is made, 8 to 240 ms a length (30 to 100 ms for most), and the driver keeps
+    it in its cache of compiled code (~/.nv/ComputeCache, CUDA_CACHE_PATH), so that a machine pays it for every new
+    size of picture until its cache holds them all, every time where the cache is new (a fresh VM, a container) or
+    off (CUDA_CACHE_DISABLE), and again for the lengths the cache evicts once it reaches its size limit
+    (CUDA_CACHE_MAXSIZE), which a machine that meets many lengths reaches. The longer lengths are made of several
+    kernels the library ships. So the length is a power of 2, 3 or 5 up to the
+    points of a block's shared memory (12,672 on an L4), and above them the host's 2^a 3^b 5^c (pfa2._fft_size)."""
+    if not _SHARED:
+        import cupy as cp
+        _SHARED.append(int(cp.cuda.Device().attributes['MaxSharedMemoryPerBlockOptin']) // 8)
+    n = int(max(n, 2))
+    best = _fft_size(max(n, _SHARED[0] + 1))                 # beyond one kernel's points
+    for q in (2, 3, 5):
+        p = q
+        while p < n:
+            p *= q
+        best = min(best, p)
+    return int(best)
+
+
+def _cuda_lengths(correct):
+    """_geometry's transform lengths on the CUDA path: those cuFFT ships compiled (_fft_cuda) for the gates, and for
+    the raster's periods where the picture is their transform itself (uncorrected); a corrected picture keeps the
+    host's raster, and its padded transforms take such lengths (_cuda_transforms)."""
+    return dict(fft=_fft_cuda, raster=_fft_size if correct else _fft_cuda)
+
+
+def _cuda_transforms(g, correct):
+    """(Ny, Nx): the lengths of the CUDA path's image transforms along range and azimuth. Uncorrected, the raster's
+    periods (the picture is their transform). Corrected, the padded transforms that the final kernel reads: at least
+    ov times the periods, of a length cuFFT ships compiled (_fft_cuda), so that the image is sampled ov or a little
+    more times finer than the pixels (Ny / nfy, Nx / nfx) and the raster keeps the host's periods."""
+    if not correct:
+        return int(g['nfy']), int(g['nfx'])
+    return _fft_cuda(g['ov'] * g['nfy']), _fft_cuda(g['ov'] * g['nfx'])
 
 
 _TPU_ODD = (1, 3, 5, 9, 15, 25, 27, 45, 75, 81, 125, 135, 225, 243)
@@ -475,13 +529,16 @@ def _places(t):
 
 
 def _geometry(ant, fmin, df, K, nx, ny, spx, spy, e1, e2, correct, ov=OVERSAMPLE, window=True, warn=False,
-              support='union', fft=None):
+              support='union', fft=None, raster=None):
     """The float64 setup of the quick look's polar format for a cut history: the raster, the two gates, the
     resampling positions and the distortion model. e1, e2: the picture's axes, any pair that spans its plane with
     e2 away from the radar (a slant plane along the line of sight, the ground plane along the ground range): the
-    raster's wavenumbers are the components of the samples' along them."""
+    raster's wavenumbers are the components of the samples' along them. fft: the gates' transform length for n
+    samples; raster: the raster's period for n samples (fft's when None), whose image transform is ov times as long
+    when correct."""
     P = len(ant)
     fs = fft or _fft_size                           # the transform lengths (a TPU takes its own: _fft_tpu)
+    fr = raster or fs
     r0 = np.linalg.norm(ant, axis=1)
     u = ant / r0[:, None]
     ur = -(u @ e2)
@@ -526,8 +583,8 @@ def _geometry(ant, fmin, df, K, nx, ny, spx, spy, e1, e2, correct, ov=OVERSAMPLE
     Er = float(np.abs(dR).max()) + 2 * spy * ur_hi
     Ex = (Hx + shx) * float(1 + np.abs(dtp / dts - 1).max()) + 2 * spx
     # the raster: its periods hold the picture, the displacement and a gate's far edge
-    nfy = fs(int(np.ceil((Hy + shy + (Er + gy) / ur_lo) / spy)) + 2)
-    nfx = fs(int(np.ceil((Hx + shx + Ex + gx) / spx)) + 2)
+    nfy = fr(int(np.ceil((Hy + shy + (Er + gy) / ur_lo) / spy)) + 2)
+    nfx = fr(int(np.ceil((Hx + shx + Ex + gx) / spx)) + 2)
     dkr, dka = 2 * math.pi / (nfy * spy), 2 * math.pi / (nfx * spx)
     kr_lo, kr_hi = 4 * math.pi * f[0] / C * ur, 4 * math.pi * f[-1] / C * ur     # each pulse's band
     kr_min, kr_max = float(kr_lo.min()), float(kr_hi.max())
@@ -904,8 +961,9 @@ def _pfa(S, ant, fmin, df, nx, ny, spx, spy, e1, e2, *, correct=True, window=Tru
     if backend in ('jax', 'tpu'):
         import jax
         fft = _fft_tpu if jax.devices()[0].platform == 'tpu' else None
+    lengths = _cuda_lengths(correct) if backend == 'cuda' else dict(fft=fft)
     g = _geometry(ant, float(fmin), float(df), box[0].shape[1], int(nx), int(ny), float(spx), float(spy), e1, e2, correct,
-                  window=bool(window), warn=warn, support=support, fft=fft)
+                  window=bool(window), warn=warn, support=support, **lengths)
     timing['geometry'] = timing.get('geometry', 0.0) + time.perf_counter() - t0
     info = {} if info is None else info
     info.update(shift_px=g['dist']['max_shift_px'], fit_rms_px=g['dist']['rms_px'], raster=(g['nkr'], g['nka']),
@@ -944,11 +1002,12 @@ def _pfa(S, ant, fmin, df, nx, ny, spx, spy, e1, e2, *, correct=True, window=Tru
 
 def _host(d):
     """A CuPy array on the host; a large one through page-locked memory, several times faster than into pageable
-    memory (the array returned then lies in that memory, which CuPy's pool takes back when it is released)."""
+    memory (the array returned then lies in that memory, which CuPy's pool takes back when it is released; a block
+    an earlier picture left there serves a new size within a factor of two: memory._pinned_reused)."""
     from . import memory
     if d.nbytes < (16 << 20):
         return d.get()
-    host = np.frombuffer(memory._pinned(d.nbytes), d.dtype, d.size).reshape(d.shape)
+    host = np.frombuffer(memory._pinned_reused(d.nbytes, 'display'), d.dtype, d.size).reshape(d.shape)
     d.get(out=host)
     return host
 
@@ -1000,11 +1059,11 @@ __device__ __forceinline__ float tabled(float d, const float* tab) {
 }
 // quicklook_cpu.cpp's ql_gather on the device: one thread per pixel, i along azimuth (fastest), c the range pixel of
 // the block. The apparent position from the distortion polynomial in float64, the baseband image (the block's rows
-// rb0 .. of [Ny2, Nx2], oversampled by ov) read there with LTAPS x LTAPS taps whose weights come from the polyphase
-// table tab [Q + 1, LTAPS]; each row of taps at the column fx + shear (row - fy). The result times exp(j (kr_c Ya -
-// ka_c Xa)), or its amplitude (detect), written range-major: out[c, i].
+// rb0 .. of [Ny2, Nx2], oversampled by ovx and ovy, its center at (Ny2 / 2, Nx2 / 2)) read there with LTAPS x LTAPS
+// taps whose weights come from the polyphase table tab [Q + 1, LTAPS]; each row of taps at the column fx + shear
+// (row - fy). The result times exp(j (kr_c Ya - ka_c Xa)), or its amplitude (detect), written range-major: out[c, i].
 extern "C" __global__ void ql_gather(const float2* base, int span, int Nx2, int Ny2, int rb0, int n, int jb, int nx,
-                                     int ny, double spx, double spy, double ov, double dsx, double dsy,
+                                     int ny, double spx, double spy, double ovx, double ovy, double dsx, double dsy,
                                      const double* cx, const double* cy, const int* pw, double kr_c, double ka_c,
                                      double shear, const float* tab, int detect, float gain, float* out) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x, c = blockIdx.y;
@@ -1020,7 +1079,7 @@ extern "C" __global__ void ql_gather(const float2* base, int span, int Nx2, int 
     const double t = px[pw[2*k]] * py[pw[2*k+1]];
     Xa += cx[k] * t; Ya += cy[k] * t;
   }
-  const double fx = Xa * (ov / spx) + Nx2 / 2.0, fy = Ya * (ov / spy) + Ny2 / 2.0;
+  const double fx = Xa * (ovx / spx) + (Nx2 / 2), fy = Ya * (ovy / spy) + (Ny2 / 2);
   const double fiy = floor(fy);
   const int iy0 = (int)fiy - HALF_L + 1;
   const float* wy = tab + (int)((fy - fiy) * QTAB + 0.5) * LTAPS;
@@ -1200,9 +1259,11 @@ extern "C" __global__ void ql_resample_az(const float2* A, int R, const double* 
 }
 // out [nka, Ny], the raster's azimuth wavenumbers down the rows and its range wavenumbers along them in the order a
 // transform of Ny takes: out[a, c] = the sum of B[J, a] over the rows J = (c + hy) mod Ny, + Ny, ... (the rows of a
-// sheared raster that meet in one bin), times (-1)^(J - hy + a - sx0) when signs (the padded transforms' outputs
-// then count from the image's center)
-extern "C" __global__ void ql_place(const float2* B, int nkr, int nka, int hy, int Ny, int signs, int sx0,
+// sheared raster that meet in one bin). shift: times the phase that moves the outputs of the padded transforms (the
+// inverse one of Ny along range, then the forward one of Nx along azimuth, whose input bin of a is x = (a - sx0) mod
+// Nx) to count from the image's center, at Ny / 2 and Nx / 2: exp(2 pi j (x (Nx / 2) / Nx - c (Ny / 2) / Ny)), which
+// is (-1)^(c + x) for even lengths.
+extern "C" __global__ void ql_place(const float2* B, int nkr, int nka, int hy, int Ny, int shift, int sx0, int Nx,
                                     const long long* off, const int* lo, const int* hi, int nb, int kept, int r0,
                                     int nr, float2* out) {
   const int c = blockIdx.x * blockDim.x + threadIdx.x, a = r0 + blockIdx.y;
@@ -1210,7 +1271,18 @@ extern "C" __global__ void ql_place(const float2* B, int nkr, int nka, int hy, i
   float2 v = make_float2(0.f, 0.f);
   for (int J = (c + hy) % Ny; J < nkr; J += Ny) {
     const float2 b = kept ? ql_kept(B, off, lo, hi, nb, nkr, J, a) : B[(long)J * nka + a];
-    if (signs && ((J - hy + a - sx0) & 1)) { v.x -= b.x; v.y -= b.y; } else { v.x += b.x; v.y += b.y; }
+    v.x += b.x; v.y += b.y;
+  }
+  if (shift) {
+    const int x = ((a - sx0) % Nx + Nx) % Nx;
+    if (!(Ny & 1) && !(Nx & 1)) {
+      if ((c + x) & 1) { v.x = -v.x; v.y = -v.y; }
+    } else {
+      const double t = (double)(((long long)x * (Nx / 2)) % Nx) / Nx - (double)(((long long)c * (Ny / 2)) % Ny) / Ny;
+      double sn, cs;
+      sincospi(2.0 * t, &sn, &cs);
+      v = make_float2((float)(v.x * cs - v.y * sn), (float)(v.x * sn + v.y * cs));
+    }
   }
   out[(long)blockIdx.y * Ny + c] = v;
 }
@@ -1240,38 +1312,148 @@ extern "C" __global__ void ql_cut(const float2* T, const float2* cy, const float
 }
 """
 _CUDA = {}
-_PLANS = threading.local()    # .kept: {(n, batch): plan}, the calling thread's cuFFT plans that take no work area
+_PLANS = threading.local()    # .kept: {(device, n, batch): plan}, the calling thread's cuFFT plans
+_CUFFT = []
+
+
+def _cufft():
+    """cuFFT's own functions, by ctypes from the library CuPy loaded (found in the process's memory map), or None
+    where it cannot be found."""
+    if not _CUFFT:
+        lib = None
+        try:
+            import ctypes
+            from cupy.cuda import cufft
+            cufft.getVersion()                        # the library, loaded
+            with open('/proc/self/maps') as fh:
+                paths = {line.split()[-1] for line in fh if '/libcufft.so' in line}
+            if len(paths) == 1:
+                lib = ctypes.CDLL(paths.pop())
+                h, p = ctypes.c_int, ctypes.c_void_p
+                lib.cufftCreate.argtypes = [ctypes.POINTER(h)]
+                lib.cufftSetAutoAllocation.argtypes = [h, ctypes.c_int]
+                lib.cufftMakePlan1d.argtypes = [h, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_size_t)]
+                lib.cufftSetWorkArea.argtypes = [h, p]
+                lib.cufftSetStream.argtypes = [h, p]
+                lib.cufftExecC2C.argtypes = [h, p, p, ctypes.c_int]
+                lib.cufftDestroy.argtypes = [h]
+        except Exception:
+            lib = None
+        _CUFFT.append(lib)
+    return _CUFFT[0]
+
+
+def _cufft_ok(result, what):
+    if result:
+        raise RuntimeError(f'cuFFT: {what} returned {result}')
+
+
+class _Plan:
+    """A cuFFT plan of `batch` C2C transforms of n points (cuFFT's own API, _cufft) that keeps between calls without
+    its work area: attach() takes one from CuPy's pool for a stage, release() gives it back at the stage's end."""
+
+    def __init__(self, n, batch):
+        import ctypes
+        import cupy as cp
+        L, h = _cufft(), ctypes.c_int()
+        _cufft_ok(L.cufftCreate(ctypes.byref(h)), 'cufftCreate')
+        self.handle, self.n, self.batch, self.mem, self.L = h.value, int(n), int(batch), None, L
+        try:
+            _cufft_ok(L.cufftSetAutoAllocation(self.handle, 0), 'cufftSetAutoAllocation')
+            size = ctypes.c_size_t()
+            r = L.cufftMakePlan1d(self.handle, self.n, 0x29, self.batch, ctypes.byref(size))      # CUFFT_C2C
+            if r == 2:                                # CUFFT_ALLOC_FAILED: the pool's unused blocks back, and again
+                cp.get_default_memory_pool().free_all_blocks()
+                r = L.cufftMakePlan1d(self.handle, self.n, 0x29, self.batch, ctypes.byref(size))
+            _cufft_ok(r, f'cufftMakePlan1d({self.n}, batch {self.batch})')
+        except BaseException:
+            L.cufftDestroy(self.handle)
+            raise
+        self.work = int(size.value)
+
+    def attach(self):
+        if self.work and self.mem is None:
+            import cupy as cp
+            mem = cp.cuda.alloc(self.work)
+            _cufft_ok(self.L.cufftSetWorkArea(self.handle, mem.ptr), 'cufftSetWorkArea')
+            self.mem = mem
+
+    def release(self):
+        self.mem = None
+
+    def run(self, x, inverse):
+        import cupy as cp
+        _cufft_ok(self.L.cufftSetStream(self.handle, cp.cuda.get_current_stream().ptr), 'cufftSetStream')
+        _cufft_ok(self.L.cufftExecC2C(self.handle, x.data.ptr, x.data.ptr, 1 if inverse else -1), 'cufftExecC2C')
+
+    def __del__(self):
+        try:
+            self.L.cufftDestroy(self.handle)
+        except Exception:
+            pass
+
+
+class _CupyPlan:
+    """CuPy's Plan1d where cuFFT's own API is not found (_cufft): its work area is its own for its life, so one with
+    a work area serves its stage only (it is not kept)."""
+
+    def __init__(self, n, batch):
+        from cupy.cuda import cufft
+        self.p, self.batch, self.cufft = cufft.Plan1d(n, cufft.CUFFT_C2C, batch), int(batch), cufft
+        self.work = int(getattr(getattr(self.p.work_area, 'mem', None), 'size', 0))
+
+    def attach(self):
+        pass
+
+    def release(self):
+        pass
+
+    def run(self, x, inverse):
+        self.p.fft(x, x, self.cufft.CUFFT_INVERSE if inverse else self.cufft.CUFFT_FORWARD)
 
 
 def _cuda_fft(x, inverse, plans, sync):
     """The transform of each row of x [batch, n] (complex64, C-contiguous), in place, by a cuFFT plan of this path's
     own; the inverse comes without its 1 / n (the stages fold it into a factor they apply anyway, which saves a pass
-    over the array). plans: the dict of the stage's plans by n, which the stage empties when it ends.
+    over the array). plans: the dict of the stage's plans by n, whose work areas the stage gives back when it ends
+    (_cuda_release).
 
     CuPy's own plan cache is not used. It keeps the last 16 plans of a thread for the life of the process, each with
     a work area the size of its batch (cuFFT asks for one for most lengths above a few thousand), taken from CuPy's
     pool and counted there as in use: after one full image and its uncorrected twin on an L4, 15 plans held 8 of the
-    device's 23 GB, the next call planned with 14.7 GB in place of 20.7 and kept an array on the host. A plan is
-    made in a quarter of a millisecond, so the plans with a work area live for their stage (one batch size at a
-    time: the last block's plan replaces the others'), and only those without one are kept between calls."""
-    from cupy.cuda import cufft
+    device's 23 GB, the next call planned with 14.7 GB in place of 20.7 and kept an array on the host. The plans
+    here are kept between calls by length and batch (_Plan), their work areas taken for a stage (one batch size at a
+    time: the last block's plan takes the area the others' gave back) and given back at its end: a plan with a work
+    area takes 1 to 4 ms to make, a dozen of them a call."""
     b, n = x.shape
     p = plans.get(n)
     if p is None or p.batch != b:
-        kept = _PLANS.__dict__.setdefault('kept', {})
-        p = kept.get((n, b))
+        if p is not None and p.work:                  # the stage's last block: the other blocks' work area goes back
+            sync()                                    # first, once nothing runs in it
+            p.release()
+            del plans[n]
+        import cupy as cp
+        kept, key = _PLANS.__dict__.setdefault('kept', {}), (cp.cuda.Device().id, n, b)
+        p = kept.get(key)
         if p is None:
-            if n in plans:                            # the stage's last block: the work area of the other blocks' plan
-                sync()                                # is released first, once nothing runs in it
-                del plans[n]
-            p = cufft.Plan1d(n, cufft.CUFFT_C2C, b)
-            if not getattr(getattr(p.work_area, 'mem', None), 'size', 0):
+            p = (_Plan if _cufft() is not None else _CupyPlan)(n, b)
+            if isinstance(p, _Plan) or not p.work:
                 if len(kept) >= 64:
                     kept.clear()
-                kept[(n, b)] = p
+                kept[key] = p
+        p.attach()
         plans[n] = p
-    p.fft(x, x, cufft.CUFFT_INVERSE if inverse else cufft.CUFFT_FORWARD)
+    p.run(x, inverse)
     return x
+
+
+def _cuda_release(plans=None):
+    """The work areas of a stage's plans (or of every kept plan of the calling thread: a call that ended early may
+    have left some), back to CuPy's pool; the caller has brought the device to completion."""
+    for p in (plans.values() if plans is not None else _PLANS.__dict__.get('kept', {}).values()):
+        p.release()
+    if plans is not None:
+        plans.clear()
 
 
 def _cuda_room(g, correct, complex_image):
@@ -1326,7 +1508,7 @@ def _cuda_plan(g, correct, complex_image, budget, block):
     picture), so the largest go to the host first until what is left fits. Beside them a stage takes up to two
     blocks: its temporaries, its plans' work areas and the device ends of its crossings."""
     P, nwin, nkr, nka, nx, ny = g['P'], g['nwin'], g['nkr'], g['nka'], g['nx'], g['ny']
-    Ny = (g['ov'] if correct else 1) * g['nfy']
+    Ny = _cuda_transforms(g, correct)[0]
     size = dict(A=8 * P * nwin, B=8 * nkr * nka, F=8 * nka * Ny, out=(8 if complex_image else 4) * nx * ny)
     names = dict(A="the range stage's output", B='the raster', F="the raster's range transform", out='the picture')
     on = dict.fromkeys(size, True)
@@ -1364,7 +1546,8 @@ class _Link:
     piece arrives. The orders that matter are set by events: a copy up waits for the kernel that still reads the
     device block it overwrites, a kernel for the copy that brings its input, a copy down for the kernel that writes
     what it takes. The buffers come from CuPy's pinned pool in sizes that are powers of two up to 64 MB and stay
-    there between calls: locking memory takes a second per gigabyte, far more than using it.
+    there between calls, a smaller call taking the larger buffers an earlier one left (memory._pinned_reused):
+    locking memory takes a second per gigabyte, far more than using it.
 
     timed: every copy is waited for where it is made, and its seconds counted (stats['up_link'], ['down_link']):
     the link's own rate, which a detailed call reports; otherwise the copies overlap the work and only the host's
@@ -1384,7 +1567,7 @@ class _Link:
         i = at[0] % count
         at[0] += 1
         if len(bufs) <= i:
-            bufs.append(np.frombuffer(memory._pinned(self.size), np.uint8, self.size))
+            bufs.append(np.frombuffer(memory._pinned_reused(self.size, 'staging'), np.uint8, self.size))
             last.append(None)
         if last[i] is not None:
             last[i].synchronize()
@@ -1550,6 +1733,7 @@ def _pfa_cuda(S, g, window, correct, complex_image, timing, phase=None, info=Non
     main = cp.cuda.get_current_stream()
     sync = main.synchronize
     sync()                                            # nothing of the caller's still runs in memory the pool gives out
+    _cuda_release()                                   # (work areas a call that raised left attached)
     budget, blk, plan = _cuda_room(g, correct, complex_image)
     if info is not None:
         info['device'] = dict(budget=int(budget), block=int(blk),
@@ -1562,9 +1746,10 @@ def _pfa_cuda(S, g, window, correct, complex_image, timing, phase=None, info=Non
     if isinstance(S, np.ndarray):
         S = np.ascontiguousarray(S, c64)
     kind, rowb = (S.kind, K * S.itemsize) if raw else (0, 8 * K)
-    # the staging buffers: a power of two that holds a block of the history, 64 MB for a large one
+    # the staging buffers: a power of two that holds a block of the history (at most 1,024 pulses), 64 MB for a
+    # large one
     size = 1 << 20
-    while size < (64 << 20) and size < (P * rowb if staged else 64 << 20):
+    while size < (64 << 20) and size < (min(P, 1024) * rowb if staged else 64 << 20):
         size <<= 1
     while size < rowb and staged:
         size <<= 1
@@ -1586,7 +1771,7 @@ def _pfa_cuda(S, g, window, correct, complex_image, timing, phase=None, info=Non
 
     def lap(name, t0):
         sync()
-        plans.clear()                                 # the stage's plans and their work areas, back to the pool
+        _cuda_release(plans)                          # the stage's plans' work areas, back to the pool
         timing[name] = timing.get(name, 0.0) + time.perf_counter() - t0
         return time.perf_counter()
 
@@ -1820,8 +2005,9 @@ def _pfa_cuda(S, g, window, correct, complex_image, timing, phase=None, info=Non
     # 3. the raster's range transform, in blocks of azimuth wavenumbers (each along a row, its range wavenumbers in
     # the order the transform takes, the rows of a sheared raster that meet in one bin summed), in its place in
     # the transform's array where that is on the device
-    ov = g['ov'] if correct else 1
-    Ny, hy, hx = ov * nfy, (g['hy'] if correct else 0), (nka // 2 if correct else 0)
+    Ny, Nx = _cuda_transforms(g, correct)
+    ovy, ovx = Ny / nfy, Nx / nfx                      # the image's sampling, times the pixels' (ov or a little more)
+    hy, hx = (g['hy'] if correct else 0), (nka // 2 if correct else 0)
     na = rows_of(nka, (8 if plan['F'] else 32) * Ny + (0 if plan['B'] else 16 * nkr))
     blocks = [(a, min(na, nka - a)) for a in range(0, nka, na)]
     F = cp.empty((nka, Ny), c64) if plan['F'] else _Kept(nka, Ny, na)
@@ -1837,7 +2023,8 @@ def _pfa_cuda(S, g, window, correct, complex_image, timing, phase=None, info=Non
         t1 = time.perf_counter()
         Z = F[a0:a0 + n] if plan['F'] else cp.empty((n, Ny), c64)
         run('place', Ny, n, a0, (B if plan['B'] else U[i % 2], i32(nkr), i32(nka), i32(hy), i32(Ny), i32(1 if correct else 0),
-                                 i32(hx)) + (here if plan['B'] else (tabs[0][i], tabs[1][i], tabs[2][i], i32(B.nb), i32(1))), Z)
+                                 i32(hx), i32(Nx))
+            + (here if plan['B'] else (tabs[0][i], tabs[1][i], tabs[2][i], i32(B.nb), i32(1))), Z)
         fft(Z, True)
         t1 = step('image transforms', t1)
         if not plan['F']:
@@ -1851,18 +2038,18 @@ def _pfa_cuda(S, g, window, correct, complex_image, timing, phase=None, info=Non
     # apparent positions
     otype = np.dtype(c64 if complex_image else np.float32)
     out = cp.empty((ny, nx), otype) if plan['out'] else np.empty((ny, nx), otype)
-    Nx = ov * nfx
-    per = 16 * Nx * ov + (0 if plan['F'] else 16 * ov * nka) + (0 if plan['out'] else 2 * otype.itemsize * nx)
+    per = int(16 * Nx * ovy + (0 if plan['F'] else 16 * ovy * nka) + (0 if plan['out'] else 2 * otype.itemsize * nx))
     if correct:
         dist = g['dist']
         d_cx, d_cy = cp.asarray(np.asarray(dist['cx'], f64)), cp.asarray(np.asarray(dist['cy'], f64))
         d_pw = cp.asarray(np.asarray(powers, np.int32).ravel())
         kr_c, ka_c = g['kr_min'] + hy * g['dkr'], g['ka_lo'] + hx * g['dka']
-        shear = float(g['shear'] * g['spy'] / g['spx'])
-        msy = int(math.ceil(g['shift'][1] / g['spy'])) * ov + LANCZOS + 2
+        shear = float(g['shear'] * g['spy'] / g['spx'] * ovx / ovy)          # columns of the transform per row
+        # the transform's rows a block of pixels reads: theirs, the displacement and the kernel's half
+        msy = int(math.ceil(g['shift'][1] / g['spy'] * ovy)) + LANCZOS + 2
         bw = rows_of(ny, per, 16)
         blocks = [(jb, min(bw, ny - jb)) for jb in range(0, ny, bw)]
-        bins = [(max(0, Ny // 2 + ov * (jb - ny // 2) - msy), min(Ny, Ny // 2 + ov * (jb + n - ny // 2) + msy))
+        bins = [(max(0, Ny // 2 + math.floor(ovy * (jb - ny / 2)) - msy), min(Ny, Ny // 2 + math.ceil(ovy * (jb + n - ny / 2)) + msy))
                 for jb, n in blocks]
     else:
         y, x = (np.arange(ny) - ny / 2.0) * g['spy'], (np.arange(nx) - nx / 2.0) * g['spx']
@@ -1891,7 +2078,7 @@ def _pfa_cuda(S, g, window, correct, complex_image, timing, phase=None, info=Non
         if correct:
             kern['gather']((-(-nx // 128), n), (128,),
                            (Z, i32(span), i32(Nx), i32(Ny), i32(rb0), i32(n), i32(jb), i32(nx), i32(ny), f64(g['spx']),
-                            f64(g['spy']), f64(ov), f64(dist['sx']), f64(dist['sy']), d_cx, d_cy, d_pw, f64(kr_c), f64(ka_c),
+                            f64(g['spy']), f64(ovx), f64(ovy), f64(dist['sx']), f64(dist['sy']), d_cx, d_cy, d_pw, f64(kr_c), f64(ka_c),
                             f64(shear), kern['lanczos'], i32(0 if complex_image else 1), np.float32(1.0), ob))
         else:
             run('cut', nx, n, jb, (Z, cy[jb:jb + n], cx, i32(Nx), i32(nx), i32(0 if complex_image else 1)), ob)
@@ -1976,7 +2163,11 @@ def write_png(path, image, level=1):
         return struct.pack('>I', len(body)) + kind + body + struct.pack('>I', zlib.crc32(kind + body))
     color = {1: 0, 3: 2, 4: 6}[1 if np.ndim(image) == 2 else np.shape(image)[2]]
     adler = 1
-    with open(path, 'wb', buffering=0) as fh:
+    # An existing file is written over and cut to the new length at the end, not truncated to nothing first: ext4
+    # (auto_da_alloc) then starts writing a file out when it is closed, and the next truncation of it waits for that
+    # write, which on a network disk took 0.4 to 0.5 s of every quick look written to one path.
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | getattr(os, 'O_BINARY', 0), 0o666)
+    with open(fd, 'wb', buffering=0) as fh:
         fh.write(b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', cols, rows, 8, color, 0, 0, 0)))
         for i, (pieces, crc, a2, n2) in enumerate(_ordered(deflate, len(starts))):
             # the stream's Adler-32 from the blocks' own (zlib's adler32_combine)
@@ -1996,6 +2187,8 @@ def write_png(path, image, level=1):
                     view = view[fh.write(view):]
             fh.write(struct.pack('>I', crc))
         fh.write(chunk(b'IEND', b''))
+        if stat.S_ISREG(os.fstat(fd).st_mode):
+            os.ftruncate(fd, fh.tell())
 
 
 def read_png(path):

@@ -218,9 +218,17 @@ def test_scatterer_outside_the_grid_stays_out():
         fastsar.pfa2._fft_size(g['nx'] + int(600 / g['spx'])) / fastsar.pfa2._fft_size(g['nx'] + int(20 / g['spx'])), rel=1e-5)
 
 
+def _host_lengths(monkeypatch):
+    """The cuda stages on the cpu stages' transform lengths, where their image is the cpu stages' to rounding (on
+    their own, quick._cuda_lengths, it differs by the interpolation's error, polar format's accuracy)."""
+    monkeypatch.setattr(fastsar.quick, '_fft_cuda', fastsar.pfa2._fft_size)
+
+
 @pytest.mark.cuda
-def test_scatterer_outside_the_grid_stays_out_on_cuda():
-    """The cuda stages take the gates of the same geometry: a scatterer beyond the gate, in azimuth and in range."""
+def test_scatterer_outside_the_grid_stays_out_on_cuda(monkeypatch):
+    """The cuda stages take the gates of the same geometry: a scatterer beyond the gate, in azimuth and in range,
+    leaves the cpu stages' image on their transform lengths, and as little of itself on their own (60 dB over the
+    scene, its residue there is sampled differently)."""
     rng = np.random.default_rng(12)
     col = sim.make_collect(res=0.3, scene=220.0, r0=30e3)
     g = _slant_grid(col, 256, 256, 0.28)
@@ -228,10 +236,15 @@ def test_scatterer_outside_the_grid_stays_out_on_cuda():
     geo = fastsar.quick._geometry(col.ant, col.fmin, col.df, col.K, g['nx'], g['ny'], g['spx'], g['spy'], e1, e2, True)
     scene = rng.uniform(-30, 30, (30, 1)) * e1 + rng.uniform(-30, 30, (30, 1)) * e2
     S0 = sim.simulate_brute(col, scene, rng.standard_normal(30) + 1j * rng.standard_normal(30)).astype(np.complex64)
+    alone = fastsar.form_image(S0, col.ant, col.fmin, col.df, **g, algorithm='pfa', backend='cpu')
     for e, d in ((e1, geo['Ex'] + 1.5 * geo['gx']), (e2, geo['Er'] + 1.5 * geo['gy']), (e1, geo['nfx'] * g['spx'] - 10.0)):
         S = S0 + sim.simulate_brute(col, (d * e)[None], np.array([1000.0 + 0j])).astype(np.complex64)
         a = fastsar.form_image(S, col.ant, col.fmin, col.df, **g, algorithm='pfa', backend='cuda')
         b = fastsar.form_image(S, col.ant, col.fmin, col.df, **g, algorithm='pfa', backend='cpu')
+        assert rel_db(a, alone) < rel_db(b, alone) + 0.25
+        with monkeypatch.context() as m:
+            _host_lengths(m)
+            a = fastsar.form_image(S, col.ant, col.fmin, col.df, **g, algorithm='pfa', backend='cuda')
         assert rel_db(a, b) < -50
 
 
@@ -247,14 +260,20 @@ def test_stages_on_a_tpu(scene):
 
 
 @pytest.mark.cuda
-def test_stages_on_cuda(scene):
-    """The cuda backend's stages give the cpu backend's image."""
+def test_stages_on_cuda(scene, monkeypatch):
+    """The cuda backend's stages give the cpu backend's image: to rounding on the cpu stages' transform lengths, to
+    polar format's accuracy on their own, as close to exact backprojection."""
     col, S = scene
     a = fastsar.form_image(S, col.ant, col.fmin, col.df, **GRID, algorithm='pfa', pfa_guard=10.0, backend='cuda')
     b = fastsar.form_image(S, col.ant, col.fmin, col.df, **GRID, algorithm='pfa', pfa_guard=10.0, backend='cpu')
-    e = rel_db(a, b)
-    print(f'polar format, cuda against cpu: {e:.1f} dB')
-    assert isinstance(a, np.ndarray) and a.dtype == np.complex64 and e < -60
+    ex = fastsar.form_image(S, col.ant, col.fmin, col.df, **GRID, algorithm='bp', backend='cpu')
+    e, ea, eb = rel_db(a, b), rel_db(a, ex), rel_db(b, ex)
+    with monkeypatch.context() as m:
+        _host_lengths(m)
+        e0 = rel_db(fastsar.form_image(S, col.ant, col.fmin, col.df, **GRID, algorithm='pfa', pfa_guard=10.0, backend='cuda'), b)
+    print(f'polar format, cuda against cpu: {e:.1f} dB ({e0:.1f} dB on its lengths); against backprojection {ea:.1f} '
+          f'dB, cpu {eb:.1f} dB')
+    assert isinstance(a, np.ndarray) and a.dtype == np.complex64 and e < -40 and e0 < -60 and ea < eb + 1
 
 
 @pytest.mark.cuda

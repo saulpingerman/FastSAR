@@ -7,7 +7,8 @@
 
 For each backend (cpu, and cuda where CuPy has a GPU; --backends cpu,tpu on a TPU VM) and each size ('full', the
 whole tasked scene at the finest resolution the collection holds, first; then 4096, 2048 and 1024 pixels), with the
-displacement correction on and off: fastsar.quicklook from the file to the PNG, the first call of the process, then
+displacement correction on and off: fastsar.quicklook from the file to the PNG, the first call at that size (with
+its stage times, `first_call_stages`; the first of the process for the first row of a backend), then
 `--repeat` calls, of which the fastest is kept with its stage times (plan, read, reference, geometry, range,
 azimuth, the transforms, the correction, the remap, the display and the PNG), the cut (pulses, samples, megabytes
 read), the picture's shape and what was kept on the host where the device had no room. On a device one more
@@ -16,8 +17,10 @@ weights and padding, the range transforms, gate and resampling, the azimuth layo
 resampling, the image transforms, the read at the apparent positions and the blocks that cross to and from the
 host; on jax and tpu the programs of fastsar.quick_jax by name. The steps do not overlap as they do in a normal
 call, so they sum to more than the stages; their shares say where the device's time goes. On jax and tpu each row
-also lists the programs its first call compiled, with the seconds of their first calls (`compiled`). The file is
-read from the page cache after the first call: the read time is not a cold one.
+also lists the programs its first call compiled, with the seconds of their first calls (`compiled`); on cuda, the cuFFT plans
+the first call and the later ones made (`plans`: count, seconds and the slowest, a length cuFFT compiles at run
+time taking tens of milliseconds where the driver's cache does not hold it). The file is read from the page cache
+after the first call: the read time is not a cold one.
 
 --history: a prepared collection (.npz with S [pulses, samples], ant, fmin, df, nx, ny, spx, spy, e1, e2) whose
 full image form_image(algorithm='pfa') forms on each backend, from the history in memory to the complex image on
@@ -28,7 +31,10 @@ smaller device's blocks and what it keeps on the host.
 
 The JSON also holds what backend='auto' takes for each cut and the thresholds it used (quick.AUTO_CUDA_SAMPLES,
 quick.AUTO_CUDA_FIRST_SAMPLES, quick.AUTO_TPU_SAMPLES), so the crossover between the host's cores and a device can
-be read off the two backends' times by the cut's samples.
+be read off the two backends' times by the cut's samples. --fresh N: then, for each backend and size, N new
+processes that each import fastsar and make one quick look to the PNG (`fresh`: the seconds of that look, which on
+cuda include importing CuPy, making the context and loading the kernels; and of the import): the first look of a
+process, which quick.AUTO_CUDA_FIRST_SAMPLES is for.
 """
 import argparse
 import json
@@ -51,6 +57,7 @@ def main():
     ap.add_argument('--history', default=None, help='a prepared collection (.npz) for form_image(algorithm=\'pfa\')')
     ap.add_argument('--device-mb', default=None, help='megabytes the device paths may take (FASTSAR_CUDA_BLOCK_MB, FASTSAR_JAX_BLOCK_MB)')
     ap.add_argument('--program', action='store_true', help='with --history: also time the JAX program of 0.3.0')
+    ap.add_argument('--fresh', type=int, default=0, help='new processes per backend and size, each timing its first quick look')
     a = ap.parse_args()
     if a.device_mb:
         os.environ['FASTSAR_CUDA_BLOCK_MB'] = os.environ['FASTSAR_JAX_BLOCK_MB'] = a.device_mb
@@ -82,18 +89,43 @@ def main():
         for name, _, sec in new:
             by[name] = round(by.get(name, 0.0) + sec, 2)
         return dict(programs=len(new), seconds=round(sum(c[2] for c in new), 2), by_name=by)
+    made = []                                         # the cuFFT plans the cuda path made: (length, batch, seconds)
     if 'cuda' in backends:
         import cupy as cp
         dev = cp.cuda.Device()
         free, total = dev.mem_info
         doc['gpu'] = dict(name=cp.cuda.runtime.getDeviceProperties(dev.id)['name'].decode(), memory_gb=round(total / 1e9, 1),
-                          free_gb=round(free / 1e9, 1), cupy=cp.__version__)
+                          free_gb=round(free / 1e9, 1), cupy=cp.__version__, cufft=cp.cuda.cufft.getVersion(),
+                          driver=cp.cuda.runtime.driverGetVersion(),
+                          shared_points=int(dev.attributes['MaxSharedMemoryPerBlockOptin']) // 8)
+        for name in ('_Plan', '_CupyPlan'):
+            base = getattr(quick, name, None)
+            if base is not None:
+                def init(self, n, batch, _base=base):
+                    t = time.perf_counter()
+                    _base.__init__(self, n, batch)
+                    made.append((int(n), int(batch), time.perf_counter() - t))
+                setattr(quick, name, type(name, (base,), {'__init__': init}))
+
+    def plans(since, until=None):
+        """The cuFFT plans made from the since-th to the until-th: count, seconds, the slowest [length, batch, ms]."""
+        new = made[since:until]
+        top = max(new, key=lambda m: m[2]) if new else None
+        return dict(count=len(new), seconds=round(sum(m[2] for m in new), 4),
+                    slowest=[top[0], top[1], round(1e3 * top[2], 1)] if top else None)
 
     def save():
-        tmp = a.out + '.tmp'
-        with open(tmp, 'w') as fh:
-            json.dump(doc, fh, indent=1)
-        os.replace(tmp, a.out)
+        """The JSON written over in place and cut to its length: a file renamed over another, or truncated, makes
+        ext4 force its data out, which held up the timed calls that followed by up to half a second on an L4 VM."""
+        data = json.dumps(doc, indent=1).encode()
+        fd = os.open(a.out, os.O_WRONLY | os.O_CREAT, 0o666)
+        try:
+            view = memoryview(data)
+            while len(view):
+                view = view[os.write(fd, view):]
+            os.ftruncate(fd, len(data))
+        finally:
+            os.close(fd)
     doc['device_mb'] = a.device_mb
     if a.history:
         d = np.load(a.history)
@@ -103,13 +135,17 @@ def main():
         for backend in backends:
             row = dict(mode='form_image', backend=backend, history=list(S.shape), picture=[grid[0], grid[1]])
             try:
-                ts, n0 = [], len(quick_jax.COMPILED) if backend in on_jax else 0
+                ts, n0, m0 = [], len(quick_jax.COMPILED) if backend in on_jax else 0, len(made)
                 for k in range(a.repeat + 1):
                     t = time.perf_counter()
                     img = fastsar.form_image(S, ant, fmin, df, *grid, algorithm='pfa', backend=backend)
                     ts.append(time.perf_counter() - t)
                     if k == 0 and backend in on_jax:
                         row['compiled'] = compiled(n0)
+                    if k == 0:
+                        m1 = len(made)
+                if backend == 'cuda':
+                    row['plans'] = dict(first_call=plans(m0, m1), later_calls=plans(m1))
                     if k < a.repeat:
                         del img
                 if backend == 'cpu':
@@ -181,17 +217,19 @@ def main():
                 kw = dict(resolution='full') if size == 'full' else dict(size=int(size))
                 row = dict(mode='quicklook', backend=backend, size=size, correct=correct)
                 try:
-                    ts, best, n0 = [], None, len(quick_jax.COMPILED) if backend in on_jax else 0
+                    ts, best, n0, m0 = [], None, len(quick_jax.COMPILED) if backend in on_jax else 0, len(made)
                     for k in range(a.repeat + 1):
                         t = time.perf_counter()
                         out = fastsar.quicklook(a.cphd, png, backend=backend, correct=correct, **kw)
                         el = time.perf_counter() - t
                         if k == 0:
                             row['first_call_seconds'] = round(el, 4)
+                            row['first_call_stages'] = {k: round(float(v), 4) for k, v in out['timing'].items()}
                             row['first_of_process'] = first[backend]
                             first[backend] = False
                             if backend in on_jax:
                                 row['compiled'] = compiled(n0)
+                            m1 = len(made)
                             continue
                         ts.append(el)
                         if best is None or el <= min(ts):
@@ -203,6 +241,8 @@ def main():
                                pixel_m=round(out['pixel'], 4), history=[P, K], samples=P * K,
                                megabytes_read=round(cut['signal_bytes'] / 1e6, 1), formed_on=out['backend'],
                                auto_takes=quick._auto(P * K), kept_on_host=[n for n in out['notes'] if 'kept on the host' in n])
+                    if backend == 'cuda':
+                        row['plans'] = dict(first_call=plans(m0, m1), later_calls=plans(m1))
                     if backend != 'cpu' and out['backend'] == backend:
                         # the steps on the device, one at a time
                         col = quick._collection(a.cphd, backend=backend, **(dict(resolution='full') if size == 'full' else dict(size=int(size))))
@@ -233,6 +273,35 @@ def main():
                     row['failed'] = f'{type(e).__name__}: {str(e)[:300]}'
                     print(f'{backend} {size} corrected={correct}: {row["failed"]}', flush=True)
                 doc['results'].append(row)
+                save()
+    if a.fresh:
+        import subprocess
+        code = ('import json, sys, time\nt0 = time.perf_counter()\nimport fastsar\nt1 = time.perf_counter()\n'
+                'out = fastsar.quicklook(sys.argv[1], sys.argv[2], backend=sys.argv[3], **json.loads(sys.argv[4]))\n'
+                't2 = time.perf_counter()\nc = out["cut"]\n'
+                'print(json.dumps(dict(import_seconds=t1 - t0, seconds=t2 - t1, backend=out["backend"], '
+                'samples=(c["pulses"][1] - c["pulses"][0]) * (c["samples"][1] - c["samples"][0]))))\n')
+        env = dict(os.environ, PYTHONPATH=os.pathsep.join(
+            [os.path.dirname(os.path.dirname(os.path.abspath(fastsar.__file__)))] + [p for p in [os.environ.get('PYTHONPATH')] if p]))
+        doc['fresh'] = []
+        for backend in backends:
+            for size in sizes:
+                kw = dict(resolution='full') if size == 'full' else dict(size=int(size))
+                row = dict(backend=backend, size=size, seconds=[], import_seconds=[])
+                try:
+                    for _ in range(a.fresh):
+                        r = subprocess.run([sys.executable, '-c', code, a.cphd, png, backend, json.dumps(kw)], env=env,
+                                           capture_output=True, text=True, check=True)
+                        got = json.loads(r.stdout.strip().splitlines()[-1])
+                        row['seconds'].append(round(got['seconds'], 4))
+                        row['import_seconds'].append(round(got['import_seconds'], 4))
+                        row.update(samples=got['samples'], formed_on=got['backend'])
+                    print(f"{backend:5s} {size:>5s} first look of a new process: {min(row['seconds']):.3f} s (of "
+                          f"{', '.join(f'{s:.3f}' for s in row['seconds'])}); {row['samples']:.3g} samples", flush=True)
+                except Exception as e:
+                    row['failed'] = f'{type(e).__name__}: {str(getattr(e, "stderr", "") or e)[-300:]}'
+                    print(f'{backend} {size} fresh: {row["failed"]}', flush=True)
+                doc['fresh'].append(row)
                 save()
     save()
     print(f'wrote {a.out}')
