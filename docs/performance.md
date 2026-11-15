@@ -361,3 +361,125 @@ the two meet between 1024 and 2048 pixels on a side. On the c4d-highmem-16 facto
 2.6 s at 1024 pixels, 269 against 7.2 s at 8192; the CPU's exact kernel has since become faster, 433 s to 366 s on
 the full Panama image). On the three Panama regions exact backprojection is 19 to 21 dB more
 accurate against the 64 times truth. Records: `results/fastsar/crossover` in sar-accel-study.
+
+## Quick look
+
+`fastsar.quicklook` ([processing-chain.md](processing-chain.md#quick-look)) from the file to the PNG, with polar
+format's displacement corrected, as the second call of a process with the file in the page cache: on an AMD Ryzen
+Threadripper PRO 7965WX held to 16 threads (a 16-CPU quota and `OMP_NUM_THREADS=16`), and with `backend='cuda'` on
+an RTX PRO 6000 that another job kept at full load. Seconds on the CPU and on the GPU, and the megabytes of samples
+read:
+
+| Collection | `resolution='full'` | `size=4096` | `size=2048` | `size=1024` |
+|---|---|---|---|---|
+| Capella spotlight, 9.13 GB (78,269 pulses of 29,162 samples) | 13,216 by 13,216 pixels of 0.38 m: 7.4 / 1.66 s, 4,676 MB | 0.48 / 0.18 s, 449 MB | 0.15 / 0.07 s, 112 MB | 0.05 / 0.05 s, 28 MB |
+| Umbra spotlight, 8.73 GB (9,038 pulses of 120,736 samples) | 5,822 by 5,822 pixels of 0.86 m: 2.2 / 0.99 s, 8,518 MB | 1.09 / 0.49 s, 4,221 MB | 0.29 / 0.15 s, 1,055 MB | 0.09 / 0.07 s, 264 MB |
+| Capella spotlight at 84 degrees of grazing, 10.90 GB (212,858 pulses of 12,802 samples) | 1,710 by 1,710 pixels of 2.93 m: 0.13 / 0.08 s, 197 MB | as full | as full | 0.06 / 0.06 s, 71 MB |
+
+The full picture is the whole tasked scene, 5 km square, at the finest resolution the collection holds on both
+ground axes. `form_cphd` takes 30.9 s, 365 s and 43.5 s on the three files. The first call of a process takes 0.1
+to 0.2 s longer on the CPU (the kernels are loaded and the thread pools started) and 0.7 s longer on the GPU (CuPy,
+the context, the kernels and the transforms' plans). The read is not a cold one: the machine is shared and its page
+cache was not dropped; the megabytes are what the process asks the file for, with `pread`, a block of pulses per
+thread. The time of the largest CPU pictures followed the machine's free memory over the runs (5.8 to 10.5 s for
+the first row's).
+
+Stages of the full pictures, seconds (CPU, then GPU):
+
+| Stage | Capella, 175 megapixels | Umbra, 34 megapixels |
+|---|---|---|
+| plan and read | 0.92 / 0.44 | 0.45 / 0.45 |
+| reference phase | 0.16 / on the device | 0.14 / on the device |
+| range (weights, gate, resampling; the upload on the GPU) | 5.6 / 0.43 | 0.99 / 0.36 |
+| azimuth (gate, resampling) | 0.92 / 0.16 | 0.25 / 0.03 |
+| transforms | 0.78 / 0.05 | 0.34 / 0.01 |
+| read at the apparent positions | 0.83 / 0.13 | 0.15 / 0.03 |
+| remap and layout | 0.75 / 0.06 | 0.14 / 0.02 |
+| PNG | 0.41 / 0.39 | 0.08 / 0.08 |
+
+On the GPU the device's own time goes to the upload of the history (30 to 40% of the steps when each is brought
+to completion alone), the range transforms (20 to 24%), the range resampling and the range gate (about 10% each)
+and the azimuth and image transforms (7 to 11% each); `tests/bench_quicklook.py` prints these shares on another
+machine. A device with less memory to give forms the same pictures in smaller blocks, and keeps on the host the
+arrays that do not fit: held to 21.6 GB (a 24 GB device) both collections form wholly on the device at the times
+above; held to 6 GB the 175 megapixel picture keeps the range stage's output and the raster's range transform on
+the host and takes about ten times as long.
+
+`backend='auto'` takes the CPU for a cut below `quick.AUTO_CUDA_SAMPLES` (1e7 samples, where the two met here) and,
+for the first GPU quick look of a process, below `quick.AUTO_CUDA_FIRST_SAMPLES` (2.5e8 samples, where the device
+repays its 0.7 s start).
+
+`looks` costs its count: n by n looks read n by n times the samples and form as many images.
+
+### Polar format by stages
+
+`form_image(algorithm='pfa')` on the `cpu` and `cuda` backends runs the same stages
+([algorithms.md](algorithms.md#polar-format)). On full-resolution slant grids along the line of sight, with the
+history in memory, seconds to the complex image on the host for the stages on the CPU, on the GPU, and for the JAX
+program of `fastsar.pfa2` on the CPU (`FASTSAR_PFA_PROGRAM=jax`), all second calls on the machine above:
+
+| History and grid | Stages, CPU | Stages, GPU | JAX program |
+|---|---|---|---|
+| Panama, 15,186 by 14,399 to 12,207 by 8,808 pixels | 1.16 | 0.28 | 9.6 |
+| Umbra, 9,035 by 117,843 to 5,118 by 5,820 | 1.09 | 0.58 | 22.5 |
+| Capella, 40,087 by 29,162 to 19,092 by 13,216 | 4.2 to 4.9 | 1.85 | 44 to 49 |
+| Capella at 84 degrees, 3,843 by 12,802 to 1,728 by 1,708 | 0.08 | 0.06 | 1.03 |
+
+The program resamples the pulses to an even spacing (16 indexed loads of the whole history), gates and resamples
+each axis on transforms of the history's own length (14,399 samples and 15,186 pulses on Panama, neither a fast
+length, the second along the columns), and runs them single-threaded through XLA. The stages gate each axis to the
+scene before they resample it, so the arrays shrink as they go; every transform has a fast length and runs along
+rows on all cores; no pulse is resampled twice; the weights come from tables.
+
+The two images agree, at one scale, and the stages are the closer to exact backprojection over the whole image
+(one complex gain fitted to each image; the exact image on a lattice of every pixel, or every second, fourth or
+sixth pixel of the larger grids):
+
+| Grid | Stages against the program, rms and peak | Stages against exact | Program against exact |
+|---|---|---|---|
+| Panama | -32.6 dB, -43.0 dB | -33.7 dB | -32.1 dB |
+| Umbra | -33.7 dB, -34.9 dB | -39.6 dB | -33.2 dB |
+| Capella | -19.0 dB, -24.9 dB (amplitudes -45.7 dB) | -19.5 dB | -18.6 dB |
+| Capella at 84 degrees | -35.8 dB, -45.8 dB | -44.0 dB | -35.3 dB |
+
+By fifths of the image the stages are level with the program at the corners, where both show polar format's own
+defocus (Panama -26 dB, the 252 megapixel Capella grid -13 dB), and 3 to 9 dB closer at the center. The complex
+difference on the Capella grid is a smooth phase: the stages take the apparent position as the weighted
+least-squares line of the range history, which leaves no mean phase, and the program takes its expansion at
+mid-aperture.
+
+### On a TPU
+
+`fastsar/quick_jax.py` holds polar format's stages for a JAX device. Its building blocks were measured on a TPU
+v6e (one chip, 44 host vCPUs) by `tests/bench_tpu_blocks.py`, at 12,288 by 9,216 (113 million values):
+
+| Block | Seconds |
+|---|---|
+| 2-D transform, complex64 / as two float32 planes | 0.040 / 0.031 |
+| One resampling pass (16 taps): an indexed load per tap | 119 |
+| The same by window rows and selects (`fastsar/resample_jax.py`'s blocks) | 0.61 |
+| The same by window rows and a product of each block of 32 outputs with its weights | 0.19 |
+| The same by a chirp-z transform / by one dense matrix for all rows | 0.38 / 0.047 |
+| The final read as two passes: indexed loads / window rows and products | 167 / 0.68 |
+| History to the device (906 MB), complex64 / two planes | 0.066 / 0.049 |
+| Picture to the host: uint8 / float32 / complex as two planes / complex64 | 0.016 / 0.036 / 0.071 / 4.8 |
+
+A transform is fast only at lengths whose odd part is small: 128 rows of 21,600, 24,576, 31,104 or 32,768
+samples take 1 ms, of 29,160, 29,400 or 30,000 samples 67 ms; the stages take a power of two times an odd part
+up to 243 there. A matrix product needs `Precision.HIGHEST` (the default leaves an error of 2e-3). A complex array
+crosses to the host 68 times slower than its two planes.
+
+The stages therefore keep every array on the device from the upload of the history (its own bytes, as pairs of
+float32) to the download of the image (two planes), read by window rows and products, and make the read at the
+apparent positions two passes, along the padded image's rows and then along its columns, with the positions
+formed on the device as the pixel's index plus the displacement polynomial in float32. The Panama image (12,207 by
+8,808 pixels, complex, from 15,186 pulses of 14,399 samples in memory to the image on the host) takes 1.72 s on
+the v6e: the upload 0.12 s, the range stage 0.28 s, the azimuth stage 0.26 s, the range transform 0.04 s, the
+padded azimuth transform and the read along the rows 0.49 s, the read along the columns with the carrier 0.33 s,
+the download 0.18 s. It is the C++ stages' image to -68 dB. The first call compiles for 106 s. The C++ stages on
+that VM's 44 cores take 1.27 s (range 0.20 s, azimuth 0.20 s, transforms 0.60 s, the read 0.22 s), so on a TPU
+host `backend='auto'` takes the host's cores (`quick.AUTO_TPU_SAMPLES`); `backend='tpu'` forms on the device.
+Blocks of 2 GB ran in 2 s and blocks of 4.6 GB in 100 s on the 32 GB device. This device-resident path takes a
+plain raster (no sheared rows, no missing pulses) that fits on the device; other formations run the same stages
+with the large arrays on the host, their blocks crossing, and indexed loads (21.7 s for the Panama image through
+JAX on 16 CPU threads; on a TPU that read is the slow one above). A TPU v5e was not measured.

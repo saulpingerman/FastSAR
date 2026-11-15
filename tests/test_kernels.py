@@ -45,7 +45,7 @@ def test_source_hash_ignores_tuning_flags_only():
 
 def _call_sites(monkeypatch):
     """(name, source, flags) of every shared_object call of the package, each module made to ask again."""
-    from fastsar import bp, exact, ffbp_cpu, io, pfa2, resample, sentinel1
+    from fastsar import bp, exact, ffbp_cpu, io, pfa2, quick, resample, sentinel1
     seen = []
 
     def record(name, src, flags):
@@ -56,7 +56,8 @@ def _call_sites(monkeypatch):
     for mod, var, empty, load in ((ffbp_cpu, '_lib', None, ffbp_cpu.lib), (exact, '_cpu_lib', None, exact._cpu),
                                   (bp, '_cpu_lib', None, bp._cpu), (pfa2, '_CPU_LIB', None, pfa2._cpu_gather_lib),
                                   (resample, '_LIB', type(resample._LIB)(), resample._lib),
-                                  (io, '_LIB', type(io._LIB)(), io._lib), (sentinel1, '_lib', None, sentinel1._decoder)):
+                                  (io, '_LIB', type(io._LIB)(), io._lib), (sentinel1, '_lib', None, sentinel1._decoder),
+                                  (quick, '_LIB', [], quick._lib)):
         monkeypatch.setattr(mod, var, empty)
         try:
             load()

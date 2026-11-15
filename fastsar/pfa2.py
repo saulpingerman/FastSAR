@@ -18,10 +18,10 @@ backprojection as it comes out, so the comparison includes the algorithm's own e
 import math
 
 import numpy as np
-import jax
-import jax.numpy as jnp
 
 C = 299792458.0
+# JAX is imported by the functions that build or run its programs (make_pfa, arrays): the geometry, the distortion
+# model, the kernel tables and the C++ and CUDA kernels of this module serve fastsar.quick without it
 
 
 _GATHER_SRC = r"""
@@ -449,6 +449,8 @@ def make_pfa(geo, nx, ny, spx, spy, resample='dense', mm_dtype=None, precision=N
     without its carriers, and resampled at the apparent position of every pixel by a 4-tap cubic kernel along
     each axis, with the carriers restored at the apparent position. crop = (i0, j0, h, w) limits the corrected
     output to a region of the native grid. taps: taps per axis of the Lanczos resampling kernel."""
+    import jax
+    import jax.numpy as jnp
     f = jnp.float32
     two_pi = 2.0 * math.pi
     nkr, nka, nfy, nfx = geo['nkr'], geo['nka'], geo['nfy'], geo['nfx']
@@ -814,6 +816,7 @@ def make_pfa(geo, nx, ny, spx, spy, resample='dense', mm_dtype=None, precision=N
 def arrays(geo, P, resample='dense'):
     """The device arrays of the pulse resampling for the geometry geo and P pulses: the dense [P, P] matrix
     (resample='dense'), or the (indices, weights) of its taps (float32)."""
+    import jax.numpy as jnp
     f = np.float32
     W = pulse_matrix(geo, P).astype(f) if resample == 'dense' else tuple(np.asarray(v) for v in pulse_taps(geo, P))
     return (jnp.asarray(W) if resample == 'dense' else (jnp.asarray(W[0].astype(np.int32)), jnp.asarray(W[1].astype(f))),

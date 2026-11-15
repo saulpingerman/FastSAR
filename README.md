@@ -116,9 +116,20 @@ fastsar.process_stack(['a_CPHD.cphd', 'b_CPHD.cphd'], 'coherence.tif', product='
   their incoherent average, or the coherence, interferogram, coherent sum or change of a pair
   ([stack.md](https://github.com/saulpingerman/FastSAR/blob/main/docs/stack.md)).
 
+For a look at a spotlight collection without the full chain, `quicklook` reads only the pulses and samples its
+resolution needs and forms a picture of the tasked scene by polar format: a 2048-pixel picture of a 9.1 GB Capella
+file in 0.15 s on 16 CPU threads, from 112 MB of its samples, and the whole scene at full resolution (175
+megapixels) in 7 s, or 1.7 s on a GPU
+([processing-chain.md](https://github.com/saulpingerman/FastSAR/blob/main/docs/processing-chain.md#quick-look)).
+
+```python
+fastsar.quicklook('scene_CPHD.cphd', 'look.png')        # 2048 pixels on the longer side; size=, resolution=
+```
+
 [`examples/chain.py`](https://github.com/saulpingerman/FastSAR/blob/main/examples/chain.py) runs this chain from the command line (`--simulate` needs no data);
 [`form_umbra.py`](https://github.com/saulpingerman/FastSAR/blob/main/examples/form_umbra.py) and [`form_capella_stripmap.py`](https://github.com/saulpingerman/FastSAR/blob/main/examples/form_capella_stripmap.py) form
-vendor grids.
+vendor grids. [`quicklook.py`](https://github.com/saulpingerman/FastSAR/blob/main/examples/quicklook.py) writes a quick look and prints the
+time of each stage.
 
 ## Supported data, modes and devices
 

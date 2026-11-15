@@ -57,12 +57,12 @@ def _sicd_spacing(sm):
     return spx, spy
 
 
-def _image_area(cphd, meta):
+def _image_area(cphd, meta, reader=None):
     """Corners [4, 3] of the CPHD's image area rectangle and its reference point [3] (local frame), or (None, IARP or
-    None)."""
+    None). reader: the file, already open."""
     if 'image_area' in meta:                       # a reader that supplies the footprint itself (read_nisar)
         return meta['image_area'], meta.get('refpt')
-    m = io._open_cphd(cphd).cphd_meta
+    m = (io._open_cphd(cphd) if reader is None else reader).cphd_meta
     sc = getattr(m, 'SceneCoordinates', None)
     if sc is None:                                 # CPHD 0.3: the image area is four corners (latitude, longitude, height)
         ia3 = getattr(getattr(m, 'Global', None), 'ImageArea', None)

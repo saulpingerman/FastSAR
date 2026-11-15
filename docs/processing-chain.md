@@ -98,3 +98,49 @@ products.write_sicd('out.nitf', img, 'scene_SICD.nitf')    # image on the templa
 ```
 
 The SICD metadata is described in [products.md](products.md#sicd-output).
+
+## Quick look
+
+When a look at the data is wanted, `quicklook` forms a picture of a spotlight collection by polar format from the
+part of the file its resolution needs:
+
+```python
+out = fastsar.quicklook('scene_CPHD.cphd', 'look.png')                    # 2048 pixels on the longer side
+out = fastsar.quicklook('scene_CPHD.cphd', 'full.png', resolution='full') # the whole scene, full resolution
+out = fastsar.quicklook('scene_CPHD.cphd', size=4096, correct=False)      # the fastest picture of that size
+out = fastsar.quicklook('scene_CPHD.cphd', 'look.nitf', resolution=1.0)   # 1 m, the complex image as a SICD
+out['display'], out['corners'], out['cut'], out['notes'], out['timing']
+```
+
+The header and a few hundred per-pulse parameters decide the cut: the central run of frequency samples and the
+central run of pulses whose bands give the pixel asked for, never more than the collection holds. Only those are
+read (`read_cphd(pulses=, samples=)`). The picture is the tasked area on the ground, on the grid of
+`form_cphd(axes='los')`: the range axis along the mid-aperture line of sight projected on the ground, square pixels
+of 0.96 of the reciprocal of the band on each axis. It is detected, remapped (`remap='nrl'`, as a SIDD from
+`process_cphd`) and laid out shadows down. `resolution='full'` is the whole scene at the finest resolution the
+collection holds on both axes.
+
+The grid is on the ground because the slant plane of a squinted pass is twisted about the line of sight: a
+rectangle of a slant plane that holds a 5 km ground square under a twist of 54 degrees spans 6.7 km of Doppler,
+more than the 4.2 km the pulse rate leaves unambiguous, while at any one range the scene spans 2.8 km. Polar
+format on the ground axes keeps each range line inside the unambiguous width. The samples then fill a sheared
+part of the wavenumber raster, which the stages follow ([algorithms.md](algorithms.md#quick-look)).
+
+`correct=True` (the default) removes polar format's displacement of scatterers; `correct=False` skips that step.
+At a resolution finer than about a meter over several kilometers polar format defocuses the corners of the
+picture; the product estimates by how much (`corner_error`), a note says so, and `form_cphd` is the tool for that
+image. `looks=n` averages the power of n by n images of the same pixels, formed from sub-apertures and sub-bands
+side by side, for less speckle at n by n times the bytes and the formation time. `output` is a `.png` file,
+written with the standard library alone, or a `.nitf` file, the complex image as a ground-plane SICD.
+
+Every backend runs polar format's stages written for it: `'cpu'` in C++ on all cores, `'cuda'` in CUDA kernels
+and cuFFT, `'jax'` and `'tpu'` in float32 planes on JAX's device. The device paths work in blocks sized from the
+device's free memory, and what does not fit there stays on the host and crosses in blocks, with a note.
+`backend='auto'` takes the device that forms the cut soonest by its size: the CPU for a small cut, without
+starting a device. `FASTSAR_QUICKLOOK_JAX=ffbp` forms the same cut on the same grid by the factorized former on
+the jax and tpu backends.
+
+A moving-beam collection (stripmap, sliding spotlight) is refused with a `ValueError` that names `process_cphd`:
+polar format assumes one scene reference point, and a moving beam's azimuth resolution is set per pixel by the
+processed Doppler band, not by a run of pulses. Times, bytes read and accuracy are in
+[performance.md](performance.md#quick-look) and [algorithms.md](algorithms.md#quick-look).

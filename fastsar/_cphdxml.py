@@ -356,6 +356,19 @@ class Reader:
         a = self._pvp_native(index)
         return a.copy() if the_range is None else a[slice(*the_range) if isinstance(the_range, tuple) else the_range].copy()
 
+    def read_pvp_rows(self, index=0, first=0, last=None, step=1):
+        """The per-vector parameters of the vectors first, first + step, ... below last of one channel, as a
+        structured array in native byte order. Only those vectors are read from the file: the planning of a part of
+        a long collection, and its reading, do not take the whole block (56 MB for 212,858 vectors)."""
+        c = self._index(index)
+        n = int(self._channels[c].NumVectors)
+        first, last = int(first), n if last is None else int(last)
+        if not 0 <= first <= last <= n or int(step) < 1:
+            raise ValueError(f'{self.file_name}: vectors {first} to {last} by {step} of the {n} of channel {c}')
+        if c in self._pvp:
+            return self._pvp[c][first:last:int(step)].copy()
+        return np.array(self.pvp_map(c)[first:last:int(step)]).astype(self.pvp_dtype('='))
+
     def read_pvp_variable(self, name, index=0, the_range=None):
         """One per-vector parameter of a channel [vectors] or [vectors, n] (a copy), None when the file has none."""
         a = self._pvp_native(index)

@@ -41,11 +41,14 @@ from . import _deps
 C = 299792458.0
 
 
-def _sinc_regrid(S, u, taps=16, beta=8.0, nbins=4096, out=None):
+def _sinc_regrid(S, u, taps=16, beta=8.0, nbins=4096, out=None, first=0, total=None):
     """Resample each row of S [P, K] at fractional sample positions u [P, K] (Kaiser-windowed sinc from a table of
     nbins fractional offsets; zero outside the row). u may be a function of a row slice returning its rows of u, so
-    that the full array is never built; out=S resamples in place (rows are independent)."""
+    that the full array is never built; out=S resamples in place (rows are independent). first, total: S holds the
+    samples first .. first + K - 1 of rows of `total` samples (a reader's sample selection), and u counts in the
+    whole row: the weights and the samples that count as outside the row are then the whole row's."""
     P, K = S.shape
+    total = K if total is None else total
     h = taps // 2
     fr = np.arange(nbins + 1) / nbins
     x = fr[:, None] - np.arange(-h + 1, h + 1)[None, :]
@@ -60,6 +63,9 @@ def _sinc_regrid(S, u, taps=16, beta=8.0, nbins=4096, out=None):
         for j, t in enumerate(range(-h + 1, h + 1)):
             i = i0 + t
             ok = (i >= 0) & (i < K)
+            if first or total != K:                 # a window of the row: its own samples, the row's bounds
+                ok = (i >= 0) & (i < total) & (i >= first) & (i < first + K)
+                i = i - first
             acc += np.where(ok, W[b, j] * np.take_along_axis(S[sl], np.clip(i, 0, K - 1), axis=1), 0)
         out[sl] = acc
     return out
@@ -119,17 +125,17 @@ def _mode_type(r, m, notes):
     return mode
 
 
-def _cphd1_samples(r, m, channel):
+def _cphd1_samples(r, m, channel, pv=None):
     """The signal array of one channel of a CPHD 1.x file as it lies in the file: (a read-only memory map [P, K, 2]
     of the real and imaginary parts in the file's big-endian sample type, AmpSF per vector as float32 or None), or
     None where the reader gives no such map (a compressed signal block, whose read then raises; a stand-in reader)
     and read_chip is used. Reading through the map on all cores is some ten times faster than a conversion on
-    one."""
+    one. pv: the per-vector parameters of a selection of pulses (AmpSF is then theirs)."""
     try:
         if not hasattr(r, 'signal_map') or getattr(r, 'compression', None) is not None:
             return None
         sig = r.signal_map(channel)
-        amp = r.read_pvp_variable('AmpSF', channel)
+        amp = r.read_pvp_variable('AmpSF', channel) if pv is None else pv('AmpSF')
     except (KeyError, AttributeError, TypeError, ValueError, OSError):
         return None
     if amp is not None:
@@ -138,14 +144,18 @@ def _cphd1_samples(r, m, channel):
     return sig, amp
 
 
-def _cphd03_channel(r, m, arrays, channel):
+def _cphd03_channel(r, m, arrays, channel, pulses=None, samples=None):
     """CPHD 0.3 per-vector parameters and samples of one channel, read at the offsets the 0.3 layout gives:
     channel c's vector block starts NumBytesVBP times the vectors of the channels before it into the vector-based
     block, and its samples after those channels' samples (fastsar._cphdxml).
-    -> (pv(name) -> float64 array or None, read_rows(p0, p1) -> complex64 [rows, K])."""
-    vb = r.read_pvp_array(channel)
-    names = vb.dtype.names
+    -> (pv(name) -> float64 array or None, read_rows(p0, p1) -> complex64 [rows, K]). pulses, samples: (first,
+    last + 1) of the vectors and of the samples of each that pv and read_rows count in (default all)."""
     K = int(arrays[channel].NumSamples)
+    pa = 0 if pulses is None else int(pulses[0])
+    ka, kb = (0, K) if samples is None else (int(samples[0]), int(samples[1]))
+    vb = r.read_pvp_array(channel) if pulses is None else r.read_pvp_rows(channel, pa, int(pulses[1]))
+    names = vb.dtype.names
+    K = kb - ka
     sig = r.signal_map(channel)
     amp = np.asarray(vb['AmpSF'], np.float64) if 'AmpSF' in names else None
 
@@ -153,7 +163,7 @@ def _cphd03_channel(r, m, arrays, channel):
         return np.array(vb[name], np.float64) if name in names else None
 
     def read_rows(p0, p1):
-        b = sig[p0:p1]
+        b = sig[pa + p0:pa + p1] if samples is None else sig[pa + p0:pa + p1, ka:kb]
         out = np.empty((p1 - p0, K), np.complex64)
         out.real, out.imag = b[..., 0], b[..., 1]
         if amp is not None:
@@ -182,26 +192,35 @@ def _lib():
                 L.phase_ramp.argtypes = [p, n, n, p, p]
                 L.cphd_load.argtypes = [p, i, n, n, p, i, p, p, p, p]
                 L.phase_ramp.restype = L.cphd_load.restype = None
-            except (RuntimeError, OSError):
+                L.phase_ramp_from.argtypes = [p, n, n, p, p, n]
+                L.phase_ramp_from.restype = None
+                L.cphd_read.argtypes = [i, ctypes.c_longlong, i, n, n, n, n, n, p, i, p, p]
+                L.cphd_read.restype = ctypes.c_longlong
+            except (RuntimeError, OSError, AttributeError):
                 L = None
         _LIB.append(L)
     return _LIB[0]
 
 
-def _phase_rows(S, f, coef, sign, linear=None):
+def _phase_rows(S, f, coef, sign, linear=None, first=0):
     """In place, in row blocks on all cores: S[p, k] *= exp(sign 2j pi f[p, k] coef[p]) with f(slice, out) writing the
     frequencies (Hz) of a row slice into out [rows, K] (no full-size temporary). The phase is formed in float64 and its
     cosine and sine taken straight into complex64 (on one core a 17 GB history took 100 s, the most of a read).
     linear: (f0, df), numbers or arrays [P], when the frequencies are f0[p] + k df[p]: the compiled pass then steps
-    the phasor along each row instead of taking a cosine and a sine per sample, in a fifth of the time."""
+    the phasor along each row instead of taking a cosine and a sine per sample, in a fifth of the time. first: a
+    multiple of 16, when S holds the samples from `first` on of longer rows (a reader's sample selection) and the
+    frequencies are f0[p] + (first + k) df[p]; f writes those."""
     from .patches import _rows_with
     c = sign * 2 * np.pi * np.asarray(coef, np.float64)
     P, K = S.shape
     lib = _lib() if linear is not None and S.dtype == np.complex64 and S.flags.c_contiguous else None
-    if lib is not None:
+    if lib is not None and (not first or (first % 16 == 0 and hasattr(lib, 'phase_ramp_from'))):
         a = np.ascontiguousarray(np.broadcast_to(np.asarray(linear[0], np.float64) * c, (P,)))
         b = np.ascontiguousarray(np.broadcast_to(np.asarray(linear[1], np.float64) * c, (P,)))
-        lib.phase_ramp(S.ctypes.data, P, K, a.ctypes.data, b.ctypes.data)
+        if first:
+            lib.phase_ramp_from(S.ctypes.data, P, K, a.ctypes.data, b.ctypes.data, first)
+        else:
+            lib.phase_ramp(S.ctypes.data, P, K, a.ctypes.data, b.ctypes.data)
         return S
     rows = 128
 
@@ -216,13 +235,14 @@ def _phase_rows(S, f, coef, sign, linear=None):
     return S
 
 
-def rereference(S, fmin, df, dref):
+def rereference(S, fmin, df, dref, first=0):
     """Move the motion-compensation point of each pulse: S [P, K] compensated to ranges ref_old becomes compensated
     to ref_new, given dref = ref_old - ref_new [P] (one way, or the mean of the two legs). Returns a new complex64
-    array (S is not modified), built in row blocks without a full-size temporary."""
+    array (S is not modified), built in row blocks without a full-size temporary. first: S holds the samples from
+    `first` on of rows whose sample 0 lies at fmin."""
     S = np.asarray(S)
     P, K = S.shape
-    f = fmin + df * np.arange(K)
+    f = fmin + df * np.arange(first, first + K)
     dref = np.asarray(dref, np.float64)
     out = np.empty((P, K), np.complex64)
     for p0 in range(0, P, 1024):
@@ -248,12 +268,13 @@ def _start(v):
     return str(v)
 
 
-def _assemble(S, tx, rcv, srp, f0, df, notes, sicd, meta, info):
+def _assemble(S, tx, rcv, srp, f0, df, notes, sicd, meta, info, first=0, keep=None):
     """The tail shared by the readers: the local frame at the mid-aperture scene reference point, the reference
     range of each pulse (re-referenced to one point when the scene reference point barely moves), the SICD grid
     when one is given, and the (col, meta) outputs. S [P, K] is the frequency-domain phase history on the grid
     f0 + k df compensated to each pulse's srp [P, 3] (ECF), tx and rcv [P, 3] the antenna positions (ECF), info
-    the source-specific metadata fields."""
+    the source-specific metadata fields. first, keep: a reader's sample selection, S holding the samples from
+    `first` on of the grid (a multiple of 16) and the columns keep = (first, last + 1) of S the ones returned."""
     P, K = S.shape
     # local frame at the mid-aperture scene reference point, z along the ellipsoid normal (not the geocentric radial,
     # which leans up to 0.19 degrees from it: 3 m of height across 1 km)
@@ -273,11 +294,11 @@ def _assemble(S, tx, rcv, srp, f0, df, notes, sicd, meta, info):
     if moved > 1e-6:
         if moved < 0.25 * C / (2 * df):
             # exp(-j 4 pi f (|x - a| - ref)) -> exp(-j 4 pi f (|x - a| - ref0))
-            fk = f0 + df * np.arange(K)
+            fk = f0 + df * np.arange(first, first + K)
 
             def freq(sl, out):
                 out[:] = fk
-            _phase_rows(S, freq, 2 * (ref - ref0) / C, -1, linear=(f0, df))
+            _phase_rows(S, freq, 2 * (ref - ref0) / C, -1, linear=(f0, df), first=first)
             notes.append(f're-referenced to the mid-aperture scene reference point (range change up to {moved:.1f} m)')
         else:
             fixed_ref = False
@@ -312,10 +333,13 @@ def _assemble(S, tx, rcv, srp, f0, df, notes, sicd, meta, info):
     shift = (origin - s0) @ R.T
     if np.abs(shift).max() > 0:
         ref1 = 0.5 * (np.linalg.norm(tx - origin, axis=1) + np.linalg.norm(rcv - origin, axis=1))
-        S = rereference(S, f0, df, cur_ref - ref1)
+        S = rereference(S, f0, df, cur_ref - ref1, first)
         cur_ref = ref1
         notes.append(f'grid origin moved {np.linalg.norm(shift):.2f} m from the scene reference point onto the SICD pixel grid')
-    out = dict(S=S, ant=(apc - origin) @ R.T, fmin=f0, df=df)
+    if keep is not None and tuple(keep) != (0, K):                 # the samples asked for, of those read
+        S = np.ascontiguousarray(S[:, keep[0]:keep[1]])
+    k0 = first + (0 if keep is None else keep[0])
+    out = dict(S=S, ant=(apc - origin) @ R.T, fmin=f0 + k0 * df if k0 else f0, df=df)
     if sicd is not None:
         out.update({k: v for k, v in grid.items() if k != 'transpose'})
     if not meta:
@@ -329,7 +353,7 @@ def _assemble(S, tx, rcv, srp, f0, df, notes, sicd, meta, info):
 
 
 def read_cphd(cphd, sicd=None, channel=0, meta=False, regrid_tol=1e-3, drop_flagged=False, troposphere=None, phase_sign=None,
-              ref_freq=None):
+              ref_freq=None, pulses=None, samples=None):
     """-> dict(S, ant, fmin, df[, nx, ny, spx, spy, e1, e2]) ready for form_image(**d), and with meta=True also a
     dict: tx, rcv [P, 3] (local frame, m), ref [P] (the one-way range each pulse is compensated to after this
     function's corrections, m), fixed_ref (False when the scene reference point moves and the image needs
@@ -342,21 +366,41 @@ def read_cphd(cphd, sicd=None, channel=0, meta=False, regrid_tol=1e-3, drop_flag
     does not define, is reported but not applied. A 0.3 file with RefFreqIndex set declares its frequencies to be
     offsets from a reference frequency it does not contain, and is refused unless ref_freq gives that reference in
     Hz; ref_freq=0.0 asserts that the file's frequencies are absolute despite the flag.
+    pulses, samples: (first, last + 1) of the channel's vectors, and of the samples of each, to read (default all).
+    Only those per-vector parameters and those samples are read from the file, so a part of a large collection costs
+    the reading of that part. The result is the collection those pulses and samples make: fmin is the frequency of
+    the first sample kept, the local frame and the reference range are those of the pulses read (their mid-aperture
+    scene reference point), and for a collection with one scene reference point and one frequency grid S equals
+    the rows and columns of the whole read's S. meta['pulses'] and meta['samples'] count in the file's vectors and
+    samples; meta['signal_bytes'] is the size of the samples read as the file stores them.
     A file that cannot be read as the format describes it (a header or XML that does not parse, blocks or arrays
     that do not fit the file, a time-of-arrival or compressed signal array) raises a ValueError that starts with the
     file's path."""
     from ._xmlmeta import reading
     with reading(cphd, 'CPHD file', wrap=False):
-        return _read_cphd(cphd, sicd, channel, meta, regrid_tol, drop_flagged, troposphere, phase_sign, ref_freq)
+        return _read_cphd(cphd, sicd, channel, meta, regrid_tol, drop_flagged, troposphere, phase_sign, ref_freq,
+                          pulses, samples)
 
 
-def _read_cphd(cphd, sicd, channel, meta, regrid_tol, drop_flagged, troposphere, phase_sign, ref_freq):
-    r = _open_cphd(cphd)
-    m = r.cphd_meta
-    # CPHD 0.3 (the pre-standard NGA format) keeps the per-vector positions and times under the 1.x names but sizes
-    # its channels in Data.ArraySize, gives the frequency grid as Fx0 and Fx_SS, the phase sign as Global.PhaseSGN and
-    # the collection and polarization in SICD-style CollectionInfo and RadarCollection blocks
-    v03 = str(getattr(r, 'cphd_version', '') or '').startswith('0.3')
+def _selection(sel, n, name):
+    """A reader's pulses= or samples= argument, (first, last + 1) among n, checked -> (first, last + 1); None: all."""
+    if sel is None:
+        return 0, int(n)
+    try:
+        a, b = sel
+        if a != int(a) or b != int(b):
+            raise ValueError
+        a, b = int(a), int(b)
+    except (TypeError, ValueError):
+        raise ValueError(f'{name} must be (first, last + 1), two whole numbers, got {sel!r}') from None
+    if not 0 <= a < b - 1 < n:
+        raise ValueError(f'{name}=({a}, {b}): (first, last + 1) of at least 2 among the {n} of the channel')
+    return a, b
+
+
+def _cphd_channel(r, m, v03, channel):
+    """A channel given by index, identifier or polarization -> (its index, the file's channel entries, their
+    identifiers, their polarizations)."""
     if v03:
         arrays = list(m.Data.ArraySize)
         ids = [str(i) for i in range(len(arrays))]
@@ -390,15 +434,42 @@ def _read_cphd(cphd, sicd, channel, meta, regrid_tol, drop_flagged, troposphere,
             raise ValueError(f'channel {channel!r} not among identifiers {ids} or polarizations {pols}')
     if not 0 <= channel < len(arrays):
         raise ValueError(f'channel {channel} out of range: the file has {len(arrays)} channels')
+    return channel, arrays, ids, pols
+
+
+def _read_cphd(cphd, sicd, channel, meta, regrid_tol, drop_flagged, troposphere, phase_sign, ref_freq, pulses=None,
+               samples=None, reader=None):
+    r = _open_cphd(cphd) if reader is None else reader
+    m = r.cphd_meta
+    # CPHD 0.3 (the pre-standard NGA format) keeps the per-vector positions and times under the 1.x names but sizes
+    # its channels in Data.ArraySize, gives the frequency grid as Fx0 and Fx_SS, the phase sign as Global.PhaseSGN and
+    # the collection and polarization in SICD-style CollectionInfo and RadarCollection blocks
+    v03 = str(getattr(r, 'cphd_version', '') or '').startswith('0.3')
+    channel, arrays, ids, pols = _cphd_channel(r, m, v03, channel)
     ch = arrays[channel]
     P, K = ch.NumVectors, ch.NumSamples
     if m.Global.DomainType != 'FX':
         raise ValueError('needs a frequency-domain (FX) CPHD; time-of-arrival (TOA) CPHD is not supported')
+    # a selection: the vectors pa .. pb - 1 of the file's and of each the samples k0 .. k1 - 1; the samples read are
+    # ka .. kb - 1, which hold them (set below, once the frequency grids are known)
+    sel = pulses is not None or samples is not None
+    Kfile = int(K)
+    (pa, pb), (k0, k1) = _selection(pulses, P, 'pulses'), _selection(samples, K, 'samples')
+    ka, kb = k0, k1
     if v03:
         if troposphere is True:
             raise ValueError("troposphere=True: CPHD 0.3's TropoSRP does not define its units, so it cannot be applied; "
                              "use troposphere='model' or None")
-        pv, read_rows = _cphd03_channel(r, m, arrays, channel)
+        pv, read_rows = _cphd03_channel(r, m, arrays, channel, (pa, pb) if sel else None)
+    elif sel:
+        if hasattr(r, 'read_pvp_rows'):                 # those vectors' parameters alone
+            vb = r.read_pvp_rows(channel, pa, pb)
+            pv = lambda n: np.array(vb[n]) if n in vb.dtype.names else None
+        else:
+            def pv(n):
+                a = r.read_pvp_variable(n, channel)
+                return None if a is None else np.array(a[pa:pb])
+        read_rows = lambda p0, p1: r.read_chip((pa + p0, pa + p1), (ka, kb), index=channel)
     else:
         pv = lambda n: r.read_pvp_variable(n, channel)
         read_rows = lambda p0, p1: r.read_chip((p0, p1), (0, K), index=channel)
@@ -416,12 +487,60 @@ def _read_cphd(cphd, sicd, channel, meta, regrid_tol, drop_flagged, troposphere,
             ref_note = [f'RefFreqIndex set; {float(ref_freq):.6g} Hz added to Fx0 (ref_freq)']
     else:
         sc0, scss = pv('SC0'), pv('SCSS')
+    if sel:
+        P = pb - pa
+        if samples is not None:
+            # the compiled phase ramps step in blocks of 16 samples from the row's first: the samples are read from
+            # a multiple of 16, so that every block, and every value, is the whole read's; where the per-pulse
+            # frequency grids are resampled, the samples the kernel's taps reach are read as well
+            ok = np.isfinite(sc0) & np.isfinite(scss) & (scss != 0)
+            margin = 0
+            if ok.any():
+                fm, dm = float(np.median(sc0[ok])), float(np.median(scss[ok]))
+                a_, b_ = (fm - sc0[ok]) / scss[ok], dm / scss[ok] - 1.0
+                off = float(np.maximum(np.abs(a_), np.abs(a_ + (Kfile - 1) * b_)).max())
+                margin = 10 + int(np.ceil(off)) if off > regrid_tol else 0
+            ka, kb = max(0, (k0 - margin) // 16 * 16), min(Kfile, k1 + margin)
+        K = kb - ka
+        if v03:
+            read_rows = _cphd03_channel(r, m, arrays, channel, (pa, pb), (ka, kb))[1]
     # read in pulse blocks into one complex64 array; every later step works in place on blocks of rows, so the
     # reader needs about the history's complex64 size (a 16.5 GB ICEYE file needed over 128 GB with whole-array steps)
     S = np.empty((P, K), np.complex64)
-    direct = None if v03 else _cphd1_samples(r, m, channel)
+    direct = None if v03 else _cphd1_samples(r, m, channel, pv if sel else None)
     loaded = None
-    if direct is not None and _lib() is not None:
+    signal_bytes = None
+    if sel and direct is not None:
+        # a part of the array: its bytes alone are asked of the file (pread on all cores), or, without the compiled
+        # pass, taken through the memory map
+        import os
+        sig, amp = direct
+        signal_bytes = P * K * 2 * sig.dtype.itemsize
+        lib = _lib()
+        if lib is not None and hasattr(lib, 'cphd_read'):
+            loaded = np.zeros(P, np.uint8)
+            fd = os.open(sig.filename, os.O_RDONLY)
+            try:
+                if K < Kfile and hasattr(os, 'posix_fadvise'):      # rows apart in the file: no read-ahead between them
+                    os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_RANDOM)
+                got = lib.cphd_read(fd, sig.offset, sig.dtype.itemsize, Kfile, pa, P, ka, K,
+                                    None if amp is None else amp.ctypes.data, 0, S.ctypes.data, loaded.ctypes.data)
+            finally:
+                os.close(fd)
+            if got != signal_bytes:
+                raise ValueError(f'reading pulses {pa} to {pb - 1}, samples {ka} to {kb - 1} of the signal array failed: '
+                                 + (os.strerror(int(-got)) if got < 0 else f'{got} of {signal_bytes} bytes read'))
+        else:
+            Sv = S.view(np.float32).reshape(P, K, 2)
+
+            def rows(sl):
+                Sv[sl] = sig[pa + sl.start:pa + sl.stop, ka:kb]
+                if amp is not None:
+                    Sv[sl] *= amp[sl, None, None]
+            from .patches import _rows
+            _rows(rows, P, int(max(1, min(256, (1 << 21) // max(K, 1)))))
+        del sig
+    elif direct is not None and _lib() is not None:
         # one compiled pass on all cores: byte order, scale, conjugation, the check for non-finite and empty rows
         sig, amp = direct
         loaded = np.zeros(P, np.uint8)
@@ -521,12 +640,12 @@ def _read_cphd(cphd, sicd, channel, meta, regrid_tol, drop_flagged, troposphere,
     else:
         # the data hold the SRP's echo at its tropospheric delay td beyond the geometric one: exp(+j 2 pi f td)
         # moves it back, f from each pulse's own grid
-        kk = np.arange(K)
+        kk = np.arange(ka, ka + K) if sel else np.arange(K)
 
         def freq(sl, out):                      # sc0 + scss k, formed in out
             np.multiply(scss[sl, None], kk[None, :], out=out)
             out += sc0[sl, None]
-        _phase_rows(S, freq, td, +1, linear=(sc0, scss))
+        _phase_rows(S, freq, td, +1, linear=(sc0, scss), first=ka if sel else 0)
         notes.append(f'removed {what} at the SRP (mean {td.mean() * 1e9:.2f} ns, span {np.ptp(td) * 1e9:.3f} ns)')
     f0, df = float(np.median(sc0)), float(np.median(scss))
     t1, t2 = pv('TOA1'), pv('TOA2')
@@ -540,17 +659,27 @@ def _read_cphd(cphd, sicd, channel, meta, regrid_tol, drop_flagged, troposphere,
             notes.append(msg)
     # u - k is linear in k for each pulse, so its largest magnitude is at the first or the last sample
     a_, b_ = (f0 - sc0) / scss, df / scss - 1.0
-    shift = float(np.maximum(np.abs(a_), np.abs(a_ + (K - 1) * b_)).max())
-    if shift > regrid_tol:
+    shift = float(np.maximum(np.abs(a_), np.abs(a_ + (Kfile - 1) * b_)).max())
+    if shift > regrid_tol and sel:              # in the file's sample numbers, from the samples read
+        _sinc_regrid(S, lambda sl: (f0 + np.arange(ka, ka + K)[None, :] * df - sc0[sl, None]) / scss[sl, None], out=S,
+                     first=ka, total=Kfile)
+        notes.append(f'resampled per-pulse frequency grids (largest offset {shift:.3g} samples)')
+    elif shift > regrid_tol:
         _sinc_regrid(S, lambda sl: (f0 + np.arange(K)[None, :] * df - sc0[sl, None]) / scss[sl, None], out=S)
         notes.append(f'resampled per-pulse frequency grids (largest offset {shift:.3g} samples)')
     cpath = 'CollectionInfo' if v03 else 'CollectionID'
-    info = dict(tx_time=pv('TxTime')[lo:hi], rcv_time=pv('RcvTime')[lo:hi], pulses=(lo, hi),
+    info = dict(tx_time=pv('TxTime')[lo:hi], rcv_time=pv('RcvTime')[lo:hi], pulses=(pa + lo, pa + hi),
                 polarization=pols[channel], channel=ids[channel], channel_index=channel,
                 mode=_mode_type(r, m, notes), cphd_version=str(getattr(r, 'cphd_version', '') or '') or None,
                 start=_opt(m, 'Global.CollectStart' if v03 else 'Global.Timeline.CollectionStart', _start),
                 collector=_opt(m, f'{cpath}.CollectorName'), core_name=_opt(m, f'{cpath}.CoreName'))
-    return _assemble(S, tx, rcv, srp, f0, df, notes, sicd, meta, info)
+    if not sel:
+        return _assemble(S, tx, rcv, srp, f0, df, notes, sicd, meta, info)
+    if signal_bytes is None:                    # read through the reader's own chips
+        signal_bytes = (pb - pa) * K * 2 * (r.signal_map(channel).dtype.itemsize if hasattr(r, 'signal_map') else 4)
+    info.update(samples=(k0, k1), signal_bytes=int(signal_bytes))
+    notes.append(f'read pulses {pa} to {pb - 1} of {int(ch.NumVectors)} and samples {k0} to {k1 - 1} of {Kfile}')
+    return _assemble(S, tx, rcv, srp, f0, df, notes, sicd, meta, info, first=ka, keep=(k0 - ka, k1 - ka))
 
 
 def read_collection(path, **kw):

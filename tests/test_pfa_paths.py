@@ -1,6 +1,8 @@
-"""Polar format's device paths against its JAX path on a simulated scene: the kernel gather of the final resampling
-(C++ on the CPU, CUDA on a GPU) against the JAX gather, and the direct Kaiser-sinc resampling (FASTSAR_PFA_CZT=0)
-against the chirp-z transforms; ExactFormer's float16 profiles against its float32 ones on cuda."""
+"""Polar format on a simulated scene. The JAX program's device paths (FASTSAR_PFA_PROGRAM=jax, the jax and tpu
+backends): the kernel gather of the final resampling (C++ on the CPU, CUDA on a GPU) against the JAX gather, and
+the direct Kaiser-sinc resampling (FASTSAR_PFA_CZT=0) against the chirp-z transforms. The stages that form on the
+cpu and cuda backends against that program and against exact backprojection. ExactFormer's float16 profiles against
+its float32 ones on cuda."""
 import os
 
 import numpy as np
@@ -26,14 +28,16 @@ def scene():
     return col, S
 
 
-def _pfa(scene, **env):
+def _pfa(scene, grid=GRID, guard=10.0, **env):
+    """form_image's polar format by the JAX program, under the environment given."""
     col, S = scene
+    env = dict(env, FASTSAR_PFA_PROGRAM='jax')
     old = {k: os.environ.get(k) for k in env}
     try:
         for k, v in env.items():
             os.environ[k] = v
         fastsar.api._PFA_PROGRAMS.clear()
-        return fastsar.form_image(S, col.ant, col.fmin, col.df, **GRID, algorithm='pfa', pfa_guard=10.0)
+        return fastsar.form_image(S, col.ant, col.fmin, col.df, **grid, algorithm='pfa', pfa_guard=guard)
     finally:
         for k, v in old.items():
             if v is None:
@@ -59,6 +63,72 @@ def test_direct_resampling_matches_czt(scene):
     e = rel_db(a, b)
     print(f'direct resampling vs chirp-z: {e:.1f} dB')
     assert e < -40, e
+
+
+def _slant_grid(col, nx=120, ny=100, sp=0.48):
+    P = col.Np
+    a = col.ant[P // 2]
+    e2 = -a / np.linalg.norm(a)
+    n = np.cross(e2, col.ant[P // 2 + 1] - col.ant[P // 2 - 1])
+    n *= np.sign(n[2]) / np.linalg.norm(n)
+    return dict(nx=nx, ny=ny, spx=sp, spy=sp, e1=tuple(np.cross(e2, n)), e2=tuple(e2))
+
+
+@pytest.mark.parametrize('grid', ['slant', 'ground', 'odd'])
+def test_stages_against_the_program_and_exact_backprojection(grid):
+    """The cpu backend forms by the stages of fastsar.quick, FASTSAR_PFA_PROGRAM=jax by the JAX program. On a
+    2,000-pulse aperture, whose ends the program's pulse resampling shortens by 1.6%, the two images agree to
+    -30 dB on a slant-plane grid along the line of sight, at one scale (the program's); against exact
+    backprojection the stages are the closer. On a ground grid, where a meter of range is not a meter along the
+    range axis, the program's image carries a phase that backprojection's does not: the amplitudes agree and the
+    stages have backprojection's phase. An odd pixel count forms as an even one does."""
+    rng = np.random.default_rng(5)
+    col = sim.make_collect(res=0.5, scene=560.0, r0=200e3)
+    g = dict(slant=_slant_grid(col), ground=dict(GRID, nx=120, ny=100, spy=0.55), odd=_slant_grid(col, 121, 99))[grid]
+    e1, e2 = np.array(g['e1']), np.array(g['e2'])
+    tg = rng.uniform(-24, 24, (30, 1)) * e1 + rng.uniform(-20, 20, (30, 1)) * e2
+    S = sim.simulate_brute(col, tg, rng.standard_normal(30) + 1j * rng.standard_normal(30)).astype(np.complex64)
+    new = fastsar.form_image(S, col.ant, col.fmin, col.df, **g, algorithm='pfa', pfa_guard=40.0, backend='cpu')
+    old = _pfa((col, S), grid=g, guard=40.0)
+    ex = fastsar.ExactFormer(col.ant, col.fmin, col.df, col.K, **g, backend='cpu', window=True)(S)
+    gain = np.vdot(new.ravel(), old.ravel()) / np.vdot(new.ravel(), new.ravel())
+    e_new, e_old, e_pair = rel_db(new, ex), rel_db(old, ex), rel_db(new, old)
+    a_pair = rel_db(np.abs(new).astype(np.complex64), np.abs(old).astype(np.complex64))
+    print(f'{grid}: stages against the program {e_pair:.1f} dB (amplitudes {a_pair:.1f} dB, gain {abs(gain):.4f}); against '
+          f'exact backprojection: stages {e_new:.1f} dB, program {e_old:.1f} dB')
+    assert new.shape == old.shape == (g['nx'], g['ny']) and new.dtype == np.complex64
+    assert e_new < -35 and e_new < e_old + 1 and a_pair < -28
+    if grid != 'ground':
+        assert e_pair < -30 and abs(gain) == pytest.approx(1.0, abs=0.02) and abs(np.angle(gain)) < 0.01
+
+
+def test_program_choice(scene, monkeypatch):
+    """FASTSAR_PFA_PROGRAM: 'jax' keeps the JAX program on every backend; the jax backend keeps it too."""
+    from fastsar import api
+    assert api._pfa_stages('cpu', 'union') == 'cpu' and api._pfa_stages('cpu', 'inscribed') == 'cpu'
+    assert api._pfa_stages('jax', 'union') is None
+    monkeypatch.setenv('FASTSAR_PFA_PROGRAM', 'stages')
+    assert api._pfa_stages('jax', 'union') == 'jax' and api._pfa_stages('cpu', 'union') == 'cpu'
+    col, S = scene
+    a = fastsar.form_image(S, col.ant, col.fmin, col.df, **GRID, algorithm='pfa', pfa_guard=10.0, backend='jax')
+    b = fastsar.form_image(S, col.ant, col.fmin, col.df, **GRID, algorithm='pfa', pfa_guard=10.0, backend='cpu')
+    assert a.shape == b.shape and a.dtype == np.complex64 and rel_db(a, b) < -70
+    monkeypatch.setenv('FASTSAR_PFA_PROGRAM', 'jax')
+    assert api._pfa_stages('cpu', 'union') is None
+    monkeypatch.setenv('FASTSAR_PFA_PROGRAM', 'fast')
+    with pytest.raises(ValueError, match='FASTSAR_PFA_PROGRAM'):
+        api._pfa_stages('cpu', 'union')
+
+
+@pytest.mark.cuda
+def test_stages_on_cuda(scene):
+    """The cuda backend's stages give the cpu backend's image."""
+    col, S = scene
+    a = fastsar.form_image(S, col.ant, col.fmin, col.df, **GRID, algorithm='pfa', pfa_guard=10.0, backend='cuda')
+    b = fastsar.form_image(S, col.ant, col.fmin, col.df, **GRID, algorithm='pfa', pfa_guard=10.0, backend='cpu')
+    e = rel_db(a, b)
+    print(f'polar format, cuda against cpu: {e:.1f} dB')
+    assert isinstance(a, np.ndarray) and a.dtype == np.complex64 and e < -60
 
 
 @pytest.mark.cuda
