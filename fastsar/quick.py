@@ -187,9 +187,11 @@ def _fft_cuda(n):
     the kernels it ships. cuFFT (11.4) transforms a length whose points fit in a block's shared memory in one
     kernel, and only for powers of 2, 3 and 5 is that kernel in the library: for any other length it is compiled
     when the first plan of that length is made, 8 to 240 ms a length (30 to 100 ms for most), and the driver keeps
-    it in its cache of compiled code (~/.nv/ComputeCache), so that a machine pays it for every new size of picture
-    until its cache holds them all, and every time where the cache is new (a fresh VM, a container) or off. The
-    longer lengths are made of several kernels the library ships. So the length is a power of 2, 3 or 5 up to the
+    it in its cache of compiled code (~/.nv/ComputeCache, CUDA_CACHE_PATH), so that a machine pays it for every new
+    size of picture until its cache holds them all, every time where the cache is new (a fresh VM, a container) or
+    off (CUDA_CACHE_DISABLE), and again for the lengths the cache evicts once it reaches its size limit
+    (CUDA_CACHE_MAXSIZE), which a machine that meets many lengths reaches. The longer lengths are made of several
+    kernels the library ships. So the length is a power of 2, 3 or 5 up to the
     points of a block's shared memory (12,672 on an L4), and above them the host's 2^a 3^b 5^c (pfa2._fft_size)."""
     if not _SHARED:
         import cupy as cp
