@@ -125,11 +125,14 @@ def _starts(n, per):
 
 def _blocks_of(total, per, multiple=1):
     """The blocks of a stage over `total` rows when `per` fit in its memory: (rows of a block, a size of the
-    ladder; rows of it that are the array's; starts). One block where the rows fit: it is padded to the ladder's
-    next size. multiple: the block's rows are a multiple of it (total is)."""
+    ladder; rows of it that are the array's; starts). The fewest blocks that hold the rows, of the ladder's size
+    next above an even share (the last is moved back to end at the last row, and repeats few rows); one block
+    where the rows fit, padded to the ladder's next size. multiple: the block's rows are a multiple of it (total
+    is)."""
     per = int(max(multiple, (_ladder_down(max(per, 1)) // multiple) * multiple))
     if total <= per:
         return _up(_ladder(total), multiple), int(total), [0]
+    per = min(per, _up(_ladder(-(-total // -(-total // per))), multiple))
     return per, per, _starts(total, per)[1]
 
 

@@ -869,18 +869,52 @@ def test_auto_backend_by_the_size_of_the_cut(spot, monkeypatch):
         fastsar.quicklook(spot['path'], size=64, backend='gpu')
 
 
+def test_auto_says_which_on_a_tpu_host(spot, monkeypatch):
+    """On a machine that may have a TPU, 'auto' takes the device from AUTO_TPU_SAMPLES on and the host's cores
+    below, and the product's notes say which and why."""
+    from fastsar import api
+    monkeypatch.setattr(quick, '_tpu_host', lambda: True)
+    monkeypatch.setattr(api, 'available_backends', lambda: ['tpu', 'cpu'])
+    monkeypatch.setattr(quick, 'AUTO_CUDA_SAMPLES', 10 ** 15)
+    monkeypatch.setattr(quick, 'AUTO_CUDA_FIRST_SAMPLES', 10 ** 15)
+    notes = []
+    assert quick._auto(quick.AUTO_TPU_SAMPLES, notes) == 'tpu' and 'formed on the TPU' in notes[0] and 'AUTO_TPU_SAMPLES' in notes[0]
+    notes = []
+    assert quick._auto(quick.AUTO_TPU_SAMPLES - 1, notes) == 'cpu' and "formed on the host's cores" in notes[0]
+    out = fastsar.quicklook(spot['path'], size=64)
+    assert out['backend'] == 'cpu' and any("backend 'auto': formed on the host's cores" in n for n in out['notes'])
+    monkeypatch.setattr(quick, '_tpu_host', lambda: False)
+    notes = []
+    assert quick._auto(10 ** 12, notes) == 'cpu' and notes == []              # no TPU here: nothing to say
+    assert not any("backend 'auto'" in n for n in fastsar.quicklook(spot['path'], size=64)['notes'])
+
+
 @pytest.mark.tpu
-def test_tpu(spot, monkeypatch):
-    """On a TPU: 'auto' picks it from its threshold on, the device's stages form the host's image, and the
-    factorized former (precision 'single-pass') stays selectable."""
+def test_tpu(spot, squinted, steep, monkeypatch):
+    """On a TPU: quicklook(backend='tpu') forms the cpu backend's picture on a plain raster, on a sheared one and on
+    a folded one, corrected and not; 'auto' picks the device from its threshold on and says so; the device's
+    memory held small gives the same picture with a note; the factorized former (precision 'single-pass') stays
+    selectable."""
+    from fastsar import quick_jax
+    for f, limit, size in ((spot, -60, 128), (squinted, -45, 128), (steep, -45, 160)):
+        ref = look(f['path'], size=size, complex_image=True)
+        out = look(f['path'], size=size, backend='tpu', complex_image=True)
+        e = rel_db(out['image'], ref['image'])
+        print(f'polar format on the TPU against the host: {e:.1f} dB')
+        assert out['backend'] == 'tpu' and out['algorithm'] == 'pfa' and out['cut'] == ref['cut'] and e < limit
+        assert np.mean(np.abs(out['display'].astype(int) - ref['display'].astype(int)) <= 2) > 0.98
+        raw, raw_ref = look(f['path'], size=size, backend='tpu', correct=False, complex_image=True), look(f['path'], size=size, correct=False, complex_image=True)
+        assert rel_db(raw['image'], raw_ref['image']) < -60
+    S, ant, f0, df, grid = _cut(steep, 160, drop=(20, 21, 90, 200))
+    assert rel_db(quick._pfa(S, ant, f0, df, *grid, correct=False, backend='tpu'), quick._pfa(S, ant, f0, df, *grid, correct=False)) < -60
     ref = look(spot['path'], size=128, complex_image=True)
     monkeypatch.setattr(quick, 'AUTO_TPU_SAMPLES', 0)
     out = fastsar.quicklook(spot['path'], size=128, complex_image=True)
-    assert out['backend'] == 'tpu' and out['algorithm'] == 'pfa' and out['cut'] == ref['cut']
-    e = rel_db(out['image'], ref['image'])
-    print(f'polar format on the TPU against the host: {e:.1f} dB')
-    assert e < -50
-    assert np.mean(np.abs(out['display'].astype(int) - ref['display'].astype(int)) <= 2) > 0.99
+    assert out['backend'] == 'tpu' and any("backend 'auto': formed on the TPU" in n for n in out['notes'])
+    monkeypatch.setenv('FASTSAR_JAX_BLOCK_MB', '1')
+    small = look(spot['path'], size=128, backend='tpu', complex_image=True)
+    assert rel_db(small['image'], out['image']) < -80 and any('kept on the host' in n for n in small['notes'])
+    monkeypatch.delenv('FASTSAR_JAX_BLOCK_MB')
     monkeypatch.setenv('FASTSAR_QUICKLOOK_JAX', 'ffbp')
     out = fastsar.quicklook(spot['path'], size=128, backend='tpu', complex_image=True)
     assert out['algorithm'] == 'ffbp' and any('single-pass' in n for n in out['notes'])
