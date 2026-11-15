@@ -1048,9 +1048,12 @@ def test_cuda_streams_what_does_not_fit(spot, squinted, monkeypatch, megabytes):
             if ref is not None:
                 e = rel_db(out['image'], ref['image'])
                 print(f'{k}, {megabytes} MB of device memory: {e:.1f} dB against the picture formed with room')
-                assert e < -80 and np.array_equal(out['display'], ref['display'])
+                # (a picture kept on the host is detected and remapped there: a pixel may round to the next level)
+                diff = np.abs(out['display'].astype(int) - ref['display'].astype(int))
+                assert e < -80 and diff.max() <= 1 and np.mean(diff > 0) < 1e-3
     col = quick._collection(spot['path'], size=256)
-    g = quick._geometry(col['ant'], col['fmin'], col['df'], col['S'].shape[1], *(col[k] for k in ('nx', 'ny', 'spx', 'spy', 'e1', 'e2')), True)
+    g = quick._geometry(col['ant'], col['fmin'], col['df'], col['S'].shape[1], *(col[k] for k in ('nx', 'ny', 'spx', 'spy', 'e1', 'e2')),
+                        True, **quick._cuda_lengths(True))
     assert quick._cuda_plan(g, True, False, 1 << 40, 1 << 20)['kept'] == []
     assert len(quick._cuda_plan(g, True, False, 1 << 10, 1 << 8)['kept']) == 4
 
@@ -1068,14 +1071,14 @@ def test_cuda_gives_the_device_back():
     P, K = len(ant), col.K
     S = (rng.standard_normal((P, K), np.float32) + 1j * rng.standard_normal((P, K), np.float32)).astype(np.complex64)
     grid = (128, 1024, 0.3, 0.3, np.array([0.0, 1.0, 0.0]), np.array([1.0, 0.0, 0.0]))
-    g = quick._geometry(ant, col.fmin, col.df, K, *grid, True)
-    assert g['Kf'] > 20000                                                     # a length with a work area
     pool, cache = cp.get_default_memory_pool(), cp.fft.config.get_plan_cache()
     quick._cuda()                                                              # the kernels and tables, loaded
     cache.clear()
     limit = pool.get_limit()
     try:
         for correct in (True, False):
+            g = quick._geometry(ant, col.fmin, col.df, K, *grid, correct, **quick._cuda_lengths(correct))
+            assert g['Kf'] > 20000                                             # a length with a work area
             need = next(b for b in range(1 << 20, 1 << 30, 1 << 16)
                         if not quick._cuda_plan(g, correct, False, b, b // 4)['kept'])
             pool.free_all_blocks()
@@ -1084,7 +1087,7 @@ def test_cuda_gives_the_device_back():
             for call in range(3):
                 if call == 2:                                                  # another caller's plan, with its work area
                     cp.fft.fft(cp.zeros((8, 13500), cp.complex64), axis=1)
-                    assert cache.get_curr_memsize() > 0.1 * need
+                    assert cache.get_curr_memsize() > 0.05 * need                # beyond the 3% the limit leaves
                 info = {}
                 img = quick._pfa(S, ant, col.fmin, col.df, *grid, correct=correct, complex_image=False, backend='cuda', info=info)
                 cp.cuda.get_current_stream().synchronize()
@@ -1099,27 +1102,59 @@ def test_cuda_gives_the_device_back():
         pool.set_limit(size=limit)
 
 
-@pytest.mark.cuda
-def test_cuda_sheared_raster(squinted):
-    """The CUDA path on a ground grid under a twisted slant plane: the host's image."""
+def _against_host(S, ant, f0, df, grid, monkeypatch, **kw):
+    """The CUDA path's image of a history against the host's -> (dB on the CUDA path's own transform lengths, dB on
+    the host's). On the host's lengths the kernels give the host's image to rounding; on its own (quick._cuda_lengths:
+    those cuFFT ships compiled; corrected, the raster's padded transforms a little finer than twice its periods,
+    uncorrected a longer raster) the image differs from the host's by the interpolation's own error, within polar
+    format's accuracy against exact backprojection."""
     import cupy as cp
+    h = quick._pfa(S, ant, f0, df, *grid, **kw)
+    out = []
+    for host in (False, True):
+        with monkeypatch.context() as m:
+            if host:
+                m.setattr(quick, '_fft_cuda', quick._fft_size)
+            d = quick._pfa(S, ant, f0, df, *grid, backend='cuda', **kw)
+        assert isinstance(d, cp.ndarray) and d.dtype == h.dtype and d.shape == h.shape
+        out.append(rel_db(cp.asnumpy(d).astype(np.complex64), h.astype(np.complex64)))
+    return out
+
+
+@pytest.mark.cuda
+def test_cuda_lengths():
+    """The CUDA path's transform lengths are those cuFFT ships compiled: powers of 2, 3 or 5 up to the points a
+    block's shared memory holds, the host's 2^a 3^b 5^c above them; a corrected picture's padded transforms are at
+    least twice the raster's periods, which are the host's."""
+    import cupy as cp
+    top = cp.cuda.Device().attributes['MaxSharedMemoryPerBlockOptin'] // 8
+    for n in list(range(2, 300)) + [1000, 1025, 2050, 4100, 6600, 8200, top - 1, top, top + 1, 20001]:
+        m = quick._fft_cuda(n)
+        q = next(q for q in (2, 3, 5) if m % q == 0)
+        assert m >= n and (m > top and m == quick._fft_size(max(n, top + 1)) or m == q ** round(np.log(m) / np.log(q))), (n, m)
+        assert m == min(quick._fft_size(max(n, top + 1)), *(q ** int(np.ceil(np.log(n) / np.log(q) - 1e-9)) for q in (2, 3, 5)))
+    g = dict(nfy=1080, nfx=2160, ov=2)
+    assert quick._cuda_transforms(g, True) == (2187, 6561) and quick._cuda_transforms(g, False) == (1080, 2160)
+
+
+@pytest.mark.cuda
+def test_cuda_sheared_raster(squinted, monkeypatch):
+    """The CUDA path on a ground grid under a twisted slant plane: the host's image (_against_host)."""
     col = quick._collection(squinted['path'], size=128)
     S, ant, f0, df = col['S'], col['ant'], col['fmin'], col['df']
     grid = tuple(col[k] for k in ('nx', 'ny', 'spx', 'spy', 'e1', 'e2'))
     assert quick._geometry(ant, f0, df, S.shape[1], *grid, True)['jlo'] is not None
     for correct in (True, False):
         for cplx in (True, False):
-            h = quick._pfa(S, ant, f0, df, *grid, correct=correct, complex_image=cplx)
-            d = quick._pfa(S, ant, f0, df, *grid, correct=correct, complex_image=cplx, backend='cuda')
-            e = rel_db(cp.asnumpy(d).astype(np.complex64), h.astype(np.complex64))
-            print(f'cuda against the host on a sheared raster, correct {correct}, complex {cplx}: {e:.1f} dB')
-            assert d.shape == h.shape and e < -60
+            e, e0 = _against_host(S, ant, f0, df, grid, monkeypatch, correct=correct, complex_image=cplx)
+            print(f'cuda against the host on a sheared raster, correct {correct}, complex {cplx}: {e:.1f} dB '
+                  f'({e0:.1f} dB on the host\'s lengths)')
+            assert e < (-40 if correct else -35) and e0 < -60
 
 
 @pytest.mark.cuda
-def test_cuda_missing_pulses():
-    """The CUDA path on a history that lacks pulses: the host's image."""
-    import cupy as cp
+def test_cuda_missing_pulses(monkeypatch):
+    """The CUDA path on a history that lacks pulses: the host's image (_against_host)."""
     rng = np.random.default_rng(8)
     col = sim.make_collect(res=0.5, scene=200.0, r0=60e3)
     keep = np.ones(col.Np, bool)
@@ -1130,41 +1165,41 @@ def test_cuda_missing_pulses():
     grid = (300, 240, 0.5, 0.6, np.array([0.0, 1.0, 0.0]), np.array([1.0, 0.0, 0.0]))
     assert quick._geometry(ant, col.fmin, col.df, col.K, *grid, True)['place'] is not None
     for correct in (True, False):
-        h = quick._pfa(S, ant, col.fmin, col.df, *grid, correct=correct)
-        d = quick._pfa(S, ant, col.fmin, col.df, *grid, correct=correct, backend='cuda')
-        e = rel_db(cp.asnumpy(d), h)
-        print(f'cuda against the host with pulses missing, correct {correct}: {e:.1f} dB')
-        assert e < -60
+        e, e0 = _against_host(S, ant, col.fmin, col.df, grid, monkeypatch, correct=correct)
+        print(f'cuda against the host with pulses missing, correct {correct}: {e:.1f} dB ({e0:.1f} dB on the host\'s lengths)')
+        assert e < (-40 if correct else -35) and e0 < -60
 
 
 @pytest.mark.cuda
-def test_cuda(spot):
-    """The CUDA path (CuPy alone): the same image as the host's to rounding, corrected and uncorrected, complex and
-    detected, and the same picture."""
+def test_cuda(spot, monkeypatch):
+    """The CUDA path (CuPy alone): the host's image (_against_host), corrected and uncorrected, complex and detected,
+    as close to exact backprojection as the host's, and the same picture."""
     import cupy as cp
     col = quick._collection(spot['path'], size=256)
     S, ant, f0, df = col['S'], col['ant'], col['fmin'], col['df']
     grid = tuple(col[k] for k in ('nx', 'ny', 'spx', 'spy', 'e1', 'e2'))
     for correct in (True, False):
         for cplx in (True, False):
-            h = quick._pfa(S, ant, f0, df, *grid, correct=correct, complex_image=cplx)
-            d = quick._pfa(S, ant, f0, df, *grid, correct=correct, complex_image=cplx, backend='cuda')
-            assert isinstance(d, cp.ndarray) and d.dtype == h.dtype and d.shape == h.shape
-            e = rel_db(cp.asnumpy(d).astype(np.complex64), h.astype(np.complex64))
-            print(f'cuda against the host, correct {correct}, complex {cplx}: {e:.1f} dB')
-            assert e < -60
+            e, e0 = _against_host(S, ant, f0, df, grid, monkeypatch, correct=correct, complex_image=cplx)
+            print(f'cuda against the host, correct {correct}, complex {cplx}: {e:.1f} dB ({e0:.1f} dB on the host\'s lengths)')
+            assert e < (-40 if correct else -35) and e0 < -60
+    ex = fastsar.ExactFormer(ant, f0, df, S.shape[1], *grid, backend='cpu', window=True)(S)
+    eh = rel_db(quick._pfa(S, ant, f0, df, *grid), ex)
+    ed = rel_db(cp.asnumpy(quick._pfa(S, ant, f0, df, *grid, backend='cuda')), ex)
+    print(f'against exact backprojection: cuda {ed:.1f} dB, host {eh:.1f} dB')
+    assert ed < eh + 1
     a = look(spot['path'], size=256, backend='cuda')
     b = look(spot['path'], size=256, backend='cpu')
     assert a['backend'] == 'cuda' and isinstance(a['display'], np.ndarray) and a['display'].shape == b['display'].shape
-    assert np.mean(np.abs(a['display'].astype(int) - b['display'].astype(int)) <= 1) > 0.999
+    assert np.mean(np.abs(a['display'].astype(int) - b['display'].astype(int)) <= 2) > 0.99
     assert a['cut'] == b['cut'] and {'range', 'azimuth', 'correction'} <= set(a['timing'])
     c = look(spot['path'], size=256, backend='cuda', complex_image=True)
     d = look(spot['path'], size=256, backend='cpu', complex_image=True)
-    assert isinstance(c['image'], np.ndarray) and c['image'].flags.c_contiguous and rel_db(c['image'], d['image']) < -60
+    assert isinstance(c['image'], np.ndarray) and c['image'].flags.c_contiguous and rel_db(c['image'], d['image']) < -40
     # looks on the device: the remap is given a CuPy image
     got = []
     out = look(spot['path'], size=128, looks=2, backend='cuda', remap=lambda x, valid=None: (got.append(x), cp.zeros(x.shape, cp.uint8))[1])
     ref = []
     look(spot['path'], size=128, looks=2, remap=lambda x, valid=None: (ref.append(np.array(x)), np.zeros(x.shape, np.uint8))[1])
     assert out['looks'] == (2, 2) and isinstance(got[0], cp.ndarray)
-    assert rel_db(cp.asnumpy(got[0]).astype(np.complex64), ref[0].astype(np.complex64)) < -60
+    assert rel_db(cp.asnumpy(got[0]).astype(np.complex64), ref[0].astype(np.complex64)) < -40
