@@ -781,7 +781,12 @@ def test_tpu_programs_cut_each_band_where_the_cpu_does(strip, monkeypatch):
         print(f'  {name} {what} (tpu programs{"" if real else ", interpreted"}): {pk:.1e} of the peak, {db:.1f} dB')
         worst.append((what, float(pk), round(float(db), 1)))
     assert ('fused_final2', True) in weighted and ('fused_final2', False) not in weighted, set(weighted)
-    assert max(w[1] for w in worst) < 2e-3 and max(w[2] for w in worst) < -60, worst
+    # interpreted on a CUDA device (a GPU host whose JAX is the CUDA build) the programs agree with the cpu former
+    # at -51 to -52 dB (an L4, an A100 and an H100), where the CPU device and a TPU give under -60; the band cut at
+    # other pulses, which this test is for, stood at -32 to -45 dB
+    import jax
+    bound = -45 if (not real and jax.default_backend() == 'gpu') else -60
+    assert max(w[1] for w in worst) < 2e-3 and max(w[2] for w in worst) < bound, worst
 
 
 @pytest.mark.cuda
