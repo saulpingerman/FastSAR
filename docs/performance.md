@@ -30,6 +30,14 @@ on the Melbourne and Iowa collections as well.
 
 ![Cost per 1000 Panama images against error for every FastSAR configuration and the open-source implementations](images/teaser.png)
 
+![Seconds per Panama image against cost per 1000 images, with the Pareto front of each accuracy regime](images/speed_cost.png)
+
+The second figure plots time against cost for every configuration the precision page scores, with the Pareto front
+of each accuracy regime (regime 1, no visible change; regime 2, coherence loss beside bright returns). The front of
+regime 1 is factorized backprojection on the H100, the A100 and the L4 in float16; the front of regime 2 is the polar
+format on the same three GPUs. No CPU or TPU configuration and no exact backprojection lies on either front. Seconds
+are the warm single-image time and costs the back-to-back throughput, as in the table above.
+
 Single-pass on the TPUs takes 2.5 s (v6e) and 3.6 s (v5e) at -46.2 dB, $1.19 and $0.83 per 1000 images. Float16
 on the L4 and single-pass on the TPUs lower each device's cost by 15 to 37%. Polar format takes 0.73 s on the L4
 ($0.14 per 1000, the lowest cost of any configuration), 0.35 s on the A100, 0.18 s on the H100, 1.9 s on the

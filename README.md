@@ -24,6 +24,14 @@ estimated 4.8 h.*
 *Cost per 1000 Panama images (October 2026 prices) against error over the lock, port and ship regions (FastSAR relative to
 a float64 backprojection at 64 times oversampling, the open-source codes to the float64 reference; [performance](https://github.com/saulpingerman/FastSAR/blob/main/docs/performance.md), [comparison](https://github.com/saulpingerman/FastSAR/blob/main/docs/comparison.md)).*
 
+![Seconds per Panama image against cost per 1000 images, with the Pareto front of each accuracy regime](https://raw.githubusercontent.com/saulpingerman/FastSAR/main/docs/images/speed_cost.png)
+
+*Seconds per Panama image (warm, host memory to host memory) against cost per 1000 images (back to back, October
+2026 on-demand us-central1 prices) for every configuration the precision page scores. Regime 1, no visible change:
+exact and factorized backprojection, -57.8 dB or better over the whole image. Regime 2, coherence loss beside bright
+returns: the polar format joins, at -33.7 dB. Each line is a regime's Pareto front, and faded points are off it
+([performance](https://github.com/saulpingerman/FastSAR/blob/main/docs/performance.md#time-and-cost-per-image)).*
+
 ## Install
 
 Linux on x86-64 or 64-bit ARM and macOS on Apple silicon, Python 3.10 to 3.13. The wheels for these platforms
