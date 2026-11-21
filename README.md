@@ -27,11 +27,13 @@ a float64 backprojection at 64 times oversampling, the open-source codes to the 
 ![Seconds per Panama image against cost per 1000 images, with the Pareto front of each accuracy regime](https://raw.githubusercontent.com/saulpingerman/FastSAR/main/docs/images/speed_cost.png)
 
 *Seconds per Panama image (warm, host memory to host memory) against cost per 1000 images (back to back, October
-2026 on-demand us-central1 prices) for every scored configuration. The regimes are those of the figure above, set
+2026 on-demand us-central1 prices) for the configurations of the figure above, with the polar format on the A100 and
+H100 as well. The regimes are those of the figure above, set
 by each image's coherence with the reference: regime 1 (no visible change) holds every backprojection at float32
 class, float16 or exact; regime 2 (coherence loss beside bright returns) adds single-pass bfloat16 on the TPUs and
-the polar format; regime 3 (striped coherence loss) has held no configuration since 0.3.1. Each line is a regime's
-Pareto front, and faded points are off it
+the polar format; regime 3 (striped coherence loss) has held no configuration since 0.3.1. The dashed and solid
+lines are the Pareto fronts of regimes 1 and 2, the dash-dot line that of exact backprojection alone (cubic, 8 times,
+-67.4 dB), and faded points are off every front
 ([performance](https://github.com/saulpingerman/FastSAR/blob/main/docs/performance.md#time-and-cost-per-image)).*
 
 ## Install
